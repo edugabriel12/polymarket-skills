@@ -137,6 +137,114 @@ Para reduzir mais: aumente `AGENT_INTERVAL` (1800 = 30 min, metade do custo), tr
 - **`Permission to … denied`** ao gravar no DB: ajuste `ReadWritePaths` no unit para o caminho real do seu portfolio.
 - **Agente repetindo a mesma análise**: normal — cada ciclo é independente. Se quiser memória entre ciclos, escreva no DB ou em um arquivo dentro de `~/.polymarket-paper/`.
 
+## Modo Live Autônomo (opt-in)
+
+⚠️ **Dinheiro real. Sem confirmação humana por trade.** Leia `CLAUDE.md` §4.1 antes de ativar.
+
+### Pré-requisitos
+
+1. **Burner wallet criada e fundada.** Nunca use sua wallet principal.
+   ```bash
+   source ~/.venv/bin/activate
+   python ~/polymarket-skills/polymarket-live-executor/scripts/setup_wallet.py --create
+   # Salva endereço + chave (mostrados uma única vez)
+   # Envia ~$100 USDC + ~0.05 MATIC pra o endereço, na rede Polygon
+   POLYMARKET_PRIVATE_KEY=0x... python setup_wallet.py --check-balance
+   ```
+
+2. **Critérios de live-readiness atendidos** (CLAUDE.md §4): 20+ paper trades fechados, win rate >55%, Sharpe >0.5, drawdown <15%. O agente bloqueia live automaticamente se qualquer um falhar.
+   ```bash
+   python ~/polymarket-skills/polymarket-strategy-advisor/scripts/backtest.py --live-check
+   # verdict deve ser READY
+   ```
+
+3. **Bot Telegram** pra alertas:
+   - Falar com [@BotFather](https://t.me/botfather), `/newbot`, salvar token
+   - Mandar `/start` pro bot
+   - `curl https://api.telegram.org/bot<TOKEN>/getUpdates` → copiar `chat.id`
+
+### Ativação
+
+Edite `.env`:
+```bash
+POLYMARKET_AUTO_CONFIRM=true
+POLYMARKET_PRIVATE_KEY=0x...        # burner wallet
+POLYMARKET_CONFIRM=true
+POLYMARKET_MAX_SIZE=5
+POLYMARKET_DAILY_LOSS_LIMIT=50
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+```
+
+Restart:
+```bash
+systemctl --user restart polymarket-agent
+journalctl --user -u polymarket-agent -f
+```
+
+No log você deve ver:
+```
+[startup] live_enabled=True ...
+[startup] LIVE mode is ENABLED. Per-cycle gates: ...
+[mode] LIVE_ENABLED=true ready=True reason='4/4 criteria'
+```
+
+Se aparecer `ready=False`, o agente segue em paper até as métricas passarem.
+
+### Killswitch
+
+Pra parar live trading **imediatamente** (próximo ciclo, ≤15 min):
+```bash
+touch ~/halt-trading
+```
+
+Pra retomar:
+```bash
+rm ~/halt-trading
+```
+
+O killswitch é checado:
+- No início de cada ciclo (skip do ciclo inteiro)
+- Antes de cada chamada à `execute_live.py` (refuse no meio do ciclo)
+
+Pra parada total imediata: `systemctl --user stop polymarket-agent`.
+
+### Monitoramento
+
+- **Telegram:** uma mensagem por trade (sucesso ou falha) com argumentos e stdout.
+- **Trade log:** `~/.polymarket-live/trades.log` (JSON, uma linha por evento).
+- **Posições on-chain:** `python check_positions.py --balance --orders --trades`.
+- **journalctl:** `journalctl --user -u polymarket-agent -f | grep -E '\[live\]|\[mode\]'`.
+
+### Camadas de segurança que permanecem em modo autônomo
+
+| Camada | Ativa em live autônomo? |
+|---|---|
+| `POLYMARKET_CONFIRM=true` env gate | Sim |
+| `POLYMARKET_MAX_SIZE` hard cap por trade | Sim ($5) |
+| `POLYMARKET_DAILY_LOSS_LIMIT` | Sim ($50) |
+| Drawdown graduado 10/15/20% (CLAUDE.md §2) | Sim — fecha tudo aos $20 perdidos |
+| Live-readiness gate (CLAUDE.md §4) | Sim — checado todo ciclo |
+| Killswitch `~/halt-trading` | Sim — checado pré-ciclo + pré-trade |
+| Telegram alert por trade | Sim |
+| systemd `ProtectHome=read-only` | Sim |
+| Burner wallet (não main) | Disciplina sua |
+
+### Reverter pra paper-only
+
+Edite `.env`, deixe `POLYMARKET_AUTO_CONFIRM=` (vazio), restart. Nenhuma mudança de código necessária.
+
+### Riscos aceitos
+
+Lendo `CLAUDE.md` §4.1 e ativando este modo, você está conscientemente aceitando:
+1. Bug no agente → ordem errada (capped a $5).
+2. Prompt injection via market data → trade indevido (capped + alertado).
+3. Caps + drawdown podem ainda assim resultar em perda total dos $100.
+4. Slippage/market impact reais não capturados em paper.
+5. Sem confirmação por trade — regra #4 do CLAUDE.md fica suspensa enquanto este modo está ativo.
+
+---
+
 ## Limitações
 
 - Sem replay/resume — se um ciclo crash no meio de uma execução paper, pode ficar half-done. O `paper_engine.py` é transacional, então o DB fica consistente, mas a recomendação foi perdida.
