@@ -1,0 +1,27 @@
+[Unit]
+Description=Polymarket autonomous paper-trading agent
+Documentation=file:%h/polymarket-skills/agent/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/polymarket-skills/agent/.env
+ExecStart=/usr/bin/env python3 %h/polymarket-skills/agent/run.py
+Restart=on-failure
+RestartSec=30s
+StandardOutput=journal
+StandardError=journal
+# Resource caps — adjust if your workload needs more.
+MemoryMax=512M
+CPUQuota=50%
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.polymarket-paper
+
+[Install]
+WantedBy=default.target
