@@ -12,7 +12,7 @@ Loop em Python que roda o workflow do `CLAUDE.md` em ciclos periódicos, dirigid
            │
            ▼
 ┌───────────────────────┐    a cada AGENT_INTERVAL segundos
-│ agent/run.py          │ ──► chama Claude (Opus 4.7 default)
+│ agent/run.py          │ ──► chama Claude (Sonnet 4.6 default)
 │ - tool: run_script    │     com SYSTEM_PROMPT cacheado
 │ - tool: read_file     │
 └──────────┬────────────┘
@@ -105,11 +105,11 @@ Estimativa grosseira para `AGENT_INTERVAL=900` (96 ciclos/dia):
 
 | Modelo | Caching efetivo? | Custo aproximado/mês |
 |---|---|---|
-| `claude-opus-4-7` | Não no prompt atual (~3K tokens, abaixo do mínimo de 4096 para Opus) | $400–900 |
-| `claude-sonnet-4-6` | Sim (mínimo 2048 tokens) | $20–80 |
+| `claude-sonnet-4-6` (**default**) | Sim (mínimo 2048 tokens) | $20–80 |
 | `claude-haiku-4-5` | Sim | $5–20 |
+| `claude-opus-4-7` | Não no prompt atual (~3K tokens, abaixo do mínimo de 4096 para Opus) | $400–900 |
 
-Para reduzir: aumente `AGENT_INTERVAL` (1800 = 30 min metade do custo), troque para Sonnet 4.6 via `CLAUDE_MODEL=claude-sonnet-4-6` no `.env`, ou diminua `AGENT_MAX_TURNS`.
+Para reduzir mais: aumente `AGENT_INTERVAL` (1800 = 30 min, metade do custo), troque para Haiku 4.5 via `CLAUDE_MODEL=claude-haiku-4-5` no `.env`, ou diminua `AGENT_MAX_TURNS`.
 
 ## Limites e segurança
 

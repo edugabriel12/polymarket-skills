@@ -27,7 +27,7 @@ import anthropic
 ROOT = Path(
     os.environ.get("POLYMARKET_SKILLS_ROOT", str(Path.home() / "polymarket-skills"))
 ).resolve()
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-7")
+MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 INTERVAL = int(os.environ.get("AGENT_INTERVAL", "900"))  # seconds between cycles
 MAX_TURNS = int(os.environ.get("AGENT_MAX_TURNS", "20"))
 MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "16000"))
