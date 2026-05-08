@@ -211,6 +211,46 @@ All new strategies, all new users, and all sessions without explicit live author
 
 **Live workflow:** Analyze opportunities → paper-trade the idea first → review `polymarket-live-executor/references/live-trading-checklist.md` → set env vars → verify wallet with `check_positions.py` → execute with `execute_live.py` → confirm each trade → monitor.
 
+### 4.1 Autonomous Live Mode (Opt-In)
+
+When the operator explicitly authorizes autonomous live trading, **rule #4 of Section 1 is suspended in this specific mode**: the agent may execute live orders without per-trade human confirmation. This is a deliberate operator choice with risk consciously accepted, gated by every other safeguard.
+
+**Activation requires ALL of:**
+
+1. `POLYMARKET_AUTO_CONFIRM=true` in the agent's environment (master switch).
+2. `POLYMARKET_PRIVATE_KEY` set to a **burner** wallet (never the operator's main wallet).
+3. `POLYMARKET_CONFIRM=true` (existing gate, still required by `execute_live.py`).
+4. Live-readiness criteria from §4 above all passing — checked every cycle by `backtest.py --live-check --json`. If any fails, the cycle falls back to paper mode automatically.
+5. Killswitch file (default `~/halt-trading`) **absent**. Touch the file to halt all live trading within at most one cycle.
+
+**Hard caps that remain enforced (never relaxed in this mode):**
+
+| Parameter | Source | Behavior |
+|---|---|---|
+| `POLYMARKET_MAX_SIZE` | `execute_live.py` | Per-trade USD ceiling, rejects above |
+| `POLYMARKET_DAILY_LOSS_LIMIT` | `execute_live.py` | Daily spend ceiling, rejects above |
+| Graduated drawdown 10/15/20% | §2 above | Reduce → halt sequence still applies |
+| Daily loss 5%, weekly 10% | §2 above | Still trigger entry-blocking |
+| Forced exit conditions | §2 above | Still trigger immediate close-all |
+
+**Required notifications:** Every live execution (success **or** failure) must emit a notification through a side channel (Telegram, Discord, or email). Silent live trades are forbidden — the operator must be able to verify activity within minutes.
+
+**The agent's obligations under this mode:**
+
+- Treat the LIVE/PAPER mode signal in the kickoff message as authoritative. Do not attempt live trades unless the kickoff explicitly says "LIVE MODE ACTIVE".
+- Mirror every live trade into the paper portfolio for performance continuity.
+- Apply the same edge-classification, Kelly sizing, and risk-validation steps as paper mode. The fact that a trade is live does not lower the bar for whether to take it.
+- If a live trade fails (network, slippage, insufficient balance), log it and continue. Do not retry within the same cycle.
+
+**Operator's responsibilities:**
+
+- Fund the burner wallet only with capital classified as fully expendable.
+- Monitor notifications and the journalctl log at least daily.
+- Halt the agent (`touch ~/halt-trading` or `systemctl --user stop polymarket-agent`) at the first sign of anomalous behavior — bug, prompt-injected market, unexpected losses.
+- Treat this mode as an experiment, not a deployment. Re-evaluate after every full week of operation.
+
+**Reverting to paper-only:** Set `POLYMARKET_AUTO_CONFIRM=` (blank) in `.env` and restart the service. No code changes needed.
+
 ---
 
 ## 5. Skill Map

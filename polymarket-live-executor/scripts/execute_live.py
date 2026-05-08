@@ -312,23 +312,29 @@ def main():
     )
     print(confirmation)
 
-    # Ask for confirmation
-    try:
-        response = input("\n  Type 'yes' to execute this trade: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print("\nTrade cancelled.")
-        log_trade({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "status": "CANCELLED",
-            "reason": "User did not confirm",
-            "token_id": args.token_id,
-            "side": args.side,
-            "size": args.size,
-            "price": args.price,
-            "amount": args.amount,
-            "is_market": args.market,
-        })
-        sys.exit(0)
+    # Ask for confirmation. POLYMARKET_AUTO_CONFIRM=true bypasses the prompt
+    # for autonomous-agent use; manual usage still requires typing "yes".
+    auto_confirm = os.environ.get("POLYMARKET_AUTO_CONFIRM", "").lower() == "true"
+    if auto_confirm:
+        print("\n  [AUTO-CONFIRM] POLYMARKET_AUTO_CONFIRM=true; executing without prompt.")
+        response = "yes"
+    else:
+        try:
+            response = input("\n  Type 'yes' to execute this trade: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nTrade cancelled.")
+            log_trade({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "status": "CANCELLED",
+                "reason": "User did not confirm",
+                "token_id": args.token_id,
+                "side": args.side,
+                "size": args.size,
+                "price": args.price,
+                "amount": args.amount,
+                "is_market": args.market,
+            })
+            sys.exit(0)
 
     if response != "yes":
         print("Trade cancelled. You must type exactly 'yes' to confirm.")

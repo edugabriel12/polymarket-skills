@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scan and search active Polymarket prediction markets via the Gamma API."""
+"""Scan active Polymarket weather prediction markets via the Gamma API."""
 
 import argparse
 import json
@@ -9,6 +9,8 @@ import sys
 import requests
 
 GAMMA_API = "https://gamma-api.polymarket.com"
+
+WEATHER_TAG_SLUG = "weather"
 
 MAX_TEXT_LEN = 200
 
@@ -23,19 +25,17 @@ def sanitize_text(text):
     return text
 
 
-def fetch_markets(limit=20, category=None, search=None, min_volume=0,
+def fetch_markets(limit=20, search=None, min_volume=0,
                   sort_by="volume24hr", ascending=False):
-    """Fetch active markets from Gamma API with filtering and sorting."""
+    """Fetch active weather markets from Gamma API with filtering and sorting."""
     params = {
         "limit": min(limit, 100),
         "active": "true",
         "closed": "false",
         "order": sort_by,
         "ascending": str(ascending).lower(),
+        "tag_slug": WEATHER_TAG_SLUG,
     }
-
-    if category:
-        params["tag_slug"] = category.lower()
 
     resp = requests.get(f"{GAMMA_API}/markets", params=params, timeout=30)
     resp.raise_for_status()
@@ -93,15 +93,11 @@ def fetch_markets(limit=20, category=None, search=None, min_volume=0,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scan active Polymarket prediction markets"
+        description="Scan active Polymarket weather prediction markets"
     )
     parser.add_argument(
         "--limit", type=int, default=20,
         help="Number of markets to return (max 100, default 20)"
-    )
-    parser.add_argument(
-        "--category", type=str, default=None,
-        help="Filter by tag/category (e.g. crypto, politics, sports)"
     )
     parser.add_argument(
         "--search", type=str, default=None,
@@ -126,7 +122,6 @@ def main():
     try:
         markets = fetch_markets(
             limit=args.limit,
-            category=args.category,
             search=args.search,
             min_volume=args.min_volume,
             sort_by=args.sort_by,
