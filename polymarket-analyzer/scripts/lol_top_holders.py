@@ -50,11 +50,12 @@ LOL_COMPETITION_TAGS = (
     "lpl",          # League of Legends Pro League (China)
     "lcs",          # League Championship Series (NA)
     "lcp",          # League Championship Pacific (replaced LCO/PCS/VCS)
+    "cblol",        # Campeonato Brasileiro de LoL
     "lol-worlds",   # Worlds Championship
     "worlds",       # Sometimes tagged just "worlds"
     "msi",          # Mid-Season Invitational
     "first-stand",  # First Stand tournament
-    "league-of-legends",  # parent tag, in case the API exposes it
+    "league-of-legends",  # parent tag — empirically covers everything
 )
 
 # Legacy alias kept for /markets fallback path; same content.
@@ -488,53 +489,60 @@ def determine_winner(market: dict) -> dict | None:
 
 
 def fetch_holders(api: APIClient, condition_id: str, token_id: str, limit: int) -> list[dict]:
-    """Fetch top holders of `token_id`. Tries multiple endpoint shapes.
+    """Fetch top holders of the winning side from Polymarket Data API.
 
-    Returns a list of {address, shares}. Empty list if no endpoint shape works.
-    Tries: /holders (market), /holders (token), /holders (both),
-           /positions (market), /leaderboard (market). Logs raw responses on
-           debug so the caller can identify which shape Polymarket actually uses.
+    Real /holders shape (verified):
+        [
+          {"token": "<token_id>", "holders": [
+              {"proxyWallet": "0x...", "amount": 1786, "name": "...",
+               "pseudonym": "Pleasant-Sequel", "outcomeIndex": 0, ...},
+              ...
+          ]},
+          {"token": "<other_token_id>", "holders": [...]}
+        ]
+
+    Returns the holders array for the entry whose `token` matches `token_id`.
     """
-    attempts = (
-        ("/holders", {"market": condition_id, "limit": limit}),
-        ("/holders", {"token": token_id, "limit": limit}),
-        ("/holders", {"market": condition_id, "token": token_id, "limit": limit}),
-        ("/positions", {"market": condition_id, "limit": limit, "sortBy": "size", "sortDirection": "desc"}),
-        ("/leaderboard", {"market": condition_id, "limit": limit}),
-    )
-    for path, params in attempts:
-        try:
-            data = api.get(f"{DATA_API}{path}", params=params)
-        except requests.exceptions.RequestException:
-            continue
-        if not data:
-            if api.debug:
-                log(f"    [holders {path}] empty/null response with params={params}")
-            continue
+    try:
+        data = api.get(
+            f"{DATA_API}/holders",
+            params={"market": condition_id, "limit": limit},
+        )
+    except requests.exceptions.RequestException:
+        return []
+    if not isinstance(data, list):
         if api.debug:
-            preview = json.dumps(data)[:600] if not isinstance(data, str) else data[:600]
-            log(f"    [holders {path}] response preview: {preview}")
-        # Normalize: Data API may return list of dicts with keys like
-        # `proxyWallet`, `user`, `address`; size keys like `amount`, `size`,
-        # `balance`. Extract whichever we find.
+            log(f"    [holders] unexpected response type: {type(data).__name__}")
+        return []
+
+    target = str(token_id)
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("token") or "") != target:
+            continue
         normalized = []
-        items = data if isinstance(data, list) else data.get("data") or data.get("holders") or []
-        for item in items:
-            if not isinstance(item, dict):
+        for h in entry.get("holders") or []:
+            if not isinstance(h, dict):
                 continue
-            addr = item.get("proxyWallet") or item.get("user") or item.get("address") or ""
-            shares = item.get("amount") or item.get("size") or item.get("balance") or 0
+            addr = h.get("proxyWallet") or h.get("user") or h.get("address") or ""
             try:
-                shares_f = float(shares)
+                shares = float(h.get("amount") or h.get("size") or h.get("balance") or 0)
             except (TypeError, ValueError):
-                shares_f = 0.0
-            if not addr or shares_f <= 0:
+                shares = 0.0
+            if not addr or shares <= 0:
                 continue
-            normalized.append({"address": addr.lower(), "shares": shares_f})
-        # Filter to winning token if we got an aggregated response
-        if normalized:
-            normalized.sort(key=lambda h: h["shares"], reverse=True)
-            return normalized[:limit]
+            normalized.append({
+                "address": addr.lower(),
+                "shares": shares,
+                "name": (h.get("name") or h.get("pseudonym") or "").strip(),
+            })
+        normalized.sort(key=lambda h: h["shares"], reverse=True)
+        return normalized[:limit]
+
+    if api.debug:
+        tokens_seen = [str(e.get("token", "?"))[:20] for e in data if isinstance(e, dict)]
+        log(f"    [holders] target token {target[:20]}... not in response (tokens: {tokens_seen})")
     return []
 
 
@@ -615,7 +623,7 @@ def write_json(report: dict, path: Path) -> None:
 def write_csv(report: dict, path: Path) -> None:
     fields = [
         "market_slug", "question", "end_date", "winning_outcome",
-        "address", "shares_at_resolution", "avg_entry_price",
+        "address", "name", "shares_at_resolution", "avg_entry_price",
         "realized_pnl_usd", "unrealized_pnl_usd", "total_pnl_usd", "n_trades",
     ]
     with path.open("w", newline="") as f:
@@ -629,6 +637,7 @@ def write_csv(report: dict, path: Path) -> None:
                     "end_date": m["end_date"],
                     "winning_outcome": m["winning_outcome"],
                     "address": h["address"],
+                    "name": h.get("name", ""),
                     "shares_at_resolution": h.get("shares_at_resolution", ""),
                     "avg_entry_price": h.get("avg_entry_price", ""),
                     "realized_pnl_usd": h.get("realized_pnl_usd", ""),
@@ -720,6 +729,7 @@ def main() -> None:
         for h in holders:
             row = {
                 "address": h["address"],
+                "name": h.get("name", ""),
                 "shares_at_resolution": round(h["shares"], 4),
             }
             if not args.no_pnl:
