@@ -180,13 +180,17 @@ def fetch_markets_by_tag(api: APIClient, tag_slug: str, after_iso: str) -> list[
             break
 
         if page_num == 0:
-            matches = sum(1 for m in page if _has_lol_keyword(m))
+            # Use slug-prefix match only (`lol-`). Keyword match has too many false
+            # positives — short tokens like "lec" hit "select", "lecture", etc.
+            matches = sum(1 for m in page if _has_lol_slug(m))
             ratio = matches / len(page)
             if ratio < LOL_KEYWORD_MIN_RATIO:
+                sample = ", ".join((m.get("slug") or "?")[:30] for m in page[:5])
                 log(
-                    f"  WARN: tag {tag_slug!r} looks ignored by API "
-                    f"({matches}/{len(page)} = {ratio:.0%} LoL keyword match) — aborting tag"
+                    f"  WARN: tag {tag_slug!r} looks ignored "
+                    f"({matches}/{len(page)} = {ratio:.0%} 'lol-' slug prefix) — aborting"
                 )
+                log(f"  first 5 slugs: {sample}")
                 return []
 
         keep, stop = [], False
@@ -378,14 +382,16 @@ def fetch_holders(api: APIClient, condition_id: str, token_id: str, limit: int) 
     """Fetch top holders of `token_id`. Tries multiple endpoint shapes.
 
     Returns a list of {address, shares}. Empty list if no endpoint shape works.
-    Documented assumption: data-api.polymarket.com exposes a /holders endpoint
-    keyed either by `market` (conditionId) or `token` (tokenId). We try both.
-    If both fail, returns [] and the script reports zero holders for that market.
+    Tries: /holders (market), /holders (token), /holders (both),
+           /positions (market), /leaderboard (market). Logs raw responses on
+           debug so the caller can identify which shape Polymarket actually uses.
     """
     attempts = (
         ("/holders", {"market": condition_id, "limit": limit}),
         ("/holders", {"token": token_id, "limit": limit}),
         ("/holders", {"market": condition_id, "token": token_id, "limit": limit}),
+        ("/positions", {"market": condition_id, "limit": limit, "sortBy": "size", "sortDirection": "desc"}),
+        ("/leaderboard", {"market": condition_id, "limit": limit}),
     )
     for path, params in attempts:
         try:
@@ -393,7 +399,12 @@ def fetch_holders(api: APIClient, condition_id: str, token_id: str, limit: int) 
         except requests.exceptions.RequestException:
             continue
         if not data:
+            if api.debug:
+                log(f"    [holders {path}] empty/null response with params={params}")
             continue
+        if api.debug:
+            preview = json.dumps(data)[:600] if not isinstance(data, str) else data[:600]
+            log(f"    [holders {path}] response preview: {preview}")
         # Normalize: Data API may return list of dicts with keys like
         # `proxyWallet`, `user`, `address`; size keys like `amount`, `size`,
         # `balance`. Extract whichever we find.
