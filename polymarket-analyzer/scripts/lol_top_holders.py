@@ -42,14 +42,23 @@ import requests
 GAMMA_API = "https://gamma-api.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
 
-# Tags to try in order if --tag isn't passed. Empirically the most likely for
-# League of Legends; if none yield results, the script falls back to ?q= search.
+# Tags to try in order. From observed Polymarket URLs (e.g.
+# polymarket.com/esports/league-of-legends/lec/...), real tag slugs are the
+# competition names, not "league-of-legends" generically.
 DEFAULT_TAG_CANDIDATES = (
-    "league-of-legends",
-    "lol",
-    "league-of-legends-worlds",
+    "lec",
+    "lck",
+    "lpl",
+    "lcs",
+    "lol-worlds",
+    "msi",
+    "league-of-legends",  # try last in case it ever exists
     "esports",
 )
+
+# Every LoL market slug observed starts with "lol-" (e.g. lol-mkoi-kc-2026-05-09).
+# This is the most reliable signal — works regardless of tag system.
+LOL_SLUG_PREFIXES = ("lol-",)
 
 LOL_TEXT_KEYWORDS = ("league of legends", "lck", "lpl", "lec", "lcs", "worlds", "msi")
 
@@ -131,7 +140,15 @@ class APIClient:
 # ---------------------------------------------------------------------------
 
 
+def _has_lol_slug(market: dict) -> bool:
+    slug = (market.get("slug") or "").lower()
+    return any(slug.startswith(p) for p in LOL_SLUG_PREFIXES)
+
+
 def _has_lol_keyword(market: dict) -> bool:
+    """A market 'looks like LoL' if either slug prefix or text keywords match."""
+    if _has_lol_slug(market):
+        return True
     text = (market.get("question", "") + " " + (market.get("description") or "")).lower()
     return any(kw in text for kw in LOL_TEXT_KEYWORDS)
 
@@ -226,6 +243,46 @@ def fetch_markets_by_search(api: APIClient, query: str, after_iso: str) -> list[
     return out
 
 
+def fetch_markets_by_slug_prefix(api: APIClient, after_iso: str) -> list[dict]:
+    """Final fallback: scan recent closed markets, client-filter by slug prefix.
+
+    Polymarket slugs every LoL market with a `lol-` prefix. This is the most
+    reliable identifier when tag filtering fails. Walks recent closed markets
+    in date-desc order and keeps only those with slug starting in LOL_SLUG_PREFIXES.
+    """
+    out: list[dict] = []
+    for page_num in range(MAX_PAGES):
+        offset = page_num * GAMMA_PAGE_SIZE
+        page = api.get(
+            f"{GAMMA_API}/markets",
+            params={
+                "closed": "true",
+                "limit": GAMMA_PAGE_SIZE,
+                "offset": offset,
+                "order": "endDate",
+                "ascending": "false",
+            },
+        )
+        if not isinstance(page, list) or not page:
+            break
+        keep, stop = [], False
+        for m in page:
+            end = m.get("endDate") or ""
+            if not end:
+                continue
+            if end < after_iso:
+                stop = True
+                break
+            if _has_lol_slug(m):
+                keep.append(m)
+        out.extend(keep)
+        if stop or len(page) < GAMMA_PAGE_SIZE:
+            break
+    else:
+        log(f"  WARN: hit MAX_PAGES={MAX_PAGES} cap during slug-prefix scan")
+    return out
+
+
 def discover_markets(
     api: APIClient,
     tag_override: str | None,
@@ -272,7 +329,16 @@ def discover_markets(
     except requests.exceptions.RequestException as e:
         log(f"  text search failed: {e}")
         markets = []
-    return ("text:league of legends", markets)
+    if markets:
+        return ("text:league of legends", markets)
+
+    log("Text search empty; falling back to slug-prefix scan ('lol-')")
+    try:
+        markets = fetch_markets_by_slug_prefix(api, after_iso)
+    except requests.exceptions.RequestException as e:
+        log(f"  slug-prefix scan failed: {e}")
+        markets = []
+    return ("slug-prefix:lol-", markets)
 
 
 # ---------------------------------------------------------------------------
