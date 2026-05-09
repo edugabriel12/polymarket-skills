@@ -488,6 +488,11 @@ def determine_winner(market: dict) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
+def _profile_url(address: str) -> str:
+    """Polymarket public profile URL for a wallet address."""
+    return f"https://polymarket.com/profile/{address}"
+
+
 def fetch_holders(api: APIClient, condition_id: str, token_id: str, limit: int) -> list[dict]:
     """Fetch top holders of the winning side from Polymarket Data API.
 
@@ -536,6 +541,7 @@ def fetch_holders(api: APIClient, condition_id: str, token_id: str, limit: int) 
                 "address": addr.lower(),
                 "shares": shares,
                 "name": (h.get("name") or h.get("pseudonym") or "").strip(),
+                "profile_url": _profile_url(addr.lower()),
             })
         normalized.sort(key=lambda h: h["shares"], reverse=True)
         return normalized[:limit]
@@ -662,8 +668,9 @@ def print_summary(report: dict, top_global: int = 10) -> None:
     if report.get("global_top_20"):
         print(f"\nGlobal top {min(top_global, len(report['global_top_20']))} by total P&L:")
         for h in report["global_top_20"][:top_global]:
-            print(f"  {h['address']}  pnl=${h['total_pnl_usd']:>10.2f}  "
-                  f"wins={h['n_winning_markets']}")
+            name = f" {h['name']}" if h.get("name") else ""
+            print(f"  {h['address']}{name}  pnl=${h['total_pnl_usd']:>10.2f}  "
+                  f"wins={h['n_winning_markets']}  {h['profile_url']}")
 
 
 # ---------------------------------------------------------------------------
@@ -678,10 +685,15 @@ def aggregate_global(report_markets: list[dict], top_n: int = 20) -> list[dict]:
         for h in m["top_holders"]:
             entry = by_addr.setdefault(h["address"], {
                 "address": h["address"],
+                "name": h.get("name", ""),
+                "profile_url": _profile_url(h["address"]),
                 "total_pnl_usd": 0.0,
                 "n_winning_markets": 0,
                 "markets": [],
             })
+            # Update name if a later occurrence has one
+            if not entry["name"] and h.get("name"):
+                entry["name"] = h["name"]
             entry["total_pnl_usd"] += float(h.get("total_pnl_usd") or 0)
             entry["n_winning_markets"] += 1
             entry["markets"].append(m["slug"])
