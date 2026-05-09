@@ -1,5 +1,7 @@
 # Polymarket Data API — endpoint reference
 
+> **Maintenance rule:** any change to `polymarket-analyzer/scripts/lol_top_holders.py` MUST be mirrored in `polymarket-analyzer/notebooks/lol_top_holders_colab.ipynb` in the same commit. The notebook duplicates the script's helpers (discovery, winner detection, holders fetch, P&L) and drifts silently if not synced.
+
 Base URL: `https://data-api.polymarket.com`
 
 The Data API is a public, unauthenticated read-only API for Polymarket on-chain
