@@ -42,19 +42,23 @@ import requests
 GAMMA_API = "https://gamma-api.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
 
-# Tags to try in order. From observed Polymarket URLs (e.g.
-# polymarket.com/esports/league-of-legends/lec/...), real tag slugs are the
-# competition names, not "league-of-legends" generically.
-DEFAULT_TAG_CANDIDATES = (
-    "lec",
-    "lck",
-    "lpl",
-    "lcs",
-    "lol-worlds",
-    "msi",
-    "league-of-legends",  # try last in case it ever exists
-    "esports",
+# LoL competition tags. League of Legends has multiple regional/global leagues;
+# we query the events endpoint for each since each is a separate tag.
+LOL_COMPETITION_TAGS = (
+    "lec",          # League European Championship
+    "lck",          # League Champions Korea
+    "lpl",          # League of Legends Pro League (China)
+    "lcs",          # League Championship Series (NA)
+    "lcp",          # League Championship Pacific (replaced LCO/PCS/VCS)
+    "lol-worlds",   # Worlds Championship
+    "worlds",       # Sometimes tagged just "worlds"
+    "msi",          # Mid-Season Invitational
+    "first-stand",  # First Stand tournament
+    "league-of-legends",  # parent tag, in case the API exposes it
 )
+
+# Legacy alias kept for /markets fallback path; same content.
+DEFAULT_TAG_CANDIDATES = LOL_COMPETITION_TAGS + ("esports",)
 
 # Every LoL market slug observed starts with "lol-" (e.g. lol-mkoi-kc-2026-05-09).
 # This is the most reliable signal — works regardless of tag system.
@@ -247,6 +251,82 @@ def fetch_markets_by_search(api: APIClient, query: str, after_iso: str) -> list[
     return out
 
 
+def fetch_events_by_tag(api: APIClient, tag_slug: str, after_iso: str) -> list[dict]:
+    """Fetch closed events for one tag from /events endpoint, paginated.
+
+    Events are taxonomically clean — `lec`/`lck`/`lpl` filter correctly here
+    (unlike /markets where they're often ignored). Each event contains a
+    `markets` array; we extract those for downstream winner/holder lookup.
+
+    Returns a list of MARKET dicts (not events) — already flattened.
+    """
+    out: list[dict] = []
+    for page_num in range(MAX_PAGES):
+        offset = page_num * GAMMA_PAGE_SIZE
+        page = api.get(
+            f"{GAMMA_API}/events",
+            params={
+                "tag_slug": tag_slug,
+                "closed": "true",
+                "limit": GAMMA_PAGE_SIZE,
+                "offset": offset,
+                "order": "endDate",
+                "ascending": "false",
+            },
+        )
+        if not isinstance(page, list) or not page:
+            break
+
+        # Sanity: if first page of events has no LoL-tagged item, /events also ignored the slug
+        if page_num == 0:
+            tagged = sum(1 for ev in page if _event_has_lol_tag(ev))
+            ratio = tagged / len(page)
+            if ratio < LOL_KEYWORD_MIN_RATIO:
+                sample = ", ".join((ev.get("slug") or "?")[:30] for ev in page[:5])
+                log(
+                    f"  WARN: /events tag {tag_slug!r} looks ignored "
+                    f"({tagged}/{len(page)} = {ratio:.0%} LoL-tagged) — aborting"
+                )
+                log(f"  first 5 event slugs: {sample}")
+                return []
+
+        keep_events, stop = [], False
+        for ev in page:
+            end = ev.get("endDate") or ""
+            if not end:
+                continue
+            if end < after_iso:
+                stop = True
+                break
+            keep_events.append(ev)
+
+        # Flatten: extract markets from each event
+        for ev in keep_events:
+            for m in ev.get("markets") or []:
+                # Inherit endDate from event if market doesn't have one
+                if not m.get("endDate"):
+                    m["endDate"] = ev.get("endDate", "")
+                # Carry the parent event slug for diagnostics
+                m.setdefault("eventSlug", ev.get("slug", ""))
+                out.append(m)
+
+        if stop or len(page) < GAMMA_PAGE_SIZE:
+            break
+    return out
+
+
+def _event_has_lol_tag(event: dict) -> bool:
+    """Check if an event has any LoL competition tag."""
+    tags = event.get("tags") or []
+    if isinstance(tags, list):
+        for t in tags:
+            slug = (t.get("slug") if isinstance(t, dict) else str(t)).lower()
+            if slug in LOL_COMPETITION_TAGS or slug.startswith("lol-"):
+                return True
+    # Slug fallback (events often have lol- prefixed slugs too)
+    return _has_lol_slug(event)
+
+
 def fetch_markets_by_slug_prefix(api: APIClient, after_iso: str) -> list[dict]:
     """Final fallback: scan recent closed markets, client-filter by slug prefix.
 
@@ -312,11 +392,40 @@ def discover_markets(
                 log(f"  WARN: market {slug!r} not found")
         return ("explicit", out)
 
+    # PRIMARY: query /events (taxonomically clean) for ALL LoL competitions and merge.
+    # `lec` is European, `lck` Korean, etc — we want all, not just one region.
+    if not tag_override:
+        log("Querying /events for all LoL competitions")
+        all_markets: list[dict] = []
+        seen_condition_ids: set[str] = set()
+        tags_with_results: list[str] = []
+        for tag in LOL_COMPETITION_TAGS:
+            try:
+                markets = fetch_events_by_tag(api, tag, after_iso)
+            except requests.exceptions.RequestException as e:
+                log(f"  WARN: /events tag {tag!r} failed: {e}")
+                continue
+            if not markets:
+                continue
+            new = 0
+            for m in markets:
+                cid = m.get("conditionId") or m.get("condition_id") or ""
+                if cid and cid not in seen_condition_ids:
+                    seen_condition_ids.add(cid)
+                    all_markets.append(m)
+                    new += 1
+            log(f"  /events tag={tag!r}: {len(markets)} markets ({new} new)")
+            if new > 0:
+                tags_with_results.append(tag)
+        if all_markets:
+            return (f"events:{','.join(tags_with_results)}", all_markets)
+        log("No /events tag yielded markets; falling through to /markets path")
+
     candidates = (tag_override,) if tag_override else DEFAULT_TAG_CANDIDATES
     for slug in candidates:
         if not slug:
             continue
-        log(f"Trying tag_slug={slug!r}")
+        log(f"Trying /markets tag_slug={slug!r}")
         try:
             markets = fetch_markets_by_tag(api, slug, after_iso)
         except requests.exceptions.RequestException as e:
