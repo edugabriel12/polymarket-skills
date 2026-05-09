@@ -74,6 +74,31 @@ python scripts/correlation_tracker.py --json
 python scripts/correlation_tracker.py --threshold 0.10
 ```
 
+### 5. LoL Top Holders (`scripts/lol_top_holders.py`)
+
+Scan resolved League of Legends markets and identify the top holders of the
+winning side, with optional P&L estimation. Useful for copy-trading research
+(find wallets that consistently bet correctly) and whale tracking.
+
+- Pulls closed markets from Gamma API (tries `league-of-legends`, `lol`, `esports`
+  tag slugs; falls back to text search)
+- Determines winning outcome from `outcomePrices` (skips disputed/canceled)
+- Fetches top N holders of the winning CLOB token via the Polymarket Data API
+- Optionally fetches each holder's trades and computes weighted-avg entry +
+  realized/unrealized P&L
+- Aggregates cross-market: top 20 wallets globally by total P&L
+
+```bash
+python scripts/lol_top_holders.py                       # last 30d, top 10, JSON
+python scripts/lol_top_holders.py --days 90 --top 20
+python scripts/lol_top_holders.py --tag esports
+python scripts/lol_top_holders.py --markets slug-1 slug-2 --no-pnl
+python scripts/lol_top_holders.py --output csv --out /tmp/holders.csv
+```
+
+See `references/data-api.md` for the assumed Data API endpoint shapes and how
+to verify them against the live API.
+
 ## Workflow
 
 1. Run `find_edges.py` to scan for arbitrage across all active markets
