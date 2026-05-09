@@ -55,6 +55,8 @@ LOL_TEXT_KEYWORDS = ("league of legends", "lck", "lpl", "lec", "lcs", "worlds", 
 
 MAX_TEXT_LEN = 200
 GAMMA_PAGE_SIZE = 100
+MAX_PAGES = 30  # hard cap: never paginate more than 3000 markets per tag attempt
+LOL_KEYWORD_MIN_RATIO = 0.30  # if first page has <30% LoL keyword matches, tag was silently ignored
 
 
 # ---------------------------------------------------------------------------
@@ -129,11 +131,23 @@ class APIClient:
 # ---------------------------------------------------------------------------
 
 
+def _has_lol_keyword(market: dict) -> bool:
+    text = (market.get("question", "") + " " + (market.get("description") or "")).lower()
+    return any(kw in text for kw in LOL_TEXT_KEYWORDS)
+
+
 def fetch_markets_by_tag(api: APIClient, tag_slug: str, after_iso: str) -> list[dict]:
-    """Fetch closed markets for one tag_slug, paginating, end-date descending."""
+    """Fetch closed markets for one tag_slug, paginating, end-date descending.
+
+    Sanity check: the Gamma API silently ignores unknown tag_slug values and
+    returns ALL closed markets (~60K). On the first page, we check that at
+    least 30% of question texts contain LoL keywords. If not, we abort and
+    return empty (so the caller can try the next candidate tag or fallback).
+    Hard cap of MAX_PAGES prevents runaway pagination either way.
+    """
     out: list[dict] = []
-    offset = 0
-    while True:
+    for page_num in range(MAX_PAGES):
+        offset = page_num * GAMMA_PAGE_SIZE
         page = api.get(
             f"{GAMMA_API}/markets",
             params={
@@ -147,27 +161,42 @@ def fetch_markets_by_tag(api: APIClient, tag_slug: str, after_iso: str) -> list[
         )
         if not isinstance(page, list) or not page:
             break
-        # Stop when end_date drops below the cutoff
-        keep = []
-        stop = False
+
+        if page_num == 0:
+            matches = sum(1 for m in page if _has_lol_keyword(m))
+            ratio = matches / len(page)
+            if ratio < LOL_KEYWORD_MIN_RATIO:
+                log(
+                    f"  WARN: tag {tag_slug!r} looks ignored by API "
+                    f"({matches}/{len(page)} = {ratio:.0%} LoL keyword match) — aborting tag"
+                )
+                return []
+
+        keep, stop = [], False
         for m in page:
             end = m.get("endDate") or ""
-            if end and end < after_iso:
+            if not end:
+                continue  # skip undated; don't let them stop the loop
+            if end < after_iso:
                 stop = True
                 break
             keep.append(m)
         out.extend(keep)
         if stop or len(page) < GAMMA_PAGE_SIZE:
             break
-        offset += GAMMA_PAGE_SIZE
+    else:
+        log(f"  WARN: hit MAX_PAGES={MAX_PAGES} cap for tag {tag_slug!r}")
     return out
 
 
 def fetch_markets_by_search(api: APIClient, query: str, after_iso: str) -> list[dict]:
-    """Fallback: text search via Gamma `q=` param, client-side filter for keywords."""
+    """Fallback: text search via Gamma `q=` param, client-side LoL keyword filter.
+
+    Capped at MAX_PAGES to avoid runaway pagination if `q` is also ignored.
+    """
     out: list[dict] = []
-    offset = 0
-    while True:
+    for page_num in range(MAX_PAGES):
+        offset = page_num * GAMMA_PAGE_SIZE
         page = api.get(
             f"{GAMMA_API}/markets",
             params={
@@ -181,20 +210,19 @@ def fetch_markets_by_search(api: APIClient, query: str, after_iso: str) -> list[
         )
         if not isinstance(page, list) or not page:
             break
-        keep = []
-        stop = False
+        keep, stop = [], False
         for m in page:
             end = m.get("endDate") or ""
-            if end and end < after_iso:
+            if not end:
+                continue
+            if end < after_iso:
                 stop = True
                 break
-            q = (m.get("question", "") + " " + (m.get("description") or "")).lower()
-            if any(kw in q for kw in LOL_TEXT_KEYWORDS):
+            if _has_lol_keyword(m):
                 keep.append(m)
         out.extend(keep)
         if stop or len(page) < GAMMA_PAGE_SIZE:
             break
-        offset += GAMMA_PAGE_SIZE
     return out
 
 
