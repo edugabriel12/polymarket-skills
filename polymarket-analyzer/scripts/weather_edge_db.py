@@ -1,0 +1,317 @@
+"""SQLite persistence for the weather edge bot.
+
+Schema versioned via PRAGMA user_version. Migrations are idempotent — calling
+init_db() on an existing DB is safe and brings it up to the current version.
+
+Tables: entries, monitor_checks, cashouts, resolutions, counterfactuals,
+judge_reviews. See plan in /root/.claude/plans/ for column definitions.
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterable
+
+DB_PATH = Path.home() / ".polymarket-paper" / "weather_edge.db"
+SCHEMA_VERSION = 1
+
+
+SCHEMA_V1 = """
+CREATE TABLE IF NOT EXISTS entries (
+  entry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  market_slug TEXT NOT NULL,
+  market_question TEXT NOT NULL,
+  condition_id TEXT,
+  token_id_yes TEXT,
+  token_id_no TEXT,
+  end_date TEXT,
+  side TEXT CHECK(side IN ('YES','NO','SKIP')),
+  entry_price REAL,
+  size_shares REAL,
+  size_usd REAL,
+  forecast_prob_at_entry REAL,
+  implied_prob_at_entry REAL,
+  edge_pp_at_entry REAL,
+  forecast_snapshot_json TEXT,
+  parser_confidence REAL,
+  city_resolved TEXT,
+  threshold_value REAL,
+  threshold_unit TEXT,
+  comparison TEXT,
+  ttr_hours_at_entry REAL,
+  skip_reason TEXT,
+  status TEXT NOT NULL DEFAULT 'PROPOSED'
+    CHECK(status IN ('PROPOSED','APPROVED','REJECTED','ADJUSTED','EXECUTED','SKIPPED','FAST_PATH')),
+  judge_skipped_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_entries_ts ON entries(ts);
+CREATE INDEX IF NOT EXISTS idx_entries_status ON entries(status);
+CREATE INDEX IF NOT EXISTS idx_entries_market ON entries(market_slug);
+
+CREATE TABLE IF NOT EXISTS monitor_checks (
+  check_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entry_id INTEGER NOT NULL REFERENCES entries(entry_id),
+  ts TEXT NOT NULL,
+  forecast_prob_now REAL,
+  forecast_snapshot_json TEXT,
+  market_best_bid REAL,
+  market_best_ask REAL,
+  decision TEXT CHECK(decision IN ('HOLD','CASHOUT','TRY_CASHOUT_BLOCKED')),
+  decision_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_monitor_entry ON monitor_checks(entry_id);
+
+CREATE TABLE IF NOT EXISTS cashouts (
+  cashout_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entry_id INTEGER NOT NULL REFERENCES entries(entry_id),
+  ts TEXT NOT NULL,
+  exit_price REAL,
+  exit_shares REAL,
+  realized_pnl_usd REAL,
+  forecast_prob_at_exit REAL,
+  forecast_snapshot_json TEXT,
+  reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_cashouts_entry ON cashouts(entry_id);
+
+CREATE TABLE IF NOT EXISTS resolutions (
+  resolution_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entry_id INTEGER NOT NULL REFERENCES entries(entry_id),
+  ts_resolved TEXT NOT NULL,
+  final_outcome TEXT CHECK(final_outcome IN ('YES','NO','VOID')),
+  payout_per_share REAL,
+  observed_value REAL
+);
+CREATE INDEX IF NOT EXISTS idx_resolutions_entry ON resolutions(entry_id);
+
+CREATE TABLE IF NOT EXISTS counterfactuals (
+  counterfactual_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entry_id INTEGER UNIQUE NOT NULL REFERENCES entries(entry_id),
+  cashout_id INTEGER REFERENCES cashouts(cashout_id),
+  realized_pnl REAL,
+  hypothetical_hold_pnl REAL,
+  delta REAL,
+  computed_at TEXT NOT NULL,
+  notes TEXT
+);
+
+CREATE TABLE IF NOT EXISTS judge_reviews (
+  review_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entry_id INTEGER NOT NULL REFERENCES entries(entry_id),
+  ts TEXT NOT NULL,
+  verdict TEXT NOT NULL CHECK(verdict IN ('APPROVE','REJECT','ADJUST')),
+  confidence REAL,
+  judge_prob REAL,
+  bot_prob REAL,
+  prob_delta REAL,
+  rationale TEXT,
+  evidence_json TEXT,
+  adjusted_side TEXT,
+  adjusted_size_usd REAL,
+  llm_model TEXT,
+  tokens_in INTEGER,
+  tokens_out INTEGER,
+  cache_read_tokens INTEGER,
+  cost_usd REAL,
+  duration_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_judge_entry ON judge_reviews(entry_id);
+CREATE INDEX IF NOT EXISTS idx_judge_verdict ON judge_reviews(verdict);
+"""
+
+
+def init_db(path: Path = DB_PATH) -> None:
+    """Create the DB and tables if missing. Idempotent. Bumps user_version."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        cur = conn.cursor()
+        current = cur.execute("PRAGMA user_version").fetchone()[0]
+        if current < 1:
+            cur.executescript(SCHEMA_V1)
+            cur.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.commit()
+
+
+@contextmanager
+def connect(path: Path = DB_PATH):
+    """Context manager yielding a sqlite3 connection with foreign_keys ON and Row factory."""
+    init_db(path)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Insert helpers
+# ---------------------------------------------------------------------------
+
+
+def insert_entry(conn, **kwargs) -> int:
+    """Insert a row into entries. Returns entry_id.
+
+    Required: ts, market_slug, market_question. Other fields optional.
+    JSON-serializable fields (forecast_snapshot_json) are dumped if dict/list.
+    """
+    if isinstance(kwargs.get("forecast_snapshot_json"), (dict, list)):
+        kwargs["forecast_snapshot_json"] = json.dumps(kwargs["forecast_snapshot_json"])
+    cols = list(kwargs.keys())
+    vals = [kwargs[c] for c in cols]
+    placeholders = ",".join("?" * len(cols))
+    q = f"INSERT INTO entries ({','.join(cols)}) VALUES ({placeholders})"
+    cur = conn.execute(q, vals)
+    return cur.lastrowid
+
+
+def insert_monitor_check(conn, entry_id: int, **kwargs) -> int:
+    if isinstance(kwargs.get("forecast_snapshot_json"), (dict, list)):
+        kwargs["forecast_snapshot_json"] = json.dumps(kwargs["forecast_snapshot_json"])
+    kwargs["entry_id"] = entry_id
+    cols = list(kwargs.keys())
+    vals = [kwargs[c] for c in cols]
+    placeholders = ",".join("?" * len(cols))
+    q = f"INSERT INTO monitor_checks ({','.join(cols)}) VALUES ({placeholders})"
+    return conn.execute(q, vals).lastrowid
+
+
+def insert_cashout(conn, entry_id: int, **kwargs) -> int:
+    if isinstance(kwargs.get("forecast_snapshot_json"), (dict, list)):
+        kwargs["forecast_snapshot_json"] = json.dumps(kwargs["forecast_snapshot_json"])
+    kwargs["entry_id"] = entry_id
+    cols = list(kwargs.keys())
+    vals = [kwargs[c] for c in cols]
+    placeholders = ",".join("?" * len(cols))
+    q = f"INSERT INTO cashouts ({','.join(cols)}) VALUES ({placeholders})"
+    return conn.execute(q, vals).lastrowid
+
+
+def insert_resolution(conn, entry_id: int, **kwargs) -> int:
+    kwargs["entry_id"] = entry_id
+    cols = list(kwargs.keys())
+    vals = [kwargs[c] for c in cols]
+    placeholders = ",".join("?" * len(cols))
+    q = f"INSERT INTO resolutions ({','.join(cols)}) VALUES ({placeholders})"
+    return conn.execute(q, vals).lastrowid
+
+
+def insert_judge_review(conn, entry_id: int, **kwargs) -> int:
+    if isinstance(kwargs.get("evidence_json"), (dict, list)):
+        kwargs["evidence_json"] = json.dumps(kwargs["evidence_json"])
+    kwargs["entry_id"] = entry_id
+    cols = list(kwargs.keys())
+    vals = [kwargs[c] for c in cols]
+    placeholders = ",".join("?" * len(cols))
+    q = f"INSERT INTO judge_reviews ({','.join(cols)}) VALUES ({placeholders})"
+    return conn.execute(q, vals).lastrowid
+
+
+def upsert_counterfactual(conn, entry_id: int, **kwargs) -> int:
+    kwargs["entry_id"] = entry_id
+    cols = list(kwargs.keys())
+    vals = [kwargs[c] for c in cols]
+    placeholders = ",".join("?" * len(cols))
+    q = (
+        f"INSERT INTO counterfactuals ({','.join(cols)}) VALUES ({placeholders}) "
+        f"ON CONFLICT(entry_id) DO UPDATE SET "
+        + ", ".join(f"{c}=excluded.{c}" for c in cols if c != "entry_id")
+    )
+    return conn.execute(q, vals).lastrowid
+
+
+def update_entry_status(conn, entry_id: int, status: str, **extras) -> None:
+    sets = ["status = ?"]
+    vals: list[Any] = [status]
+    for k, v in extras.items():
+        sets.append(f"{k} = ?")
+        vals.append(v)
+    vals.append(entry_id)
+    conn.execute(f"UPDATE entries SET {', '.join(sets)} WHERE entry_id = ?", vals)
+
+
+# ---------------------------------------------------------------------------
+# Query helpers
+# ---------------------------------------------------------------------------
+
+
+def query_pending_proposals(conn, limit: int = 50) -> list[sqlite3.Row]:
+    """Entries awaiting judge review, oldest first by ttr."""
+    return conn.execute(
+        "SELECT * FROM entries WHERE status = 'PROPOSED' "
+        "ORDER BY ttr_hours_at_entry ASC, ts ASC LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+
+def query_approved_unexecuted(conn) -> list[sqlite3.Row]:
+    """Entries APPROVED but not yet executed (bot picks these up)."""
+    return conn.execute(
+        "SELECT * FROM entries WHERE status = 'APPROVED' ORDER BY ts ASC"
+    ).fetchall()
+
+
+def query_open_positions(conn) -> list[sqlite3.Row]:
+    """Entries that were executed and have no cashout yet."""
+    return conn.execute(
+        "SELECT e.* FROM entries e "
+        "LEFT JOIN cashouts c ON c.entry_id = e.entry_id "
+        "WHERE e.status IN ('EXECUTED','FAST_PATH') AND c.cashout_id IS NULL"
+    ).fetchall()
+
+
+def query_unresolved_past_end(conn, now_iso: str) -> list[sqlite3.Row]:
+    """Entries whose end_date < now and no resolution row yet."""
+    return conn.execute(
+        "SELECT e.* FROM entries e "
+        "LEFT JOIN resolutions r ON r.entry_id = e.entry_id "
+        "WHERE e.status IN ('EXECUTED','FAST_PATH') "
+        "AND e.end_date IS NOT NULL AND e.end_date < ? "
+        "AND r.resolution_id IS NULL",
+        (now_iso,),
+    ).fetchall()
+
+
+def query_for_counterfactual(conn) -> list[sqlite3.Row]:
+    """Entries with both a cashout AND a resolution (ready for delta)."""
+    return conn.execute(
+        "SELECT e.entry_id, e.entry_price, e.size_shares, "
+        "       c.cashout_id, c.exit_price, c.realized_pnl_usd, "
+        "       r.payout_per_share "
+        "FROM entries e "
+        "JOIN cashouts c ON c.entry_id = e.entry_id "
+        "JOIN resolutions r ON r.entry_id = e.entry_id "
+        "LEFT JOIN counterfactuals cf ON cf.entry_id = e.entry_id "
+        "WHERE cf.counterfactual_id IS NULL"
+    ).fetchall()
+
+
+def market_already_proposed(conn, market_slug: str, side: str) -> bool:
+    """True if an entry for (market, side) is already PROPOSED/APPROVED/EXECUTED.
+
+    Avoids the bot re-proposing the same trade every 10 min.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM entries WHERE market_slug = ? AND side = ? "
+        "AND status IN ('PROPOSED','APPROVED','EXECUTED','FAST_PATH','ADJUSTED') LIMIT 1",
+        (market_slug, side),
+    ).fetchone()
+    return row is not None
+
+
+if __name__ == "__main__":
+    # Smoke test: init DB and print version
+    init_db()
+    with connect() as conn:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        tables = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ).fetchall()
+        print(f"DB: {DB_PATH}")
+        print(f"Schema version: {version}")
+        print(f"Tables: {[t['name'] for t in tables]}")

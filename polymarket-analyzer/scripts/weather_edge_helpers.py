@@ -1,0 +1,512 @@
+"""Pure helper functions for the weather edge bot.
+
+All functions are deterministic and side-effect free; testable in isolation.
+
+Three responsibility groups:
+  1. Market parsing — extract (city, threshold, comparison, target_date) from
+     a Polymarket weather question.
+  2. Forecast → probability — convert OpenWeather forecast JSON into P(YES)
+     for a parsed market spec.
+  3. Slippage-aware sizing — walk an orderbook to find the max trade size
+     that keeps weighted-avg fill within a slippage cap.
+"""
+from __future__ import annotations
+
+import json
+import re
+import statistics
+from dataclasses import dataclass, asdict
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+
+# ---------------------------------------------------------------------------
+# Constants — calibrated MAEs for normal-CDF probability conversion
+# ---------------------------------------------------------------------------
+
+MAE_TEMP_F = 5.0      # OpenWeather 3-5d temp forecast MAE in °F
+MAE_TEMP_C = 2.78     # = MAE_TEMP_F converted
+MAE_PRECIP_MM = 3.0   # precip total MAE
+MAE_WIND_KPH = 8.0    # wind speed MAE
+
+
+# ---------------------------------------------------------------------------
+# Market parsing
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MarketSpec:
+    """Parsed weather market specification."""
+    city: str                      # canonical city name (matched against weather-cities.json)
+    threshold_value: float         # numeric threshold (e.g. 75)
+    threshold_unit: str            # "F", "C", "mm", "in", "kph", "mph"
+    metric: str                    # "temp", "precip", "wind", "snow"
+    comparison: str                # "exceed", "below", "at_least", "at_most"
+    target_date: Optional[date]    # the day the market resolves on
+    confidence: float              # 0-1, parser self-assessed
+    raw_question: str              # original text
+
+
+CITY_LOOKUP_PATH = Path(__file__).parent.parent / "references" / "weather-cities.json"
+
+
+def load_cities(path: Path = CITY_LOOKUP_PATH) -> dict[str, Any]:
+    """Load weather-cities.json. Returns empty dict if missing (parser still
+    handles cities not in the list, just with lower confidence)."""
+    if not path.exists():
+        return {"world": [], "europe_top30": [], "north_america_extra": [],
+                "us_top50": [], "aliases": {}}
+    return json.loads(path.read_text())
+
+
+def _all_known_cities(cities: dict[str, Any]) -> dict[str, str]:
+    """Build {lowercase_name: canonical_name} including aliases."""
+    out: dict[str, str] = {}
+    for group in ("world", "europe_top30", "north_america_extra", "us_top50"):
+        for c in cities.get(group, []):
+            out[c.lower()] = c
+    for alias, canonical in cities.get("aliases", {}).items():
+        out[alias.lower()] = canonical
+    return out
+
+
+def _resolve_city(text: str, cities: dict[str, Any]) -> Optional[str]:
+    """Find the canonical city name in `text` if any."""
+    lookup = _all_known_cities(cities)
+    text_lower = text.lower()
+    # Try longest matches first to avoid "York" matching when "New York" should
+    for name in sorted(lookup, key=len, reverse=True):
+        if re.search(r"\b" + re.escape(name) + r"\b", text_lower):
+            return lookup[name]
+    return None
+
+
+# Pattern catalog: (regex, handler_fn) — applied in order.
+# Each handler returns (threshold_value, threshold_unit, metric, comparison, confidence) or None.
+
+_TEMP_RE = re.compile(
+    r"(?P<comp>exceed|above|over|reach|hit|at\s+least|below|under|less\s+than)"
+    r"\s+(?P<val>-?\d+(?:\.\d+)?)\s*(?:°\s*)?(?P<unit>F|C|fahrenheit|celsius)\b",
+    re.IGNORECASE,
+)
+_PRECIP_RE = re.compile(
+    r"(?P<comp>more\s+than|over|exceed|at\s+least|less\s+than|below|under)"
+    r"\s+(?P<val>\d+(?:\.\d+)?)\s*(?P<unit>mm|inches?|in)\b(?:\s+of)?\s+(?:rain|precipitation|precip)",
+    re.IGNORECASE,
+)
+_RAIN_BINARY_RE = re.compile(r"\bwill\s+it\s+rain\b", re.IGNORECASE)
+_SNOW_BINARY_RE = re.compile(r"\bwill\s+it\s+snow\b", re.IGNORECASE)
+
+
+def _normalize_comparison(comp: str) -> str:
+    c = comp.lower().strip()
+    if c in ("exceed", "above", "over", "reach", "hit", "more than"):
+        return "exceed"
+    if c in ("at least", "at_least"):
+        return "at_least"
+    if c in ("below", "under", "less than"):
+        return "below"
+    if c in ("at most", "at_most"):
+        return "at_most"
+    return "exceed"
+
+
+def _parse_target_date(question: str, end_date: Optional[str] = None) -> Optional[date]:
+    """Best-effort target date extraction. Falls back to end_date if provided.
+
+    Recognizes: 'tomorrow', 'today', 'on YYYY-MM-DD', month + day names.
+    """
+    q = question.lower()
+    today = datetime.now(timezone.utc).date()
+    if "tomorrow" in q:
+        return today + timedelta(days=1)
+    if "today" in q:
+        return today
+    m = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", question)
+    if m:
+        try:
+            return datetime.fromisoformat(m.group(1)).date()
+        except ValueError:
+            pass
+    if end_date:
+        try:
+            return datetime.fromisoformat(end_date.replace("Z", "+00:00")).date()
+        except (ValueError, AttributeError):
+            pass
+    return None
+
+
+def parse_market(question: str, end_date: Optional[str] = None,
+                 cities: Optional[dict] = None) -> Optional[MarketSpec]:
+    """Parse a Polymarket weather market question into a MarketSpec.
+
+    Returns None if neither a city nor a recognizable threshold is found.
+    Confidence rubric: 1.0 if all four extracted (city, threshold, comparison,
+    date); 0.6 if no date but rest OK; 0.4 if fuzzy on city; below that we
+    return None (caller should skip).
+    """
+    if cities is None:
+        cities = load_cities()
+    city = _resolve_city(question, cities)
+    if not city:
+        return None
+
+    target_date = _parse_target_date(question, end_date)
+    confidence = 1.0 if target_date else 0.6
+
+    m = _TEMP_RE.search(question)
+    if m:
+        unit = m.group("unit")[0].upper()
+        return MarketSpec(
+            city=city,
+            threshold_value=float(m.group("val")),
+            threshold_unit=unit,
+            metric="temp",
+            comparison=_normalize_comparison(m.group("comp")),
+            target_date=target_date,
+            confidence=confidence,
+            raw_question=question,
+        )
+
+    m = _PRECIP_RE.search(question)
+    if m:
+        unit_raw = m.group("unit").lower()
+        unit = "mm" if unit_raw == "mm" else "in"
+        return MarketSpec(
+            city=city,
+            threshold_value=float(m.group("val")),
+            threshold_unit=unit,
+            metric="precip",
+            comparison=_normalize_comparison(m.group("comp")),
+            target_date=target_date,
+            confidence=confidence,
+            raw_question=question,
+        )
+
+    if _RAIN_BINARY_RE.search(question):
+        return MarketSpec(city=city, threshold_value=0.0, threshold_unit="mm",
+                          metric="precip", comparison="exceed",
+                          target_date=target_date, confidence=confidence * 0.9,
+                          raw_question=question)
+    if _SNOW_BINARY_RE.search(question):
+        return MarketSpec(city=city, threshold_value=0.0, threshold_unit="mm",
+                          metric="snow", comparison="exceed",
+                          target_date=target_date, confidence=confidence * 0.9,
+                          raw_question=question)
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Forecast → probability
+# ---------------------------------------------------------------------------
+
+
+def _norm_cdf(z: float) -> float:
+    return statistics.NormalDist().cdf(z)
+
+
+def forecast_probability(spec: MarketSpec, forecast: dict) -> Optional[float]:
+    """Compute P(YES) for `spec` given OpenWeather forecast JSON.
+
+    forecast shape (from get_weather.py forecast):
+        {"location": ..., "forecasts": [{"date": "YYYY-MM-DD",
+            "temp_high_f": 78, "temp_low_f": 60, "precip_probability": 30,
+            "precip_mm": 1.2, ...}, ...]}
+
+    Returns None if no matching day in forecast (target_date out of range).
+    """
+    if not forecast or "forecasts" not in forecast:
+        return None
+    target = spec.target_date
+    if not target:
+        return None
+    target_str = target.isoformat()
+
+    day = next((d for d in forecast["forecasts"] if d.get("date") == target_str), None)
+    if not day:
+        return None
+
+    if spec.metric == "temp":
+        # Use temp_high for "exceed" / "at_least"; temp_low for "below" / "at_most".
+        if spec.comparison in ("exceed", "at_least"):
+            ref = day.get(f"temp_high_{spec.threshold_unit.lower()}")
+        else:
+            ref = day.get(f"temp_low_{spec.threshold_unit.lower()}")
+        if ref is None:
+            return None
+        mae = MAE_TEMP_F if spec.threshold_unit == "F" else MAE_TEMP_C
+        z = (ref - spec.threshold_value) / mae
+        if spec.comparison in ("exceed", "at_least"):
+            return _norm_cdf(z)
+        return _norm_cdf(-z)
+
+    if spec.metric == "precip":
+        # Binary "will it rain" → use precip_probability directly (already a prob)
+        if spec.threshold_value == 0 and spec.comparison == "exceed":
+            pop = day.get("precip_probability")
+            return pop / 100.0 if pop is not None else None
+        # "more than X mm" → normal CDF on precip_mm
+        forecast_mm = day.get("precip_mm")
+        if forecast_mm is None:
+            return None
+        threshold_mm = spec.threshold_value if spec.threshold_unit == "mm" \
+            else spec.threshold_value * 25.4
+        z = (forecast_mm - threshold_mm) / MAE_PRECIP_MM
+        if spec.comparison in ("exceed", "at_least"):
+            return _norm_cdf(z)
+        return _norm_cdf(-z)
+
+    if spec.metric == "snow":
+        # Approximate: use precip_probability if condition mentions snow.
+        cond = (day.get("condition_main") or "").lower()
+        if "snow" in cond:
+            return (day.get("precip_probability") or 0) / 100.0
+        return 0.05  # tiny baseline if forecast doesn't show snow at all
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Slippage-aware sizing
+# ---------------------------------------------------------------------------
+
+
+def compute_max_size_for_slippage(orderbook: dict, side: str,
+                                  max_slippage: float = 0.20) -> dict:
+    """Walk the orderbook to find the max size that keeps weighted-avg fill
+    within (1 + max_slippage) * best_price for BUY, or above (1 - max_slippage) *
+    best_price for SELL.
+
+    orderbook shape (from get_orderbook.py):
+        {"bids": [{"price": float, "size": float}, ...] sorted desc,
+         "asks": [{"price": float, "size": float}, ...] sorted asc}
+
+    side: "BUY" or "SELL".
+
+    Returns: {"max_usd", "max_shares", "avg_fill", "slippage_pct", "best_price"}.
+    """
+    if side.upper() == "BUY":
+        levels = orderbook.get("asks", [])
+        if not levels:
+            return _empty_size()
+        best = float(levels[0]["price"])
+        cap = best * (1.0 + max_slippage)
+        cum_cost = 0.0
+        cum_shares = 0.0
+        for lvl in levels:
+            price = float(lvl["price"])
+            size = float(lvl["size"])
+            if price > cap:
+                break
+            # Tentatively add this whole level; check if avg fill stays within cap.
+            tentative_cost = cum_cost + price * size
+            tentative_shares = cum_shares + size
+            tentative_avg = tentative_cost / tentative_shares
+            if tentative_avg <= cap:
+                cum_cost = tentative_cost
+                cum_shares = tentative_shares
+            else:
+                # Partial fill at this level: max fillable shares such that avg <= cap
+                # avg = (cum_cost + price * x) / (cum_shares + x) <= cap
+                # cum_cost + price*x <= cap * (cum_shares + x)
+                # cum_cost - cap*cum_shares <= (cap - price) * x
+                if cap - price <= 0:
+                    break
+                x = (cap * cum_shares - cum_cost) / (price - cap) * -1
+                # The above algebra can be off; do it cleanly:
+                x = (cap * cum_shares - cum_cost) / (price - cap)
+                if x <= 0:
+                    break
+                x = min(x, size)
+                cum_cost += price * x
+                cum_shares += x
+                break
+        if cum_shares == 0:
+            return _empty_size(best_price=best)
+        avg = cum_cost / cum_shares
+        return {
+            "max_usd": round(cum_cost, 4),
+            "max_shares": round(cum_shares, 4),
+            "avg_fill": round(avg, 6),
+            "slippage_pct": round((avg - best) / best, 6),
+            "best_price": best,
+        }
+    else:
+        levels = orderbook.get("bids", [])
+        if not levels:
+            return _empty_size()
+        best = float(levels[0]["price"])
+        floor_price = best * (1.0 - max_slippage)
+        cum_value = 0.0
+        cum_shares = 0.0
+        for lvl in levels:
+            price = float(lvl["price"])
+            size = float(lvl["size"])
+            if price < floor_price:
+                break
+            tentative_value = cum_value + price * size
+            tentative_shares = cum_shares + size
+            tentative_avg = tentative_value / tentative_shares
+            if tentative_avg >= floor_price:
+                cum_value = tentative_value
+                cum_shares = tentative_shares
+            else:
+                # avg = (cum_value + price*x) / (cum_shares + x) >= floor
+                if floor_price - price <= 0:
+                    break
+                x = (cum_value - floor_price * cum_shares) / (floor_price - price)
+                if x <= 0:
+                    break
+                x = min(x, size)
+                cum_value += price * x
+                cum_shares += x
+                break
+        if cum_shares == 0:
+            return _empty_size(best_price=best)
+        avg = cum_value / cum_shares
+        return {
+            "max_usd": round(cum_value, 4),
+            "max_shares": round(cum_shares, 4),
+            "avg_fill": round(avg, 6),
+            "slippage_pct": round((best - avg) / best, 6),
+            "best_price": best,
+        }
+
+
+def _empty_size(best_price: float = 0.0) -> dict:
+    return {"max_usd": 0.0, "max_shares": 0.0, "avg_fill": 0.0,
+            "slippage_pct": 0.0, "best_price": best_price}
+
+
+def implied_probabilities(orderbook_yes: dict, orderbook_no: dict) -> dict:
+    """Extract implied P(YES) and P(NO) from orderbook midpoints.
+
+    Best ask of YES = market price to buy YES = implied P(YES).
+    Best ask of NO = implied P(NO) = 1 - implied P(YES).
+    """
+    yes_ask = orderbook_yes.get("asks", [{}])[0].get("price")
+    yes_bid = orderbook_yes.get("bids", [{}])[0].get("price")
+    no_ask = orderbook_no.get("asks", [{}])[0].get("price")
+    no_bid = orderbook_no.get("bids", [{}])[0].get("price")
+    return {
+        "yes_ask": float(yes_ask) if yes_ask else None,
+        "yes_bid": float(yes_bid) if yes_bid else None,
+        "no_ask": float(no_ask) if no_ask else None,
+        "no_bid": float(no_bid) if no_bid else None,
+    }
+
+
+def compute_edge(forecast_prob: float, implied: dict) -> dict:
+    """Given P(forecast) for YES and orderbook prices, return the edge.
+
+    Returns dict with: edge_yes, edge_no, best_side ("YES"/"NO"/None),
+    edge_pp_at_best (in percentage points).
+    """
+    edge_yes = None
+    if implied["yes_ask"] is not None:
+        edge_yes = forecast_prob - implied["yes_ask"]  # we'd buy YES at yes_ask
+    edge_no = None
+    if implied["no_ask"] is not None:
+        edge_no = (1.0 - forecast_prob) - implied["no_ask"]
+
+    best_side = None
+    edge_pp = 0.0
+    if edge_yes is not None and (edge_no is None or edge_yes >= edge_no):
+        best_side = "YES" if edge_yes > 0 else None
+        edge_pp = edge_yes * 100
+    elif edge_no is not None:
+        best_side = "NO" if edge_no > 0 else None
+        edge_pp = edge_no * 100
+
+    return {
+        "edge_yes": edge_yes,
+        "edge_no": edge_no,
+        "best_side": best_side,
+        "edge_pp_at_best": round(edge_pp, 2),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Inline tests
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # Test 1: parse a simple temp market
+    cities_fixture = {
+        "world": ["New York", "Manhattan", "London"],
+        "us_top50": ["Boston"],
+        "aliases": {"NYC": "New York"},
+        "europe_top30": [], "north_america_extra": [],
+    }
+    spec = parse_market("Will Manhattan exceed 75°F tomorrow?",
+                        end_date="2026-05-11T23:59Z", cities=cities_fixture)
+    assert spec and spec.city == "Manhattan" and spec.threshold_value == 75.0
+    assert spec.threshold_unit == "F" and spec.comparison == "exceed"
+    assert spec.metric == "temp"
+    print(f"Test 1 PASS: {spec}")
+
+    # Test 2: precip market
+    spec2 = parse_market("Will London get more than 5mm of rain on 2026-06-15?",
+                         cities=cities_fixture)
+    assert spec2 and spec2.city == "London" and spec2.metric == "precip"
+    assert spec2.threshold_value == 5.0 and spec2.threshold_unit == "mm"
+    print(f"Test 2 PASS: {spec2}")
+
+    # Test 3: forecast → prob (temperature)
+    forecast = {"forecasts": [
+        {"date": (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat(),
+         "temp_high_f": 78, "temp_low_f": 60, "precip_probability": 30, "precip_mm": 1.2,
+         "condition_main": "Clear"}
+    ]}
+    p = forecast_probability(spec, forecast)
+    # z = (78-75)/5 = 0.6, norm.cdf(0.6) ≈ 0.7257
+    assert p is not None and 0.70 <= p <= 0.74, f"got {p}"
+    print(f"Test 3 PASS: P(YES) = {p:.4f} for forecast_high=78, threshold=75, MAE=5°F")
+
+    # Test 4: forecast → prob (precipitation, "more than 5mm")
+    forecast2 = {"forecasts": [
+        {"date": "2026-06-15", "precip_mm": 8.0, "precip_probability": 70,
+         "temp_high_f": 70, "temp_low_f": 55, "condition_main": "Rain"}
+    ]}
+    spec2_with_date = parse_market(
+        "Will London get more than 5mm of rain on 2026-06-15?",
+        cities=cities_fixture)
+    p2 = forecast_probability(spec2_with_date, forecast2)
+    # z = (8 - 5) / 3 = 1.0, norm.cdf(1.0) ≈ 0.8413
+    assert p2 is not None and 0.83 <= p2 <= 0.85, f"got {p2}"
+    print(f"Test 4 PASS: P(YES) = {p2:.4f} for forecast_mm=8, threshold=5mm")
+
+    # Test 5: slippage sizing — BUY at most 20% over best ask
+    book = {
+        "asks": [
+            {"price": 0.40, "size": 100},
+            {"price": 0.42, "size": 100},
+            {"price": 0.45, "size": 200},
+            {"price": 0.50, "size": 1000},  # 25% above best — out of range
+        ],
+        "bids": [{"price": 0.38, "size": 100}],
+    }
+    sizing = compute_max_size_for_slippage(book, "BUY", max_slippage=0.20)
+    # best=0.40, cap=0.48; first 3 levels all <= 0.48; level 4 (0.50) skipped
+    # cum_shares = 400 (100+100+200), cum_cost = 40+42+90 = 172
+    # avg = 172/400 = 0.43, slippage = (0.43-0.40)/0.40 = 0.075 = 7.5%
+    assert sizing["max_shares"] == 400, sizing
+    assert abs(sizing["avg_fill"] - 0.43) < 0.001, sizing
+    assert sizing["slippage_pct"] < 0.20, sizing
+    print(f"Test 5 PASS: BUY sizing = {sizing}")
+
+    # Test 6: implied + edge
+    book_yes = {"asks": [{"price": 0.42, "size": 100}], "bids": [{"price": 0.40, "size": 100}]}
+    book_no = {"asks": [{"price": 0.60, "size": 100}], "bids": [{"price": 0.58, "size": 100}]}
+    impl = implied_probabilities(book_yes, book_no)
+    assert impl["yes_ask"] == 0.42 and impl["no_ask"] == 0.60
+    edge = compute_edge(0.65, impl)
+    # edge_yes = 0.65 - 0.42 = 0.23 → 23pp; edge_no = 0.35 - 0.60 = -0.25
+    # best_side = YES, edge_pp = 23
+    assert edge["best_side"] == "YES" and edge["edge_pp_at_best"] == 23.0
+    print(f"Test 6 PASS: edge = {edge}")
+
+    print("\nAll helper tests PASS")

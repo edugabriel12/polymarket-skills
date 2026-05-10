@@ -1,0 +1,26 @@
+[Unit]
+Description=Polymarket weather edge bot (paper-only)
+Documentation=file:%h/polymarket-skills/polymarket-analyzer/references/weather-edge-strategy.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/polymarket-skills/agent/.env
+ExecStart=/usr/bin/env python3 %h/polymarket-skills/polymarket-analyzer/scripts/weather_edge_bot.py --daemon
+Restart=on-failure
+RestartSec=60s
+StandardOutput=journal
+StandardError=journal
+MemoryMax=256M
+CPUQuota=25%
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.polymarket-paper
+
+[Install]
+WantedBy=default.target

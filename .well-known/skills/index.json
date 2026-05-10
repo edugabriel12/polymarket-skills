@@ -19,10 +19,20 @@
         "SKILL.md",
         "references/fee-model.md",
         "references/viable-strategies.md",
+        "references/data-api.md",
+        "references/weather-cities.json",
+        "references/weather-edge-strategy.md",
+        "references/weather-judge-prompt.md",
         "scripts/analyze_orderbook.py",
         "scripts/correlation_tracker.py",
         "scripts/find_edges.py",
-        "scripts/momentum_scanner.py"
+        "scripts/momentum_scanner.py",
+        "scripts/lol_top_holders.py",
+        "scripts/weather_edge_db.py",
+        "scripts/weather_edge_helpers.py",
+        "scripts/weather_edge_bot.py",
+        "scripts/weather_edge_judge.py",
+        "scripts/weather_edge_analyzer.py"
       ]
     },
     {
