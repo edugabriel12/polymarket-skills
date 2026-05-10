@@ -39,14 +39,15 @@ MAE_WIND_KPH = 8.0    # wind speed MAE
 @dataclass
 class MarketSpec:
     """Parsed weather market specification."""
-    city: str                      # canonical city name (matched against weather-cities.json)
-    threshold_value: float         # numeric threshold (e.g. 75)
-    threshold_unit: str            # "F", "C", "mm", "in", "kph", "mph"
-    metric: str                    # "temp", "precip", "wind", "snow"
-    comparison: str                # "exceed", "below", "at_least", "at_most"
-    target_date: Optional[date]    # the day the market resolves on
-    confidence: float              # 0-1, parser self-assessed
-    raw_question: str              # original text
+    city: str                              # canonical city name
+    threshold_value: float                 # primary threshold (low end for range)
+    threshold_unit: str                    # "F", "C", "mm", "in", "kph", "mph"
+    metric: str                            # "temp", "precip", "wind", "snow"
+    comparison: str                        # "exceed", "below", "at_least", "at_most", "range"
+    target_date: Optional[date]
+    confidence: float
+    raw_question: str
+    threshold_value_high: Optional[float] = None  # for "X-Y°F" range markets
 
 
 CITY_LOOKUP_PATH = Path(__file__).parent.parent / "references" / "weather-cities.json"
@@ -89,6 +90,26 @@ def _resolve_city(text: str, cities: dict[str, Any]) -> Optional[str]:
 _TEMP_RE = re.compile(
     r"(?P<comp>exceed|above|over|reach|hit|at\s+least|below|under|less\s+than)"
     r"\s+(?P<val>-?\d+(?:\.\d+)?)\s*(?:°\s*)?(?P<unit>F|C|fahrenheit|celsius)\b",
+    re.IGNORECASE,
+)
+
+# Range patterns: "65-69°F", "65 to 69°F", "between 65 and 69°F"
+_TEMP_RANGE_RE = re.compile(
+    r"(?:between\s+)?(?P<low>\d+(?:\.\d+)?)\s*(?:°\s*[FC]?\s*)?"
+    r"(?:-|to|–|—|and)\s*"
+    r"(?P<high>\d+(?:\.\d+)?)\s*°?\s*(?P<unit>F|C|fahrenheit|celsius)?\b",
+    re.IGNORECASE,
+)
+# "70°F or higher" / "70°F or above" / "70°F+"
+_TEMP_AT_LEAST_RE = re.compile(
+    r"(?P<val>-?\d+(?:\.\d+)?)\s*(?:°\s*)?(?P<unit>F|C|fahrenheit|celsius)?"
+    r"\s*(?:\+|or\s+(?:higher|above|greater|more))",
+    re.IGNORECASE,
+)
+# "60°F or lower" / "60°F or below"
+_TEMP_AT_MOST_RE = re.compile(
+    r"(?P<val>-?\d+(?:\.\d+)?)\s*(?:°\s*)?(?P<unit>F|C|fahrenheit|celsius)?"
+    r"\s*or\s+(?:lower|below|less|fewer)",
     re.IGNORECASE,
 )
 _PRECIP_RE = re.compile(
@@ -170,6 +191,43 @@ def parse_market(question: str, end_date: Optional[str] = None,
             raw_question=question,
         )
 
+    # Range: "65-69°F" / "between 65 and 69°F"
+    m = _TEMP_RANGE_RE.search(question)
+    if m:
+        low = float(m.group("low"))
+        high = float(m.group("high"))
+        # Sanity: range should be within plausible temps and ordered
+        if 0 < low < high < 200 and (high - low) < 50:
+            unit = (m.group("unit") or "F")[0].upper()
+            return MarketSpec(
+                city=city, threshold_value=low, threshold_value_high=high,
+                threshold_unit=unit, metric="temp", comparison="range",
+                target_date=target_date, confidence=confidence,
+                raw_question=question,
+            )
+
+    # "X°F or higher"
+    m = _TEMP_AT_LEAST_RE.search(question)
+    if m:
+        unit = (m.group("unit") or "F")[0].upper()
+        return MarketSpec(
+            city=city, threshold_value=float(m.group("val")),
+            threshold_unit=unit, metric="temp", comparison="at_least",
+            target_date=target_date, confidence=confidence,
+            raw_question=question,
+        )
+
+    # "X°F or lower"
+    m = _TEMP_AT_MOST_RE.search(question)
+    if m:
+        unit = (m.group("unit") or "F")[0].upper()
+        return MarketSpec(
+            city=city, threshold_value=float(m.group("val")),
+            threshold_unit=unit, metric="temp", comparison="at_most",
+            target_date=target_date, confidence=confidence,
+            raw_question=question,
+        )
+
     m = _PRECIP_RE.search(question)
     if m:
         unit_raw = m.group("unit").lower()
@@ -230,14 +288,17 @@ def forecast_probability(spec: MarketSpec, forecast: dict) -> Optional[float]:
         return None
 
     if spec.metric == "temp":
-        # Use temp_high for "exceed" / "at_least"; temp_low for "below" / "at_most".
-        if spec.comparison in ("exceed", "at_least"):
-            ref = day.get(f"temp_high_{spec.threshold_unit.lower()}")
-        else:
-            ref = day.get(f"temp_low_{spec.threshold_unit.lower()}")
+        # For "highest temperature" markets (typical Polymarket weather event),
+        # we always use temp_high as the reference.
+        ref = day.get(f"temp_high_{spec.threshold_unit.lower()}")
         if ref is None:
             return None
         mae = MAE_TEMP_F if spec.threshold_unit == "F" else MAE_TEMP_C
+        if spec.comparison == "range" and spec.threshold_value_high is not None:
+            # P(low ≤ temp < high) under N(ref, mae)
+            z_low = (ref - spec.threshold_value) / mae
+            z_high = (ref - spec.threshold_value_high) / mae
+            return max(0.0, _norm_cdf(z_low) - _norm_cdf(z_high))
         z = (ref - spec.threshold_value) / mae
         if spec.comparison in ("exceed", "at_least"):
             return _norm_cdf(z)
@@ -508,5 +569,41 @@ if __name__ == "__main__":
     # best_side = YES, edge_pp = 23
     assert edge["best_side"] == "YES" and edge["edge_pp_at_best"] == 23.0
     print(f"Test 6 PASS: edge = {edge}")
+
+    # Test 7: bracket range parser ("65-69°F" with city in event title)
+    cities3 = {**cities_fixture, "world": ["Jakarta", "Manhattan", "London"]}
+    combined = "Highest temperature in Jakarta on May 11, 2026 65-69°F"
+    spec3 = parse_market(combined, end_date="2026-05-11T23:59Z", cities=cities3)
+    assert spec3 and spec3.city == "Jakarta" and spec3.comparison == "range"
+    assert spec3.threshold_value == 65.0 and spec3.threshold_value_high == 69.0
+    print(f"Test 7 PASS: range parse → {spec3}")
+
+    # Test 8: range probability — forecast 75°F, bracket 65-69°F should be SMALL
+    forecast3 = {"forecasts": [
+        {"date": "2026-05-11", "temp_high_f": 75, "temp_low_f": 60,
+         "precip_probability": 10, "precip_mm": 0, "condition_main": "Clear"}
+    ]}
+    p3 = forecast_probability(spec3, forecast3)
+    # P(65 ≤ T < 69 | T~N(75,5)) = cdf((65-75)/5) - cdf((69-75)/5) = cdf(-2) - cdf(-1.2)
+    #                            = 0.0228 - 0.1151 = -0.092 → clamped to 0... wait,
+    # Actually cdf(-2) - cdf(-1.2) is NEGATIVE because cdf(-2) < cdf(-1.2).
+    # We want P(low ≤ T < high) = cdf(z_low) - cdf(z_high) where z_low > z_high,
+    # but here z_low = (75-65)/5 = +2 → no, the formula uses (ref - threshold) so
+    # z_low = (75-65)/5 = +2, z_high = (75-69)/5 = +1.2.
+    # _norm_cdf(z_low) - _norm_cdf(z_high) = cdf(2) - cdf(1.2) = 0.977 - 0.885 = 0.092
+    assert p3 is not None and 0.05 <= p3 <= 0.13, f"got {p3}"
+    print(f"Test 8 PASS: P(65-69°F | high=75) = {p3:.4f}")
+
+    # Test 9: "70°F or above" pattern
+    spec4 = parse_market("Highest temperature in Manhattan on May 11, 2026 70°F or above",
+                         end_date="2026-05-11T23:59Z", cities=cities3)
+    assert spec4 and spec4.comparison == "at_least" and spec4.threshold_value == 70
+    print(f"Test 9 PASS: at_least → {spec4}")
+
+    # Test 10: "60°F or lower" pattern
+    spec5 = parse_market("Highest temperature in Manhattan on May 11, 2026 60°F or lower",
+                         end_date="2026-05-11T23:59Z", cities=cities3)
+    assert spec5 and spec5.comparison == "at_most" and spec5.threshold_value == 60
+    print(f"Test 10 PASS: at_most → {spec5}")
 
     print("\nAll helper tests PASS")

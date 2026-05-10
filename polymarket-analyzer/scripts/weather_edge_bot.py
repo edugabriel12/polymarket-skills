@@ -157,9 +157,16 @@ def fetch_weather_markets(min_volume: float = 5000, max_pages: int = 5) -> list[
     n_low_vol = 0
     for m in all_markets:
         question = m.get("question", "")
-        if not _WEATHER_KEYWORDS.search(question):
+        events = m.get("events") or []
+        event_text = " ".join(
+            (e.get("title", "") + " " + e.get("slug", ""))
+            for e in events if isinstance(e, dict))
+        combined = f"{event_text} {question}"
+        if not _WEATHER_KEYWORDS.search(combined):
             continue
         n_keyword_match += 1
+        # Stash combined text on the market dict for the discovery stage.
+        m["_combined_text"] = combined.strip()
         # Skip clearly stale markets (endDate already past)
         try:
             end_date = datetime.fromisoformat(
@@ -272,8 +279,11 @@ def run_discovery(args, cities: dict) -> int:
                 continue
             ttr_hours = (end_date - now).total_seconds() / 3600.0
 
-            # Parse market spec
-            spec = parse_market(question, end_date_str, cities)
+            # Parse market spec — use combined event-title + question text so
+            # multi-outcome bracket sub-markets (where question is just "65-69°F")
+            # still resolve a city + threshold from the parent event title.
+            text_for_parser = m.get("_combined_text") or question
+            spec = parse_market(text_for_parser, end_date_str, cities)
             if not spec:
                 skipped["parser_failed"] += 1
                 log_event("market_skipped", {"slug": slug, "reason": "parser_failed",
