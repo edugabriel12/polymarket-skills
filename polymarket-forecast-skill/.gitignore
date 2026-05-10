@@ -27,3 +27,11 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local API key override — keeps real keys out of git.
+# Edit config.json with PASTE_YOUR_API_KEY_HERE for new clones, or create
+# config.local.json with your real key (script does NOT yet read this — see
+# README for current setup; this is a placeholder convention until env-var
+# loading is added).
+config.local.json
+.env
