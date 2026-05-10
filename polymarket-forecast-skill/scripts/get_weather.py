@@ -16,15 +16,19 @@ import urllib.error
 
 
 def load_api_key():
-    """Load API key from config.json in the skill directory"""
+    """Load API key. Priority: OPENWEATHER_API_KEY env var → config.json."""
+    env_key = os.environ.get("OPENWEATHER_API_KEY", "").strip()
+    if env_key and env_key != "PASTE_YOUR_API_KEY_HERE":
+        return env_key
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(os.path.dirname(script_dir), 'config.json')
-    
+
     try:
         with open(config_path, 'r') as f:
             config = json.load(f)
             api_key = config.get('api_key', '')
-            
+
             if not api_key or api_key == 'PASTE_YOUR_API_KEY_HERE':
                 return None
             return api_key.strip()

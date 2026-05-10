@@ -110,7 +110,7 @@ def log_event(event_type: str, payload: dict | None = None, level: str = "INFO")
            "payload": payload or {}}
     line = json.dumps(rec, default=str, ensure_ascii=False)
     try:
-        with LOG_FILE.open("a") as f:
+        with LOG_FILE.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception as e:
         print(f"[log-error] {e}", file=sys.stderr, flush=True)
@@ -444,6 +444,12 @@ def run_discovery(args, cities: dict) -> int:
                                                   "ttr_h": round((end_date - now).total_seconds() / 3600, 1)})
                 continue
             ttr_hours = (end_date - now).total_seconds() / 3600.0
+
+            # Skip dead brackets (no orderbook → no trade possible) before any
+            # parsing or HTTP work. Saves ~200 wasted API calls per cycle.
+            if m.get("acceptingOrders") is False:
+                skipped["orderbook_unavailable"] = skipped.get("orderbook_unavailable", 0) + 1
+                continue
 
             # Parse market spec — use combined event-title + question text so
             # multi-outcome bracket sub-markets (where question is just "65-69°F")
