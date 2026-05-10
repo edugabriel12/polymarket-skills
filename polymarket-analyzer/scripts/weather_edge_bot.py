@@ -73,6 +73,17 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 WEATHER_TAG = "weather"
 FORECAST_SCRIPT = REPO_ROOT / "polymarket-forecast-skill" / "scripts" / "get_weather.py"
 
+# Keywords used to client-side filter markets to weather-related ones.
+# (Gamma's tag_slug=weather param is silently ignored, so we filter ourselves.)
+import re as _re
+_WEATHER_KEYWORDS = _re.compile(
+    r"\b(weather|temperature|temp|rain|rainfall|snow|snowfall|"
+    r"precipitation|precip|hurricane|storm|wind|fahrenheit|celsius|"
+    r"hottest|coldest|warmest|coolest|degrees|°[fc]|inches\s+of|"
+    r"mm\s+of|cm\s+of)\b",
+    _re.IGNORECASE,
+)
+
 # Default cadences (seconds)
 DISCOVERY_INTERVAL = 600        # 10 min
 MONITOR_TICK = 60               # check every minute; per-position adaptive
@@ -111,29 +122,69 @@ def log_event(event_type: str, payload: dict | None = None, level: str = "INFO")
 # ---------------------------------------------------------------------------
 
 
-def fetch_weather_markets(min_volume: float = 5000, limit: int = 100) -> list[dict]:
-    """Fetch closed=false weather markets from Gamma."""
-    try:
-        r = requests.get(f"{GAMMA_API}/markets", params={
-            "tag_slug": WEATHER_TAG, "active": "true", "closed": "false",
-            "limit": limit, "order": "endDate", "ascending": "true",
-        }, timeout=30)
-        r.raise_for_status()
-        markets = r.json()
-    except requests.exceptions.RequestException as e:
-        log_event("error", {"where": "fetch_weather_markets", "err": str(e)},
-                  level="WARN")
-        return []
+def fetch_weather_markets(min_volume: float = 5000, max_pages: int = 5) -> list[dict]:
+    """Fetch active markets from Gamma, paginate, filter client-side to
+    weather-related questions with future endDate.
+
+    NOTE: Gamma's `tag_slug` filter is silently ignored as of 2026-05.
+    We fetch generic active markets sorted by endDate ascending and filter
+    by question keywords + endDate validity client-side.
+    """
+    now = datetime.now(timezone.utc)
+    all_markets: list[dict] = []
+    for page in range(max_pages):
+        try:
+            r = requests.get(f"{GAMMA_API}/markets", params={
+                "active": "true", "closed": "false",
+                "limit": 100, "offset": page * 100,
+                "order": "endDate", "ascending": "true",
+            }, timeout=30)
+            r.raise_for_status()
+            batch = r.json()
+        except requests.exceptions.RequestException as e:
+            log_event("error", {"where": "fetch_weather_markets", "page": page,
+                                "err": str(e)}, level="WARN")
+            break
+        if not isinstance(batch, list) or not batch:
+            break
+        all_markets.extend(batch)
+        if len(batch) < 100:
+            break
 
     out = []
-    for m in markets:
+    n_keyword_match = 0
+    n_past_end = 0
+    n_low_vol = 0
+    for m in all_markets:
+        question = m.get("question", "")
+        if not _WEATHER_KEYWORDS.search(question):
+            continue
+        n_keyword_match += 1
+        # Skip clearly stale markets (endDate already past)
+        try:
+            end_date = datetime.fromisoformat(
+                (m.get("endDate") or "").replace("Z", "+00:00"))
+            if end_date < now:
+                n_past_end += 1
+                continue
+        except (ValueError, TypeError):
+            continue
         try:
             vol = float(m.get("volumeNum", 0) or 0)
             if vol < min_volume:
+                n_low_vol += 1
                 continue
             out.append(m)
         except (ValueError, TypeError):
             continue
+
+    log_event("fetch_summary", {
+        "total_fetched": len(all_markets),
+        "keyword_matches": n_keyword_match,
+        "past_end_skipped": n_past_end,
+        "low_volume_skipped": n_low_vol,
+        "passed": len(out),
+    })
     return out
 
 
