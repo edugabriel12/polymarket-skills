@@ -500,9 +500,10 @@ def run_discovery(args, cities: dict) -> int:
                                                   "no_ask": implied["no_ask"]})
                 continue
 
-            # Fetch forecast
-            forecast = fetch_forecast(spec.city,
-                                      days=max(2, int(ttr_hours / 24) + 1))
+            # Fetch forecast — always ask for 5 days (free tier max).
+            # Cheaper to fetch all and let probability lookup pick the right day
+            # than fight with off-by-one TZ issues at the boundary.
+            forecast = fetch_forecast(spec.city, days=5)
             if not forecast:
                 skipped["forecast_unavailable"] += 1
                 log_event("market_skipped", {"slug": slug, "reason": "forecast_unavailable",

@@ -205,14 +205,21 @@ def parse_market(question: str, end_date: Optional[str] = None,
             raw_question=question,
         )
 
-    # Range: "65-69°F" / "between 65 and 69°F"
-    m = _TEMP_RANGE_RE.search(question)
-    if m:
-        low = float(m.group("low"))
-        high = float(m.group("high"))
-        # Sanity: range should be within plausible temps and ordered
-        if 0 < low < high < 200 and (high - low) < 50:
-            unit = (m.group("unit") or "F")[0].upper()
+    # Range: "65-69°F" / "between 65 and 69°F" — try ALL matches and accept
+    # the first that passes sanity. The slug we get appended to the question
+    # often contains "-2026-" which the regex initially matches as a 11-2026
+    # numeric range (and silently fails sanity if we only used .search).
+    for m in _TEMP_RANGE_RE.finditer(question):
+        try:
+            low = float(m.group("low"))
+            high = float(m.group("high"))
+        except (TypeError, ValueError):
+            continue
+        # Sanity: range should be within plausible temps and ordered.
+        # Require an explicit unit (F or C) so we don't grab raw numeric
+        # ranges like "11-2026" without temperature context.
+        if 0 < low < high < 200 and (high - low) < 50 and m.group("unit"):
+            unit = m.group("unit")[0].upper()
             return MarketSpec(
                 city=city, threshold_value=low, threshold_value_high=high,
                 threshold_unit=unit, metric="temp", comparison="range",
@@ -243,9 +250,13 @@ def parse_market(question: str, end_date: Optional[str] = None,
         )
 
     # Bare single-value bracket: "be 17°C on May 10" → 1-degree range [v, v+1)
-    m = _TEMP_BARE_RE.search(question)
-    if m:
-        val = float(m.group("val"))
+    for m in _TEMP_BARE_RE.finditer(question):
+        try:
+            val = float(m.group("val"))
+        except (TypeError, ValueError):
+            continue
+        if not (-100 < val < 200):
+            continue
         unit = m.group("unit").upper()
         return MarketSpec(
             city=city, threshold_value=val, threshold_value_high=val + 1.0,
@@ -309,7 +320,15 @@ def forecast_probability(spec: MarketSpec, forecast: dict) -> Optional[float]:
         return None
     target_str = target.isoformat()
 
+    # Try exact date match first; fall back to ±1 day to absorb timezone edges
+    # at the day boundary (UTC vs local, market endDate vs forecast day).
     day = next((d for d in forecast["forecasts"] if d.get("date") == target_str), None)
+    if not day:
+        for delta in (1, -1):
+            alt = (target + timedelta(days=delta)).isoformat()
+            day = next((d for d in forecast["forecasts"] if d.get("date") == alt), None)
+            if day:
+                break
     if not day:
         return None
 
