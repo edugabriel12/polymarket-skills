@@ -4,10 +4,10 @@ How the weather edge bot identifies, sizes, and exits trades on Polymarket weath
 
 ## TL;DR
 
-1. **Discover** weather markets resolving in the next 48h with volume ≥ $5K.
+1. **Discover** weather markets resolving in the next 48h with volume ≥ $100.
 2. **Compute** P(YES) from the OpenWeather forecast for the city + threshold.
 3. **Find edge**: `edge_pp = P(forecast) - P(implied)`. Take the side with edge ≥ 10pp.
-4. **Filter price band**: chosen side's price must be in [0.20, 0.70] for asymmetric upside.
+4. **Filter price band**: chosen side's price in [0.05, 0.95] (only excludes near-zero and near-one extremes; the asymmetric tail brackets are exactly where edges are biggest).
 5. **Size by liquidity**: walk the orderbook for max size at ≤ 20% slippage.
 6. **AI judge** (Claude Sonnet 4.6) cross-checks with NWS / Visual Crossing / web before approving.
 7. **Monitor** approved positions. Cash out only if `forecast_prob_now < entry_implied` AND `best_bid >= entry_price` (break-even or profit). Otherwise, hold.

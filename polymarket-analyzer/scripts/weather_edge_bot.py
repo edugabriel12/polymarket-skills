@@ -866,8 +866,11 @@ def main():
     p.add_argument("--min-edge-pp", type=float, default=10.0)
     p.add_argument("--min-volume", type=float, default=100,
                    help="Min market USD volume; sub-bracket markets have low volume each")
-    p.add_argument("--min-price", type=float, default=0.20)
-    p.add_argument("--max-price", type=float, default=0.70)
+    p.add_argument("--min-price", type=float, default=0.05,
+                   help="Min entry-side price (0.05 default; tail brackets often "
+                        "have biggest payout asymmetry and biggest edge)")
+    p.add_argument("--max-price", type=float, default=0.95,
+                   help="Max entry-side price (0.95 default)")
     p.add_argument("--max-slippage", type=float, default=0.20)
     p.add_argument("--window-hours", type=float, default=48)
     p.add_argument("--daemon", action="store_true", default=True)
