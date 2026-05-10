@@ -306,27 +306,37 @@ def _norm_cdf(z: float) -> float:
 def forecast_probability(spec: MarketSpec, forecast: dict) -> Optional[float]:
     """Compute P(YES) for `spec` given OpenWeather forecast JSON.
 
-    forecast shape (from get_weather.py forecast):
-        {"location": ..., "forecasts": [{"date": "YYYY-MM-DD",
-            "temp_high_f": 78, "temp_low_f": 60, "precip_probability": 30,
-            "precip_mm": 1.2, ...}, ...]}
+    forecast shape (from get_weather.py forecast command):
+        {"location": ..., "daily_forecast": [
+            {"date": "YYYY-MM-DD",
+             "temp_high_f": 78, "temp_low_f": 60,
+             "temp_high_c": ..., "temp_low_c": ...,
+             "precip_probability": 30, "precip_mm": 1.2,
+             "condition_main": "Clear", ...}, ...]}
+
+    Earlier versions of this helper expected key "forecasts"; the actual
+    skill output uses "daily_forecast" (see
+    polymarket-forecast-skill/scripts/get_weather.py:get_weather_forecast_detailed).
+    Accept either for compatibility.
 
     Returns None if no matching day in forecast (target_date out of range).
     """
-    if not forecast or "forecasts" not in forecast:
+    if not forecast:
+        return None
+    days = forecast.get("daily_forecast") or forecast.get("forecasts")
+    if not days:
         return None
     target = spec.target_date
     if not target:
         return None
     target_str = target.isoformat()
 
-    # Try exact date match first; fall back to ±1 day to absorb timezone edges
-    # at the day boundary (UTC vs local, market endDate vs forecast day).
-    day = next((d for d in forecast["forecasts"] if d.get("date") == target_str), None)
+    # Try exact date match first; fall back to ±1 day to absorb timezone edges.
+    day = next((d for d in days if d.get("date") == target_str), None)
     if not day:
         for delta in (1, -1):
             alt = (target + timedelta(days=delta)).isoformat()
-            day = next((d for d in forecast["forecasts"] if d.get("date") == alt), None)
+            day = next((d for d in days if d.get("date") == alt), None)
             if day:
                 break
     if not day:
