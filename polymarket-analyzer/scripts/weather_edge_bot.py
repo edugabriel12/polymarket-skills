@@ -122,34 +122,84 @@ def log_event(event_type: str, payload: dict | None = None, level: str = "INFO")
 # ---------------------------------------------------------------------------
 
 
-def fetch_weather_markets(min_volume: float = 5000, max_pages: int = 5) -> list[dict]:
-    """Fetch active markets from Gamma, paginate, filter client-side to
-    weather-related questions with future endDate.
-
-    NOTE: Gamma's `tag_slug` filter is silently ignored as of 2026-05.
-    We fetch generic active markets sorted by endDate ascending and filter
-    by question keywords + endDate validity client-side.
-    """
-    now = datetime.now(timezone.utc)
-    all_markets: list[dict] = []
+def _fetch_with_params(params: dict, max_pages: int = 5) -> list[dict]:
+    """Paginate Gamma /markets with given params. Returns flat list."""
+    out: list[dict] = []
     for page in range(max_pages):
+        p = {**params, "limit": 100, "offset": page * 100}
         try:
-            r = requests.get(f"{GAMMA_API}/markets", params={
-                "active": "true", "closed": "false",
-                "limit": 100, "offset": page * 100,
-                "order": "endDate", "ascending": "true",
-            }, timeout=30)
+            r = requests.get(f"{GAMMA_API}/markets", params=p, timeout=30)
             r.raise_for_status()
             batch = r.json()
         except requests.exceptions.RequestException as e:
-            log_event("error", {"where": "fetch_weather_markets", "page": page,
+            log_event("error", {"where": "_fetch_with_params", "page": page,
                                 "err": str(e)}, level="WARN")
             break
         if not isinstance(batch, list) or not batch:
             break
-        all_markets.extend(batch)
+        out.extend(batch)
         if len(batch) < 100:
             break
+    return out
+
+
+def fetch_weather_markets(min_volume: float = 5000, max_pages: int = 5) -> list[dict]:
+    """Fetch markets ending in next ~7 days, filter client-side to weather.
+
+    Strategy: server-side filter `end_date_min=now` so we skip the pile of
+    stale 2025 markets that Gamma still returns with closed=false. Try a few
+    param-name variants because Gamma's parameter naming changes between
+    versions (snake_case vs camelCase).
+    """
+    now = datetime.now(timezone.utc)
+    now_iso = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    # Try multiple known variants of the date-filter param name. First one
+    # that returns mostly future-ending markets wins.
+    candidate_params = [
+        {"active": "true", "closed": "false",
+         "order": "endDate", "ascending": "true",
+         "end_date_min": now_iso},
+        {"active": "true", "closed": "false",
+         "order": "endDate", "ascending": "true",
+         "endDateMin": now_iso},
+        {"active": "true", "closed": "false",
+         "order": "endDate", "ascending": "true",
+         "start_date_max": now_iso, "end_date_min": now_iso},
+        # Last resort: no date filter, hope newer markets come back
+        {"active": "true", "closed": "false",
+         "order": "endDate", "ascending": "false"},  # newest endDate first
+    ]
+
+    all_markets: list[dict] = []
+    chosen_param_set = None
+    for idx, params in enumerate(candidate_params):
+        batch = _fetch_with_params(params, max_pages=max_pages)
+        if not batch:
+            continue
+        # Validate: count how many have endDate > now in the first 50
+        future_count = 0
+        for m in batch[:50]:
+            try:
+                ed = datetime.fromisoformat((m.get("endDate") or "").replace("Z", "+00:00"))
+                if ed >= now:
+                    future_count += 1
+            except (ValueError, TypeError):
+                pass
+        log_event("fetch_attempt", {"variant": idx, "params": list(params.keys()),
+                                    "returned": len(batch),
+                                    "future_in_first_50": future_count})
+        if future_count >= 30:  # accept if most are future
+            all_markets = batch
+            chosen_param_set = idx
+            break
+
+    if not all_markets:
+        log_event("fetch_failed", {"reason": "no variant returned mostly future markets"},
+                  level="WARN")
+        return []
+    log_event("fetch_using_variant", {"variant": chosen_param_set,
+                                       "total": len(all_markets)})
 
     out = []
     n_keyword_match = 0
