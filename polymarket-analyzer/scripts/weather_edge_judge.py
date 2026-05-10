@@ -38,6 +38,27 @@ import requests
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "polymarket-analyzer" / "scripts"))
 
+
+def _load_dotenv() -> None:
+    """Minimal .env loader. Reads agent/.env if present, OS env wins."""
+    env_path = REPO_ROOT / "agent" / ".env"
+    if not env_path.exists():
+        return
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+    except Exception:
+        pass
+
+
+_load_dotenv()
+
 import weather_edge_db as db  # noqa: E402
 
 LOG_DIR = Path.home() / ".polymarket-paper"

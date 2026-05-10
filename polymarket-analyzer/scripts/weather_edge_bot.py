@@ -37,6 +37,29 @@ sys.path.insert(0, str(REPO_ROOT / "polymarket-analyzer" / "scripts"))
 sys.path.insert(0, str(REPO_ROOT / "polymarket-scanner" / "scripts"))
 sys.path.insert(0, str(REPO_ROOT / "polymarket-paper-trader" / "scripts"))
 
+
+def _load_dotenv() -> None:
+    """Minimal .env loader (no python-dotenv dep). Reads agent/.env if present
+    and sets missing env vars. Existing OS env vars take precedence."""
+    env_path = REPO_ROOT / "agent" / ".env"
+    if not env_path.exists():
+        return
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            k = k.strip()
+            v = v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+    except Exception:
+        pass
+
+
+_load_dotenv()
+
 from weather_edge_helpers import (  # noqa: E402
     parse_market, forecast_probability, compute_max_size_for_slippage,
     implied_probabilities, compute_edge, load_cities, MarketSpec,
@@ -166,6 +189,15 @@ def run_discovery(args, cities: dict) -> int:
     now = datetime.now(timezone.utc)
     cutoff = now + timedelta(hours=args.window_hours)
     proposed = 0
+    # Diagnostic counters
+    skipped = {
+        "no_end_date": 0, "outside_window": 0, "parser_failed": 0,
+        "parser_low_confidence": 0, "no_token_ids": 0,
+        "orderbook_unavailable": 0, "no_implied_prices": 0,
+        "price_band_miss": 0, "forecast_unavailable": 0,
+        "no_forecast_for_target_date": 0, "low_edge": 0,
+        "already_proposed": 0,
+    }
 
     with db.connect() as conn:
         for m in raw_markets:
@@ -175,63 +207,84 @@ def run_discovery(args, cities: dict) -> int:
             try:
                 end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
             except (ValueError, TypeError):
+                skipped["no_end_date"] += 1
                 continue
 
             # Window filter: must resolve within window
             if end_date < now or end_date > cutoff:
+                skipped["outside_window"] += 1
+                if args.debug:
+                    log_event("market_skipped", {"slug": slug,
+                                                  "reason": "outside_window",
+                                                  "end_date": end_date_str,
+                                                  "ttr_h": round((end_date - now).total_seconds() / 3600, 1)})
                 continue
             ttr_hours = (end_date - now).total_seconds() / 3600.0
 
             # Parse market spec
             spec = parse_market(question, end_date_str, cities)
             if not spec:
+                skipped["parser_failed"] += 1
                 log_event("market_skipped", {"slug": slug, "reason": "parser_failed",
                                               "question": question[:100]})
                 continue
             if spec.confidence < 0.5:
+                skipped["parser_low_confidence"] += 1
                 log_event("market_skipped", {"slug": slug,
                                               "reason": "parser_low_confidence",
                                               "confidence": spec.confidence})
                 continue
 
-            # Already proposed for this market+side? skip
+            # Token IDs
             try:
                 token_ids = json.loads(m.get("clobTokenIds", "[]"))
                 if len(token_ids) < 2:
+                    skipped["no_token_ids"] += 1
                     continue
                 token_id_yes, token_id_no = str(token_ids[0]), str(token_ids[1])
             except (json.JSONDecodeError, TypeError):
+                skipped["no_token_ids"] += 1
                 continue
 
             # Fetch orderbooks
             book_yes = fetch_orderbook(token_id_yes)
             book_no = fetch_orderbook(token_id_no)
             if not book_yes or not book_no:
+                skipped["orderbook_unavailable"] += 1
                 continue
             implied = implied_probabilities(book_yes, book_no)
             if implied["yes_ask"] is None or implied["no_ask"] is None:
+                skipped["no_implied_prices"] += 1
                 continue
 
             # Price band filter
             if not (args.min_price <= implied["yes_ask"] <= args.max_price or
                     args.min_price <= implied["no_ask"] <= args.max_price):
+                skipped["price_band_miss"] += 1
+                if args.debug:
+                    log_event("market_skipped", {"slug": slug, "reason": "price_band_miss",
+                                                  "yes_ask": implied["yes_ask"],
+                                                  "no_ask": implied["no_ask"]})
                 continue
 
             # Fetch forecast
             forecast = fetch_forecast(spec.city,
                                       days=max(2, int(ttr_hours / 24) + 1))
             if not forecast:
+                skipped["forecast_unavailable"] += 1
                 log_event("market_skipped", {"slug": slug, "reason": "forecast_unavailable",
                                               "city": spec.city})
                 continue
 
             forecast_prob = forecast_probability(spec, forecast)
             if forecast_prob is None:
+                skipped["no_forecast_for_target_date"] += 1
                 log_event("market_skipped", {"slug": slug, "reason": "no_forecast_for_target_date"})
                 continue
 
             edge = compute_edge(forecast_prob, implied)
             if edge["best_side"] is None or edge["edge_pp_at_best"] < args.min_edge_pp:
+                skipped["low_edge"] += 1
                 log_event("market_evaluated", {
                     "slug": slug, "side": edge["best_side"],
                     "edge_pp": edge["edge_pp_at_best"],
@@ -246,10 +299,12 @@ def run_discovery(args, cities: dict) -> int:
             entry_price = implied["yes_ask"] if side == "YES" else implied["no_ask"]
             # Recheck price band on the chosen side
             if not (args.min_price <= entry_price <= args.max_price):
+                skipped["price_band_miss"] += 1
                 continue
 
             # Already proposed?
             if db.market_already_proposed(conn, slug, side):
+                skipped["already_proposed"] += 1
                 continue
 
             # Propose
@@ -285,7 +340,9 @@ def run_discovery(args, cities: dict) -> int:
                 "city": spec.city, "ttr_h": round(ttr_hours, 1),
             })
 
-    log_event("discovery_end", {"proposed": proposed})
+    log_event("discovery_end", {"proposed": proposed,
+                                 "fetched": len(raw_markets),
+                                 "skipped_breakdown": skipped})
     return proposed
 
 
