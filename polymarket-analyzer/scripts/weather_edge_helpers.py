@@ -468,21 +468,25 @@ def _empty_size(best_price: float = 0.0) -> dict:
             "slippage_pct": 0.0, "best_price": best_price}
 
 
-def implied_probabilities(orderbook_yes: dict, orderbook_no: dict) -> dict:
-    """Extract implied P(YES) and P(NO) from orderbook midpoints.
+def _best_level(book: dict, side: str) -> Optional[float]:
+    """Return best price on given side, or None if the side is empty/missing."""
+    levels = book.get(side) or []
+    if not levels:
+        return None
+    return float(levels[0].get("price")) if levels[0].get("price") is not None else None
 
-    Best ask of YES = market price to buy YES = implied P(YES).
+
+def implied_probabilities(orderbook_yes: dict, orderbook_no: dict) -> dict:
+    """Extract implied P(YES) and P(NO) from orderbook best levels.
+
+    Best ask of YES = price to buy YES = implied P(YES).
     Best ask of NO = implied P(NO) = 1 - implied P(YES).
     """
-    yes_ask = orderbook_yes.get("asks", [{}])[0].get("price")
-    yes_bid = orderbook_yes.get("bids", [{}])[0].get("price")
-    no_ask = orderbook_no.get("asks", [{}])[0].get("price")
-    no_bid = orderbook_no.get("bids", [{}])[0].get("price")
     return {
-        "yes_ask": float(yes_ask) if yes_ask else None,
-        "yes_bid": float(yes_bid) if yes_bid else None,
-        "no_ask": float(no_ask) if no_ask else None,
-        "no_bid": float(no_bid) if no_bid else None,
+        "yes_ask": _best_level(orderbook_yes, "asks"),
+        "yes_bid": _best_level(orderbook_yes, "bids"),
+        "no_ask": _best_level(orderbook_no, "asks"),
+        "no_bid": _best_level(orderbook_no, "bids"),
     }
 
 

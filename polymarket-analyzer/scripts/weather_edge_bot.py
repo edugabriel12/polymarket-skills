@@ -351,21 +351,47 @@ def fetch_orderbook(token_id: str) -> Optional[dict]:
         return None
 
 
+_FORECAST_KEY_WARNED = False
+
+
 def fetch_forecast(city: str, days: int = 5) -> Optional[dict]:
     """Subprocess get_weather.py forecast and return parsed JSON, or None."""
+    global _FORECAST_KEY_WARNED
+    if not os.environ.get("OPENWEATHER_API_KEY"):
+        if not _FORECAST_KEY_WARNED:
+            log_event("config_missing", {"key": "OPENWEATHER_API_KEY",
+                                          "impact": "all forecast lookups will fail"},
+                      level="ERROR")
+            _FORECAST_KEY_WARNED = True
+        return None
+
+    if not FORECAST_SCRIPT.exists():
+        log_event("error", {"where": "fetch_forecast",
+                            "err": f"forecast script not found: {FORECAST_SCRIPT}"},
+                  level="ERROR")
+        return None
+
     try:
+        env = {**os.environ}  # ensure subprocess inherits OPENWEATHER_API_KEY
         result = subprocess.run(
             [sys.executable, str(FORECAST_SCRIPT), "forecast", city, str(days)],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=30, env=env,
         )
         if result.returncode != 0:
             log_event("error", {"where": "fetch_forecast", "city": city,
-                                "stderr": result.stderr[:500]}, level="WARN")
+                                "exit_code": result.returncode,
+                                "stderr": result.stderr[:500],
+                                "stdout": result.stdout[:200]}, level="WARN")
             return None
-        return json.loads(result.stdout)
+        out = result.stdout.strip()
+        if not out:
+            log_event("error", {"where": "fetch_forecast", "city": city,
+                                "err": "empty stdout from get_weather.py"}, level="WARN")
+            return None
+        return json.loads(out)
     except (subprocess.TimeoutExpired, json.JSONDecodeError) as e:
         log_event("error", {"where": "fetch_forecast", "city": city,
-                            "err": str(e)}, level="WARN")
+                            "err": str(e), "type": type(e).__name__}, level="WARN")
         return None
 
 
