@@ -1,0 +1,29 @@
+# Build artifacts
+forecast-skill.zip
+*-bundle.zip
+test-build.zip
+test-extract/
+build/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

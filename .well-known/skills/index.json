@@ -72,6 +72,17 @@
         "scripts/execute_live.py",
         "scripts/setup_wallet.py"
       ]
+    },
+    {
+      "name": "polymarket-forecast-skill",
+      "description": "Use this skill when the user asks about current or future weather conditions, temperature, precipitation, or weather-dependent planning for any location. Provides real-time weather data and 5-day forecasts via OpenWeather, plus multi-location comparisons and activity suitability scoring (skiing, hiking, picnic, etc). Useful as a signal source for Polymarket weather markets. Imported from kevinl95/ForecastSkill (MIT).",
+      "files": [
+        "SKILL.md",
+        "config.json",
+        "references/prompt_templates.md",
+        "references/setup.md",
+        "scripts/get_weather.py"
+      ]
     }
   ]
 }
