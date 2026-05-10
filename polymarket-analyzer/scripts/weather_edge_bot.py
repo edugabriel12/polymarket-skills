@@ -122,6 +122,59 @@ def log_event(event_type: str, payload: dict | None = None, level: str = "INFO")
 # ---------------------------------------------------------------------------
 
 
+def _fetch_weather_events(now: datetime, max_pages: int = 3) -> list[dict]:
+    """Fetch weather-tagged events from /events and flatten to their markets.
+
+    Some Polymarket weather markets only appear via the /events endpoint
+    (multi-outcome events). Each event contains a `markets` array of binary
+    sub-markets (one per bracket).
+    """
+    now_iso = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    out: list[dict] = []
+    # Try a few param variations
+    for params_try in [
+        {"active": "true", "closed": "false", "end_date_min": now_iso,
+         "tag_slug": "weather", "limit": 100},
+        {"active": "true", "closed": "false", "end_date_min": now_iso,
+         "tag": "weather", "limit": 100},
+        # Search by query (events with weather/temperature in title)
+        {"active": "true", "closed": "false", "end_date_min": now_iso,
+         "q": "temperature", "limit": 100},
+    ]:
+        for page in range(max_pages):
+            p = {**params_try, "offset": page * 100}
+            try:
+                r = requests.get(f"{GAMMA_API}/events", params=p, timeout=30)
+                r.raise_for_status()
+                events = r.json()
+            except requests.exceptions.RequestException as e:
+                log_event("error", {"where": "_fetch_weather_events",
+                                     "params": list(params_try.keys()),
+                                     "page": page, "err": str(e)}, level="WARN")
+                break
+            if not isinstance(events, list) or not events:
+                break
+            for ev in events:
+                ev_title = ev.get("title", "")
+                ev_slug = ev.get("slug", "")
+                # Each event has a `markets` array of binary sub-markets
+                sub_markets = ev.get("markets") or []
+                for sm in sub_markets:
+                    if not isinstance(sm, dict):
+                        continue
+                    # Inject parent event context so the parser can resolve city
+                    sm["events"] = sm.get("events") or [{"title": ev_title,
+                                                          "slug": ev_slug}]
+                    out.append(sm)
+            if len(events) < 100:
+                break
+        if out:
+            log_event("events_endpoint_hit", {"variant": list(params_try.keys()),
+                                                "events_returned": len(out)})
+            return out
+    return out
+
+
 def _fetch_with_params(params: dict, max_pages: int = 5) -> list[dict]:
     """Paginate Gamma /markets with given params. Returns flat list."""
     out: list[dict] = []
@@ -200,6 +253,27 @@ def fetch_weather_markets(min_volume: float = 5000, max_pages: int = 5) -> list[
         return []
     log_event("fetch_using_variant", {"variant": chosen_param_set,
                                        "total": len(all_markets)})
+
+    # Dump first 3 markets in compact form so we can see what fields exist.
+    for i, m in enumerate(all_markets[:3]):
+        events = m.get("events") or []
+        ev_titles = [e.get("title") for e in events if isinstance(e, dict)]
+        log_event("fetch_sample", {
+            "i": i,
+            "question": (m.get("question") or "")[:120],
+            "slug": (m.get("slug") or "")[:80],
+            "endDate": m.get("endDate"),
+            "volumeNum": m.get("volumeNum"),
+            "event_titles": ev_titles[:2],
+            "event_slugs": [e.get("slug") for e in events if isinstance(e, dict)][:2],
+            "all_keys": sorted(m.keys())[:30],
+        })
+
+    # Also try /events endpoint and merge any weather-tagged markets we find
+    events_extras = _fetch_weather_events(now)
+    if events_extras:
+        log_event("events_endpoint_added", {"count": len(events_extras)})
+        all_markets.extend(events_extras)
 
     out = []
     n_keyword_match = 0
