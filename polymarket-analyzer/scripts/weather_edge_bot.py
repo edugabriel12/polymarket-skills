@@ -67,7 +67,7 @@ from weather_edge_helpers import (  # noqa: E402
 import weather_edge_db as db  # noqa: E402
 
 LOG_DIR = Path.home() / ".polymarket-paper"
-LOG_FILE = LOG_DIR / "weather_edge.jsonl"
+LOG_FILE = LOG_DIR / "weather_edge.jsonl"  # default; overridable via --log-file
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 WEATHER_TAG = "weather"
@@ -878,8 +878,21 @@ def main():
     p.add_argument("--judge-mode", choices=("sync", "off"), default="sync")
     p.add_argument("--fast-path-ttr-min", type=int, default=60)
     p.add_argument("--portfolio", default="default")
+    p.add_argument("--log-file", default=None,
+                   help="Write JSONL log here (default ~/.polymarket-paper/weather_edge.jsonl)")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args()
+
+    # Override log file if user asked
+    global LOG_FILE
+    if args.log_file:
+        LOG_FILE = Path(args.log_file).resolve()
+        # If user gave a relative path, make it absolute and ensure parent exists
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Truncate on --once for a clean per-run file
+        if args.once:
+            LOG_FILE.write_text("")
+        print(f"Logging JSONL to: {LOG_FILE}", flush=True)
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
     signal.signal(signal.SIGINT, _handle_sigterm)
@@ -896,6 +909,11 @@ def main():
             run_execute(args)
         run_monitor_tick(args, cities)
         run_resolution_sweep()
+        try:
+            size = LOG_FILE.stat().st_size
+            print(f"\n=== Full log: {LOG_FILE} ({size:,} bytes) ===", flush=True)
+        except OSError:
+            pass
         return
 
     discovery_int = args.discovery_interval_min * 60
