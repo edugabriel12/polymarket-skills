@@ -320,16 +320,32 @@ def fetch_weather_markets(min_volume: float = 5000, max_pages: int = 5) -> list[
 
 
 def fetch_orderbook(token_id: str) -> Optional[dict]:
-    """Fetch orderbook for a CLOB token. Returns {bids, asks} or None on error."""
+    """Fetch orderbook directly from CLOB HTTP endpoint (no SDK dependency).
+
+    Endpoint returns: {market, asset_id, bids: [...], asks: [...]} where each
+    side has {price, size} entries (as strings).
+    """
     try:
-        from py_clob_client.client import ClobClient
-        client = ClobClient("https://clob.polymarket.com")
-        book = client.get_order_book(token_id)
-        return {
-            "bids": [{"price": float(b.price), "size": float(b.size)} for b in book.bids],
-            "asks": [{"price": float(a.price), "size": float(a.size)} for a in book.asks],
-        }
-    except Exception as e:
+        r = requests.get("https://clob.polymarket.com/book",
+                         params={"token_id": token_id}, timeout=15)
+        if r.status_code != 200:
+            log_event("error", {"where": "fetch_orderbook",
+                                 "token_id": token_id[:12],
+                                 "status": r.status_code}, level="WARN")
+            return None
+        data = r.json()
+        bids = sorted(
+            [{"price": float(b["price"]), "size": float(b["size"])}
+             for b in (data.get("bids") or [])],
+            key=lambda b: b["price"], reverse=True,
+        )
+        asks = sorted(
+            [{"price": float(a["price"]), "size": float(a["size"])}
+             for a in (data.get("asks") or [])],
+            key=lambda a: a["price"],
+        )
+        return {"bids": bids, "asks": asks}
+    except (requests.exceptions.RequestException, ValueError, KeyError) as e:
         log_event("error", {"where": "fetch_orderbook", "token_id": token_id[:12],
                             "err": str(e)}, level="WARN")
         return None
@@ -822,7 +838,8 @@ def _handle_sigterm(signum, frame):
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--min-edge-pp", type=float, default=10.0)
-    p.add_argument("--min-volume", type=float, default=5000)
+    p.add_argument("--min-volume", type=float, default=100,
+                   help="Min market USD volume; sub-bracket markets have low volume each")
     p.add_argument("--min-price", type=float, default=0.20)
     p.add_argument("--max-price", type=float, default=0.70)
     p.add_argument("--max-slippage", type=float, default=0.20)

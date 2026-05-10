@@ -15,10 +15,17 @@ from __future__ import annotations
 import json
 import re
 import statistics
+import unicodedata
 from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+
+def _strip_accents(s: str) -> str:
+    """Remove diacritics so 'São Paulo' matches 'Sao Paulo'."""
+    return "".join(c for c in unicodedata.normalize("NFD", s)
+                   if not unicodedata.combining(c))
 
 
 # ---------------------------------------------------------------------------
@@ -63,20 +70,20 @@ def load_cities(path: Path = CITY_LOOKUP_PATH) -> dict[str, Any]:
 
 
 def _all_known_cities(cities: dict[str, Any]) -> dict[str, str]:
-    """Build {lowercase_name: canonical_name} including aliases."""
+    """Build {lowercase_unaccented_name: canonical_name} including aliases."""
     out: dict[str, str] = {}
     for group in ("world", "europe_top30", "north_america_extra", "us_top50"):
         for c in cities.get(group, []):
-            out[c.lower()] = c
+            out[_strip_accents(c).lower()] = c
     for alias, canonical in cities.get("aliases", {}).items():
-        out[alias.lower()] = canonical
+        out[_strip_accents(alias).lower()] = canonical
     return out
 
 
 def _resolve_city(text: str, cities: dict[str, Any]) -> Optional[str]:
-    """Find the canonical city name in `text` if any."""
+    """Find the canonical city name in `text` if any. Accent-insensitive."""
     lookup = _all_known_cities(cities)
-    text_lower = text.lower()
+    text_lower = _strip_accents(text).lower()
     # Try longest matches first to avoid "York" matching when "New York" should
     for name in sorted(lookup, key=len, reverse=True):
         if re.search(r"\b" + re.escape(name) + r"\b", text_lower):
@@ -110,6 +117,13 @@ _TEMP_AT_LEAST_RE = re.compile(
 _TEMP_AT_MOST_RE = re.compile(
     r"(?P<val>-?\d+(?:\.\d+)?)\s*(?:°\s*)?(?P<unit>F|C|fahrenheit|celsius)?"
     r"\s*or\s+(?:lower|below|less|fewer)",
+    re.IGNORECASE,
+)
+# Bare single-value bracket: "be 17°C on May 10" — Polymarket multi-outcome
+# events often have a sub-market per integer degree. We treat this as a
+# 1-degree range [val, val+1).
+_TEMP_BARE_RE = re.compile(
+    r"\bbe\s+(?P<val>-?\d+(?:\.\d+)?)\s*°\s*(?P<unit>F|C)\b\s*(?:on|by|$|\?)",
     re.IGNORECASE,
 )
 _PRECIP_RE = re.compile(
@@ -225,6 +239,18 @@ def parse_market(question: str, end_date: Optional[str] = None,
             city=city, threshold_value=float(m.group("val")),
             threshold_unit=unit, metric="temp", comparison="at_most",
             target_date=target_date, confidence=confidence,
+            raw_question=question,
+        )
+
+    # Bare single-value bracket: "be 17°C on May 10" → 1-degree range [v, v+1)
+    m = _TEMP_BARE_RE.search(question)
+    if m:
+        val = float(m.group("val"))
+        unit = m.group("unit").upper()
+        return MarketSpec(
+            city=city, threshold_value=val, threshold_value_high=val + 1.0,
+            threshold_unit=unit, metric="temp", comparison="range",
+            target_date=target_date, confidence=confidence * 0.95,
             raw_question=question,
         )
 
@@ -605,5 +631,24 @@ if __name__ == "__main__":
                          end_date="2026-05-11T23:59Z", cities=cities3)
     assert spec5 and spec5.comparison == "at_most" and spec5.threshold_value == 60
     print(f"Test 10 PASS: at_most → {spec5}")
+
+    # Test 11: bare single-value bracket from real Polymarket question
+    cities4 = {**cities3, "world": ["Sao Paulo", "London", "Tokyo", "Manhattan", "Jakarta"]}
+    spec_bare = parse_market("Will the highest temperature in London be 17°C on May 10?",
+                             end_date="2026-05-10T23:59Z", cities=cities4)
+    assert spec_bare and spec_bare.city == "London"
+    assert spec_bare.comparison == "range"
+    assert spec_bare.threshold_value == 17.0 and spec_bare.threshold_value_high == 18.0
+    assert spec_bare.threshold_unit == "C"
+    print(f"Test 11 PASS: bare value → {spec_bare}")
+
+    # Test 12: accent-insensitive city resolution
+    cities_with_accent = {"world": ["São Paulo"], "us_top50": [],
+                           "europe_top30": [], "north_america_extra": [], "aliases": {}}
+    spec_acc = parse_market("Will the highest temperature in Sao Paulo be 23°C or higher on May 10?",
+                            end_date="2026-05-10T23:59Z", cities=cities_with_accent)
+    assert spec_acc and spec_acc.city == "São Paulo"
+    assert spec_acc.comparison == "at_least" and spec_acc.threshold_value == 23.0
+    print(f"Test 12 PASS: accent-insensitive → {spec_acc}")
 
     print("\nAll helper tests PASS")
