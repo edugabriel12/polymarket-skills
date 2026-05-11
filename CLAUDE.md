@@ -42,9 +42,9 @@ This is the single source of truth for all risk parameters. These numbers overri
 
 | Parameter | Limit |
 |---|---|
-| Max concurrent positions | 5 |
+| Max concurrent positions | 15 |
 | Max single market exposure | 20% of portfolio |
-| Max new trades per day | 10 |
+| Max new trades per day | 30 |
 | Human approval required | Trades > 15% of portfolio |
 
 ### Loss Limits

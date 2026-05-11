@@ -32,7 +32,7 @@ DEFAULT_BALANCE = 1000.0
 DEFAULT_RISK = {
     "max_position_pct": 0.10,       # 10% of bankroll per trade
     "max_drawdown_pct": 0.30,       # 30% total drawdown halts trading
-    "max_concurrent_positions": 5,
+    "max_concurrent_positions": 15,
     "daily_loss_limit_pct": 0.05,   # 5% of starting bankroll
     "max_single_market_pct": 0.20,  # 20% portfolio in one market
     "human_approval_pct": 0.15,     # trades > 15% need human approval
