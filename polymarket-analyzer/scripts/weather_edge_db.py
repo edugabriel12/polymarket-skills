@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 DB_PATH = Path.home() / ".polymarket-paper" / "weather_edge.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 SCHEMA_V1 = """
@@ -123,6 +123,13 @@ CREATE INDEX IF NOT EXISTS idx_judge_verdict ON judge_reviews(verdict);
 """
 
 
+SCHEMA_V2_MIGRATIONS = [
+    # Peak bid tracking for trailing-stop cashout policy.
+    "ALTER TABLE entries ADD COLUMN peak_bid_seen REAL",
+    "ALTER TABLE entries ADD COLUMN peak_bid_seen_at TEXT",
+]
+
+
 def init_db(path: Path = DB_PATH) -> None:
     """Create the DB and tables if missing. Idempotent. Bumps user_version."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -131,7 +138,17 @@ def init_db(path: Path = DB_PATH) -> None:
         current = cur.execute("PRAGMA user_version").fetchone()[0]
         if current < 1:
             cur.executescript(SCHEMA_V1)
-            cur.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            current = 1
+        if current < 2:
+            for stmt in SCHEMA_V2_MIGRATIONS:
+                try:
+                    cur.execute(stmt)
+                except sqlite3.OperationalError as e:
+                    # Column may already exist if a partial migration happened.
+                    if "duplicate column name" not in str(e).lower():
+                        raise
+            current = 2
+        cur.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
 
 

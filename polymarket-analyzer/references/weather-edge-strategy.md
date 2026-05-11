@@ -54,22 +54,49 @@ Final size = `min(slippage_max, kelly_size, all caps)`. Minimum trade $10.
 
 ## Cash-out logic
 
-The simplest rule that captures the operator's intent:
+Multi-trigger policy — any of four triggers fires → cashout. Implemented in
+`weather_edge_helpers.py:evaluate_cashout_triggers`.
 
-```python
-if forecast_prob_now < entry_implied:
-    # Our edge has disappeared
-    if current_bid >= entry_price:
-        cash_out()        # break-even or profit
-    else:
-        hold()            # bid too low; wait for recovery
-else:
-    hold()                # edge still intact
+```
+Trigger 1: profit_lock        bid - entry >= 50pp  (default; --profit-lock-pp)
+Trigger 2: trailing_stop      peak >= entry + 20pp AND bid <= peak * 0.70
+                              (default 30%; --trailing-drawdown-pct)
+Trigger 3: convergence        bid >= fair_value - 5pp where
+                              fair = forecast_prob_yes (YES) or 1 - forecast_prob_yes (NO)
+                              (default 5pp; --convergence-pp)
+Trigger 4: forecast_reversal  forecast_prob_now < entry_implied AND bid >= entry
+                              (existing logic; break-even backstop)
+
+Guard: if bid < entry_price, triggers 1-3 are suppressed (never sell at a loss).
 ```
 
-**No hard stop-loss.** If the forecast continues to support the position, we hold to resolution. If it deteriorates but the market won't pay break-even, we still hold — losing only when the market's resolution itself goes against us.
+### Why this design
 
-This protects against panic-selling on transient forecast wobbles AND lets us capture cleanly when the bid recovers to entry.
+The original "forecast_below_entry → cashout if bid >= entry" rule never fired
+for tail-bracket NO bets. Example: NO @ $0.13 with forecast P(NO)=0.95 →
+`forecast_prob_now < entry_implied` is `0.95 < 0.13` → always False. The
+position would ride all the way to resolution, exposed to:
+
+- the 5% loss tail (paying $0 instead of $1)
+- capital lock-up that prevents redeployment
+- evaporated paper gains if bid spikes to $0.80 then crashes back to $0.40
+
+The new policy captures profit during the convergence path:
+
+- **profit_lock** locks a known good outcome (4-5x typical on tail bets)
+- **trailing_stop** protects realized paper gains against reversal
+- **convergence** exits when the orderbook reaches forecast-fair (no more edge to mine)
+- **forecast_reversal** retained as backstop for break-even exits
+
+### Persistence
+
+`entries.peak_bid_seen` (added in schema v2) tracks the highwater bid per
+position. Updated on every monitor check when current bid exceeds prior peak.
+`monitor_checks.decision_reason` records which trigger fired (`profit_lock`,
+`trailing_stop`, `convergence`, `forecast_reversal`, or `none` for HOLD).
+
+The analyzer aggregates by trigger so the operator can tune thresholds based
+on observed P&L per trigger.
 
 ## Monitor cadence
 

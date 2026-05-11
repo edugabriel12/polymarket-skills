@@ -155,6 +155,50 @@ def _summarize(rows: list[dict]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Cashout trigger aggregation
+# ---------------------------------------------------------------------------
+
+
+def aggregate_cashout_triggers(conn, since_iso: str) -> dict:
+    """Group cashouts by which trigger fired (parsed from decision_reason of
+    the monitor_check that immediately preceded the cashout). Returns per-
+    trigger counts + mean realized PnL.
+
+    Trigger name is the prefix of monitor_check.decision_reason before ':'
+    (set by the bot as f'{trigger}: {reason}').
+    """
+    rows = conn.execute(
+        "SELECT c.cashout_id, c.realized_pnl_usd, c.ts, c.entry_id, "
+        "       (SELECT decision_reason FROM monitor_checks m "
+        "        WHERE m.entry_id = c.entry_id AND m.decision = 'CASHOUT' "
+        "        ORDER BY m.ts DESC LIMIT 1) AS reason "
+        "FROM cashouts c WHERE c.ts >= ?",
+        (since_iso,),
+    ).fetchall()
+
+    by_trigger: dict[str, list[float]] = defaultdict(list)
+    for r in rows:
+        reason = (r["reason"] or "").strip()
+        trigger = reason.split(":", 1)[0].strip() if ":" in reason else "unknown"
+        if not trigger:
+            trigger = "unknown"
+        pnl = r["realized_pnl_usd"]
+        if pnl is not None:
+            by_trigger[trigger].append(float(pnl))
+
+    out = {}
+    for trigger, pnls in by_trigger.items():
+        out[trigger] = {
+            "n": len(pnls),
+            "total_pnl_usd": round(sum(pnls), 2),
+            "mean_pnl_usd": round(sum(pnls) / len(pnls), 2) if pnls else 0,
+            "min_pnl_usd": round(min(pnls), 2) if pnls else 0,
+            "max_pnl_usd": round(max(pnls), 2) if pnls else 0,
+        }
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Judge calibration
 # ---------------------------------------------------------------------------
 
@@ -333,7 +377,7 @@ def replay_entry(conn, entry_id: int) -> str:
 
 
 def format_report_md(buckets: dict, judge: dict, suggestions: list[str],
-                     since_iso: str) -> str:
+                     since_iso: str, triggers: dict | None = None) -> str:
     out = [
         "# Weather Edge Bot — Analysis Report",
         "",
@@ -367,6 +411,15 @@ def format_report_md(buckets: dict, judge: dict, suggestions: list[str],
         wr_str = f"{wr * 100:.0f}%" if wr is not None else "-"
         out.append(f"| {bucket} | {v['n']} | {v['yes']} | {wr_str} | "
                    f"{expected.get(bucket, '-')} |")
+
+    if triggers:
+        out.append("\n## Cashouts by Trigger")
+        out.append("| Trigger | N | Total $ | Mean $ | Min $ | Max $ |")
+        out.append("|---|---|---|---|---|---|")
+        for trig, v in sorted(triggers.items(), key=lambda kv: -kv[1]["n"]):
+            out.append(f"| {trig} | {v['n']} | {v['total_pnl_usd']} | "
+                       f"{v['mean_pnl_usd']} | {v['min_pnl_usd']} | "
+                       f"{v['max_pnl_usd']} |")
 
     out.append("\n## Judge Performance")
     out.append(f"- Total reviews: {judge['n_reviews']}")
@@ -425,11 +478,12 @@ def main():
 
         buckets = aggregate_by_bucket(conn, since_iso)
         judge = aggregate_judge(conn, since_iso)
+        triggers = aggregate_cashout_triggers(conn, since_iso)
         suggestions = generate_suggestions(buckets, judge)
 
     if args.output == "json":
         report = {"since": since, "buckets": buckets, "judge": judge,
-                  "suggestions": suggestions}
+                  "cashout_triggers": triggers, "suggestions": suggestions}
         text = json.dumps(report, indent=2, default=str)
     elif args.output == "csv":
         out_path = Path(args.out or "weather_edge_report.csv")
@@ -437,7 +491,7 @@ def main():
         print(f"CSV written to {out_path}", file=sys.stderr)
         return
     else:
-        text = format_report_md(buckets, judge, suggestions, since_iso)
+        text = format_report_md(buckets, judge, suggestions, since_iso, triggers)
 
     if args.out:
         Path(args.out).write_text(text)

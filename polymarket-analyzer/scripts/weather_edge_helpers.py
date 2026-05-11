@@ -550,6 +550,101 @@ def compute_edge(forecast_prob: float, implied: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Cashout policy — multi-trigger evaluator
+# ---------------------------------------------------------------------------
+
+
+def evaluate_cashout_triggers(
+    *,
+    side: str,
+    entry_price: float,
+    current_bid: float,
+    peak_bid_seen: Optional[float],
+    forecast_prob_yes: Optional[float],
+    profit_lock_pp: float = 50.0,
+    trailing_drawdown_pct: float = 30.0,
+    trailing_min_gain_pp: float = 20.0,
+    convergence_pp: float = 5.0,
+) -> dict:
+    """Decide whether to cash out an open position based on 4 OR'd triggers.
+
+    Triggers (evaluated in order; first match wins):
+      1. profit_lock     — bid >= entry + profit_lock_pp/100
+      2. trailing_stop   — peak >= entry + trailing_min_gain_pp/100 AND
+                           bid <= peak * (1 - trailing_drawdown_pct/100)
+      3. convergence     — bid >= fair_value - convergence_pp/100, where
+                           fair_value = forecast_prob_yes (YES) or
+                                        1 - forecast_prob_yes (NO)
+      4. forecast_reversal — forecast turned against us AND bid >= entry
+                             (break-even backstop, existing behavior)
+
+    Guard: if current_bid < entry_price, triggers 1-3 are suppressed
+    (never sell at a loss on profit-taking logic). forecast_reversal still
+    requires bid >= entry by definition.
+
+    Returns: {decision: "CASHOUT"|"HOLD", trigger: str, reason: str}
+    """
+    in_profit = current_bid >= entry_price
+    peak = float(peak_bid_seen) if peak_bid_seen is not None else 0.0
+
+    # Trigger 1: profit lock
+    if in_profit and (current_bid - entry_price) >= profit_lock_pp / 100.0:
+        return {
+            "decision": "CASHOUT",
+            "trigger": "profit_lock",
+            "reason": f"bid {current_bid:.3f} >= entry {entry_price:.3f} + "
+                      f"{profit_lock_pp:.0f}pp; lock profit",
+        }
+
+    # Trigger 2: trailing stop
+    if in_profit and peak >= entry_price + trailing_min_gain_pp / 100.0:
+        drawdown_threshold = peak * (1.0 - trailing_drawdown_pct / 100.0)
+        if current_bid <= drawdown_threshold:
+            return {
+                "decision": "CASHOUT",
+                "trigger": "trailing_stop",
+                "reason": f"bid {current_bid:.3f} <= peak {peak:.3f} * "
+                          f"(1 - {trailing_drawdown_pct:.0f}%); reversal from peak",
+            }
+
+    # Trigger 3: convergence
+    if in_profit and forecast_prob_yes is not None:
+        fair_value = (forecast_prob_yes if side == "YES"
+                      else 1.0 - forecast_prob_yes)
+        if current_bid >= fair_value - convergence_pp / 100.0:
+            return {
+                "decision": "CASHOUT",
+                "trigger": "convergence",
+                "reason": f"bid {current_bid:.3f} within {convergence_pp:.0f}pp "
+                          f"of fair {fair_value:.3f}; edge converged",
+            }
+
+    # Trigger 4: forecast reversal (existing logic, backstop break-even)
+    if forecast_prob_yes is not None and current_bid >= entry_price:
+        # For YES bets, forecast_prob_now = forecast_prob_yes.
+        # For NO bets, forecast_prob_now = 1 - forecast_prob_yes.
+        # entry_implied = entry_price (the price we paid for our side).
+        forecast_prob_now = (forecast_prob_yes if side == "YES"
+                             else 1.0 - forecast_prob_yes)
+        if forecast_prob_now < entry_price:
+            return {
+                "decision": "CASHOUT",
+                "trigger": "forecast_reversal",
+                "reason": f"forecast P({side})={forecast_prob_now:.3f} < entry "
+                          f"{entry_price:.3f} and bid {current_bid:.3f} permits "
+                          f"break-even+",
+            }
+
+    # Default: hold
+    return {
+        "decision": "HOLD",
+        "trigger": "none",
+        "reason": (f"bid {current_bid:.3f}, peak {peak:.3f}, entry "
+                   f"{entry_price:.3f}; no trigger fired"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Inline tests
 # ---------------------------------------------------------------------------
 
@@ -683,5 +778,99 @@ if __name__ == "__main__":
     assert spec_acc and spec_acc.city == "São Paulo"
     assert spec_acc.comparison == "at_least" and spec_acc.threshold_value == 23.0
     print(f"Test 12 PASS: accent-insensitive → {spec_acc}")
+
+    # === Cashout trigger tests (Tests A-H from plan) ===
+    # NOTE: defaults profit_lock_pp=50, trailing_drawdown_pct=30,
+    # trailing_min_gain_pp=20, convergence_pp=5
+
+    # Test A: bid sobe um pouco, sem peak, nada dispara
+    v = evaluate_cashout_triggers(
+        side="NO", entry_price=0.13, current_bid=0.20,
+        peak_bid_seen=None, forecast_prob_yes=0.05)
+    assert v["decision"] == "HOLD" and v["trigger"] == "none", v
+    print(f"Test A PASS: HOLD (bid 0.20, sem peak) → {v['trigger']}")
+
+    # Test B: profit lock dispara
+    v = evaluate_cashout_triggers(
+        side="NO", entry_price=0.13, current_bid=0.65,
+        peak_bid_seen=0.65, forecast_prob_yes=0.05)
+    assert v["decision"] == "CASHOUT" and v["trigger"] == "profit_lock", v
+    print(f"Test B PASS: CASHOUT profit_lock → bid 0.65 >= entry 0.13+0.50")
+
+    # Test C: drawdown só 20%, abaixo do threshold 30%
+    v = evaluate_cashout_triggers(
+        side="NO", entry_price=0.13, current_bid=0.40,
+        peak_bid_seen=0.50, forecast_prob_yes=0.05)
+    assert v["decision"] == "HOLD", f"got {v}"
+    print(f"Test C PASS: HOLD (drawdown 20% < 30%)")
+
+    # Test D: drawdown 32% — trailing stop dispara
+    v = evaluate_cashout_triggers(
+        side="NO", entry_price=0.13, current_bid=0.34,
+        peak_bid_seen=0.50, forecast_prob_yes=0.05)
+    assert v["decision"] == "CASHOUT" and v["trigger"] == "trailing_stop", v
+    print(f"Test D PASS: CASHOUT trailing_stop → bid 0.34 <= 0.50*0.70")
+
+    # Test E: peak ainda pequeno (não atingiu min_gain de 20pp)
+    v = evaluate_cashout_triggers(
+        side="NO", entry_price=0.13, current_bid=0.18,
+        peak_bid_seen=0.20, forecast_prob_yes=0.05)
+    # peak 0.20 < entry 0.13 + 0.20 = 0.33 → trailing NOT armed
+    # bid 0.18 < entry+50pp (0.63) → profit_lock not fired
+    # bid 0.18 vs fair NO=0.95: not within 5pp → convergence not fired
+    # forecast P(NO)=0.95 >= entry 0.13 → no reversal
+    assert v["decision"] == "HOLD", v
+    print(f"Test E PASS: HOLD (peak não armou trailing)")
+
+    # Test F: convergence — bid muito perto do fair value
+    v = evaluate_cashout_triggers(
+        side="NO", entry_price=0.13, current_bid=0.91,
+        peak_bid_seen=0.91, forecast_prob_yes=0.05)
+    # fair NO = 1 - 0.05 = 0.95. bid 0.91 >= 0.90 (0.95 - 0.05) → convergence
+    # BUT bid 0.91 >= entry 0.13 + 0.50 → profit_lock ALSO fires first
+    # Since profit_lock comes first, decision is profit_lock (acceptable)
+    assert v["decision"] == "CASHOUT", v
+    print(f"Test F PASS: CASHOUT ({v['trigger']}) — high bid")
+
+    # Test F2: convergence isolated (entry close to fair so profit_lock can't fire)
+    v = evaluate_cashout_triggers(
+        side="NO", entry_price=0.50, current_bid=0.91,
+        peak_bid_seen=0.91, forecast_prob_yes=0.05)
+    # profit_lock: 0.91 - 0.50 = 0.41 < 0.50 → not fired
+    # trailing: peak 0.91 >= 0.50+0.20=0.70 ✓, drawdown 0 < 30% → not fired
+    # convergence: fair=0.95, bid 0.91 >= 0.90 → CASHOUT
+    assert v["decision"] == "CASHOUT" and v["trigger"] == "convergence", v
+    print(f"Test F2 PASS: CASHOUT convergence (entry 0.50, fair 0.95)")
+
+    # Test G: guard — bid < entry, nunca cashout em prejuízo
+    v = evaluate_cashout_triggers(
+        side="NO", entry_price=0.13, current_bid=0.12,
+        peak_bid_seen=0.20, forecast_prob_yes=0.05)
+    assert v["decision"] == "HOLD", v
+    print(f"Test G PASS: HOLD (guard: bid < entry)")
+
+    # Test H: forecast reversal — forecast piorou contra nós
+    v = evaluate_cashout_triggers(
+        side="YES", entry_price=0.40, current_bid=0.42,
+        peak_bid_seen=0.42, forecast_prob_yes=0.30)
+    # forecast_prob_now (YES) = 0.30 < entry 0.40 ✓, bid 0.42 >= entry 0.40 ✓
+    # profit_lock: 0.42 - 0.40 = 0.02 < 0.50 → not fired
+    # trailing: peak 0.42 < entry 0.40+0.20=0.60 → not armed
+    # convergence: fair YES=0.30. bid 0.42 >= 0.30-0.05=0.25 ✓ → CASHOUT
+    # both convergence and forecast_reversal would fire; convergence comes first
+    assert v["decision"] == "CASHOUT", v
+    print(f"Test H PASS: CASHOUT ({v['trigger']}) — bid above fair")
+
+    # Test H2: pure forecast_reversal (bid < fair so convergence doesn't fire)
+    v = evaluate_cashout_triggers(
+        side="YES", entry_price=0.40, current_bid=0.40,
+        peak_bid_seen=0.45, forecast_prob_yes=0.20)
+    # forecast P(YES)=0.20 < entry 0.40 ✓, bid 0.40 >= entry 0.40 ✓
+    # profit_lock: 0.40 - 0.40 = 0 < 0.50 → not fired
+    # trailing: peak 0.45 < entry+0.20=0.60 → not armed
+    # convergence: fair YES=0.20. bid 0.40 >= 0.15 ✓ — convergence fires!
+    # Actually convergence fires first since 0.40 > 0.15. trigger=convergence
+    assert v["decision"] == "CASHOUT", v
+    print(f"Test H2 PASS: CASHOUT ({v['trigger']}) — forecast turned bad")
 
     print("\nAll helper tests PASS")

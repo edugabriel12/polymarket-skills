@@ -63,6 +63,7 @@ _load_dotenv()
 from weather_edge_helpers import (  # noqa: E402
     parse_market, forecast_probability, compute_max_size_for_slippage,
     implied_probabilities, compute_edge, load_cities, MarketSpec,
+    evaluate_cashout_triggers,
 )
 import weather_edge_db as db  # noqa: E402
 
@@ -730,27 +731,41 @@ def _do_monitor_check(conn, row, cities: dict, args) -> None:
     forecast_prob_yes = forecast_probability(spec, forecast)
     if forecast_prob_yes is None:
         return
-    forecast_prob_now = forecast_prob_yes if side == "YES" else 1 - forecast_prob_yes
-    entry_implied = float(row["implied_prob_at_entry"] or row["entry_price"])
 
     token_id = row["token_id_yes"] if side == "YES" else row["token_id_no"]
     book = fetch_orderbook(token_id)
     if not book:
         return
-    bid = book["bids"][0]["price"] if book.get("bids") else 0
-    ask = book["asks"][0]["price"] if book.get("asks") else 0
+    bid = book["bids"][0]["price"] if book.get("bids") else 0.0
+    ask = book["asks"][0]["price"] if book.get("asks") else 0.0
+    entry_price = float(row["entry_price"])
 
-    decision = "HOLD"
-    reason = ""
-    if forecast_prob_now < entry_implied:
-        if bid >= float(row["entry_price"]):
-            decision = "CASHOUT"
-            reason = f"forecast_below_entry ({forecast_prob_now:.3f}<{entry_implied:.3f}); bid {bid:.3f}>=entry {row['entry_price']:.3f}"
-        else:
-            decision = "TRY_CASHOUT_BLOCKED"
-            reason = f"forecast_below_entry but bid {bid:.3f}<entry {row['entry_price']:.3f}; holding"
-    else:
-        reason = f"forecast_prob {forecast_prob_now:.3f} >= entry {entry_implied:.3f}; edge intact"
+    # Track peak bid for trailing-stop trigger
+    prev_peak = float(row["peak_bid_seen"] or 0.0)
+    peak = max(prev_peak, bid)
+    if bid > prev_peak:
+        conn.execute(
+            "UPDATE entries SET peak_bid_seen = ?, peak_bid_seen_at = ? "
+            "WHERE entry_id = ?",
+            (bid, _now_iso(), entry_id),
+        )
+
+    verdict = evaluate_cashout_triggers(
+        side=side,
+        entry_price=entry_price,
+        current_bid=bid,
+        peak_bid_seen=peak,
+        forecast_prob_yes=forecast_prob_yes,
+        profit_lock_pp=args.profit_lock_pp,
+        trailing_drawdown_pct=args.trailing_drawdown_pct,
+        convergence_pp=args.convergence_pp,
+    )
+    decision = verdict["decision"]
+    trigger = verdict["trigger"]
+    reason = f"{trigger}: {verdict['reason']}"
+
+    # Also need forecast_prob_now for legacy monitor_checks payload + downstream
+    forecast_prob_now = forecast_prob_yes if side == "YES" else 1.0 - forecast_prob_yes
 
     db.insert_monitor_check(
         conn, entry_id=entry_id,
@@ -763,9 +778,11 @@ def _do_monitor_check(conn, row, cities: dict, args) -> None:
         decision_reason=reason,
     )
     log_event("monitor_check", {"entry_id": entry_id, "decision": decision,
+                                "trigger": trigger,
                                 "forecast_prob_now": forecast_prob_now,
-                                "entry_implied": entry_implied,
-                                "bid": bid, "reason": reason})
+                                "entry_price": entry_price,
+                                "bid": bid, "peak": peak,
+                                "reason": verdict["reason"]})
 
     if decision == "CASHOUT":
         _do_cashout(conn, row, bid, forecast, forecast_prob_now, args, reason)
@@ -787,10 +804,12 @@ def _do_cashout(conn, row, bid: float, forecast: dict,
         result = engine.close_position(token_id=token_id, side=side,
                                         reasoning=f"weather_edge_bot: {reason}")
         if result.get("status") == "closed":
+            # paper_engine returns avg_sell_price (not avg_price)
+            exit_price = result.get("avg_sell_price") or result.get("avg_price")
             db.insert_cashout(
                 conn, entry_id=entry_id,
                 ts=_now_iso(),
-                exit_price=result.get("avg_price"),
+                exit_price=exit_price,
                 exit_shares=result.get("shares_sold"),
                 realized_pnl_usd=result.get("realized_pnl"),
                 forecast_prob_at_exit=forecast_prob_now,
@@ -798,7 +817,7 @@ def _do_cashout(conn, row, bid: float, forecast: dict,
                 reason=reason[:200],
             )
             log_event("cashout_executed", {"entry_id": entry_id,
-                                            "exit_price": result.get("avg_price"),
+                                            "exit_price": exit_price,
                                             "pnl": result.get("realized_pnl")})
         else:
             log_event("cashout_rejected", {"entry_id": entry_id,
@@ -887,6 +906,12 @@ def main():
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--judge-mode", choices=("sync", "off"), default="sync")
     p.add_argument("--fast-path-ttr-min", type=int, default=60)
+    p.add_argument("--profit-lock-pp", type=float, default=50.0,
+                   help="Cashout when bid >= entry + X pp (default 50pp = +$0.50)")
+    p.add_argument("--trailing-drawdown-pct", type=float, default=30.0,
+                   help="Cashout if bid falls X%% below peak (default 30%%)")
+    p.add_argument("--convergence-pp", type=float, default=5.0,
+                   help="Cashout when bid within X pp of forecast fair value (default 5pp)")
     p.add_argument("--portfolio", default="default")
     p.add_argument("--log-file", default=None,
                    help="Write JSONL log here (default ~/.polymarket-paper/weather_edge.jsonl)")
