@@ -268,6 +268,15 @@ Scanner ──→ Analyzer ──→ Strategy Advisor ──→ Paper Trader ─
 | Get trade recommendations | polymarket-strategy-advisor | `advisor.py`, `daily_review.py` |
 | Simulate trades | polymarket-paper-trader | `paper_engine.py`, `execute_paper.py`, `portfolio_report.py` |
 | Execute real trades | polymarket-live-executor | `execute_live.py`, `check_positions.py` |
+| Weekly self-tuning meta-agent (suggestion-only) | polymarket-analyzer | `weather_strategy_advisor.py` |
+
+**Note on the strategy advisor (`weather_strategy_advisor.py`)**: this is a
+weekly Claude Opus 4.7 daemon that reads aggregate bot performance and
+proposes tuning changes. It is **read-only**: it never modifies code or
+config. The operator reviews its markdown report in
+`~/.polymarket-paper/advisor_reports/` and applies any changes manually.
+Risk limits in §2 of this document remain constitutional — the advisor may
+suggest tightening them but never loosening them.
 
 All scripts are in `<skill>/scripts/` and require the Python venv: `source ~/.venv/bin/activate`
 

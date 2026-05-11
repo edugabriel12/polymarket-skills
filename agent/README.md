@@ -327,11 +327,38 @@ echo "JUDGE_DAILY_BUDGET_USD=0" >> ~/polymarket-skills/agent/.env
 systemctl --user restart weather-edge-judge
 ```
 
+### Strategy Advisor (meta-agente semanal)
+
+Lê semanalmente os relatórios agregados do bot (buckets de edge/TTR, calibração, judge stats, cashout triggers, performance por cidade, MAE observado) e propõe mudanças de tuning. **Só sugestões — nunca aplica nada sozinho.** Operador revisa e aplica manualmente.
+
+```bash
+# Run on-demand
+python polymarket-analyzer/scripts/weather_strategy_advisor.py --once --since-days 14
+
+# Preview do payload sem chamar API (gratuito)
+python polymarket-analyzer/scripts/weather_strategy_advisor.py --dry-run --since-days 14
+
+# Mock LLM (gratuito, gera artefatos com sugestão dummy)
+python polymarket-analyzer/scripts/weather_strategy_advisor.py --once --mock-llm --since-days 14
+
+# Deploy semanal automático (domingo 06:00 UTC)
+cp agent/weather-strategy-advisor.service ~/.config/systemd/user/
+cp agent/weather-strategy-advisor.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now weather-strategy-advisor.timer
+systemctl --user list-timers | grep advisor
+```
+
+Relatórios ficam em `~/.polymarket-paper/advisor_reports/YYYY-MM-DD_strategy_report.{md,json}`. Histórico de runs em SQLite: `SELECT * FROM advisor_runs;` em `~/.polymarket-paper/weather_edge.db`.
+
+Custo estimado: ~$1-2 por run com Opus 4.7 (cache hit nas chamadas subsequentes); ~$5/mês na cadência semanal. Configure `ADVISOR_WEEKLY_BUDGET_USD` em `.env` para o cap por run.
+
 ### Documentação
 
 - `polymarket-analyzer/references/weather-edge-strategy.md` — estratégia, fórmulas, racional
 - `polymarket-analyzer/references/weather-judge-prompt.md` — system prompt do judge
-- `polymarket-analyzer/scripts/weather_edge_*.py` — código
+- `polymarket-analyzer/references/strategy-advisor-prompt.md` — system prompt do advisor
+- `polymarket-analyzer/scripts/weather_edge_*.py`, `weather_strategy_advisor.py` — código
 
 ---
 

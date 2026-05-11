@@ -1,0 +1,24 @@
+[Unit]
+Description=Polymarket weather strategy advisor (weekly Claude analysis)
+Documentation=file:%h/polymarket-skills/polymarket-analyzer/references/strategy-advisor-prompt.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/polymarket-skills/agent/.env
+ExecStart=/usr/bin/env python3 %h/polymarket-skills/polymarket-analyzer/scripts/weather_strategy_advisor.py --once --since-days 14 --trigger scheduled_weekly
+StandardOutput=journal
+StandardError=journal
+MemoryMax=512M
+CPUQuota=50%
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.polymarket-paper
+
+[Install]
+WantedBy=default.target

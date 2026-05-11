@@ -1,0 +1,12 @@
+[Unit]
+Description=Trigger Polymarket weather strategy advisor weekly
+Documentation=file:%h/polymarket-skills/agent/weather-strategy-advisor.service
+
+[Timer]
+# Sundays at 06:00 UTC. Adjust if you prefer a different cadence.
+OnCalendar=Sun *-*-* 06:00:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

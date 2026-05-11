@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 DB_PATH = Path.home() / ".polymarket-paper" / "weather_edge.db"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 SCHEMA_V1 = """
@@ -130,6 +130,30 @@ SCHEMA_V2_MIGRATIONS = [
 ]
 
 
+SCHEMA_V3_MIGRATIONS = [
+    # Strategy advisor run history.
+    """
+    CREATE TABLE IF NOT EXISTS advisor_runs (
+      run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      trigger TEXT NOT NULL,
+      since_iso TEXT NOT NULL,
+      report_path TEXT NOT NULL,
+      json_path TEXT NOT NULL,
+      n_suggestions INTEGER NOT NULL,
+      llm_model TEXT NOT NULL,
+      cost_usd REAL,
+      tokens_in INTEGER,
+      tokens_out INTEGER,
+      cache_read_tokens INTEGER,
+      status TEXT NOT NULL,
+      error_msg TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_advisor_ts ON advisor_runs(ts)",
+]
+
+
 def init_db(path: Path = DB_PATH) -> None:
     """Create the DB and tables if missing. Idempotent. Bumps user_version."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -148,6 +172,10 @@ def init_db(path: Path = DB_PATH) -> None:
                     if "duplicate column name" not in str(e).lower():
                         raise
             current = 2
+        if current < 3:
+            for stmt in SCHEMA_V3_MIGRATIONS:
+                cur.execute(stmt)
+            current = 3
         cur.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
 
@@ -226,6 +254,14 @@ def insert_judge_review(conn, entry_id: int, **kwargs) -> int:
     vals = [kwargs[c] for c in cols]
     placeholders = ",".join("?" * len(cols))
     q = f"INSERT INTO judge_reviews ({','.join(cols)}) VALUES ({placeholders})"
+    return conn.execute(q, vals).lastrowid
+
+
+def insert_advisor_run(conn, **kwargs) -> int:
+    cols = list(kwargs.keys())
+    vals = [kwargs[c] for c in cols]
+    placeholders = ",".join("?" * len(cols))
+    q = f"INSERT INTO advisor_runs ({','.join(cols)}) VALUES ({placeholders})"
     return conn.execute(q, vals).lastrowid
 
 

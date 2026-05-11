@@ -134,6 +134,26 @@ Persistence at `~/.polymarket-paper/weather_edge.db` (SQLite). Logs at
 
 Paper-only by design (CLAUDE.md §4 compliance — paper-first before live).
 
+### 7. Weather Strategy Advisor (`scripts/weather_strategy_advisor.py`)
+
+Weekly meta-agent (Claude Opus 4.7) that ingests the analyzer's aggregate
+output plus per-city/per-trigger extras and proposes concrete tuning
+suggestions: threshold defaults, MAE constants, city blacklist/whitelist,
+judge-prompt edits, data-source swaps. **Read-only — operator applies any
+change manually.** Backed by `references/strategy-advisor-prompt.md`.
+
+```bash
+# Preview without API call
+python scripts/weather_strategy_advisor.py --dry-run --since-days 14
+
+# Real run (uses ANTHROPIC_API_KEY; ~$1-2/run with cache)
+python scripts/weather_strategy_advisor.py --once --since-days 14
+```
+
+Reports: `~/.polymarket-paper/advisor_reports/YYYY-MM-DD_strategy_report.{md,json}`.
+Run history: `advisor_runs` table in `weather_edge.db` (schema v3).
+Deploy weekly via `agent/weather-strategy-advisor.{service,timer}` (systemd).
+
 ## Workflow
 
 1. Run `find_edges.py` to scan for arbitrage across all active markets
