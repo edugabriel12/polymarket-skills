@@ -9,10 +9,12 @@ commands with 4 dense, auto-refreshing tabs.
 ```powershell
 # From repo root
 pip install -r dashboard\requirements.txt
-uvicorn dashboard.main:app --host 127.0.0.1 --port 8765 --reload
+python -m uvicorn dashboard.main:app --host 127.0.0.1 --port 8765 --reload
 ```
 
 Open <http://127.0.0.1:8765> in your browser.
+
+> **Note**: use `python -m uvicorn` (not bare `uvicorn`) on Windows so it doesn't depend on `Scripts\` being in your `PATH`.
 
 ## Tabs
 
