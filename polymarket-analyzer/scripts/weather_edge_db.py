@@ -155,10 +155,13 @@ SCHEMA_V3_MIGRATIONS = [
 
 
 def init_db(path: Path = DB_PATH) -> None:
-    """Create the DB and tables if missing. Idempotent. Bumps user_version."""
+    """Create the DB and tables if missing. Idempotent. Bumps user_version.
+    Enables WAL mode so readers + writers don't block each other."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as conn:
+    with sqlite3.connect(path, timeout=5.0) as conn:
         cur = conn.cursor()
+        cur.execute("PRAGMA busy_timeout = 5000")
+        cur.execute("PRAGMA journal_mode = WAL")
         current = cur.execute("PRAGMA user_version").fetchone()[0]
         if current < 1:
             cur.executescript(SCHEMA_V1)
@@ -182,11 +185,16 @@ def init_db(path: Path = DB_PATH) -> None:
 
 @contextmanager
 def connect(path: Path = DB_PATH):
-    """Context manager yielding a sqlite3 connection with foreign_keys ON and Row factory."""
+    """Context manager yielding a sqlite3 connection with foreign_keys ON,
+    WAL mode, busy_timeout, and Row factory. WAL lets readers and writers
+    coexist without blocking each other; busy_timeout retries the lock
+    for up to 5s instead of failing immediately."""
     init_db(path)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA journal_mode = WAL")
     try:
         yield conn
         conn.commit()
