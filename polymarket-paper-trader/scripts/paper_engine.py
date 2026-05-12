@@ -109,8 +109,9 @@ def lookup_market(token_id: str) -> dict | None:
 def _get_db() -> sqlite3.Connection:
     """Open (and possibly initialize) the SQLite database."""
     DB_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=5.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     _init_schema(conn)

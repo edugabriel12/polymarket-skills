@@ -587,81 +587,89 @@ def run_discovery(args, cities: dict) -> int:
 
 
 def run_execute(args) -> int:
-    """Pick up APPROVED entries and execute them via paper_engine."""
+    """Pick up APPROVED entries and execute them via paper_engine.
+
+    The weather_edge.db connection is opened briefly per-entry rather than
+    held across HTTP calls, so the judge daemon can write between executions.
+    """
     executed = 0
+
+    # Read approved entries with a short-lived connection
     with db.connect() as conn:
         rows = db.query_approved_unexecuted(conn)
-        if not rows:
-            return 0
+    if not rows:
+        return 0
 
-        # Lazy import paper_engine
+    # Lazy import paper_engine
+    try:
+        from paper_engine import PaperEngine, DEFAULT_FEE_RATE
+    except ImportError as e:
+        log_event("error", {"where": "execute", "err": f"paper_engine import: {e}"},
+                  level="ERROR")
+        return 0
+
+    engine = PaperEngine(portfolio=args.portfolio)
+
+    for row in rows:
+        entry_id = row["entry_id"]
+        side = row["side"]
+        token_id = row["token_id_yes"] if side == "YES" else row["token_id_no"]
+        # HTTP — no DB lock held here
+        book = fetch_orderbook(token_id)
+        if not book or not book.get("asks"):
+            log_event("execute_skipped", {"entry_id": entry_id,
+                                          "reason": "no_orderbook"})
+            continue
+
+        sizing = compute_max_size_for_slippage(book, "BUY",
+                                               max_slippage=args.max_slippage)
+        if sizing["max_shares"] == 0:
+            log_event("execute_skipped", {"entry_id": entry_id,
+                                          "reason": "zero_max_size"})
+            continue
+
         try:
-            from paper_engine import PaperEngine, DEFAULT_FEE_RATE
-        except ImportError as e:
-            log_event("error", {"where": "execute", "err": f"paper_engine import: {e}"},
-                      level="ERROR")
-            return 0
+            portfolio = engine.get_portfolio()  # touches portfolio.db only
+            portfolio_value = portfolio.get("total_value", 0)
+        except Exception as e:
+            log_event("error", {"where": "execute_portfolio", "err": str(e)})
+            continue
+        per_trade_cap_usd = portfolio_value * 0.10
 
-        engine = PaperEngine(portfolio=args.portfolio)
+        target_usd = min(sizing["max_usd"], per_trade_cap_usd)
+        if target_usd < 10:
+            log_event("execute_skipped", {"entry_id": entry_id,
+                                          "reason": "size_below_min_$10"})
+            continue
 
-        for row in rows:
-            entry_id = row["entry_id"]
-            side = row["side"]
-            token_id = row["token_id_yes"] if side == "YES" else row["token_id_no"]
-            book = fetch_orderbook(token_id)
-            if not book or not book.get("asks"):
-                log_event("execute_skipped", {"entry_id": entry_id,
-                                              "reason": "no_orderbook"})
-                continue
-
-            # Slippage-aware sizing
-            sizing = compute_max_size_for_slippage(book, "BUY",
-                                                   max_slippage=args.max_slippage)
-            if sizing["max_shares"] == 0:
-                log_event("execute_skipped", {"entry_id": entry_id,
-                                              "reason": "zero_max_size"})
-                continue
-
-            # Cap by portfolio caps (10% per trade) — paper engine validates again
-            try:
-                portfolio = engine.get_portfolio()
-                portfolio_value = portfolio.get("total_value", 0)
-            except Exception as e:
-                log_event("error", {"where": "execute_portfolio", "err": str(e)})
-                continue
-            per_trade_cap_usd = portfolio_value * 0.10
-
-            target_usd = min(sizing["max_usd"], per_trade_cap_usd)
-            if target_usd < 10:
-                log_event("execute_skipped", {"entry_id": entry_id,
-                                              "reason": "size_below_min_$10"})
-                continue
-
-            if args.dry_run:
-                log_event("execute_dry_run", {"entry_id": entry_id,
-                                              "side": side, "target_usd": target_usd,
-                                              "avg_fill": sizing["avg_fill"],
-                                              "slippage_pct": sizing["slippage_pct"]})
-                db.update_entry_status(conn, entry_id, "EXECUTED",
+        if args.dry_run:
+            log_event("execute_dry_run", {"entry_id": entry_id,
+                                          "side": side, "target_usd": target_usd,
+                                          "avg_fill": sizing["avg_fill"],
+                                          "slippage_pct": sizing["slippage_pct"]})
+            with db.connect() as conn2:
+                db.update_entry_status(conn2, entry_id, "EXECUTED",
                                        size_usd=target_usd,
                                        size_shares=sizing["max_shares"],
                                        entry_price=sizing["avg_fill"])
-                executed += 1
-                continue
+            executed += 1
+            continue
 
-            # Real paper execution via PaperEngine
-            try:
-                result = engine.open_position(
-                    token_id=token_id,
-                    side=side,
-                    size_usd=target_usd,
-                    market_question=row["market_question"][:200],
-                    fee_rate=DEFAULT_FEE_RATE,
-                    confidence=0.65,  # generic confidence; judge gives real one
-                    reasoning=f"weather_edge_bot entry_id={entry_id}",
-                )
+        # Real paper execution via PaperEngine — touches portfolio.db, not weather_edge.db
+        try:
+            result = engine.open_position(
+                token_id=token_id,
+                side=side,
+                size_usd=target_usd,
+                market_question=row["market_question"][:200],
+                fee_rate=DEFAULT_FEE_RATE,
+                confidence=0.65,
+                reasoning=f"weather_edge_bot entry_id={entry_id}",
+            )
+            # Brief weather_edge.db connection just for the status update
+            with db.connect() as conn2:
                 if result.get("status") == "executed":
-                    db.update_entry_status(conn, entry_id, "EXECUTED",
+                    db.update_entry_status(conn2, entry_id, "EXECUTED",
                                            size_usd=result.get("cost_usd"),
                                            size_shares=result.get("shares_filled"),
                                            entry_price=result.get("avg_price"))
@@ -672,11 +680,11 @@ def run_execute(args) -> int:
                 else:
                     log_event("execute_rejected", {"entry_id": entry_id,
                                                    "reason": result.get("reason")})
-                    db.update_entry_status(conn, entry_id, "SKIPPED",
+                    db.update_entry_status(conn2, entry_id, "SKIPPED",
                                            skip_reason=str(result.get("reason"))[:200])
-            except Exception as e:
-                log_event("error", {"where": "open_position",
-                                    "entry_id": entry_id, "err": str(e)})
+        except Exception as e:
+            log_event("error", {"where": "open_position",
+                                "entry_id": entry_id, "err": str(e)})
 
     return executed
 
@@ -704,25 +712,38 @@ _last_monitor_per_entry: dict[int, float] = {}
 
 
 def run_monitor_tick(args, cities: dict) -> None:
-    """Check each open position; if its adaptive interval elapsed, do a check."""
+    """Check each open position; if its adaptive interval elapsed, do a check.
+
+    Reads the open-position list with a short-lived connection, then iterates
+    without holding any DB lock. Each _do_monitor_check opens its own brief
+    connection only when it needs to write — letting the judge daemon write
+    in the gaps.
+    """
     now_mono = time.monotonic()
     with db.connect() as conn:
         rows = db.query_open_positions(conn)
-        for row in rows:
-            entry_id = row["entry_id"]
-            ttr_h = _ttr_hours(row["end_date"] or "")
-            interval = _monitor_interval_for_ttr(ttr_h)
-            last = _last_monitor_per_entry.get(entry_id, 0)
-            if now_mono - last < interval:
-                continue
-            _last_monitor_per_entry[entry_id] = now_mono
-            _do_monitor_check(conn, row, cities, args)
+        # Materialize the rows now; the connection will be closed below.
+        rows = [dict(r) for r in rows]
+
+    for row in rows:
+        entry_id = row["entry_id"]
+        ttr_h = _ttr_hours(row["end_date"] or "")
+        interval = _monitor_interval_for_ttr(ttr_h)
+        last = _last_monitor_per_entry.get(entry_id, 0)
+        if now_mono - last < interval:
+            continue
+        _last_monitor_per_entry[entry_id] = now_mono
+        _do_monitor_check(None, row, cities, args)
 
 
 def _do_monitor_check(conn, row, cities: dict, args) -> None:
+    """Run one monitor check for an entry. The `conn` arg is ignored —
+    HTTP calls happen first without holding any DB lock, then a brief
+    connection is opened for the writes at the end."""
     entry_id = row["entry_id"]
     side = row["side"]
     spec = parse_market(row["market_question"], row["end_date"], cities)
+    # HTTP — no DB lock
     forecast = fetch_forecast(spec.city) if spec else None
     if not spec or not forecast:
         log_event("monitor_check", {"entry_id": entry_id, "decision": "HOLD",
@@ -733,22 +754,15 @@ def _do_monitor_check(conn, row, cities: dict, args) -> None:
         return
 
     token_id = row["token_id_yes"] if side == "YES" else row["token_id_no"]
-    book = fetch_orderbook(token_id)
+    book = fetch_orderbook(token_id)  # HTTP
     if not book:
         return
     bid = book["bids"][0]["price"] if book.get("bids") else 0.0
     ask = book["asks"][0]["price"] if book.get("asks") else 0.0
     entry_price = float(row["entry_price"])
 
-    # Track peak bid for trailing-stop trigger
     prev_peak = float(row["peak_bid_seen"] or 0.0)
     peak = max(prev_peak, bid)
-    if bid > prev_peak:
-        conn.execute(
-            "UPDATE entries SET peak_bid_seen = ?, peak_bid_seen_at = ? "
-            "WHERE entry_id = ?",
-            (bid, _now_iso(), entry_id),
-        )
 
     verdict = evaluate_cashout_triggers(
         side=side,
@@ -763,20 +777,26 @@ def _do_monitor_check(conn, row, cities: dict, args) -> None:
     decision = verdict["decision"]
     trigger = verdict["trigger"]
     reason = f"{trigger}: {verdict['reason']}"
-
-    # Also need forecast_prob_now for legacy monitor_checks payload + downstream
     forecast_prob_now = forecast_prob_yes if side == "YES" else 1.0 - forecast_prob_yes
 
-    db.insert_monitor_check(
-        conn, entry_id=entry_id,
-        ts=_now_iso(),
-        forecast_prob_now=forecast_prob_now,
-        forecast_snapshot_json=forecast,
-        market_best_bid=bid,
-        market_best_ask=ask,
-        decision=decision,
-        decision_reason=reason,
-    )
+    # Brief write-only connection
+    with db.connect() as conn2:
+        if bid > prev_peak:
+            conn2.execute(
+                "UPDATE entries SET peak_bid_seen = ?, peak_bid_seen_at = ? "
+                "WHERE entry_id = ?",
+                (bid, _now_iso(), entry_id),
+            )
+        db.insert_monitor_check(
+            conn2, entry_id=entry_id,
+            ts=_now_iso(),
+            forecast_prob_now=forecast_prob_now,
+            forecast_snapshot_json=forecast,
+            market_best_bid=bid,
+            market_best_ask=ask,
+            decision=decision,
+            decision_reason=reason,
+        )
     log_event("monitor_check", {"entry_id": entry_id, "decision": decision,
                                 "trigger": trigger,
                                 "forecast_prob_now": forecast_prob_now,
@@ -785,7 +805,7 @@ def _do_monitor_check(conn, row, cities: dict, args) -> None:
                                 "reason": verdict["reason"]})
 
     if decision == "CASHOUT":
-        _do_cashout(conn, row, bid, forecast, forecast_prob_now, args, reason)
+        _do_cashout(None, row, bid, forecast, forecast_prob_now, args, reason)
 
 
 def _do_cashout(conn, row, bid: float, forecast: dict,
@@ -804,18 +824,18 @@ def _do_cashout(conn, row, bid: float, forecast: dict,
         result = engine.close_position(token_id=token_id, side=side,
                                         reasoning=f"weather_edge_bot: {reason}")
         if result.get("status") == "closed":
-            # paper_engine returns avg_sell_price (not avg_price)
             exit_price = result.get("avg_sell_price") or result.get("avg_price")
-            db.insert_cashout(
-                conn, entry_id=entry_id,
-                ts=_now_iso(),
-                exit_price=exit_price,
-                exit_shares=result.get("shares_sold"),
-                realized_pnl_usd=result.get("realized_pnl"),
-                forecast_prob_at_exit=forecast_prob_now,
-                forecast_snapshot_json=forecast,
-                reason=reason[:200],
-            )
+            with db.connect() as conn2:
+                db.insert_cashout(
+                    conn2, entry_id=entry_id,
+                    ts=_now_iso(),
+                    exit_price=exit_price,
+                    exit_shares=result.get("shares_sold"),
+                    realized_pnl_usd=result.get("realized_pnl"),
+                    forecast_prob_at_exit=forecast_prob_now,
+                    forecast_snapshot_json=forecast,
+                    reason=reason[:200],
+                )
             log_event("cashout_executed", {"entry_id": entry_id,
                                             "exit_price": exit_price,
                                             "pnl": result.get("realized_pnl")})
