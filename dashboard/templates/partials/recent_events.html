@@ -1,0 +1,15 @@
+{% if not events %}
+  <div class="muted">No events yet.</div>
+{% else %}
+<ul class="event-list-mini">
+  {% for ev in events %}
+  <li class="lvl-{{ (ev.level or 'INFO')|lower }}">
+    <span class="ev-ts">{{ (ev.ts or '')[11:19] }}</span>
+    <span class="ev-type">{{ ev.event_type or '?' }}</span>
+    {% if ev.payload %}
+      <span class="ev-payload-mini">{{ ev.payload|tojson|truncate(80) }}</span>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}

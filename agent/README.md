@@ -353,12 +353,25 @@ Relatórios ficam em `~/.polymarket-paper/advisor_reports/YYYY-MM-DD_strategy_re
 
 Custo estimado: ~$1-2 por run com Opus 4.7 (cache hit nas chamadas subsequentes); ~$5/mês na cadência semanal. Configure `ADVISOR_WEEKLY_BUDGET_USD` em `.env` para o cap por run.
 
+### Dashboard
+
+Monitor visual local (FastAPI + HTMX) com 4 abas: Overview, Positions, Performance, Live Events. Substitui os comandos ad-hoc (`portfolio_report.py`, `Get-Content`, SQL inline) por dashboards real-time.
+
+```bash
+pip install -r dashboard/requirements.txt
+uvicorn dashboard.main:app --host 127.0.0.1 --port 8765
+# Abre http://127.0.0.1:8765 no browser
+```
+
+Read-only — lê `portfolio.db`, `weather_edge.db` e `weather_edge.jsonl` sem nunca mutar. Roda em paralelo com bot/judge sem conflito. Detalhes em `dashboard/README.md`.
+
 ### Documentação
 
 - `polymarket-analyzer/references/weather-edge-strategy.md` — estratégia, fórmulas, racional
 - `polymarket-analyzer/references/weather-judge-prompt.md` — system prompt do judge
 - `polymarket-analyzer/references/strategy-advisor-prompt.md` — system prompt do advisor
 - `polymarket-analyzer/scripts/weather_edge_*.py`, `weather_strategy_advisor.py` — código
+- `dashboard/README.md` — dashboard de monitoramento
 
 ---
 

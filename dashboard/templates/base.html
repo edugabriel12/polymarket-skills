@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Polymarket Weather — {{ active_tab|capitalize }}</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="logo">⚡</span>
+      <span class="title">Polymarket Weather</span>
+      <span class="subtitle">Paper Trading Monitor</span>
+    </div>
+    <nav>
+      <a href="/overview" class="{% if active_tab == 'overview' %}active{% endif %}">Overview</a>
+      <a href="/positions" class="{% if active_tab == 'positions' %}active{% endif %}">Positions</a>
+      <a href="/performance" class="{% if active_tab == 'performance' %}active{% endif %}">Performance</a>
+      <a href="/events" class="{% if active_tab == 'events' %}active{% endif %}">Live Events</a>
+    </nav>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+  <footer>
+    <span>Read-only · 127.0.0.1:8765 · refresh KPI {{ refresh_kpi_sec }}s · events {{ refresh_events_sec }}s · positions {{ refresh_positions_sec }}s</span>
+  </footer>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,88 @@
+{# Performance tab body — 4 charts + 3 tables. Expects `data`, `charts`, `days`. #}
+
+<section class="chart-grid">
+  <div class="card chart-card">
+    {{ charts.pnl_by_trigger(data.triggers)|safe }}
+  </div>
+  <div class="card chart-card">
+    {{ charts.win_rate_by_city(data.cities)|safe }}
+  </div>
+  <div class="card chart-card">
+    {{ charts.judge_calibration(data.judge)|safe }}
+  </div>
+  <div class="card chart-card">
+    {{ charts.counterfactual_cumulative(data.counterfactual_series)|safe }}
+  </div>
+</section>
+
+<section class="card">
+  <h2>By edge bucket</h2>
+  {% if not data.buckets.by_edge %}
+    <div class="muted">No data in this window.</div>
+  {% else %}
+  <table class="data-table">
+    <thead>
+      <tr><th>Bucket</th><th>N</th><th>Cashed out</th><th>Should have held %</th>
+          <th>Mean Δ$</th><th>Total realized $</th><th>Total held $</th></tr>
+    </thead>
+    <tbody>
+      {% for k, v in data.buckets.by_edge.items() %}
+      <tr>
+        <td class="mono">{{ k }}</td>
+        <td class="mono">{{ v.n }}</td>
+        <td class="mono">{{ v.n_with_cashout }}</td>
+        <td class="mono">{{ "%.1f"|format((v.pct_should_have_held or 0) * 100) }}%</td>
+        <td class="mono {% if (v.mean_delta_usd or 0) > 0 %}up{% elif (v.mean_delta_usd or 0) < 0 %}down{% endif %}">${{ "%.2f"|format(v.mean_delta_usd or 0) }}</td>
+        <td class="mono">${{ "%.2f"|format(v.total_realized_usd or 0) }}</td>
+        <td class="mono">${{ "%.2f"|format(v.total_held_usd or 0) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>By TTR bucket</h2>
+  {% if not data.buckets.by_ttr %}
+    <div class="muted">No data in this window.</div>
+  {% else %}
+  <table class="data-table">
+    <thead><tr><th>Bucket</th><th>N</th><th>Should have held %</th><th>Mean Δ$</th></tr></thead>
+    <tbody>
+      {% for k, v in data.buckets.by_ttr.items() %}
+      <tr>
+        <td class="mono">{{ k }}</td><td class="mono">{{ v.n }}</td>
+        <td class="mono">{{ "%.1f"|format((v.pct_should_have_held or 0) * 100) }}%</td>
+        <td class="mono {% if (v.mean_delta_usd or 0) > 0 %}up{% elif (v.mean_delta_usd or 0) < 0 %}down{% endif %}">${{ "%.2f"|format(v.mean_delta_usd or 0) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Cashout triggers detailed</h2>
+  {% if not data.triggers %}
+    <div class="muted">No cashouts in this window.</div>
+  {% else %}
+  <table class="data-table">
+    <thead><tr><th>Trigger</th><th>N</th><th>Total $</th><th>Mean $</th><th>Min $</th><th>Max $</th></tr></thead>
+    <tbody>
+      {% for trig, v in data.triggers.items() %}
+      <tr>
+        <td class="mono">{{ trig }}</td>
+        <td class="mono">{{ v.n }}</td>
+        <td class="mono {% if v.total_pnl_usd > 0 %}up{% elif v.total_pnl_usd < 0 %}down{% endif %}">${{ "%.2f"|format(v.total_pnl_usd) }}</td>
+        <td class="mono">${{ "%.2f"|format(v.mean_pnl_usd) }}</td>
+        <td class="mono">${{ "%.2f"|format(v.min_pnl_usd) }}</td>
+        <td class="mono">${{ "%.2f"|format(v.max_pnl_usd) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+
+<p class="muted small">Window: since {{ data.since_iso[:10] }} ({{ days }}d).</p>

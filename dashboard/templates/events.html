@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="card">
+  <h2>Live events <span id="conn-status" class="status-pill">connecting…</span></h2>
+
+  <div class="event-controls">
+    <div class="filter-group">
+      <span class="label">event_type:</span>
+      <input type="text" id="filter-type"
+             placeholder="comma-separated (e.g. entry_proposed,judge_verdict)"
+             oninput="updateFilters()">
+    </div>
+    <div class="filter-group">
+      <span class="label">level:</span>
+      <label><input type="checkbox" value="INFO" checked onchange="updateFilters()"> INFO</label>
+      <label><input type="checkbox" value="WARN" checked onchange="updateFilters()"> WARN</label>
+      <label><input type="checkbox" value="ERROR" checked onchange="updateFilters()"> ERROR</label>
+    </div>
+    <div class="filter-group">
+      <span class="label">actor:</span>
+      <label><input type="checkbox" value="bot" checked onchange="updateFilters()"> bot</label>
+      <label><input type="checkbox" value="judge" checked onchange="updateFilters()"> judge</label>
+      <label><input type="checkbox" value="advisor" checked onchange="updateFilters()"> advisor</label>
+    </div>
+    <div class="control-buttons">
+      <button id="btn-pause" onclick="togglePause()">⏸ Pause</button>
+      <button onclick="document.getElementById('events').innerHTML = ''">Clear</button>
+      <label><input type="checkbox" id="autoscroll" checked> Autoscroll</label>
+    </div>
+  </div>
+
+  <div id="events" class="events-stream"></div>
+</section>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+  let paused = false;
+  let filters = {types: [], levels: ['INFO', 'WARN', 'ERROR'], actors: ['bot', 'judge', 'advisor']};
+
+  function updateFilters() {
+    const typeInput = document.getElementById('filter-type').value.trim();
+    filters.types = typeInput ? typeInput.split(',').map(s => s.trim()).filter(Boolean) : [];
+    filters.levels = Array.from(document.querySelectorAll('.filter-group label input[type=checkbox]'))
+      .filter(c => c.checked && ['INFO','WARN','ERROR'].includes(c.value))
+      .map(c => c.value);
+    filters.actors = Array.from(document.querySelectorAll('.filter-group label input[type=checkbox]'))
+      .filter(c => c.checked && ['bot','judge','advisor'].includes(c.value))
+      .map(c => c.value);
+  }
+
+  function togglePause() {
+    paused = !paused;
+    document.getElementById('btn-pause').textContent = paused ? '▶ Resume' : '⏸ Pause';
+  }
+
+  function passes(ev) {
+    if (filters.types.length && !filters.types.includes(ev.event_type)) return false;
+    if (!filters.levels.includes(ev.level || 'INFO')) return false;
+    if (ev.actor && !filters.actors.includes(ev.actor)) return false;
+    return true;
+  }
+
+  function renderEvent(ev) {
+    const ts = (ev.ts || '').slice(11, 19);
+    const lvl = (ev.level || 'INFO');
+    const actor = ev.actor || '-';
+    const type = ev.event_type || '?';
+    const payload = ev.payload ? JSON.stringify(ev.payload) : '';
+    const row = document.createElement('div');
+    row.className = `event-row lvl-${lvl.toLowerCase()}`;
+    row.innerHTML = `
+      <span class="ev-ts">${ts}</span>
+      <span class="ev-lvl">${lvl}</span>
+      <span class="ev-actor">${actor}</span>
+      <span class="ev-type">${type}</span>
+      <span class="ev-payload">${payload}</span>
+    `;
+    return row;
+  }
+
+  const sse = new EventSource('/sse/events');
+  const out = document.getElementById('events');
+  const status = document.getElementById('conn-status');
+
+  sse.onopen = () => { status.textContent = 'connected'; status.className = 'status-pill ok'; };
+  sse.onerror = () => { status.textContent = 'disconnected'; status.className = 'status-pill err'; };
+
+  sse.onmessage = (e) => {
+    if (paused) return;
+    let ev;
+    try { ev = JSON.parse(e.data); } catch { return; }
+    if (!passes(ev)) return;
+    out.appendChild(renderEvent(ev));
+    // Cap to 500 rows
+    while (out.children.length > 500) out.removeChild(out.firstChild);
+    if (document.getElementById('autoscroll').checked) {
+      out.scrollTop = out.scrollHeight;
+    }
+  };
+</script>
+{% endblock %}

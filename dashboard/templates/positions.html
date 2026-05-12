@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="card">
+  <h2>Open positions</h2>
+  <p class="muted small">Click a position row to see its replay (judge verdict, forecast, history, counterfactual).</p>
+  <div id="positions-full"
+       hx-get="/api/positions"
+       hx-trigger="load, every {{ refresh_positions_sec }}s"
+       hx-swap="innerHTML">
+    <div class="muted">Loading positions…</div>
+  </div>
+</section>
+
+<div id="replay-modal" class="modal-backdrop hidden" onclick="closeReplay(event)">
+  <div class="modal-content" onclick="event.stopPropagation()">
+    <button class="modal-close" onclick="closeReplay()">×</button>
+    <div id="replay-body">
+      <div class="muted">Loading replay…</div>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+  function openReplay(entryId) {
+    const modal = document.getElementById('replay-modal');
+    const body = document.getElementById('replay-body');
+    body.innerHTML = '<div class="muted">Loading replay…</div>';
+    modal.classList.remove('hidden');
+    fetch(`/api/replay/${entryId}`)
+      .then(r => r.text())
+      .then(html => { body.innerHTML = html; })
+      .catch(e => { body.innerHTML = '<div class="err">Failed: ' + e + '</div>'; });
+  }
+  function closeReplay(e) {
+    document.getElementById('replay-modal').classList.add('hidden');
+  }
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeReplay();
+  });
+</script>
+{% endblock %}

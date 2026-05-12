@@ -1,0 +1,40 @@
+{% if not positions %}
+  <div class="muted">No open positions.</div>
+{% else %}
+<table class="data-table positions-table">
+  <thead>
+    <tr>
+      <th>ID</th><th>Market</th><th>Side</th>
+      <th>Entry</th><th>Bid</th><th>Peak</th>
+      <th>P&L</th><th>Held</th>
+      <th>Triggers</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for p in positions %}
+    <tr {% if show_full %}onclick="openReplay({{ p.entry_id }})"{% endif %} class="{% if show_full %}clickable{% endif %}">
+      <td class="mono">#{{ p.entry_id }}</td>
+      <td>
+        <div class="city">{{ p.city or '?' }}</div>
+        <div class="slug muted small">{{ p.market_slug|truncate(40) }}</div>
+      </td>
+      <td><span class="side side-{{ p.side|lower }}">{{ p.side }}</span></td>
+      <td class="mono">${{ "%.3f"|format(p.entry_price) }}</td>
+      <td class="mono">${{ "%.3f"|format(p.current_bid) }}</td>
+      <td class="mono">{% if p.peak_bid %}${{ "%.3f"|format(p.peak_bid) }}{% else %}—{% endif %}</td>
+      <td class="mono {% if p.paper_pnl_usd > 0 %}up{% elif p.paper_pnl_usd < 0 %}down{% endif %}">
+        {{ "+" if p.paper_pnl_usd >= 0 else "" }}${{ "%.2f"|format(p.paper_pnl_usd) }}
+        <span class="small muted">({{ "%.1f"|format(p.paper_pnl_pct) }}%)</span>
+      </td>
+      <td class="mono small">{{ p.held_human }}</td>
+      <td>
+        {% set t = p.triggers %}
+        <div class="trigger-stack">
+          {% include "partials/trigger_bar.html" with context %}
+        </div>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}

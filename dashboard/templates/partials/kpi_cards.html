@@ -1,0 +1,40 @@
+{% if k.error %}
+  <div class="card err">⚠ {{ k.error }}</div>
+{% else %}
+<div class="kpi-grid">
+  <div class="kpi">
+    <span class="kpi-label">Portfolio</span>
+    <span class="kpi-value">${{ "%.2f"|format(k.portfolio_total_usd) }}</span>
+    {% if k.portfolio_delta_today_usd is not none %}
+      {% set d = k.portfolio_delta_today_usd %}
+      <span class="kpi-delta {% if d >= 0 %}up{% else %}down{% endif %}">
+        {{ "+" if d >= 0 else "" }}${{ "%.2f"|format(d) }} today
+      </span>
+    {% else %}
+      <span class="kpi-delta muted">no snapshot yet</span>
+    {% endif %}
+  </div>
+
+  <div class="kpi">
+    <span class="kpi-label">Open Positions</span>
+    <span class="kpi-value">{{ k.open_positions }} / {{ k.max_positions }}</span>
+    <span class="kpi-delta muted">cash ${{ "%.2f"|format(k.cash_usd) }}</span>
+  </div>
+
+  <div class="kpi">
+    <span class="kpi-label">Realized P&L today</span>
+    {% set r = k.realized_pnl_today_usd %}
+    <span class="kpi-value {% if r > 0 %}up{% elif r < 0 %}down{% endif %}">
+      {{ "+" if r >= 0 else "" }}${{ "%.2f"|format(r) }}
+    </span>
+    <span class="kpi-delta muted">from cashouts</span>
+  </div>
+
+  <div class="kpi">
+    <span class="kpi-label">Drawdown from peak</span>
+    {% set dd = k.drawdown_pct_from_peak %}
+    <span class="kpi-value {% if dd <= -10 %}down{% endif %}">{{ "%.2f"|format(dd) }}%</span>
+    <span class="kpi-delta muted">peak ${{ "%.2f"|format(k.drawdown_peak_usd) }}</span>
+  </div>
+</div>
+{% endif %}
