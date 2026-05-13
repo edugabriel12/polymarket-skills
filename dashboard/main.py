@@ -90,8 +90,10 @@ def api_recent_events(request: Request, limit: int = 10):
 
 
 @app.get("/api/positions", response_class=HTMLResponse)
-def api_positions(request: Request, top: int = 0):
-    pos = positions.get_open_positions()
+def api_positions(request: Request, top: int = 0, sort: str = "entry_id"):
+    # Overview's mini-table uses sort=size to show the biggest stakes first;
+    # the full Positions page sticks with entry_id (newest first).
+    pos = positions.get_open_positions(sort_by=sort)
     if top > 0:
         pos = pos[:top]
     return templates.TemplateResponse(

@@ -5,7 +5,7 @@
   <thead>
     <tr>
       <th>ID</th><th>Market</th><th>Side</th>
-      <th>Entry</th><th>Bid</th><th>Peak</th>
+      <th>Stake</th><th>Entry</th><th>Bid</th><th>Peak</th>
       <th>P&L</th><th>Held</th>
       <th>Triggers</th>
     </tr>
@@ -19,6 +19,10 @@
         <div class="slug muted small">{{ p.market_slug|truncate(40) }}</div>
       </td>
       <td><span class="side side-{{ p.side|lower }}">{{ p.side }}</span></td>
+      <td class="mono">
+        ${{ "%.2f"|format(p.size_usd) }}
+        <span class="small muted">{{ "%.0f"|format(p.size_shares) }}sh</span>
+      </td>
       <td class="mono">${{ "%.3f"|format(p.entry_price) }}</td>
       <td class="mono">${{ "%.3f"|format(p.current_bid) }}</td>
       <td class="mono">{% if p.peak_bid %}${{ "%.3f"|format(p.peak_bid) }}{% else %}—{% endif %}</td>

@@ -152,9 +152,13 @@ def trigger_distances(
     }
 
 
-def get_open_positions() -> list[dict]:
+def get_open_positions(sort_by: str = "entry_id") -> list[dict]:
     """Return a list of open positions with bid, peak, P&L, trigger
-    distances, and time held. Sorted by entry_id DESC (most recent first)."""
+    distances, and time held.
+
+    sort_by: 'entry_id' (default, most recent first) or 'size' (largest
+    stake first — used by Overview's 'top 5 by size' slot).
+    """
     try:
         conn = _ro_conn(S.WEATHER_EDGE_DB)
     except FileNotFoundError:
@@ -213,8 +217,10 @@ def get_open_positions() -> list[dict]:
                 "edge_pp_at_entry": float(row["edge_pp_at_entry"] or 0),
                 "triggers": distances,
             })
-        # Most recently entered first
-        out.sort(key=lambda p: p["entry_id"], reverse=True)
+        if sort_by == "size":
+            out.sort(key=lambda p: p["size_usd"], reverse=True)
+        else:
+            out.sort(key=lambda p: p["entry_id"], reverse=True)
         return out
     finally:
         conn.close()
