@@ -42,22 +42,75 @@ JSONL_FILE = DATA_DIR / "weather_edge.jsonl"
 ADVISOR_REPORTS_DIR = DATA_DIR / "advisor_reports"
 
 
-def make_backup() -> Path:
-    """Move all existing DB files + log into a timestamped backup folder."""
+def _try_remove_or_report(f: Path) -> bool:
+    """Try to unlink a file. Returns True if removed, False if locked
+    (with an informative message about which processes might hold it)."""
+    try:
+        f.unlink()
+        return True
+    except PermissionError as e:
+        print(f"\n✗ FAILED to remove {f.name}: {e}")
+        print(f"  Something still has this file open. On Windows, run:")
+        print(f"    Get-Process | Where-Object {{ $_.Path -like '*python*' }}")
+        print(f"  Then Stop-Process -Id <PID> for each one. Common holders:")
+        print(f"    - weather_edge_bot.py (terminal running the bot)")
+        print(f"    - weather_edge_judge.py (terminal running the judge)")
+        print(f"    - uvicorn dashboard.main:app (dashboard server)")
+        print(f"    - DBeaver / any SQLite browser GUI")
+        print(f"    - Background Python from a previous --daemon you forgot to stop")
+        return False
+
+
+def make_backup() -> Path | None:
+    """Move all existing DB files + log into a timestamped backup folder.
+    Returns the backup path, or None if any move failed due to locked files."""
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     backup = DATA_DIR / f"backup-{stamp}"
     backup.mkdir(parents=True, exist_ok=True)
     moved: list[Path] = []
+    locked: list[Path] = []
     for f in WEATHER_DB_FILES + PORTFOLIO_DB_FILES + [JSONL_FILE]:
-        if f.exists():
-            dst = backup / f.name
+        if not f.exists():
+            continue
+        dst = backup / f.name
+        try:
             shutil.move(str(f), str(dst))
             moved.append(dst)
+        except PermissionError:
+            locked.append(f)
+
+    if locked:
+        # Roll back partial move so user can retry cleanly
+        for m in moved:
+            try:
+                shutil.move(str(m), str(DATA_DIR / m.name))
+            except Exception:
+                pass
+        try:
+            backup.rmdir()
+        except Exception:
+            pass
+        print(f"\n✗ {len(locked)} file(s) are locked by another process:")
+        for f in locked:
+            print(f"  - {f.name}")
+        print()
+        print("Stop ALL of the following before running reset:")
+        print("  1. weather_edge_bot.py    (Ctrl+C in its terminal)")
+        print("  2. weather_edge_judge.py  (Ctrl+C in its terminal)")
+        print("  3. uvicorn dashboard...   (Ctrl+C in its terminal)")
+        print("  4. DBeaver / SQLite Browser GUI (close the connection)")
+        print()
+        print("On PowerShell, to find leftover python processes:")
+        print("  Get-Process python | Format-Table Id, ProcessName, StartTime")
+        print("Kill a specific one with: Stop-Process -Id <PID>")
+        return None
+
     if ADVISOR_REPORTS_DIR.exists() and any(ADVISOR_REPORTS_DIR.iterdir()):
         dst = backup / "advisor_reports"
         shutil.move(str(ADVISOR_REPORTS_DIR), str(dst))
         moved.append(dst)
         ADVISOR_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
     print(f"\n✓ Backed up {len(moved)} items to:")
     print(f"  {backup}\n")
     for m in moved:
@@ -146,7 +199,9 @@ def main() -> int:
 
     # 1) Backup
     if not args.no_backup:
-        make_backup()
+        if make_backup() is None:
+            print("\nAborted — files still locked. Stop the holders and re-run.")
+            return 2
     else:
         # Just delete
         deleted = 0
