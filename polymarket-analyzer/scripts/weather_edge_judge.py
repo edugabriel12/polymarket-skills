@@ -222,7 +222,7 @@ def call_claude(entry_row: dict, evidence: dict, system_prompt: str) -> Optional
     try:
         response = client.messages.create(
             model=DEFAULT_MODEL,
-            max_tokens=2048,
+            max_tokens=4096,
             system=[{"type": "text", "text": system_prompt,
                      "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
             messages=[{"role": "user", "content": user_content}],

@@ -424,159 +424,173 @@ def run_discovery(args, cities: dict) -> int:
         "already_proposed": 0,
     }
 
-    with db.connect() as conn:
-        for m in raw_markets:
-            slug = m.get("slug", "")
-            question = m.get("question", "")
-            end_date_str = m.get("endDate", "")
-            try:
-                end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-            except (ValueError, TypeError):
-                skipped["no_end_date"] += 1
-                continue
+    # Phase 1: build candidate proposals using HTTP-only work (no DB lock held).
+    # Phase 2: snapshot already-proposed (slug, side) pairs with a brief read.
+    # Phase 3: batch-insert proposals, committing per-row so the judge can
+    # interleave its writes between iterations.
 
-            # Window filter: must resolve within window
-            if end_date < now or end_date > cutoff:
-                skipped["outside_window"] += 1
-                if args.debug:
-                    log_event("market_skipped", {"slug": slug,
-                                                  "reason": "outside_window",
-                                                  "end_date": end_date_str,
-                                                  "ttr_h": round((end_date - now).total_seconds() / 3600, 1)})
-                continue
-            ttr_hours = (end_date - now).total_seconds() / 3600.0
+    candidates: list[dict] = []
+    for m in raw_markets:
+        slug = m.get("slug", "")
+        question = m.get("question", "")
+        end_date_str = m.get("endDate", "")
+        try:
+            end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            skipped["no_end_date"] += 1
+            continue
 
-            # Skip dead brackets (no orderbook → no trade possible) before any
-            # parsing or HTTP work. Saves ~200 wasted API calls per cycle.
-            if m.get("acceptingOrders") is False:
-                skipped["orderbook_unavailable"] = skipped.get("orderbook_unavailable", 0) + 1
-                continue
-
-            # Parse market spec — use combined event-title + question text so
-            # multi-outcome bracket sub-markets (where question is just "65-69°F")
-            # still resolve a city + threshold from the parent event title.
-            text_for_parser = m.get("_combined_text") or question
-            spec = parse_market(text_for_parser, end_date_str, cities)
-            if not spec:
-                skipped["parser_failed"] += 1
-                log_event("market_skipped", {"slug": slug, "reason": "parser_failed",
-                                              "question": question[:100]})
-                continue
-            if spec.confidence < 0.5:
-                skipped["parser_low_confidence"] += 1
+        if end_date < now or end_date > cutoff:
+            skipped["outside_window"] += 1
+            if args.debug:
                 log_event("market_skipped", {"slug": slug,
-                                              "reason": "parser_low_confidence",
-                                              "confidence": spec.confidence})
-                continue
+                                              "reason": "outside_window",
+                                              "end_date": end_date_str,
+                                              "ttr_h": round((end_date - now).total_seconds() / 3600, 1)})
+            continue
+        ttr_hours = (end_date - now).total_seconds() / 3600.0
 
-            # Token IDs
-            try:
-                token_ids = json.loads(m.get("clobTokenIds", "[]"))
-                if len(token_ids) < 2:
-                    skipped["no_token_ids"] += 1
-                    continue
-                token_id_yes, token_id_no = str(token_ids[0]), str(token_ids[1])
-            except (json.JSONDecodeError, TypeError):
+        if m.get("acceptingOrders") is False:
+            skipped["orderbook_unavailable"] = skipped.get("orderbook_unavailable", 0) + 1
+            continue
+
+        text_for_parser = m.get("_combined_text") or question
+        spec = parse_market(text_for_parser, end_date_str, cities)
+        if not spec:
+            skipped["parser_failed"] += 1
+            log_event("market_skipped", {"slug": slug, "reason": "parser_failed",
+                                          "question": question[:100]})
+            continue
+        if spec.confidence < 0.5:
+            skipped["parser_low_confidence"] += 1
+            log_event("market_skipped", {"slug": slug,
+                                          "reason": "parser_low_confidence",
+                                          "confidence": spec.confidence})
+            continue
+
+        try:
+            token_ids = json.loads(m.get("clobTokenIds", "[]"))
+            if len(token_ids) < 2:
                 skipped["no_token_ids"] += 1
                 continue
+            token_id_yes, token_id_no = str(token_ids[0]), str(token_ids[1])
+        except (json.JSONDecodeError, TypeError):
+            skipped["no_token_ids"] += 1
+            continue
 
-            # Fetch orderbooks
-            book_yes = fetch_orderbook(token_id_yes)
-            book_no = fetch_orderbook(token_id_no)
-            if not book_yes or not book_no:
-                skipped["orderbook_unavailable"] += 1
-                continue
-            implied = implied_probabilities(book_yes, book_no)
-            if implied["yes_ask"] is None or implied["no_ask"] is None:
-                skipped["no_implied_prices"] += 1
-                continue
+        # HTTP — no DB lock held
+        book_yes = fetch_orderbook(token_id_yes)
+        book_no = fetch_orderbook(token_id_no)
+        if not book_yes or not book_no:
+            skipped["orderbook_unavailable"] += 1
+            continue
+        implied = implied_probabilities(book_yes, book_no)
+        if implied["yes_ask"] is None or implied["no_ask"] is None:
+            skipped["no_implied_prices"] += 1
+            continue
 
-            # Price band filter
-            if not (args.min_price <= implied["yes_ask"] <= args.max_price or
-                    args.min_price <= implied["no_ask"] <= args.max_price):
-                skipped["price_band_miss"] += 1
-                if args.debug:
-                    log_event("market_skipped", {"slug": slug, "reason": "price_band_miss",
-                                                  "yes_ask": implied["yes_ask"],
-                                                  "no_ask": implied["no_ask"]})
-                continue
+        if not (args.min_price <= implied["yes_ask"] <= args.max_price or
+                args.min_price <= implied["no_ask"] <= args.max_price):
+            skipped["price_band_miss"] += 1
+            if args.debug:
+                log_event("market_skipped", {"slug": slug, "reason": "price_band_miss",
+                                              "yes_ask": implied["yes_ask"],
+                                              "no_ask": implied["no_ask"]})
+            continue
 
-            # Fetch forecast — always ask for 5 days (free tier max).
-            # Cheaper to fetch all and let probability lookup pick the right day
-            # than fight with off-by-one TZ issues at the boundary.
-            forecast = fetch_forecast(spec.city, days=5)
-            if not forecast:
-                skipped["forecast_unavailable"] += 1
-                log_event("market_skipped", {"slug": slug, "reason": "forecast_unavailable",
-                                              "city": spec.city})
-                continue
+        forecast = fetch_forecast(spec.city, days=5)
+        if not forecast:
+            skipped["forecast_unavailable"] += 1
+            log_event("market_skipped", {"slug": slug, "reason": "forecast_unavailable",
+                                          "city": spec.city})
+            continue
 
-            forecast_prob = forecast_probability(spec, forecast)
-            if forecast_prob is None:
-                skipped["no_forecast_for_target_date"] += 1
-                log_event("market_skipped", {"slug": slug, "reason": "no_forecast_for_target_date"})
-                continue
+        forecast_prob = forecast_probability(spec, forecast)
+        if forecast_prob is None:
+            skipped["no_forecast_for_target_date"] += 1
+            log_event("market_skipped", {"slug": slug, "reason": "no_forecast_for_target_date"})
+            continue
 
-            edge = compute_edge(forecast_prob, implied)
-            if edge["best_side"] is None or edge["edge_pp_at_best"] < args.min_edge_pp:
-                skipped["low_edge"] += 1
-                log_event("market_evaluated", {
-                    "slug": slug, "side": edge["best_side"],
-                    "edge_pp": edge["edge_pp_at_best"],
-                    "decision": "skipped_low_edge",
-                    "forecast_prob": forecast_prob,
-                    "yes_ask": implied["yes_ask"],
-                    "no_ask": implied["no_ask"],
-                })
-                continue
+        edge = compute_edge(forecast_prob, implied)
+        if edge["best_side"] is None or edge["edge_pp_at_best"] < args.min_edge_pp:
+            skipped["low_edge"] += 1
+            log_event("market_evaluated", {
+                "slug": slug, "side": edge["best_side"],
+                "edge_pp": edge["edge_pp_at_best"],
+                "decision": "skipped_low_edge",
+                "forecast_prob": forecast_prob,
+                "yes_ask": implied["yes_ask"],
+                "no_ask": implied["no_ask"],
+            })
+            continue
 
-            side = edge["best_side"]
-            entry_price = implied["yes_ask"] if side == "YES" else implied["no_ask"]
-            # Recheck price band on the chosen side
-            if not (args.min_price <= entry_price <= args.max_price):
-                skipped["price_band_miss"] += 1
-                continue
+        side = edge["best_side"]
+        entry_price = implied["yes_ask"] if side == "YES" else implied["no_ask"]
+        if not (args.min_price <= entry_price <= args.max_price):
+            skipped["price_band_miss"] += 1
+            continue
 
-            # Already proposed?
-            if db.market_already_proposed(conn, slug, side):
+        candidates.append({
+            "slug": slug, "question": question,
+            "end_date_str": end_date_str, "side": side,
+            "entry_price": entry_price, "forecast_prob": forecast_prob,
+            "edge_pp": edge["edge_pp_at_best"],
+            "forecast": forecast, "spec": spec, "ttr_hours": ttr_hours,
+            "token_id_yes": token_id_yes, "token_id_no": token_id_no,
+            "implied": implied,
+            "condition_id": m.get("conditionId", ""),
+        })
+
+    # Phase 2 + 3: snapshot existing (slug, side) pairs, then insert candidates
+    # one-by-one with per-row commits. Each commit releases the writer lock
+    # immediately so the judge can interleave its updates between proposals.
+    with db.connect() as conn:
+        existing = {(r[0], r[1]) for r in conn.execute(
+            "SELECT market_slug, side FROM entries")}
+
+        for c in candidates:
+            if (c["slug"], c["side"]) in existing:
                 skipped["already_proposed"] += 1
                 continue
-
-            # Propose
+            spec = c["spec"]
             entry_id = db.insert_entry(
                 conn,
                 ts=_now_iso(),
-                market_slug=slug,
-                market_question=question,
-                condition_id=m.get("conditionId", ""),
-                token_id_yes=token_id_yes,
-                token_id_no=token_id_no,
-                end_date=end_date_str,
-                side=side,
-                entry_price=entry_price,
-                forecast_prob_at_entry=forecast_prob if side == "YES" else 1.0 - forecast_prob,
-                implied_prob_at_entry=entry_price,
-                edge_pp_at_entry=edge["edge_pp_at_best"],
-                forecast_snapshot_json=forecast,
+                market_slug=c["slug"],
+                market_question=c["question"],
+                condition_id=c["condition_id"],
+                token_id_yes=c["token_id_yes"],
+                token_id_no=c["token_id_no"],
+                end_date=c["end_date_str"],
+                side=c["side"],
+                entry_price=c["entry_price"],
+                forecast_prob_at_entry=(c["forecast_prob"] if c["side"] == "YES"
+                                        else 1.0 - c["forecast_prob"]),
+                implied_prob_at_entry=c["entry_price"],
+                edge_pp_at_entry=c["edge_pp"],
+                forecast_snapshot_json=c["forecast"],
                 parser_confidence=spec.confidence,
                 city_resolved=spec.city,
                 threshold_value=spec.threshold_value,
                 threshold_unit=spec.threshold_unit,
                 comparison=spec.comparison,
-                ttr_hours_at_entry=ttr_hours,
+                ttr_hours_at_entry=c["ttr_hours"],
                 status="PROPOSED",
             )
+            conn.commit()  # release writer lock so judge can interleave
+            existing.add((c["slug"], c["side"]))
             proposed += 1
             log_event("entry_proposed", {
-                "entry_id": entry_id, "slug": slug, "side": side,
-                "entry_price": entry_price,
-                "forecast_prob": forecast_prob,
-                "edge_pp": edge["edge_pp_at_best"],
-                "city": spec.city, "ttr_h": round(ttr_hours, 1),
+                "entry_id": entry_id, "slug": c["slug"], "side": c["side"],
+                "entry_price": c["entry_price"],
+                "forecast_prob": c["forecast_prob"],
+                "edge_pp": c["edge_pp"],
+                "city": spec.city, "ttr_h": round(c["ttr_hours"], 1),
             })
 
     log_event("discovery_end", {"proposed": proposed,
                                  "fetched": len(raw_markets),
+                                 "candidates_after_filters": len(candidates),
                                  "skipped_breakdown": skipped})
     return proposed
 
