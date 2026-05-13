@@ -247,8 +247,12 @@ def call_claude(entry_row: dict, evidence: dict, system_prompt: str) -> Optional
     try:
         parsed = json.loads(text_block)
     except json.JSONDecodeError as e:
+        # During shutdown, an in-flight response may be truncated mid-stream —
+        # that's expected. Log as WARN so it doesn't pollute the error feed.
+        level = "WARN" if _shutdown else "ERROR"
         log_event("error", {"where": "verdict_json_decode", "err": str(e),
-                            "text": text_block[:500]}, level="ERROR")
+                            "text": text_block[:500],
+                            "shutdown_in_progress": _shutdown}, level=level)
         return None
 
     # Compute cost
@@ -446,6 +450,11 @@ def main():
                 if not verdict:
                     log_event("judge_failed", {"entry_id": row_dict["entry_id"]},
                               level="WARN")
+                    # Skip the DB update during shutdown — the verdict will
+                    # be retried on next startup. Trying to write here races
+                    # with the bot and can fail with 'database is locked'.
+                    if _shutdown:
+                        break
                     with db.connect() as conn:
                         db.update_entry_status(conn, row_dict["entry_id"], "SKIPPED",
                                                 judge_skipped_reason="judge_unavailable",
