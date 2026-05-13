@@ -927,6 +927,55 @@ def _format_trades(trades: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# PaperEngine — OO wrapper around the module functions
+# ---------------------------------------------------------------------------
+
+
+class PaperEngine:
+    """Thin OO wrapper providing a stable instance-based API for callers
+    that prefer method calls over module functions (e.g., weather_edge_bot).
+
+    The wrapper only re-shapes call signatures and result keys; all real
+    work happens in the module-level `place_order`, `close_position`, and
+    `get_portfolio` functions.
+    """
+
+    def __init__(self, portfolio: str = "default"):
+        self.portfolio = portfolio
+
+    def get_portfolio(self, refresh_prices: bool = True) -> dict:
+        return get_portfolio(self.portfolio, refresh_prices=refresh_prices)
+
+    def open_position(self, *, token_id: str, side: str, size_usd: float,
+                       market_question: str = "",   # ignored — engine looks it up
+                       fee_rate: float = DEFAULT_FEE_RATE,
+                       confidence: float = 0.5,     # informational, ignored
+                       reasoning: str = "") -> dict:
+        result = place_order(
+            token_id=token_id, side=side, size=size_usd,
+            portfolio_name=self.portfolio,
+            fee_rate=fee_rate, reasoning=reasoning,
+        )
+        # Normalize result keys to what weather_edge_bot.run_execute expects.
+        if result.get("status") == "filled":
+            return {
+                **result,
+                "status": "executed",
+                "cost_usd": result.get("total_cost"),
+                "shares_filled": result.get("shares"),
+                "avg_price": result.get("avg_price"),
+            }
+        return result
+
+    def close_position(self, *, token_id: str, side: str | None = None,
+                        reasoning: str = "") -> dict:
+        return close_position(
+            token_id=token_id, side=side,
+            portfolio_name=self.portfolio, reasoning=reasoning,
+        )
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
