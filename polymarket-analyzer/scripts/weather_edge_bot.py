@@ -441,7 +441,7 @@ def run_discovery(args, cities: dict) -> int:
         "orderbook_unavailable": 0, "no_implied_prices": 0,
         "price_band_miss": 0, "forecast_unavailable": 0,
         "no_forecast_for_target_date": 0, "low_edge": 0,
-        "already_proposed": 0,
+        "already_proposed": 0, "opposite_side_held": 0,
     }
 
     # Phase 1: build candidate proposals using HTTP-only work (no DB lock held).
@@ -571,6 +571,20 @@ def run_discovery(args, cities: dict) -> int:
         for c in candidates:
             if (c["slug"], c["side"]) in existing:
                 skipped["already_proposed"] += 1
+                continue
+            # Block opposite-side entries: if we already have an entry on this
+            # market's other side, skip. Holding both YES and NO is destructive
+            # unless yes_ask + no_ask < 1 (arbitrage), which compute_edge does
+            # NOT currently detect. Forecast drift between two discovery cycles
+            # would otherwise lock in losses.
+            opposite_side = "NO" if c["side"] == "YES" else "YES"
+            if (c["slug"], opposite_side) in existing:
+                skipped["opposite_side_held"] += 1
+                log_event("market_skipped", {
+                    "slug": c["slug"], "reason": "opposite_side_held",
+                    "would_propose": c["side"],
+                    "already_have": opposite_side,
+                })
                 continue
             spec = c["spec"]
             entry_id = db.insert_entry(
