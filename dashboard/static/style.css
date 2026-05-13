@@ -90,6 +90,16 @@ footer {
 .data-table tbody tr.clickable { cursor: pointer; }
 .data-table .slug { font-family: var(--mono); }
 .data-table .city { font-weight: 600; }
+.market-link {
+  color: var(--text-muted);
+  text-decoration: none;
+  border-bottom: 1px dotted transparent;
+  transition: color 0.15s, border-color 0.15s;
+}
+.market-link:hover {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
 
 .side { display: inline-block; padding: 2px 8px; border-radius: 4px; font-weight: 700; font-size: 11px; font-family: var(--mono); }
 .side-yes { background: rgba(74,222,128,0.15); color: var(--up); }

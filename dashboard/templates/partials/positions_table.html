@@ -16,7 +16,15 @@
       <td class="mono">#{{ p.entry_id }}</td>
       <td>
         <div class="city">{{ p.city or '?' }}</div>
-        <div class="slug muted small">{{ p.market_slug|truncate(40) }}</div>
+        <div class="slug muted small">
+          <a href="https://polymarket.com/event/{{ p.market_slug }}"
+             target="_blank" rel="noopener"
+             onclick="event.stopPropagation()"
+             class="market-link"
+             title="Open on Polymarket">
+            {{ p.market_slug|truncate(40) }} ↗
+          </a>
+        </div>
       </td>
       <td><span class="side side-{{ p.side|lower }}">{{ p.side }}</span></td>
       <td class="mono">
