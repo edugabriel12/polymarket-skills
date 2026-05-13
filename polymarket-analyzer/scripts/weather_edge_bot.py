@@ -353,10 +353,18 @@ def fetch_orderbook(token_id: str) -> Optional[dict]:
 
 
 _FORECAST_KEY_WARNED = False
+# Per-process cache of cities that OpenWeather doesn't recognize.
+# Avoids re-querying every discovery cycle for cities the parser extracted
+# but OpenWeather can't geocode (typos, very small towns, ambiguous names).
+_FORECAST_UNKNOWN_CITIES: set[str] = set()
 
 
 def fetch_forecast(city: str, days: int = 5) -> Optional[dict]:
-    """Subprocess get_weather.py forecast and return parsed JSON, or None."""
+    """Subprocess get_weather.py forecast and return parsed JSON, or None.
+
+    Caches the set of cities OpenWeather couldn't resolve, so repeat
+    discovery cycles don't waste API calls on the same bad names.
+    """
     global _FORECAST_KEY_WARNED
     if not os.environ.get("OPENWEATHER_API_KEY"):
         if not _FORECAST_KEY_WARNED:
@@ -364,6 +372,9 @@ def fetch_forecast(city: str, days: int = 5) -> Optional[dict]:
                                           "impact": "all forecast lookups will fail"},
                       level="ERROR")
             _FORECAST_KEY_WARNED = True
+        return None
+
+    if city in _FORECAST_UNKNOWN_CITIES:
         return None
 
     if not FORECAST_SCRIPT.exists():
@@ -379,10 +390,19 @@ def fetch_forecast(city: str, days: int = 5) -> Optional[dict]:
             capture_output=True, text=True, timeout=30, env=env,
         )
         if result.returncode != 0:
+            # If OpenWeather doesn't recognize the city, cache it so we don't
+            # retry every discovery cycle. Heuristic: stderr mentions 404 / not
+            # found, or non-zero exit on first try.
+            stderr = (result.stderr or "")[:500]
+            if any(s in stderr.lower() for s in ("404", "not found",
+                                                  "city not found")):
+                _FORECAST_UNKNOWN_CITIES.add(city)
             log_event("error", {"where": "fetch_forecast", "city": city,
                                 "exit_code": result.returncode,
-                                "stderr": result.stderr[:500],
-                                "stdout": result.stdout[:200]}, level="WARN")
+                                "stderr": stderr,
+                                "stdout": result.stdout[:200],
+                                "cached_as_unknown": city in _FORECAST_UNKNOWN_CITIES},
+                      level="WARN")
             return None
         out = result.stdout.strip()
         if not out:

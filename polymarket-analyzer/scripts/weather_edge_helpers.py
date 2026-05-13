@@ -81,13 +81,56 @@ def _all_known_cities(cities: dict[str, Any]) -> dict[str, str]:
 
 
 def _resolve_city(text: str, cities: dict[str, Any]) -> Optional[str]:
-    """Find the canonical city name in `text` if any. Accent-insensitive."""
+    """Find the canonical city name in `text` if any. Accent-insensitive.
+
+    Two-stage lookup:
+      1) Match against the curated cities/aliases JSON (fast, deterministic).
+      2) Fallback: extract the city via regex from common Polymarket patterns
+         like "temperature in CITY on …" or "rain in CITY tomorrow". The
+         extracted name is passed straight to OpenWeather; if OpenWeather
+         doesn't know it, fetch_forecast returns None and the bot skips
+         the market with forecast_unavailable. This way we don't gate on
+         a hardcoded list — any real city OpenWeather knows is tradeable.
+    """
     lookup = _all_known_cities(cities)
     text_lower = _strip_accents(text).lower()
-    # Try longest matches first to avoid "York" matching when "New York" should
+    # Stage 1: longest-match against the known list (preserves canonical form)
     for name in sorted(lookup, key=len, reverse=True):
         if re.search(r"\b" + re.escape(name) + r"\b", text_lower):
             return lookup[name]
+    # Stage 2: regex fallback for arbitrary cities
+    return _extract_city_from_question(text)
+
+
+# Common Polymarket weather-question patterns. Captures any capitalized city
+# token sequence between an "in" preposition and a date/punctuation boundary.
+_CITY_FROM_QUESTION_RE = re.compile(
+    r"\b(?:in|for|at)\s+"
+    r"(?P<city>[A-ZÀ-Ý][A-Za-zÀ-ÿ.'\-]+(?:\s+[A-ZÀ-Ý][A-Za-zÀ-ÿ.'\-]+){0,3})"
+    r"(?=\s+(?:on|by|today|tomorrow|tonight|this|next|in\s+the|\d{4})|[?!.,]|$)",
+)
+
+# Tokens that look capitalized but aren't cities — exclude common false positives.
+_CITY_BLACKLIST = frozenset({
+    "may", "june", "july", "august", "september", "october", "november",
+    "december", "january", "february", "march", "april", "monday", "tuesday",
+    "wednesday", "thursday", "friday", "saturday", "sunday",
+    "fahrenheit", "celsius", "today", "tomorrow", "tonight", "this", "next",
+    "high", "low", "highest", "lowest", "the",
+})
+
+
+def _extract_city_from_question(text: str) -> Optional[str]:
+    """Best-effort city extraction from market question text."""
+    for m in _CITY_FROM_QUESTION_RE.finditer(text):
+        candidate = m.group("city").strip()
+        # Reject obvious non-city tokens
+        first = candidate.split()[0].lower()
+        if first in _CITY_BLACKLIST:
+            continue
+        if len(candidate) < 2:
+            continue
+        return candidate
     return None
 
 
