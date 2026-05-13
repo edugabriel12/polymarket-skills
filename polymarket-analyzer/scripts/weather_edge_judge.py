@@ -170,7 +170,15 @@ _VERDICT_SCHEMA = {
         # comparisons, web search hits). String form avoids the
         # 'additionalProperties: true' rejection from Anthropic API.
         "evidence_summary": {"type": "string"},
-        "adjusted_side": {"type": ["string", "null"], "enum": ["YES", "NO", None]},
+        # adjusted_side is "YES"/"NO" when verdict=ADJUST, null otherwise.
+        # Using anyOf instead of type-array+enum because Anthropic's schema
+        # validator does not accept enum values mixed with a nullable type.
+        "adjusted_side": {
+            "anyOf": [
+                {"type": "string", "enum": ["YES", "NO"]},
+                {"type": "null"},
+            ],
+        },
         "adjusted_size_usd": {"type": ["number", "null"]},
     },
     "required": ["verdict", "confidence", "judge_prob", "rationale", "evidence_summary"],
