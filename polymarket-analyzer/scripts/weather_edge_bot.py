@@ -441,7 +441,8 @@ def run_discovery(args, cities: dict) -> int:
         "orderbook_unavailable": 0, "no_implied_prices": 0,
         "price_band_miss": 0, "forecast_unavailable": 0,
         "no_forecast_for_target_date": 0, "low_edge": 0,
-        "already_proposed": 0, "opposite_side_held": 0,
+        "duplicate_pending": 0, "opposite_side_held": 0,
+        "market_exposure_full": 0,
     }
 
     # Phase 1: build candidate proposals using HTTP-only work (no DB lock held).
@@ -564,28 +565,66 @@ def run_discovery(args, cities: dict) -> int:
     # Phase 2 + 3: snapshot existing (slug, side) pairs, then insert candidates
     # one-by-one with per-row commits. Each commit releases the writer lock
     # immediately so the judge can interleave its updates between proposals.
+    market_cap_usd = float(args.max_market_exposure_usd)
+
     with db.connect() as conn:
-        existing = {(r[0], r[1]) for r in conn.execute(
-            "SELECT market_slug, side FROM entries")}
+        # Sets of currently-relevant (slug, side) pairs and per-slug $ exposure.
+        # pending  = proposed/approved/adjusted, not yet executed (wait — no
+        #            duplicate while one is in flight)
+        # open     = executed and NOT cashed out (counts toward exposure cap)
+        pending: set[tuple[str, str]] = set()
+        open_sides: set[tuple[str, str]] = set()
+        exposure: dict[str, float] = {}
+        for r in conn.execute(
+            "SELECT e.market_slug, e.side, e.status, "
+            "       COALESCE(e.size_usd, 0) AS size_usd, "
+            "       c.cashout_id AS cashout_id "
+            "FROM entries e "
+            "LEFT JOIN cashouts c ON c.entry_id = e.entry_id"
+        ):
+            slug_, side_, status_, size_, co = (
+                r["market_slug"], r["side"], r["status"],
+                float(r["size_usd"] or 0), r["cashout_id"])
+            if status_ in ("PROPOSED", "APPROVED", "ADJUSTED"):
+                pending.add((slug_, side_))
+            elif status_ in ("EXECUTED", "FAST_PATH") and co is None:
+                open_sides.add((slug_, side_))
+                exposure[slug_] = exposure.get(slug_, 0.0) + size_
 
         for c in candidates:
-            if (c["slug"], c["side"]) in existing:
-                skipped["already_proposed"] += 1
-                continue
-            # Block opposite-side entries: if we already have an entry on this
-            # market's other side, skip. Holding both YES and NO is destructive
-            # unless yes_ask + no_ask < 1 (arbitrage), which compute_edge does
-            # NOT currently detect. Forecast drift between two discovery cycles
-            # would otherwise lock in losses.
-            opposite_side = "NO" if c["side"] == "YES" else "YES"
-            if (c["slug"], opposite_side) in existing:
+            slug = c["slug"]
+            side = c["side"]
+            opposite = "NO" if side == "YES" else "YES"
+
+            # Block opposite-side entries — destructive unless true arb (not
+            # detected by compute_edge). Counts open + pending opposite.
+            if (slug, opposite) in open_sides or (slug, opposite) in pending:
                 skipped["opposite_side_held"] += 1
                 log_event("market_skipped", {
-                    "slug": c["slug"], "reason": "opposite_side_held",
-                    "would_propose": c["side"],
-                    "already_have": opposite_side,
+                    "slug": slug, "reason": "opposite_side_held",
+                    "would_propose": side, "already_have": opposite,
                 })
                 continue
+
+            # Block duplicate while a previous proposal on (slug, side) is
+            # still in flight (not yet executed) — avoids wasting judge cycles
+            # on a trade that will hit the exposure cap at execute time anyway.
+            if (slug, side) in pending:
+                skipped["duplicate_pending"] += 1
+                continue
+
+            # Allow re-entry on same (slug, side) AFTER execution as long as
+            # there's room under the per-market exposure cap.
+            current_exposure = exposure.get(slug, 0.0)
+            if current_exposure >= market_cap_usd:
+                skipped["market_exposure_full"] += 1
+                log_event("market_skipped", {
+                    "slug": slug, "reason": "market_exposure_full",
+                    "current_exposure_usd": round(current_exposure, 2),
+                    "cap_usd": market_cap_usd,
+                })
+                continue
+
             spec = c["spec"]
             entry_id = db.insert_entry(
                 conn,
@@ -612,7 +651,9 @@ def run_discovery(args, cities: dict) -> int:
                 status="PROPOSED",
             )
             conn.commit()  # release writer lock so judge can interleave
-            existing.add((c["slug"], c["side"]))
+            # Update in-memory state so subsequent iterations in this same
+            # discovery cycle see the new proposal as already-pending.
+            pending.add((slug, side))
             proposed += 1
             log_event("entry_proposed", {
                 "entry_id": entry_id, "slug": c["slug"], "side": c["side"],
@@ -680,15 +721,11 @@ def run_execute(args) -> int:
                                           "reason": "zero_max_size"})
             continue
 
-        try:
-            portfolio = engine.get_portfolio()  # touches portfolio.db only
-            portfolio_value = portfolio.get("total_value", 0)
-        except Exception as e:
-            log_event("error", {"where": "execute_portfolio", "err": str(e)})
-            continue
-        per_trade_cap_usd = portfolio_value * 0.10
-
-        target_usd = min(sizing["max_usd"], per_trade_cap_usd)
+        # Per-trade size is driven by orderbook slippage cap (volume/depth)
+        # and the per-market exposure cap below. The 10% portfolio cap was
+        # removed at operator request — only paper-engine's internal risk
+        # checks (insufficient balance) still gate at the engine layer.
+        target_usd = float(sizing["max_usd"])
         # Honor judge's size cap for ADJUSTED entries — usually half or a
         # third of the full size when judge has medium confidence.
         judge_size_cap = row["judge_adjusted_size_usd"] if status == "ADJUSTED" else None
