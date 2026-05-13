@@ -165,7 +165,11 @@ _VERDICT_SCHEMA = {
         "confidence": {"type": "number"},
         "judge_prob": {"type": "number"},
         "rationale": {"type": "string"},
-        "evidence_summary": {"type": "object", "additionalProperties": True},
+        # evidence_summary is a JSON-serialized string of arbitrary
+        # evidence the judge gathered (forecast deltas, ECMWF/NWS
+        # comparisons, web search hits). String form avoids the
+        # 'additionalProperties: true' rejection from Anthropic API.
+        "evidence_summary": {"type": "string"},
         "adjusted_side": {"type": ["string", "null"], "enum": ["YES", "NO", None]},
         "adjusted_size_usd": {"type": ["number", "null"]},
     },

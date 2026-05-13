@@ -91,6 +91,7 @@ def log_event(event_type: str, payload: dict | None = None,
 
 _SUGGESTIONS_SCHEMA = {
     "type": "object",
+    "additionalProperties": False,
     "properties": {
         "n_trades_analyzed": {"type": "integer"},
         "summary": {"type": "string"},
@@ -98,6 +99,7 @@ _SUGGESTIONS_SCHEMA = {
             "type": "array",
             "items": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "id": {"type": "string"},
                     "category": {
@@ -112,14 +114,16 @@ _SUGGESTIONS_SCHEMA = {
                     "title": {"type": "string"},
                     "rationale": {"type": "string"},
                     "counterfactual": {"type": "string"},
-                    "current_value": {},
-                    "proposed_value": {},
+                    "current_value": {"type": ["string", "number", "null"]},
+                    "proposed_value": {"type": ["string", "number", "null"]},
                     "param_path": {"type": "string"},
-                    "supporting_data": {"type": "object"},
+                    # JSON-serialized string of supporting data dict.
+                    "supporting_data": {"type": "string"},
                     "web_citations": {
                         "type": "array",
                         "items": {
                             "type": "object",
+                            "additionalProperties": False,
                             "properties": {
                                 "url": {"type": "string"},
                                 "snippet": {"type": "string"},

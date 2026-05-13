@@ -84,7 +84,7 @@ themselves.
       "current_value": "<scalar or string>",
       "proposed_value": "<scalar or string>",
       "param_path": "file.py:flag-or-constant-or-section",
-      "supporting_data": {"n_samples": 15, "any_other_keys": "..."},
+      "supporting_data": "{\"n_samples\": 15, \"any_other_keys\": \"...\"}",
       "web_citations": [
         {"url": "https://...", "snippet": "Quoted relevant passage"}
       ]
@@ -98,6 +98,10 @@ themselves.
 `judge_prompt` / `risk_limit` suggestions when the change is structural rather
 than a single-scalar swap. In that case `param_path` and `rationale` carry the
 content.
+
+`supporting_data` is a **JSON-encoded string**, not a raw object. Example:
+`"supporting_data": "{\"n_samples\": 15, \"mean_pnl\": 8.2}"`. This avoids
+Anthropic API rejection of objects with arbitrary additional properties.
 
 ## Process
 

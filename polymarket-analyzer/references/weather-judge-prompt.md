@@ -40,12 +40,14 @@ Example: *"Bot sees forecast 78°F (P=0.73) for Manhattan tomorrow. NWS confirms
 
 ## What to put in `evidence_summary`
 
-A flat dict / object with:
+A **JSON-serialized string** containing a flat object with these fields:
 - `nws_high_f`, `nws_low_f` (if US city), or null
 - `visual_crossing_high_f`, `visual_crossing_low_f`
 - `web_search_findings`: 1-2 sentences summary of news/climatology
 - `consensus_high_f`: median across sources
 - `divergence_pp`: |judge_prob - bot_prob| × 100
+
+Example: `"evidence_summary": "{\"nws_high_f\": 78, \"visual_crossing_high_f\": 77, \"consensus_high_f\": 77.5, \"divergence_pp\": 3, \"web_search_findings\": \"Standard May warmth, no anomaly\"}"`
 
 ## Edge cases
 
@@ -64,7 +66,7 @@ You MUST return a JSON object matching this schema (the SDK enforces it):
   "confidence": 0.0-1.0,
   "judge_prob": 0.0-1.0,
   "rationale": "<2-4 sentence string>",
-  "evidence_summary": {<see above>},
+  "evidence_summary": "<JSON-encoded string of the dict described above>",
   "adjusted_side": "YES" | "NO" | null,
   "adjusted_size_usd": <number> | null
 }
