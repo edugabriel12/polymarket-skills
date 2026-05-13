@@ -686,6 +686,30 @@ def run_execute(args) -> int:
                 "applied_target_usd": target_usd,
                 "adjusted_side": adjusted_side,
             })
+
+        # Per-market exposure cap: sum YES+NO open positions on this slug,
+        # leave at most args.max_market_exposure_usd in any single market.
+        market_slug = row["market_slug"]
+        with db.connect() as conn2:
+            current_exposure = db.current_market_exposure_usd(conn2, market_slug)
+        remaining_cap = float(args.max_market_exposure_usd) - current_exposure
+        if remaining_cap <= 0:
+            log_event("execute_skipped", {"entry_id": entry_id,
+                                          "reason": "market_exposure_cap_reached",
+                                          "market_slug": market_slug,
+                                          "current_exposure_usd": round(current_exposure, 2),
+                                          "cap_usd": float(args.max_market_exposure_usd)})
+            continue
+        if remaining_cap < target_usd:
+            log_event("execute_market_exposure_clamp", {
+                "entry_id": entry_id, "market_slug": market_slug,
+                "original_target_usd": round(target_usd, 2),
+                "current_exposure_usd": round(current_exposure, 2),
+                "cap_usd": float(args.max_market_exposure_usd),
+                "clamped_target_usd": round(remaining_cap, 2),
+            })
+            target_usd = remaining_cap
+
         if target_usd < 10:
             log_event("execute_skipped", {"entry_id": entry_id,
                                           "reason": "size_below_min_$10"})
@@ -981,6 +1005,9 @@ def main():
                    help="Cashout if bid falls X%% below peak (default 30%%)")
     p.add_argument("--convergence-pp", type=float, default=5.0,
                    help="Cashout when bid within X pp of forecast fair value (default 5pp)")
+    p.add_argument("--max-market-exposure-usd", type=float, default=50.0,
+                   help="Total $ exposure cap per market_slug (YES+NO summed, "
+                        "across all open positions). Default $50.")
     p.add_argument("--portfolio", default="default")
     p.add_argument("--log-file", default=None,
                    help="Write JSONL log here (default ~/.polymarket-paper/weather_edge.jsonl)")

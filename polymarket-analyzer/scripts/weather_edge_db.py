@@ -362,6 +362,24 @@ def query_for_counterfactual(conn) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def current_market_exposure_usd(conn, market_slug: str) -> float:
+    """Sum of size_usd for all currently-open positions on this market
+    (both YES and NO sides), excluding entries that already have a cashout.
+
+    Used by run_execute to cap total $ exposure per market.
+    """
+    row = conn.execute(
+        "SELECT COALESCE(SUM(e.size_usd), 0) "
+        "FROM entries e "
+        "LEFT JOIN cashouts c ON c.entry_id = e.entry_id "
+        "WHERE e.market_slug = ? "
+        "  AND e.status IN ('EXECUTED','FAST_PATH') "
+        "  AND c.cashout_id IS NULL",
+        (market_slug,),
+    ).fetchone()
+    return float(row[0] or 0.0)
+
+
 def market_already_proposed(conn, market_slug: str, side: str) -> bool:
     """True if an entry for (market, side) is already PROPOSED/APPROVED/EXECUTED.
 
