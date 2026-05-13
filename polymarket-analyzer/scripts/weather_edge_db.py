@@ -311,9 +311,19 @@ def query_pending_proposals(conn, limit: int = 50) -> list[sqlite3.Row]:
 
 
 def query_approved_unexecuted(conn) -> list[sqlite3.Row]:
-    """Entries APPROVED but not yet executed (bot picks these up)."""
+    """Entries APPROVED or ADJUSTED but not yet executed (bot picks these up).
+
+    Pulls in the latest judge review's adjusted_size_usd / adjusted_side so
+    the executor can honor judge's size cap when status='ADJUSTED'.
+    """
     return conn.execute(
-        "SELECT * FROM entries WHERE status = 'APPROVED' ORDER BY ts ASC"
+        "SELECT e.*, "
+        "       j.adjusted_size_usd AS judge_adjusted_size_usd, "
+        "       j.adjusted_side     AS judge_adjusted_side "
+        "FROM entries e "
+        "LEFT JOIN judge_reviews j ON j.entry_id = e.entry_id "
+        "WHERE e.status IN ('APPROVED','ADJUSTED') "
+        "ORDER BY e.ts ASC"
     ).fetchall()
 
 

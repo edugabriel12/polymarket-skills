@@ -646,7 +646,11 @@ def run_execute(args) -> int:
 
     for row in rows:
         entry_id = row["entry_id"]
-        side = row["side"]
+        status = row["status"]
+        # ADJUST verdict can override side — if the judge thought the bot
+        # picked the wrong direction, use the judge's adjusted_side instead.
+        adjusted_side = row["judge_adjusted_side"] if status == "ADJUSTED" else None
+        side = adjusted_side or row["side"]
         token_id = row["token_id_yes"] if side == "YES" else row["token_id_no"]
         # HTTP — no DB lock held here
         book = fetch_orderbook(token_id)
@@ -671,6 +675,17 @@ def run_execute(args) -> int:
         per_trade_cap_usd = portfolio_value * 0.10
 
         target_usd = min(sizing["max_usd"], per_trade_cap_usd)
+        # Honor judge's size cap for ADJUSTED entries — usually half or a
+        # third of the full size when judge has medium confidence.
+        judge_size_cap = row["judge_adjusted_size_usd"] if status == "ADJUSTED" else None
+        if judge_size_cap is not None and judge_size_cap > 0:
+            target_usd = min(target_usd, float(judge_size_cap))
+            log_event("execute_size_adjusted", {
+                "entry_id": entry_id,
+                "judge_size_cap_usd": float(judge_size_cap),
+                "applied_target_usd": target_usd,
+                "adjusted_side": adjusted_side,
+            })
         if target_usd < 10:
             log_event("execute_skipped", {"entry_id": entry_id,
                                           "reason": "size_below_min_$10"})
