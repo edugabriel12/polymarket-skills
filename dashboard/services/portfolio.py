@@ -52,24 +52,34 @@ def get_kpis(portfolio_name: str = "default") -> dict:
         pid = pf["id"]
         starting = float(pf["starting_balance"])
 
+        # positions columns (paper_engine schema): shares, avg_entry, current_price, closed
         positions = pconn.execute(
             "SELECT * FROM positions WHERE portfolio_id = ? AND closed = 0",
             (pid,),
         ).fetchall()
         positions_value = sum(
-            float(p["shares"]) * float(p["current_price"] or p["entry_price"])
+            float(p["shares"]) * float(p["current_price"] or p["avg_entry"])
             for p in positions
         )
         open_count = len(positions)
 
-        # Realized P&L today (UTC) from trades table (sell trades after market open)
+        # Realized P&L today (UTC) — paper_engine's trades table doesn't store
+        # per-trade realized_pnl, so we pull from weather_edge.db cashouts
+        # (which is what the bot uses for its own monitor cashouts and where
+        # realized_pnl_usd is computed at exit time).
         today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        realized_today = pconn.execute(
-            "SELECT COALESCE(SUM(realized_pnl), 0) FROM trades "
-            "WHERE portfolio_id = ? AND DATE(executed_at) = ?",
-            (pid, today_utc),
-        ).fetchone()[0]
-        realized_today = float(realized_today or 0)
+        realized_today = 0.0
+        if S.WEATHER_EDGE_DB.exists():
+            wconn = _ro_conn(S.WEATHER_EDGE_DB)
+            try:
+                row = wconn.execute(
+                    "SELECT COALESCE(SUM(realized_pnl_usd), 0) "
+                    "FROM cashouts WHERE DATE(ts) = ?",
+                    (today_utc,),
+                ).fetchone()
+                realized_today = float(row[0] or 0)
+            finally:
+                wconn.close()
 
         # Yesterday equity (closest daily snapshot) for delta_today
         delta_today = None
@@ -157,13 +167,14 @@ if __name__ == "__main__":
     tmp = Path(tempfile.mkdtemp())
     db_path = tmp / "portfolio.db"
     c = sqlite3.connect(db_path)
+    # Use real paper_engine schema: avg_entry (not entry_price), no realized_pnl
     c.executescript("""
         CREATE TABLE portfolios (id INTEGER PRIMARY KEY, name TEXT,
             cash_balance REAL, starting_balance REAL);
         CREATE TABLE positions (id INTEGER PRIMARY KEY, portfolio_id INTEGER,
-            shares REAL, entry_price REAL, current_price REAL, closed INTEGER);
+            shares REAL, avg_entry REAL, current_price REAL, closed INTEGER);
         CREATE TABLE trades (id INTEGER PRIMARY KEY, portfolio_id INTEGER,
-            executed_at TEXT, realized_pnl REAL);
+            executed_at TEXT);
         CREATE TABLE daily_snapshots (id INTEGER PRIMARY KEY,
             portfolio_id INTEGER, date TEXT, total_value REAL,
             cash_balance REAL, positions_value REAL);
@@ -173,24 +184,34 @@ if __name__ == "__main__":
         INSERT INTO daily_snapshots VALUES (1, 1, '2026-05-10', 850.0, 800, 50);
         INSERT INTO daily_snapshots VALUES (2, 1, '2026-05-11', 900.0, 800, 100);
     """)
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    c.execute("INSERT INTO trades VALUES (1, 1, ?, 5.50)", (today + " 10:00",))
-    c.execute("INSERT INTO trades VALUES (2, 1, ?, -2.10)", (today + " 11:00",))
-    c.execute("INSERT INTO trades VALUES (3, 1, '2026-05-10 10:00', 99.0)")
     c.commit()
     c.close()
 
+    # Seed a minimal weather_edge.db so realized_pnl_today is non-zero
+    w_path = tmp / "weather_edge.db"
+    w = sqlite3.connect(w_path)
+    w.executescript("""
+        CREATE TABLE cashouts (cashout_id INTEGER PRIMARY KEY,
+            ts TEXT, realized_pnl_usd REAL);
+    """)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%dT12:00:00+00:00")
+    w.execute("INSERT INTO cashouts VALUES (1, ?, 5.50)", (today,))
+    w.execute("INSERT INTO cashouts VALUES (2, ?, -2.10)", (today,))
+    w.execute("INSERT INTO cashouts VALUES (3, '2026-05-10T10:00:00+00:00', 99.0)")
+    w.commit()
+    w.close()
+
     # Monkeypatch settings
     S.PORTFOLIO_DB = db_path
+    S.WEATHER_EDGE_DB = w_path
     k = get_kpis()
     # cash 800 + positions (100*0.20 + 50*0.55 = 20 + 27.5 = 47.5) → total 847.5
     assert abs(k["portfolio_total_usd"] - 847.5) < 0.01, k
     assert k["open_positions"] == 2
     assert k["max_positions"] == 15
+    # today's cashouts: 5.50 + (-2.10) = 3.40
     assert abs(k["realized_pnl_today_usd"] - 3.40) < 0.01, k
-    # delta today vs last snapshot (900): 847.5 - 900 = -52.5
     assert abs(k["portfolio_delta_today_usd"] - (-52.5)) < 0.01, k
-    # drawdown: total 847.5 vs peak max(900, 1000, 847.5) = 1000 → -15.25%
     assert abs(k["drawdown_pct_from_peak"] - -15.25) < 0.1, k
     print(f"Test 1 PASS: get_kpis → {k}")
 
