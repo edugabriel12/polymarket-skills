@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 DB_PATH = Path.home() / ".polymarket-paper" / "weather_edge.db"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 SCHEMA_V1 = """
@@ -154,6 +154,28 @@ SCHEMA_V3_MIGRATIONS = [
 ]
 
 
+SCHEMA_V4_MIGRATIONS = [
+    # Audit trail for advisor suggestions applied via the dashboard.
+    """
+    CREATE TABLE IF NOT EXISTS advisor_suggestion_applies (
+      apply_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id INTEGER NOT NULL REFERENCES advisor_runs(run_id),
+      suggestion_id TEXT NOT NULL,
+      ts TEXT NOT NULL,
+      category TEXT NOT NULL,
+      param_path TEXT NOT NULL,
+      previous_value TEXT,
+      applied_value TEXT,
+      git_commit_sha TEXT,
+      status TEXT NOT NULL CHECK(status IN ('applied','failed','unsupported','reverted')),
+      error_msg TEXT,
+      UNIQUE(run_id, suggestion_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_apply_run ON advisor_suggestion_applies(run_id)",
+]
+
+
 def init_db(path: Path = DB_PATH) -> None:
     """Create the DB and tables if missing. Idempotent. Bumps user_version.
     Enables WAL mode so readers + writers don't block each other."""
@@ -179,6 +201,10 @@ def init_db(path: Path = DB_PATH) -> None:
             for stmt in SCHEMA_V3_MIGRATIONS:
                 cur.execute(stmt)
             current = 3
+        if current < 4:
+            for stmt in SCHEMA_V4_MIGRATIONS:
+                cur.execute(stmt)
+            current = 4
         cur.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
 
@@ -271,6 +297,26 @@ def insert_advisor_run(conn, **kwargs) -> int:
     placeholders = ",".join("?" * len(cols))
     q = f"INSERT INTO advisor_runs ({','.join(cols)}) VALUES ({placeholders})"
     return conn.execute(q, vals).lastrowid
+
+
+def insert_suggestion_apply(conn, **kwargs) -> int:
+    """Record an attempt to apply an advisor suggestion. UNIQUE constraint
+    on (run_id, suggestion_id) means this raises on duplicate."""
+    cols = list(kwargs.keys())
+    vals = [kwargs[c] for c in cols]
+    placeholders = ",".join("?" * len(cols))
+    q = (f"INSERT INTO advisor_suggestion_applies ({','.join(cols)}) "
+         f"VALUES ({placeholders})")
+    return conn.execute(q, vals).lastrowid
+
+
+def query_applies_for_run(conn, run_id: int) -> list[sqlite3.Row]:
+    """Return all prior apply attempts for a given advisor run."""
+    return conn.execute(
+        "SELECT * FROM advisor_suggestion_applies "
+        "WHERE run_id = ? ORDER BY ts ASC",
+        (run_id,),
+    ).fetchall()
 
 
 def upsert_counterfactual(conn, entry_id: int, **kwargs) -> int:

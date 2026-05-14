@@ -1,0 +1,65 @@
+{# Single suggestion card. Expects: s (suggestion dict), applied (apply row or None). #}
+{% set is_supported = s.category in ('threshold', 'mae_constant', 'city', 'risk_limit') %}
+{% set is_applied = applied and applied.status == 'applied' %}
+{% set is_failed = applied and applied.status == 'failed' %}
+
+<div class="suggestion-card{% if is_applied %} applied{% elif is_failed %} failed{% elif not is_supported %} disabled{% endif %}"
+     id="sug-card-{{ s.id }}">
+  <div class="sug-header">
+    <span class="sug-priority pill-{{ s.priority }}">{{ s.priority|upper }}</span>
+    <span class="sug-confidence pill-{{ s.confidence }}">{{ s.confidence }}</span>
+    <span class="sug-category">{{ s.category }}</span>
+    <span class="sug-title">{{ s.title }}</span>
+  </div>
+
+  {% if s.current_value is not none and s.proposed_value is not none %}
+  <div class="sug-change">
+    <code>{{ s.param_path }}</code>:
+    <span class="mono">{{ s.current_value }}</span>
+    →
+    <span class="mono accent">{{ s.proposed_value }}</span>
+  </div>
+  {% elif s.param_path %}
+  <div class="sug-change">
+    Target: <code>{{ s.param_path }}</code>
+  </div>
+  {% endif %}
+
+  <div class="sug-rationale">{{ s.rationale }}</div>
+  {% if s.counterfactual %}
+    <div class="sug-counterfactual muted small">
+      <strong>Counterfactual:</strong> {{ s.counterfactual }}
+    </div>
+  {% endif %}
+
+  <div class="sug-actions">
+    {% if is_applied %}
+      <div class="apply-result applied">
+        ✓ Applied at {{ (applied.ts or '')[:16] }}
+        {% if applied.previous_value %}
+          ({{ applied.previous_value }} → {{ applied.applied_value }})
+        {% endif %}
+        {% if applied.git_commit_sha %}
+          · <code>{{ applied.git_commit_sha }}</code>
+        {% endif %}
+      </div>
+    {% elif is_failed %}
+      <div class="apply-result failed">
+        ✗ Failed: {{ applied.error_msg or "unknown error" }}
+      </div>
+    {% elif not is_supported %}
+      <button class="btn btn-disabled" disabled
+              title="Category '{{ s.category }}' requires manual edit">
+        Manual edit required
+      </button>
+    {% else %}
+      <button class="btn btn-apply"
+              hx-post="/api/advisor/apply/{{ run.run_id }}/{{ s.id }}"
+              hx-target="#sug-card-{{ s.id }}"
+              hx-swap="outerHTML"
+              hx-confirm="Apply '{{ s.title }}'? This will modify a source file and create a git commit.">
+        Apply
+      </button>
+    {% endif %}
+  </div>
+</div>

@@ -51,6 +51,7 @@ _load_dotenv()
 
 import weather_edge_db as db  # noqa: E402
 import strategy_advisor_helpers as helpers  # noqa: E402
+import weather_edge_backtest as backtest  # noqa: E402
 from weather_edge_analyzer import (  # noqa: E402
     aggregate_by_bucket,
     aggregate_judge,
@@ -401,6 +402,27 @@ def main() -> int:
         strategy_breakdown = helpers.compute_strategy_breakdown(per_trade_rows)
         winner_loser = helpers.compute_winner_loser_patterns(per_trade_rows)
 
+        # Advisor v3: backtest replay of past trades with alternative
+        # cashout policy parameters. Anchors threshold suggestions in
+        # concrete simulated P&L numbers.
+        replay_data = backtest.load_replay_data(
+            conn, since_iso, limit=args.per_trade_limit)
+        defaults = current_config.get("cli_defaults", {})
+        baseline_params = backtest.BacktestParams(
+            profit_lock_pp=float(defaults.get("--profit-lock-pp", 50.0)),
+            trailing_drawdown_pct=float(defaults.get("--trailing-drawdown-pct", 30.0)),
+            convergence_pp=float(defaults.get("--convergence-pp", 5.0)),
+        )
+        baseline_results = backtest.grid_search(replay_data, [baseline_params])
+        baseline = baseline_results[0] if baseline_results else None
+        alt_results = backtest.grid_search(
+            replay_data, backtest.default_param_grid())
+        backtest_results = {
+            "n_trades_replayed": len(replay_data),
+            "current_baseline": baseline,
+            "top_alternatives": alt_results[:10],
+        }
+
         # Count trades analyzed
         n_trades = conn.execute(
             "SELECT COUNT(*) FROM entries WHERE ts >= ? AND status IN "
@@ -421,6 +443,8 @@ def main() -> int:
             "per_trade_limit_applied": args.per_trade_limit,
             "strategy_breakdown_precomputed": strategy_breakdown,
             "winner_loser_patterns_precomputed": winner_loser,
+            # Advisor v3: backtest grid-search results
+            "backtest_results": backtest_results,
         }
 
         if args.dry_run:

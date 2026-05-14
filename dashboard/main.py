@@ -17,7 +17,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from . import settings as S
-from .services import analytics, charts, costs, events, portfolio, positions
+from .services import (advisor, analytics, charts, costs, events,
+                        portfolio, positions, suggestion_applier)
 
 app = FastAPI(title="Polymarket Weather Dashboard")
 
@@ -66,6 +67,50 @@ def page_performance(request: Request, days: int = 14):
 def page_events(request: Request):
     return templates.TemplateResponse(
         request, "events.html", _common_ctx("events"))
+
+
+@app.get("/advisor", response_class=HTMLResponse)
+def page_advisor(request: Request):
+    ctx = _common_ctx("advisor")
+    ctx["kpis"] = advisor.get_summary_kpis()
+    ctx["runs"] = advisor.list_runs(limit=50)
+    return templates.TemplateResponse(request, "advisor.html", ctx)
+
+
+@app.get("/api/advisor/runs/{run_id}", response_class=HTMLResponse)
+def api_advisor_run(request: Request, run_id: int):
+    run = advisor.get_run(run_id)
+    applies = advisor.list_applies_for_run(run_id)
+    return templates.TemplateResponse(
+        request, "partials/advisor_report.html",
+        {"run": run, "applies": applies})
+
+
+@app.post("/api/advisor/apply/{run_id}/{suggestion_id}",
+          response_class=HTMLResponse)
+def api_advisor_apply(request: Request, run_id: int, suggestion_id: str):
+    run = advisor.get_run(run_id)
+    if not run or not run.get("payload"):
+        return HTMLResponse(
+            '<div class="suggestion-card failed">'
+            'Run not found or payload missing.</div>',
+            status_code=404)
+    suggestion = next(
+        (s for s in (run["payload"].get("suggestions") or [])
+         if s.get("id") == suggestion_id), None)
+    if not suggestion:
+        return HTMLResponse(
+            '<div class="suggestion-card failed">'
+            'Suggestion not found in this run.</div>',
+            status_code=404)
+    applier = suggestion_applier.SuggestionApplier()
+    result = applier.apply(run_id=run_id, suggestion=suggestion)
+    # Re-render the card with the new applied state
+    fresh_applies = advisor.list_applies_for_run(run_id)
+    return templates.TemplateResponse(
+        request, "partials/suggestion_card.html",
+        {"s": suggestion, "applied": fresh_applies.get(suggestion_id),
+         "run": run})
 
 
 @app.get("/costs", response_class=HTMLResponse)

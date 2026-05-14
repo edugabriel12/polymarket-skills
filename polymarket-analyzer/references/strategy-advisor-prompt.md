@@ -194,6 +194,51 @@ reference 1-2 of your insights or specific winner/loser patterns. This
 makes the operator's audit trail tight: "I changed profit_lock_pp because
 of insight #2, which was supported by trades [142, 156, 199...]".
 
+## Backtest results (Advisor v3 — anchor threshold suggestions)
+
+You also receive `backtest_results` with simulated P&L under different
+cashout-policy params. Structure:
+
+```json
+{
+  "n_trades_replayed": 47,
+  "current_baseline": {
+    "params": {"profit_lock_pp": 50, "trailing_drawdown_pct": 30,
+                "convergence_pp": 5},
+    "total_pnl_usd": 142.30,
+    "win_rate": 0.68,
+    "n_resolved": 38,
+    "per_trigger_counts": {"profit_lock": 12, "trailing_stop": 5, ...}
+  },
+  "top_alternatives": [
+    {
+      "params": {"profit_lock_pp": 40, "trailing_drawdown_pct": 30,
+                  "convergence_pp": 5},
+      "total_pnl_usd": 187.60,
+      ...
+    },
+    ...
+  ]
+}
+```
+
+`current_baseline` is the bot's current settings replayed; `top_alternatives`
+is the ranked top-10 alternative configurations from a 36-combo grid.
+
+**When suggesting `threshold` category changes, you MUST cite the backtest:**
+
+Good: "Backtest of 47 trades shows profit_lock_pp=40 would have yielded
+$187.60 vs current $142.30 baseline (+$45.30, n=38 resolved trades)."
+
+Bad: "Lowering profit_lock_pp should improve P&L." (No numbers.)
+
+When the simulated improvement is small (< $20 or < 10% relative), demote
+the suggestion to `low` confidence — backtest is one signal among many,
+and variance in 30-50 trades is high.
+
+When the simulated improvement is negative (alternative loses vs baseline),
+do NOT suggest the change.
+
 ## Process
 
 1. Read the user message — it contains: aggregate analyzer report (markdown),

@@ -1,0 +1,149 @@
+{# Render a single advisor run's content. Expects: run, applies (dict by sug_id). #}
+
+{% if not run %}
+  <div class="card muted">Run not found.</div>
+{% else %}
+{% set p = run.payload %}
+
+<section class="card">
+  <h2>Run #{{ run.run_id }} — {{ (run.ts or '')[:16] }} UTC</h2>
+  <p class="muted small">
+    Model: <code>{{ run.llm_model }}</code> ·
+    Cost: ${{ "%.4f"|format(run.cost_usd or 0) }} ·
+    Tokens in/out: {{ run.tokens_in or 0 }} / {{ run.tokens_out or 0 }} ·
+    Window: since {{ p.since_iso[:10] if p.since_iso else '?' }} ·
+    Trades analyzed: {{ p.n_trades_analyzed or 0 }}
+  </p>
+
+  <div id="restart-banner" class="card warn-banner hidden">
+    ⚠ <strong>Restart the bot</strong> for threshold/risk_limit changes to take
+    effect: <code>Ctrl+C the bot terminal, then re-run the daemon command.</code>
+  </div>
+
+  <h3>Summary</h3>
+  <p>{{ p.summary or "—" }}</p>
+</section>
+
+{% if p.strategy_breakdown %}
+<section class="card">
+  <h2>Strategy breakdown</h2>
+  <table class="data-table">
+    <thead>
+      <tr><th>Strategy</th><th>N</th><th>Win rate</th>
+          <th>Total P&L</th><th>Mean P&L</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+      {% for s in p.strategy_breakdown %}
+      <tr>
+        <td class="mono">{{ s.strategy }}</td>
+        <td class="mono">{{ s.n_trades }}</td>
+        <td class="mono">{% if s.win_rate is not none %}{{ "%.0f"|format(s.win_rate * 100) }}%{% else %}—{% endif %}</td>
+        <td class="mono {% if s.total_pnl_usd > 0 %}up{% elif s.total_pnl_usd < 0 %}down{% endif %}">${{ "%+.2f"|format(s.total_pnl_usd) }}</td>
+        <td class="mono">{% if s.mean_pnl_usd is not none %}${{ "%+.2f"|format(s.mean_pnl_usd) }}{% else %}—{% endif %}</td>
+        <td class="small">{{ s.notes or "" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+{% if p.winner_patterns or p.loser_patterns %}
+<section class="two-col">
+  {% if p.winner_patterns %}
+  <div class="card">
+    <h2>What winners had in common</h2>
+    <p>{{ p.winner_patterns }}</p>
+  </div>
+  {% endif %}
+  {% if p.loser_patterns %}
+  <div class="card">
+    <h2>What losers had in common</h2>
+    <p>{{ p.loser_patterns }}</p>
+  </div>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if p.insights %}
+<section class="card">
+  <h2>Key insights</h2>
+  {% for i in p.insights %}
+  <div class="insight-card">
+    <h3>{{ loop.index }}. {{ i.title }}</h3>
+    <p class="muted small">
+      Category: <code>{{ i.applies_to_category }}</code> ·
+      Supporting trades: {{ i.n_supporting_trades }}
+      {% if i.supporting_trade_ids %}
+        ({% for tid in i.supporting_trade_ids[:8] %}#{{ tid }}{% if not loop.last %}, {% endif %}{% endfor %}{% if i.supporting_trade_ids|length > 8 %}, …{% endif %})
+      {% endif %}
+    </p>
+    <p>{{ i.observation }}</p>
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
+
+{% if p.suggestions %}
+<section class="card">
+  <h2>Suggestions ({{ p.suggestions|length }})</h2>
+  <p class="muted small">
+    Click <strong>Apply</strong> to modify the source file + git commit
+    automatically. Then restart the bot/judge to activate. The 4 safe
+    categories (threshold, mae_constant, city, risk_limit) are
+    auto-applicable; <code>judge_prompt</code> and <code>data_source</code>
+    require manual editing.
+  </p>
+  {% for s in p.suggestions %}
+    {% set applied = applies.get(s.id) %}
+    {% include "partials/suggestion_card.html" with context %}
+  {% endfor %}
+</section>
+{% endif %}
+
+{% if p.research_notes %}
+<section class="card">
+  <h2>Research notes</h2>
+  <p>{{ p.research_notes }}</p>
+</section>
+{% endif %}
+
+{% if p.backtest_results %}
+<section class="card">
+  <h2>Backtest top alternatives</h2>
+  <p class="muted small">
+    Replayed {{ p.backtest_results.n_trades_replayed }} trades against
+    36 alternative parameter combinations. Top by simulated P&L:
+  </p>
+  {% if p.backtest_results.current_baseline %}
+    {% set bl = p.backtest_results.current_baseline %}
+    <p class="muted small">
+      Current baseline: profit_lock_pp={{ bl.params.profit_lock_pp }},
+      trailing={{ bl.params.trailing_drawdown_pct }},
+      convergence={{ bl.params.convergence_pp }}
+      → ${{ "%+.2f"|format(bl.total_pnl_usd) }}
+      ({{ bl.n_wins }}W/{{ bl.n_losses }}L)
+    </p>
+  {% endif %}
+  <table class="data-table">
+    <thead>
+      <tr><th>Rank</th><th>profit_lock_pp</th><th>trailing_dd_pct</th>
+          <th>convergence_pp</th><th>Sim P&L</th><th>Win rate</th></tr>
+    </thead>
+    <tbody>
+      {% for r in p.backtest_results.top_alternatives %}
+      <tr>
+        <td class="mono">{{ loop.index }}</td>
+        <td class="mono">{{ r.params.profit_lock_pp }}</td>
+        <td class="mono">{{ r.params.trailing_drawdown_pct }}</td>
+        <td class="mono">{{ r.params.convergence_pp }}</td>
+        <td class="mono {% if r.total_pnl_usd > 0 %}up{% elif r.total_pnl_usd < 0 %}down{% endif %}">${{ "%+.2f"|format(r.total_pnl_usd) }}</td>
+        <td class="mono">{% if r.win_rate is not none %}{{ "%.0f"|format(r.win_rate * 100) }}%{% else %}—{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+{% endif %}
