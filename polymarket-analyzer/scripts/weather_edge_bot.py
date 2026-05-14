@@ -721,6 +721,44 @@ def run_execute(args) -> int:
                                           "reason": "zero_max_size"})
             continue
 
+        # Re-validate edge at current market prices. The entry was approved
+        # at proposal time T0; by the time we get here (queued behind the
+        # position-limit cap, judge backlog, etc.) the market may have moved.
+        # forecast_prob_at_entry is P(YES) per forecast_probability(); the
+        # current implied prob for our side is sizing["avg_fill"] (volume-
+        # weighted fill price for target size).
+        fill_price = float(sizing["avg_fill"])
+        forecast_prob = row["forecast_prob_at_entry"]
+        if forecast_prob is None:
+            current_edge_pp = None
+        elif side == "YES":
+            current_edge_pp = round(
+                (float(forecast_prob) - fill_price) * 100.0, 4)
+        else:
+            current_edge_pp = round(
+                ((1.0 - float(forecast_prob)) - fill_price) * 100.0, 4)
+
+        min_edge_pp_for_execute = getattr(args, "execute_min_edge_pp", None)
+        if min_edge_pp_for_execute is None:
+            min_edge_pp_for_execute = args.min_edge_pp
+
+        if (current_edge_pp is not None
+                and current_edge_pp < min_edge_pp_for_execute):
+            log_event("execute_skipped", {
+                "entry_id": entry_id,
+                "reason": "edge_stale",
+                "original_edge_pp": row["edge_pp_at_entry"],
+                "current_edge_pp": round(current_edge_pp, 2),
+                "fill_price": round(fill_price, 4),
+                "forecast_prob": round(float(forecast_prob), 4),
+                "min_edge_pp_threshold": min_edge_pp_for_execute,
+                "side": side,
+            })
+            with db.connect() as conn2:
+                db.update_entry_status(conn2, entry_id, "SKIPPED",
+                                        skip_reason="edge_stale")
+            continue
+
         # Per-trade size is driven by orderbook slippage cap (volume/depth)
         # and the per-market exposure cap below. The 10% portfolio cap was
         # removed at operator request — only paper-engine's internal risk
@@ -1078,6 +1116,12 @@ def _handle_sigterm(signum, frame):
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--min-edge-pp", type=float, default=10.0)
+    p.add_argument("--execute-min-edge-pp", type=float, default=None,
+                   help="Minimum edge_pp required at EXECUTION time. "
+                        "Defaults to --min-edge-pp (same threshold as "
+                        "discovery). Set higher to enforce stricter "
+                        "re-check on queued entries that may have aged "
+                        "while waiting on position-limit or judge backlog.")
     p.add_argument("--min-volume", type=float, default=100,
                    help="Min market USD volume; sub-bracket markets have low volume each")
     p.add_argument("--min-price", type=float, default=0.05,
