@@ -57,6 +57,7 @@ from weather_edge_analyzer import (  # noqa: E402
     aggregate_judge,
     aggregate_cashout_triggers,
     compute_counterfactuals,
+    compute_judge_accuracy,
     format_report_md,
 )
 
@@ -457,6 +458,11 @@ def main() -> int:
             (since_iso,),
         ).fetchone()[0]
 
+        # Advisor v6: judge accuracy + hallucination signals
+        judge_accuracy = compute_judge_accuracy(conn, since_iso)
+        divergent_judge_samples = helpers.compute_divergent_judge_samples(
+            conn, since_iso, limit=10)
+
         user_payload = {
             "since_iso": since_iso,
             "n_trades_analyzed": n_trades,
@@ -472,6 +478,9 @@ def main() -> int:
             "winner_loser_patterns_precomputed": winner_loser,
             # Advisor v3: backtest grid-search results
             "backtest_results": backtest_results,
+            # Advisor v6: judge accuracy + divergent rationale samples
+            "judge_accuracy": judge_accuracy,
+            "divergent_judge_samples": divergent_judge_samples,
         }
 
         if args.dry_run:

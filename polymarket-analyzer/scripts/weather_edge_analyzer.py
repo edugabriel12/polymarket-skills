@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import sqlite3
 import sys
 from collections import defaultdict
@@ -254,6 +255,173 @@ def aggregate_judge(conn, since_iso: str) -> dict:
 # ---------------------------------------------------------------------------
 # Suggestions
 # ---------------------------------------------------------------------------
+
+
+def compute_judge_accuracy(conn, since_iso: str) -> dict:
+    """v6: Judge accuracy + hallucination signals.
+
+    For each RESOLVED entry the judge reviewed, compare the judge's verdict
+    and probability against the actual Polymarket outcome. Produce:
+
+      - approval_rate (APPROVE+ADJUST / total)
+      - false_positive_rate: of APPROVED+ADJUSTED resolved trades, fraction
+        that lost (resolved against the bet side)
+      - false_negative_rate: of REJECTED resolved trades, fraction that
+        would have won (resolved on the bet side)
+      - brier_score: mean squared error of judge_prob vs actual outcome
+      - log_loss: cross-entropy of judge_prob vs actual outcome
+      - calibration_buckets: 10 bins of judge_prob → actual win rate
+      - high_confidence_errors: count of APPROVE+confidence='high' that lost
+      - missed_pnl_usd: sum of hypothetical P&L from rejected winners
+
+    These feed the advisor so it can diagnose miscalibration / hallucination.
+    """
+    rows = conn.execute(
+        "SELECT j.verdict, j.confidence, j.judge_prob, j.bot_prob, "
+        "       j.rationale, j.evidence_json, "
+        "       e.entry_id, e.entry_price, e.side, e.size_usd, "
+        "       e.market_question, e.city_resolved, "
+        "       r.final_outcome, r.payout_per_share "
+        "FROM judge_reviews j "
+        "JOIN entries e ON e.entry_id = j.entry_id "
+        "LEFT JOIN resolutions r ON r.entry_id = e.entry_id "
+        "WHERE j.ts >= ?",
+        (since_iso,),
+    ).fetchall()
+
+    n_total = len(rows)
+    if n_total == 0:
+        return {"n_reviews": 0, "note": "no judge reviews in window"}
+
+    n_approve = sum(1 for r in rows if r["verdict"] in ("APPROVE", "ADJUST"))
+
+    # Resolved subset (only trades with a known outcome can be scored)
+    resolved = [r for r in rows
+                if r["final_outcome"] in ("YES", "NO")
+                and r["judge_prob"] is not None]
+
+    # Brier + log-loss vs actual chosen-side win
+    brier_sum = 0.0
+    logloss_sum = 0.0
+    approved_lost = 0
+    rejected_won = 0
+    n_approved_resolved = 0
+    n_rejected_resolved = 0
+    high_conf_errors = []
+    missed_pnl = 0.0
+    calibration_buckets: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"n": 0, "wins": 0, "sum_prob": 0.0})
+
+    def _bin(p: float) -> str:
+        """10 bins: 0.0-0.1, 0.1-0.2, ..., 0.9-1.0."""
+        b = max(0, min(9, int(p * 10)))
+        return f"{b/10:.1f}-{(b+1)/10:.1f}"
+
+    for r in resolved:
+        jp = float(r["judge_prob"])
+        won = 1.0 if r["final_outcome"] == r["side"] else 0.0
+        brier_sum += (jp - won) ** 2
+        # Clip prob to avoid log(0)
+        p_safe = max(1e-6, min(1 - 1e-6, jp))
+        logloss_sum -= won * math.log(p_safe) + (1 - won) * math.log(1 - p_safe)
+
+        bucket = _bin(jp)
+        calibration_buckets[bucket]["n"] += 1
+        calibration_buckets[bucket]["sum_prob"] += jp
+        if won:
+            calibration_buckets[bucket]["wins"] += 1
+
+        if r["verdict"] in ("APPROVE", "ADJUST"):
+            n_approved_resolved += 1
+            if not won:
+                approved_lost += 1
+                if (r["confidence"] or "").lower() == "high":
+                    high_conf_errors.append({
+                        "entry_id": r["entry_id"],
+                        "market": r["market_question"],
+                        "city": r["city_resolved"],
+                        "judge_prob": jp,
+                        "side": r["side"],
+                        "outcome": r["final_outcome"],
+                        "rationale_excerpt": (r["rationale"] or "")[:400],
+                    })
+        elif r["verdict"] == "REJECT":
+            n_rejected_resolved += 1
+            if won:
+                rejected_won += 1
+                payout = float(r["payout_per_share"] or 0)
+                entry_p = float(r["entry_price"] or 0)
+                size = float(r["size_usd"] or 100)
+                shares = size / entry_p if entry_p else 0
+                missed_pnl += (payout - entry_p) * shares
+
+    n_resolved = len(resolved)
+    brier = brier_sum / n_resolved if n_resolved else None
+    logloss = logloss_sum / n_resolved if n_resolved else None
+
+    calibration_summary = {
+        b: {
+            "n": v["n"],
+            "win_rate": round(v["wins"] / v["n"], 3) if v["n"] else None,
+            "mean_judge_prob": round(v["sum_prob"] / v["n"], 3) if v["n"] else None,
+            "calibration_gap": (round(v["sum_prob"] / v["n"]
+                                       - v["wins"] / v["n"], 3)
+                                if v["n"] else None),
+        }
+        for b, v in sorted(calibration_buckets.items())
+    }
+
+    return {
+        "n_reviews": n_total,
+        "n_resolved": n_resolved,
+        "approval_rate": round(n_approve / n_total, 3),
+        "false_positive_rate": (round(approved_lost / n_approved_resolved, 3)
+                                 if n_approved_resolved else None),
+        "false_negative_rate": (round(rejected_won / n_rejected_resolved, 3)
+                                 if n_rejected_resolved else None),
+        "brier_score": round(brier, 4) if brier is not None else None,
+        "log_loss": round(logloss, 4) if logloss is not None else None,
+        "calibration_buckets": calibration_summary,
+        "n_approved_resolved": n_approved_resolved,
+        "n_rejected_resolved": n_rejected_resolved,
+        "approved_losers": approved_lost,
+        "rejected_winners": rejected_won,
+        "missed_pnl_from_rejects_usd": round(missed_pnl, 2),
+        "high_confidence_errors": high_confidence_errors_subset(high_conf_errors),
+        "interpretation": _interpret_judge_metrics(
+            brier, n_approve / n_total if n_total else 0,
+            approved_lost / n_approved_resolved if n_approved_resolved else None,
+            rejected_won / n_rejected_resolved if n_rejected_resolved else None,
+        ),
+    }
+
+
+def high_confidence_errors_subset(errors: list[dict], limit: int = 5) -> list[dict]:
+    """Return up to `limit` high-confidence APPROVE→loss cases for the advisor.
+    These are the strongest hallucination candidates."""
+    return errors[:limit]
+
+
+def _interpret_judge_metrics(brier: float | None, approval_rate: float,
+                              fpr: float | None, fnr: float | None) -> list[str]:
+    """Plain-English flags. Advisor uses these as starting hypotheses."""
+    flags = []
+    if brier is not None and brier > 0.25:
+        flags.append(f"Brier={brier:.3f} > 0.25 — judge probabilities are "
+                     "poorly calibrated; consider tightening confidence thresholds")
+    if approval_rate > 0.7:
+        flags.append(f"approval_rate={approval_rate:.0%} > 70% — judge may be "
+                     "rubber-stamping; check false_positive_rate")
+    if approval_rate < 0.2:
+        flags.append(f"approval_rate={approval_rate:.0%} < 20% — judge may be "
+                     "over-conservative; check rejected_winners + missed_pnl")
+    if fpr is not None and fpr > 0.5:
+        flags.append(f"false_positive_rate={fpr:.0%} > 50% — judge approves "
+                     "losers more often than winners; HALLUCINATION SIGNAL")
+    if fnr is not None and fnr > 0.5:
+        flags.append(f"false_negative_rate={fnr:.0%} > 50% — judge rejects "
+                     "winners more often than losers; OVER-CONSERVATIVE SIGNAL")
+    return flags
 
 
 def generate_suggestions(buckets: dict, judge: dict) -> list[str]:

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 DB_PATH = Path.home() / ".polymarket-paper" / "weather_edge.db"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 SCHEMA_V1 = """
@@ -200,6 +200,15 @@ SCHEMA_V5_MIGRATIONS = [
 ]
 
 
+# Schema v6: persist the full input context the judge saw + the raw
+# LLM response. This is what the advisor needs to diagnose judge
+# hallucination — without it we only have a 1500-char truncated rationale.
+SCHEMA_V6_MIGRATIONS = [
+    "ALTER TABLE judge_reviews ADD COLUMN input_context_json TEXT",
+    "ALTER TABLE judge_reviews ADD COLUMN raw_response_json TEXT",
+]
+
+
 def init_db(path: Path = DB_PATH) -> None:
     """Create the DB and tables if missing. Idempotent. Bumps user_version.
     Enables WAL mode so readers + writers don't block each other."""
@@ -233,6 +242,15 @@ def init_db(path: Path = DB_PATH) -> None:
             for stmt in SCHEMA_V5_MIGRATIONS:
                 cur.execute(stmt)
             current = 5
+        if current < 6:
+            for stmt in SCHEMA_V6_MIGRATIONS:
+                try:
+                    cur.execute(stmt)
+                except sqlite3.OperationalError as e:
+                    # Column may already exist if a partial migration happened.
+                    if "duplicate column name" not in str(e).lower():
+                        raise
+            current = 6
         cur.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
 

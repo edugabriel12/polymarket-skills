@@ -397,6 +397,98 @@ def compact_per_trade(per_trade: list[dict]) -> list[dict]:
     return out
 
 
+def compute_divergent_judge_samples(conn, since_iso: str,
+                                      limit: int = 10) -> list[dict]:
+    """v6: For each resolved trade where the judge's verdict and the actual
+    outcome diverge, surface the full rationale + input context so the
+    advisor can spot hallucination patterns.
+
+    Returns up to `limit` divergent cases, prioritized by:
+      1. APPROVE → loss with high confidence (worst hallucination)
+      2. REJECT → win (missed opportunity, judge over-conservative)
+      3. Other APPROVE → loss
+    """
+    rows = conn.execute(
+        "SELECT j.verdict, j.confidence, j.judge_prob, j.bot_prob, "
+        "       j.rationale, j.evidence_json, j.input_context_json, "
+        "       e.entry_id, e.market_question, e.city_resolved, "
+        "       e.entry_price, e.side, e.size_usd, "
+        "       r.final_outcome, r.payout_per_share "
+        "FROM judge_reviews j "
+        "JOIN entries e ON e.entry_id = j.entry_id "
+        "JOIN resolutions r ON r.entry_id = e.entry_id "
+        "WHERE j.ts >= ? "
+        "  AND r.final_outcome IN ('YES','NO')",
+        (since_iso,),
+    ).fetchall()
+
+    divergent = []
+    for r in rows:
+        won = r["final_outcome"] == r["side"]
+        verdict = r["verdict"]
+        is_approve = verdict in ("APPROVE", "ADJUST")
+        is_reject = verdict == "REJECT"
+        diverged = (is_approve and not won) or (is_reject and won)
+        if not diverged:
+            continue
+
+        # Priority: 0 = high-conf APPROVE→loss, 1 = REJECT→win, 2 = other APPROVE→loss
+        conf = (r["confidence"] or "").lower()
+        if is_approve and not won and conf == "high":
+            priority = 0
+        elif is_reject and won:
+            priority = 1
+        else:
+            priority = 2
+
+        # Compute hypothetical PnL impact (signed: negative for our loss)
+        entry_p = float(r["entry_price"] or 0)
+        size = float(r["size_usd"] or 100)
+        shares = size / entry_p if entry_p else 0
+        payout = float(r["payout_per_share"] or 0)
+        if is_approve and not won:
+            # We took the bet and lost
+            pnl_impact = -size
+        elif is_reject and won:
+            # We didn't take a winning bet
+            pnl_impact = (payout - entry_p) * shares
+        else:
+            pnl_impact = 0
+
+        divergent.append({
+            "entry_id": r["entry_id"],
+            "priority": priority,
+            "pattern": ("approve_lost" if is_approve and not won
+                        else "rejected_won"),
+            "market": r["market_question"],
+            "city": r["city_resolved"],
+            "side": r["side"],
+            "outcome": r["final_outcome"],
+            "verdict": verdict,
+            "judge_confidence": r["confidence"],
+            "judge_prob": _r(r["judge_prob"], 3),
+            "bot_prob": _r(r["bot_prob"], 3),
+            "entry_price": _r(r["entry_price"], 3),
+            "pnl_impact_usd": round(pnl_impact, 2),
+            "rationale": r["rationale"] or "",
+            "evidence_summary": _try_json(r["evidence_json"]),
+            "input_context": _try_json(r["input_context_json"]),
+        })
+
+    # Sort by priority then by abs pnl impact
+    divergent.sort(key=lambda d: (d["priority"], -abs(d["pnl_impact_usd"])))
+    return divergent[:limit]
+
+
+def _try_json(s):
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
 def _r(v, digits: int):
     if v is None:
         return None

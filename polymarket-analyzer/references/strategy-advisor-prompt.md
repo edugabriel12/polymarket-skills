@@ -239,6 +239,80 @@ and variance in 30-50 trades is high.
 When the simulated improvement is negative (alternative loses vs baseline),
 do NOT suggest the change.
 
+## Judge accuracy + hallucination diagnosis (Advisor v6)
+
+You also receive two payload fields that let you assess the gatekeeper
+judge's behavior:
+
+### `judge_accuracy`
+
+```json
+{
+  "n_reviews": 47,
+  "n_resolved": 38,
+  "approval_rate": 0.62,
+  "false_positive_rate": 0.41,   // approved trades that lost
+  "false_negative_rate": 0.18,   // rejected trades that would have won
+  "brier_score": 0.21,
+  "log_loss": 0.58,
+  "calibration_buckets": {
+    "0.7-0.8": {"n": 12, "win_rate": 0.66, "mean_judge_prob": 0.74,
+                 "calibration_gap": 0.08},
+    ...
+  },
+  "approved_losers": 9,
+  "rejected_winners": 3,
+  "missed_pnl_from_rejects_usd": 87.50,
+  "high_confidence_errors": [   // top 5 worst cases
+    {"entry_id": 142, "judge_prob": 0.85, "outcome": "NO", "side": "YES",
+     "rationale_excerpt": "..."}
+  ],
+  "interpretation": [
+    "false_positive_rate=41% > 50% — judge approves losers more often..."
+  ]
+}
+```
+
+### `divergent_judge_samples`
+
+Up to 10 trades where the judge's verdict and the actual outcome
+diverged. Each entry contains the FULL judge rationale, the evidence
+the judge cited, and the original input context (forecast snapshot,
+market, bot proposal). Use these to spot specific failure modes.
+
+Priority order: high-confidence APPROVE→loss first, then REJECT→win,
+then other APPROVE→loss.
+
+### How to use these signals
+
+1. **Always read `judge_accuracy.interpretation` first.** These are
+   pre-computed flags; treat them as starting hypotheses, not conclusions.
+
+2. **Cross-check with `calibration_buckets`.** A judge with mean_prob=0.80
+   should win ~80% of bets in that bucket. If `calibration_gap` exceeds
+   ±0.15 in multiple buckets, calibration is broken.
+
+3. **Inspect `divergent_judge_samples` rationales** for hallucination
+   patterns:
+   - Citing temperature values that don't match `input_context.bot_proposal.openweather_forecast`
+   - Confident assertions that contradict the input data
+   - Repeating the same boilerplate rationale across different markets
+   - Over-weighting irrelevant factors (e.g., past day's weather instead of forecast)
+
+4. **When suggesting `judge_prompt` changes**, you MUST cite at least
+   2 specific `entry_id`s from `divergent_judge_samples` and quote
+   exact rationale text. Generic suggestions ("be more careful") are
+   rejected.
+
+5. **Severity tiers for judge-related suggestions**:
+   - `priority: high` only when `false_positive_rate > 50%` AND
+     `n_approved_resolved >= 10` (enough data)
+   - `priority: medium` when calibration_gap > 0.15 in 3+ buckets
+   - `priority: low` for individual divergent cases without a pattern
+
+6. **Do not propose changes if `n_resolved < 10`** — the metrics are
+   too noisy. Note the limitation in `research_notes` instead.
+
 ## Process
 
 1. Read the user message — it contains: aggregate analyzer report (markdown),

@@ -264,6 +264,13 @@ def call_claude(entry_row: dict, evidence: dict, system_prompt: str) -> Optional
         (usage.cache_read_input_tokens or 0) * pricing["cache_read"] / 1_000_000
     )
 
+    # Capture any thinking/reasoning blocks for the audit trail.
+    thinking_blocks = []
+    for b in response.content:
+        if getattr(b, "type", None) == "thinking":
+            thinking_blocks.append(getattr(b, "thinking", "")
+                                    or getattr(b, "text", ""))
+
     parsed["_meta"] = {
         "tokens_in": usage.input_tokens,
         "tokens_out": usage.output_tokens,
@@ -271,6 +278,13 @@ def call_claude(entry_row: dict, evidence: dict, system_prompt: str) -> Optional
         "cost_usd": cost,
         "duration_ms": duration_ms,
         "model": DEFAULT_MODEL,
+        # v6: persist the full context for hallucination diagnosis.
+        "input_context_json": user_content,
+        "raw_response_json": json.dumps({
+            "structured_output": parsed,
+            "thinking_blocks": thinking_blocks,
+            "stop_reason": response.stop_reason,
+        }, ensure_ascii=False),
     }
     return parsed
 
@@ -343,7 +357,9 @@ def apply_verdict(conn, entry_row, verdict: dict) -> None:
         judge_prob=judge_prob,
         bot_prob=bot_prob,
         prob_delta=judge_prob - bot_prob,
-        rationale=verdict["rationale"][:1500],
+        # v6: store full rationale (was truncated to 1500 chars). The
+        # advisor needs the full text to diagnose hallucination patterns.
+        rationale=verdict["rationale"],
         evidence_json=verdict.get("evidence_summary", {}),
         adjusted_side=verdict.get("adjusted_side"),
         adjusted_size_usd=verdict.get("adjusted_size_usd"),
@@ -353,6 +369,9 @@ def apply_verdict(conn, entry_row, verdict: dict) -> None:
         cache_read_tokens=meta.get("cache_read_tokens"),
         cost_usd=meta.get("cost_usd"),
         duration_ms=meta.get("duration_ms"),
+        # v6: full input + raw response for accuracy / hallucination audit.
+        input_context_json=meta.get("input_context_json"),
+        raw_response_json=meta.get("raw_response_json"),
     )
 
     new_status = {"APPROVE": "APPROVED",
