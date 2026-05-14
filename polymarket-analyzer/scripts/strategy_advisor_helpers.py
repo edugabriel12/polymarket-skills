@@ -185,6 +185,227 @@ def _city_performance(conn, since_iso: str) -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Per-trade classification + aggregation (Advisor v2)
+# ---------------------------------------------------------------------------
+
+
+def classify_trade(row: dict) -> dict:
+    """Given a per-trade row from query_per_trade_details, derive:
+      - exit_strategy: how the position ended (profit_lock, trailing_stop,
+        convergence, forecast_reversal, hold_to_resolution, still_open)
+      - outcome_class: winner/loser realization (winner_realized,
+        winner_resolved, loser_realized, loser_resolved, void, open,
+        breakeven)
+    """
+    cashout_id = row.get("cashout_id")
+    final_outcome = row.get("final_outcome")
+    side = row.get("side")
+
+    # Exit strategy
+    if cashout_id is not None:
+        reason = row.get("exit_decision_reason") or ""
+        trigger = reason.split(":", 1)[0].strip() if ":" in reason else "unknown"
+        if trigger not in ("profit_lock", "trailing_stop", "convergence",
+                            "forecast_reversal"):
+            trigger = "cashout_other" if trigger else "cashout_unknown"
+        exit_strategy = trigger
+    elif final_outcome is not None:
+        exit_strategy = "hold_to_resolution"
+    else:
+        exit_strategy = "still_open"
+
+    # Outcome
+    if cashout_id is not None:
+        pnl = row.get("realized_pnl_usd") or 0
+        if pnl > 0.001:
+            outcome_class = "winner_realized"
+        elif pnl < -0.001:
+            outcome_class = "loser_realized"
+        else:
+            outcome_class = "breakeven"
+    elif final_outcome == "VOID":
+        outcome_class = "void"
+    elif final_outcome is not None:
+        won = (
+            (side == "YES" and final_outcome == "YES")
+            or (side == "NO" and final_outcome == "NO")
+        )
+        outcome_class = "winner_resolved" if won else "loser_resolved"
+    else:
+        outcome_class = "open"
+
+    return {"exit_strategy": exit_strategy, "outcome_class": outcome_class}
+
+
+def _resolved_pnl(row: dict) -> Optional[float]:
+    """Effective realized P&L: cashout amount, or holding payout-based P&L
+    for resolved positions, or None if still open."""
+    if row.get("cashout_id") is not None:
+        return float(row.get("realized_pnl_usd") or 0)
+    if row.get("final_outcome") in ("YES", "NO", "VOID"):
+        payout = row.get("payout_per_share")
+        if payout is None:
+            return None
+        shares = float(row.get("size_shares") or 0)
+        cost = float(row.get("size_usd") or 0)
+        return round(float(payout) * shares - cost, 4)
+    return None
+
+
+def compute_strategy_breakdown(per_trade: list[dict]) -> list[dict]:
+    """Aggregate per-trade rows by exit_strategy. Skips strategies with
+    fewer than 1 sample. Returns list of dicts:
+      [{strategy, n_trades, n_resolved, n_wins, win_rate,
+        total_pnl_usd, mean_pnl_usd}, ...]
+    Sorted by n_trades desc.
+    """
+    bucket: dict[str, dict] = defaultdict(lambda: {
+        "n_trades": 0, "n_resolved": 0, "n_wins": 0,
+        "total_pnl_usd": 0.0,
+    })
+    for t in per_trade:
+        cls = t.get("_classification") or classify_trade(t)
+        strat = cls["exit_strategy"]
+        outcome = cls["outcome_class"]
+        b = bucket[strat]
+        b["n_trades"] += 1
+        if outcome in ("winner_realized", "winner_resolved",
+                       "loser_realized", "loser_resolved", "breakeven"):
+            b["n_resolved"] += 1
+            if outcome.startswith("winner"):
+                b["n_wins"] += 1
+            pnl = _resolved_pnl(t)
+            if pnl is not None:
+                b["total_pnl_usd"] += pnl
+
+    out = []
+    for strat, b in bucket.items():
+        n_res = b["n_resolved"]
+        out.append({
+            "strategy": strat,
+            "n_trades": b["n_trades"],
+            "n_resolved": n_res,
+            "n_wins": b["n_wins"],
+            "win_rate": round(b["n_wins"] / n_res, 3) if n_res > 0 else None,
+            "total_pnl_usd": round(b["total_pnl_usd"], 2),
+            "mean_pnl_usd": (round(b["total_pnl_usd"] / n_res, 2)
+                             if n_res > 0 else None),
+        })
+    out.sort(key=lambda r: -r["n_trades"])
+    return out
+
+
+def compute_winner_loser_patterns(per_trade: list[dict]) -> dict:
+    """Extract distributional features separately for winners and losers.
+    Returns {winners: {...}, losers: {...}} where each side has:
+      n, by_city (top 5), by_side, by_edge_bucket, by_ttr_bucket,
+      by_judge_verdict, by_exit_strategy, mean_parser_confidence.
+    """
+    def _summarize(group: list[dict]) -> dict:
+        if not group:
+            return {"n": 0}
+        by_city: dict[str, int] = defaultdict(int)
+        by_side: dict[str, int] = defaultdict(int)
+        by_edge: dict[str, int] = defaultdict(int)
+        by_ttr: dict[str, int] = defaultdict(int)
+        by_judge: dict[str, int] = defaultdict(int)
+        by_strat: dict[str, int] = defaultdict(int)
+        parser_confs: list[float] = []
+        for t in group:
+            city = (t.get("city_resolved") or "?")
+            by_city[city] += 1
+            by_side[t.get("side") or "?"] += 1
+            edge = float(t.get("edge_pp_at_entry") or 0)
+            if edge < 10:
+                by_edge["<10pp"] += 1
+            elif edge < 25:
+                by_edge["10-25pp"] += 1
+            elif edge < 50:
+                by_edge["25-50pp"] += 1
+            else:
+                by_edge["50+pp"] += 1
+            ttr = float(t.get("ttr_hours_at_entry") or 0)
+            if ttr < 6:
+                by_ttr["<6h"] += 1
+            elif ttr < 24:
+                by_ttr["6-24h"] += 1
+            elif ttr < 48:
+                by_ttr["24-48h"] += 1
+            else:
+                by_ttr[">48h"] += 1
+            by_judge[t.get("judge_verdict") or "no_judge"] += 1
+            cls = t.get("_classification") or classify_trade(t)
+            by_strat[cls["exit_strategy"]] += 1
+            pc = t.get("parser_confidence")
+            if pc is not None:
+                parser_confs.append(float(pc))
+        top_cities = sorted(by_city.items(), key=lambda kv: -kv[1])[:5]
+        return {
+            "n": len(group),
+            "by_city_top5": dict(top_cities),
+            "by_side": dict(by_side),
+            "by_edge_bucket": dict(by_edge),
+            "by_ttr_bucket": dict(by_ttr),
+            "by_judge_verdict": dict(by_judge),
+            "by_exit_strategy": dict(by_strat),
+            "mean_parser_confidence": (
+                round(sum(parser_confs) / len(parser_confs), 3)
+                if parser_confs else None
+            ),
+        }
+
+    winners = []
+    losers = []
+    for t in per_trade:
+        cls = t.get("_classification") or classify_trade(t)
+        oc = cls["outcome_class"]
+        if oc in ("winner_realized", "winner_resolved"):
+            winners.append(t)
+        elif oc in ("loser_realized", "loser_resolved"):
+            losers.append(t)
+    return {"winners": _summarize(winners), "losers": _summarize(losers)}
+
+
+def compact_per_trade(per_trade: list[dict]) -> list[dict]:
+    """Return compact per-trade rows for the LLM payload (one ~150-token
+    dict each). Strips long fields; adds classification."""
+    out = []
+    for t in per_trade:
+        cls = classify_trade(t)
+        out.append({
+            "id": t.get("entry_id"),
+            "ts": (t.get("ts") or "")[:16],
+            "city": t.get("city_resolved"),
+            "side": t.get("side"),
+            "entry_price": _r(t.get("entry_price"), 3),
+            "size_usd": _r(t.get("size_usd"), 2),
+            "edge_pp": _r(t.get("edge_pp_at_entry"), 1),
+            "ttr_h": _r(t.get("ttr_hours_at_entry"), 1),
+            "forecast_prob_at_entry": _r(t.get("forecast_prob_at_entry"), 3),
+            "parser_confidence": _r(t.get("parser_confidence"), 2),
+            "judge_verdict": t.get("judge_verdict"),
+            "judge_prob": _r(t.get("judge_prob"), 3),
+            "judge_confidence": _r(t.get("judge_confidence"), 2),
+            "exit_strategy": cls["exit_strategy"],
+            "exit_price": _r(t.get("exit_price"), 3),
+            "realized_pnl_usd": _r(t.get("realized_pnl_usd"), 2),
+            "final_outcome": t.get("final_outcome"),
+            "counterfactual_delta_usd": _r(t.get("counterfactual_delta_usd"), 2),
+            "outcome_class": cls["outcome_class"],
+        })
+    return out
+
+
+def _r(v, digits: int):
+    if v is None:
+        return None
+    try:
+        return round(float(v), digits)
+    except (TypeError, ValueError):
+        return None
+
+
 def read_current_config() -> dict:
     """Parse current CLI defaults + MAE constants + city count from source.
     Used by the advisor to know what's currently configured."""
@@ -312,6 +533,52 @@ def _format_markdown(payload: dict, since_iso: str, analyzer_md: str) -> str:
             for cit in s["web_citations"]:
                 out.append(f"  - <{cit.get('url', '')}> — {cit.get('snippet', '')}")
         out.append("")
+
+    # === Advisor v2 sections ===
+    strategy_breakdown = payload.get("strategy_breakdown") or []
+    if strategy_breakdown:
+        out.append("## Strategy Breakdown")
+        out.append("")
+        out.append("| Strategy | N | Win rate | Total P&L | Mean P&L | Notes |")
+        out.append("|---|---|---|---|---|---|")
+        for s in strategy_breakdown:
+            wr = s.get("win_rate")
+            wr_s = f"{wr*100:.0f}%" if wr is not None else "—"
+            mean = s.get("mean_pnl_usd")
+            mean_s = f"${mean:+.2f}" if mean is not None else "—"
+            total = s.get("total_pnl_usd", 0)
+            out.append(
+                f"| `{s.get('strategy', '?')}` | {s.get('n_trades', 0)} | "
+                f"{wr_s} | ${total:+.2f} | {mean_s} | "
+                f"{s.get('notes', '')} |"
+            )
+        out.append("")
+
+    if payload.get("winner_patterns"):
+        out.append("## What winners had in common")
+        out.append("")
+        out.append(payload["winner_patterns"])
+        out.append("")
+
+    if payload.get("loser_patterns"):
+        out.append("## What losers had in common")
+        out.append("")
+        out.append(payload["loser_patterns"])
+        out.append("")
+
+    insights = payload.get("insights") or []
+    if insights:
+        out.append("## Key Insights")
+        out.append("")
+        for i, ins in enumerate(insights, 1):
+            out.append(f"### {i}. {ins.get('title', '(no title)')}")
+            out.append("")
+            out.append(f"- **Category**: `{ins.get('applies_to_category', '?')}`")
+            out.append(f"- **Supporting trades**: "
+                       f"{ins.get('n_supporting_trades', 0)} "
+                       f"({', '.join(f'#{i}' for i in (ins.get('supporting_trade_ids') or [])[:10])})")
+            out.append(f"- **Observation**: {ins.get('observation', '')}")
+            out.append("")
 
     if payload.get("research_notes"):
         out.append("## Research Notes")
@@ -448,5 +715,140 @@ if __name__ == "__main__":
     assert json_payload["suggestions"][0]["title"] == "Lower profit-lock-pp"
     print(f"Test 6 PASS: write_advisor_report — wrote {md_p.name}, "
           f"{len(md_text)} chars md, {len(json_p.read_text())} chars json")
+
+    # === Per-trade classification + breakdown tests (Advisor v2) ===
+    sample = [
+        # 1. profit_lock winner
+        {"entry_id": 1, "side": "NO", "size_usd": 30, "size_shares": 100,
+         "city_resolved": "Tokyo", "edge_pp_at_entry": 28,
+         "ttr_hours_at_entry": 10, "parser_confidence": 1.0,
+         "judge_verdict": "APPROVE",
+         "cashout_id": 1, "realized_pnl_usd": 12.5,
+         "exit_decision_reason": "profit_lock: bid 0.65 >= entry+50pp",
+         "final_outcome": None, "payout_per_share": None},
+        # 2. trailing_stop loser
+        {"entry_id": 2, "side": "NO", "size_usd": 30, "size_shares": 100,
+         "city_resolved": "Manhattan", "edge_pp_at_entry": 22,
+         "ttr_hours_at_entry": 5, "parser_confidence": 0.6,
+         "judge_verdict": "ADJUST",
+         "cashout_id": 2, "realized_pnl_usd": -3.2,
+         "exit_decision_reason": "trailing_stop: bid 0.34 <= peak*0.70",
+         "final_outcome": None, "payout_per_share": None},
+        # 3. convergence winner
+        {"entry_id": 3, "side": "YES", "size_usd": 25, "size_shares": 80,
+         "city_resolved": "Tokyo", "edge_pp_at_entry": 35,
+         "ttr_hours_at_entry": 22, "parser_confidence": 0.95,
+         "judge_verdict": "APPROVE",
+         "cashout_id": 3, "realized_pnl_usd": 8.0,
+         "exit_decision_reason": "convergence: bid within 5pp of fair",
+         "final_outcome": None, "payout_per_share": None},
+        # 4. hold_to_resolution winner
+        {"entry_id": 4, "side": "NO", "size_usd": 40, "size_shares": 200,
+         "city_resolved": "Paris", "edge_pp_at_entry": 60,
+         "ttr_hours_at_entry": 40, "parser_confidence": 1.0,
+         "judge_verdict": "APPROVE",
+         "cashout_id": None, "realized_pnl_usd": None,
+         "exit_decision_reason": None,
+         "final_outcome": "NO", "payout_per_share": 1.0},
+        # 5. hold_to_resolution loser
+        {"entry_id": 5, "side": "NO", "size_usd": 35, "size_shares": 150,
+         "city_resolved": "Manhattan", "edge_pp_at_entry": 18,
+         "ttr_hours_at_entry": 32, "parser_confidence": 0.7,
+         "judge_verdict": "APPROVE",
+         "cashout_id": None, "realized_pnl_usd": None,
+         "exit_decision_reason": None,
+         "final_outcome": "YES", "payout_per_share": 0.0},
+        # 6. forecast_reversal breakeven
+        {"entry_id": 6, "side": "YES", "size_usd": 20, "size_shares": 70,
+         "city_resolved": "London", "edge_pp_at_entry": 15,
+         "ttr_hours_at_entry": 8, "parser_confidence": 0.85,
+         "judge_verdict": "ADJUST",
+         "cashout_id": 6, "realized_pnl_usd": 0.0,
+         "exit_decision_reason": "forecast_reversal: forecast P(YES) below entry",
+         "final_outcome": None, "payout_per_share": None},
+        # 7. still_open
+        {"entry_id": 7, "side": "NO", "size_usd": 30, "size_shares": 90,
+         "city_resolved": "Tokyo", "edge_pp_at_entry": 30,
+         "ttr_hours_at_entry": 18, "parser_confidence": 1.0,
+         "judge_verdict": "APPROVE",
+         "cashout_id": None, "realized_pnl_usd": None,
+         "exit_decision_reason": None,
+         "final_outcome": None, "payout_per_share": None},
+        # 8. VOID
+        {"entry_id": 8, "side": "YES", "size_usd": 15, "size_shares": 50,
+         "city_resolved": "Berlin", "edge_pp_at_entry": 12,
+         "ttr_hours_at_entry": 50, "parser_confidence": 0.9,
+         "judge_verdict": "APPROVE",
+         "cashout_id": None, "realized_pnl_usd": None,
+         "exit_decision_reason": None,
+         "final_outcome": "VOID", "payout_per_share": 0.5},
+    ]
+
+    # classify_trade
+    cls_map = {t["entry_id"]: classify_trade(t) for t in sample}
+    assert cls_map[1] == {"exit_strategy": "profit_lock",
+                          "outcome_class": "winner_realized"}, cls_map[1]
+    assert cls_map[2] == {"exit_strategy": "trailing_stop",
+                          "outcome_class": "loser_realized"}, cls_map[2]
+    assert cls_map[3] == {"exit_strategy": "convergence",
+                          "outcome_class": "winner_realized"}, cls_map[3]
+    assert cls_map[4] == {"exit_strategy": "hold_to_resolution",
+                          "outcome_class": "winner_resolved"}, cls_map[4]
+    assert cls_map[5] == {"exit_strategy": "hold_to_resolution",
+                          "outcome_class": "loser_resolved"}, cls_map[5]
+    assert cls_map[6]["exit_strategy"] == "forecast_reversal"
+    assert cls_map[6]["outcome_class"] == "breakeven"
+    assert cls_map[7] == {"exit_strategy": "still_open",
+                          "outcome_class": "open"}, cls_map[7]
+    assert cls_map[8]["outcome_class"] == "void", cls_map[8]
+    print("Per-trade Test 1 PASS: classify_trade — 8 scenarios")
+
+    # compute_strategy_breakdown
+    sb = compute_strategy_breakdown(sample)
+    by_strat = {r["strategy"]: r for r in sb}
+    assert by_strat["profit_lock"]["n_trades"] == 1
+    assert by_strat["profit_lock"]["n_wins"] == 1
+    assert by_strat["profit_lock"]["win_rate"] == 1.0
+    assert by_strat["trailing_stop"]["n_wins"] == 0
+    # entries 4 (winner_resolved) + 5 (loser_resolved) + 8 (void) → 3 hold_to_resolution
+    assert by_strat["hold_to_resolution"]["n_trades"] == 3
+    assert by_strat["hold_to_resolution"]["n_wins"] == 1
+    # n_resolved counts only outcomes that are W/L/breakeven (excludes void)
+    assert by_strat["hold_to_resolution"]["n_resolved"] == 2
+    assert by_strat["hold_to_resolution"]["win_rate"] == 0.5
+    assert by_strat["still_open"]["n_resolved"] == 0
+    print(f"Per-trade Test 2 PASS: compute_strategy_breakdown — "
+          f"{len(sb)} strategies, hold win_rate "
+          f"{by_strat['hold_to_resolution']['win_rate']}")
+
+    # compute_winner_loser_patterns
+    wl = compute_winner_loser_patterns(sample)
+    assert wl["winners"]["n"] == 3  # entries 1, 3, 4
+    assert wl["losers"]["n"] == 2   # entries 2, 5
+    # Manhattan should be heavily represented in losers (2 of 2)
+    assert wl["losers"]["by_city_top5"].get("Manhattan") == 2, wl["losers"]
+    # Winners had high parser_confidence avg
+    assert wl["winners"]["mean_parser_confidence"] is not None
+    assert wl["winners"]["mean_parser_confidence"] > 0.9
+    print(f"Per-trade Test 3 PASS: winner_loser_patterns — "
+          f"winners n={wl['winners']['n']}, losers n={wl['losers']['n']}, "
+          f"Manhattan in losers: {wl['losers']['by_city_top5']['Manhattan']}/2")
+
+    # _resolved_pnl
+    assert _resolved_pnl(sample[0]) == 12.5  # cashout
+    assert _resolved_pnl(sample[3]) == 1.0 * 200 - 40  # hold winner: 200-40=160
+    assert _resolved_pnl(sample[3]) == 160.0
+    assert _resolved_pnl(sample[4]) == 0.0 * 150 - 35  # hold loser: -35
+    assert _resolved_pnl(sample[4]) == -35.0
+    assert _resolved_pnl(sample[6]) is None  # still open
+    print("Per-trade Test 4 PASS: _resolved_pnl")
+
+    # compact_per_trade
+    compact = compact_per_trade(sample)
+    assert len(compact) == 8
+    assert compact[0]["exit_strategy"] == "profit_lock"
+    assert compact[0]["outcome_class"] == "winner_realized"
+    print(f"Per-trade Test 5 PASS: compact_per_trade — {len(compact)} rows, "
+          f"first.exit_strategy={compact[0]['exit_strategy']}")
 
     print("\nAll strategy_advisor_helpers tests PASS")

@@ -348,6 +348,45 @@ def query_unresolved_past_end(conn, now_iso: str) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def query_per_trade_details(conn, since_iso: str,
+                             limit: int = 200) -> list[sqlite3.Row]:
+    """One row per executed entry in the time window, joining all related
+    tables and pulling the final monitor_check's decision_reason so the
+    caller can classify the exit_strategy (profit_lock / trailing_stop /
+    convergence / forecast_reversal / hold_to_resolution / still_open).
+
+    Used by weather_strategy_advisor to feed per-trade data to Claude for
+    winner/loser pattern analysis.
+    """
+    return conn.execute(
+        "SELECT "
+        "  e.entry_id, e.ts, e.city_resolved, e.side, e.entry_price, "
+        "  e.size_usd, e.size_shares, e.edge_pp_at_entry, "
+        "  e.ttr_hours_at_entry, e.forecast_prob_at_entry, "
+        "  e.parser_confidence, e.status, e.market_slug, "
+        "  j.verdict AS judge_verdict, j.judge_prob, "
+        "  j.confidence AS judge_confidence, "
+        "  SUBSTR(j.rationale, 1, 200) AS judge_rationale_short, "
+        "  c.cashout_id, c.exit_price, c.realized_pnl_usd, "
+        "  c.ts AS cashout_ts, "
+        "  r.final_outcome, r.payout_per_share, r.observed_value, "
+        "  cf.delta AS counterfactual_delta_usd, "
+        "  cf.hypothetical_hold_pnl AS hold_pnl_usd, "
+        "  (SELECT m.decision_reason FROM monitor_checks m "
+        "   WHERE m.entry_id = e.entry_id AND m.decision='CASHOUT' "
+        "   ORDER BY m.ts DESC LIMIT 1) AS exit_decision_reason "
+        "FROM entries e "
+        "LEFT JOIN judge_reviews j ON j.entry_id = e.entry_id "
+        "LEFT JOIN cashouts c       ON c.entry_id = e.entry_id "
+        "LEFT JOIN resolutions r    ON r.entry_id = e.entry_id "
+        "LEFT JOIN counterfactuals cf ON cf.entry_id = e.entry_id "
+        "WHERE e.status IN ('EXECUTED', 'FAST_PATH') "
+        "  AND e.ts >= ? "
+        "ORDER BY e.ts DESC LIMIT ?",
+        (since_iso, limit),
+    ).fetchall()
+
+
 def query_for_counterfactual(conn) -> list[sqlite3.Row]:
     """Entries with both a cashout AND a resolution (ready for delta)."""
     return conn.execute(

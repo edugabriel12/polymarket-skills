@@ -137,9 +137,54 @@ _SUGGESTIONS_SCHEMA = {
             },
         },
         "research_notes": {"type": "string"},
+        # === Advisor v2: per-trade analysis ===
+        "strategy_breakdown": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "strategy": {"type": "string"},
+                    "n_trades": {"type": "integer"},
+                    "win_rate": {"type": ["number", "null"]},
+                    "total_pnl_usd": {"type": "number"},
+                    "mean_pnl_usd": {"type": ["number", "null"]},
+                    "notes": {"type": "string"},
+                },
+                "required": ["strategy", "n_trades", "notes"],
+            },
+        },
+        "winner_patterns": {"type": "string"},
+        "loser_patterns": {"type": "string"},
+        "insights": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "title": {"type": "string"},
+                    "observation": {"type": "string"},
+                    "applies_to_category": {
+                        "type": "string",
+                        "enum": ["threshold", "mae_constant", "city",
+                                 "judge_prompt", "data_source",
+                                 "risk_limit", "operational"],
+                    },
+                    "n_supporting_trades": {"type": "integer"},
+                    "supporting_trade_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                    },
+                },
+                "required": ["title", "observation",
+                             "applies_to_category",
+                             "n_supporting_trades"],
+            },
+        },
     },
     "required": ["n_trades_analyzed", "summary", "suggestions",
-                 "research_notes"],
+                 "research_notes", "strategy_breakdown",
+                 "winner_patterns", "loser_patterns", "insights"],
 }
 
 
@@ -237,11 +282,30 @@ def call_advisor_llm(system_prompt: str, user_payload: dict,
 
 
 def _mock_llm_response(n_trades: int) -> dict:
-    """Deterministic mock for testing without API call."""
+    """Deterministic mock for testing without API call (Advisor v2 shape)."""
     return {
         "n_trades_analyzed": n_trades,
-        "summary": ("MOCK RESPONSE — synthetic suggestions for testing. "
+        "summary": ("MOCK RESPONSE — synthetic per-trade analysis for testing. "
                     "Production prompt would analyze the data."),
+        "strategy_breakdown": [
+            {"strategy": "profit_lock", "n_trades": 5,
+             "win_rate": 1.0, "total_pnl_usd": 50.0, "mean_pnl_usd": 10.0,
+             "notes": "MOCK: all profit_lock exits profitable."},
+            {"strategy": "trailing_stop", "n_trades": 3,
+             "win_rate": 0.0, "total_pnl_usd": -8.0, "mean_pnl_usd": -2.67,
+             "notes": "MOCK: trailing fires too early."},
+        ],
+        "winner_patterns": ("MOCK: winners had parser_confidence > 0.9, "
+                            "edge > 30pp, TTR < 24h."),
+        "loser_patterns": ("MOCK: losers concentrated in Manhattan/parser "
+                           "confidence < 0.8, often exited via trailing_stop."),
+        "insights": [{
+            "title": "MOCK: tighten trailing_drawdown_pct",
+            "observation": "MOCK observation referencing trades.",
+            "applies_to_category": "threshold",
+            "n_supporting_trades": 5,
+            "supporting_trade_ids": [1, 2, 3, 4, 5],
+        }],
         "suggestions": [{
             "id": "sug_mock_001",
             "category": "threshold",
@@ -253,7 +317,7 @@ def _mock_llm_response(n_trades: int) -> dict:
             "current_value": 50.0,
             "proposed_value": 40.0,
             "param_path": "weather_edge_bot.py:--profit-lock-pp default",
-            "supporting_data": {"n_samples": 10, "mock": True},
+            "supporting_data": "{\"n_samples\": 10, \"mock\": true}",
             "web_citations": [],
         }],
         "research_notes": "MOCK: replace with real LLM output in production.",
@@ -267,8 +331,13 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--once", action="store_true",
                    help="Run a single cycle and exit (default true).")
-    p.add_argument("--since-days", type=int, default=14,
-                   help="Lookback window in days (default 14).")
+    p.add_argument("--since-days", type=int, default=30,
+                   help="Lookback window in days (default 30). Advisor v2 "
+                        "analyzes per-trade detail across this entire window.")
+    p.add_argument("--per-trade-limit", type=int, default=200,
+                   help="Max per-trade rows sent to the LLM (default 200). "
+                        "Caps token cost at ~30K input. Most recent trades "
+                        "are kept when over the cap.")
     p.add_argument("--dry-run", action="store_true",
                    help="Print what would be sent to API; do not call.")
     p.add_argument("--mock-llm", action="store_true",
@@ -320,6 +389,18 @@ def main() -> int:
         analyzer_md = format_report_md(buckets, judge, [], since_iso, triggers)
         current_config = helpers.read_current_config()
 
+        # Per-trade detail (Advisor v2): one row per executed entry with
+        # entry/judge/exit/resolution/counterfactual fields, classified by
+        # exit_strategy and outcome_class.
+        per_trade_rows = [dict(r) for r in db.query_per_trade_details(
+            conn, since_iso, limit=args.per_trade_limit)]
+        # Pre-classify so subsequent steps see _classification cached
+        for t in per_trade_rows:
+            t["_classification"] = helpers.classify_trade(t)
+        per_trade_sample = helpers.compact_per_trade(per_trade_rows)
+        strategy_breakdown = helpers.compute_strategy_breakdown(per_trade_rows)
+        winner_loser = helpers.compute_winner_loser_patterns(per_trade_rows)
+
         # Count trades analyzed
         n_trades = conn.execute(
             "SELECT COUNT(*) FROM entries WHERE ts >= ? AND status IN "
@@ -334,6 +415,12 @@ def main() -> int:
             "analyzer_report_md": analyzer_md,
             "extras": extras,
             "current_config": current_config,
+            # Advisor v2: per-trade payload
+            "per_trade_sample": per_trade_sample,
+            "per_trade_count_returned": len(per_trade_sample),
+            "per_trade_limit_applied": args.per_trade_limit,
+            "strategy_breakdown_precomputed": strategy_breakdown,
+            "winner_loser_patterns_precomputed": winner_loser,
         }
 
         if args.dry_run:

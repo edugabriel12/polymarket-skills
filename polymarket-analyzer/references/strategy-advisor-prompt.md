@@ -103,6 +103,97 @@ content.
 `"supporting_data": "{\"n_samples\": 15, \"mean_pnl\": 8.2}"`. This avoids
 Anthropic API rejection of objects with arbitrary additional properties.
 
+## Per-trade analysis (REQUIRED — Advisor v2)
+
+You receive `per_trade_sample`: up to 200 individual executed trades from
+the analysis window (default 30 days), each with these fields:
+
+- `id`, `ts`, `city`, `side`, `entry_price`, `size_usd`
+- `edge_pp`, `ttr_h`, `forecast_prob_at_entry`, `parser_confidence`
+- `judge_verdict` (APPROVE/REJECT/ADJUST), `judge_prob`, `judge_confidence`
+- `exit_strategy` (one of: profit_lock, trailing_stop, convergence,
+  forecast_reversal, hold_to_resolution, still_open, cashout_other,
+  cashout_unknown)
+- `exit_price`, `realized_pnl_usd`, `final_outcome`,
+  `counterfactual_delta_usd`
+- `outcome_class` (winner_realized | winner_resolved | loser_realized |
+  loser_resolved | breakeven | void | open)
+
+You also receive precomputed `strategy_breakdown_precomputed` and
+`winner_loser_patterns_precomputed` as starting points — verify them
+against the raw `per_trade_sample` and refine if needed.
+
+**Required output fields (top-level, in addition to suggestions[]):**
+
+### `strategy_breakdown` (array)
+
+One entry per exit_strategy that appears 3+ times in the sample. Each:
+
+```json
+{
+  "strategy": "profit_lock",
+  "n_trades": 12,
+  "win_rate": 0.83,           // null if n_resolved == 0
+  "total_pnl_usd": 142.30,
+  "mean_pnl_usd": 11.86,      // null if n_resolved == 0
+  "notes": "Saídas em 50pp consistentemente lucrativas. Considere tightening (35pp) baseado em counterfactual médio de +$8 nos peaks pós-exit."
+}
+```
+
+`notes` must reference concrete numbers from the sample, not vague language.
+
+### `winner_patterns` (string, 2-4 sentences)
+
+Quantitative description of what winning trades had in common. Examples
+of good output:
+- "Winners (n=38) had mean edge_pp of 42 vs 24 for losers."
+- "85% of winners had parser_confidence >= 0.9; only 30% of losers did."
+- "Profit_lock + convergence strategies accounted for 28/38 winners."
+
+Bad (banned): "Winners were usually high-confidence trades." (No number.)
+
+### `loser_patterns` (string, 2-4 sentences)
+
+Same shape but for losers. Identify 1-3 most actionable patterns. Examples:
+- "Losers (n=15) concentrated in 3 cities: Manhattan (5), Karachi (3),
+  Cape Town (3) — 73% of losses by count."
+- "12/15 losers had judge_verdict=ADJUST, suggesting the judge's reduced
+  sizing wasn't enough to prevent the loss."
+- "All trailing_stop exits (5/5) were losers; trigger may be firing too
+  early relative to true peak."
+
+### `insights` (array, 2-5 items)
+
+Each insight is an observation that **links a pattern to an actionable
+tuning category**. Required fields:
+
+```json
+{
+  "title": "Trades in Mumbai with edge >40pp converted 9/10",
+  "observation": "9 of 10 Mumbai trades with edge >40pp closed via
+                  profit_lock within 12h. Mean P&L $14.50, no losers.
+                  Suggests Mumbai forecast accuracy is high.",
+  "applies_to_category": "operational",  // see enum below
+  "n_supporting_trades": 10,
+  "supporting_trade_ids": [142, 156, 178, 199, 203, 215, 219, 224, 231, 247]
+}
+```
+
+`applies_to_category` enum: threshold, mae_constant, city, judge_prompt,
+data_source, risk_limit, operational. Pick the one most directly
+actionable from this insight.
+
+**Insights MUST reference real trade IDs from the sample.** Never
+hallucinate IDs. If you can't list 5+ supporting IDs, downgrade the
+observation to `research_notes` instead.
+
+### Anchoring suggestions[] to insights
+
+When you propose a tuning in `suggestions[]`, prefer rationales that
+reference 1-2 of your insights or specific winner/loser patterns. This
+makes the operator's audit trail tight: "I changed profit_lock_pp because
+of insight #2, which was supported by trades [142, 156, 199...]".
+
 ## Process
 
 1. Read the user message — it contains: aggregate analyzer report (markdown),
