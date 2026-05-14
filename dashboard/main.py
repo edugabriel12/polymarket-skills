@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from . import settings as S
-from .services import analytics, charts, events, portfolio, positions
+from .services import analytics, charts, costs, events, portfolio, positions
 
 app = FastAPI(title="Polymarket Weather Dashboard")
 
@@ -66,6 +66,26 @@ def page_performance(request: Request, days: int = 14):
 def page_events(request: Request):
     return templates.TemplateResponse(
         request, "events.html", _common_ctx("events"))
+
+
+@app.get("/costs", response_class=HTMLResponse)
+def page_costs(request: Request, days: int = 30):
+    ctx = _common_ctx("costs")
+    ctx["days"] = days
+    return templates.TemplateResponse(request, "costs.html", ctx)
+
+
+@app.get("/api/costs", response_class=HTMLResponse)
+def api_costs(request: Request, days: int = 30):
+    s = costs.get_cost_summary(days=days)
+    daily_series = costs.get_daily_cost_series(days=days)
+    top_reviews = costs.get_top_expensive_reviews(limit=15, days=days)
+    advisor_runs = costs.get_advisor_run_history(days=max(days, 90))
+    return templates.TemplateResponse(
+        request, "partials/costs_body.html",
+        {"s": s, "daily_series": daily_series,
+         "top_reviews": top_reviews, "advisor_runs": advisor_runs,
+         "charts": charts, "days": days})
 
 
 # ---------------------------------------------------------------------------

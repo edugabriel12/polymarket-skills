@@ -1,0 +1,164 @@
+{# Costs body — KPIs + chart + breakdown + tables #}
+
+<div class="kpi-grid">
+  <div class="kpi">
+    <span class="kpi-label">Total cost today</span>
+    <span class="kpi-value">${{ "%.4f"|format(s.total.today_usd) }}</span>
+    <span class="kpi-delta muted">
+      judge ${{ "%.4f"|format(s.judge.today_usd) }} ·
+      advisor ${{ "%.4f"|format(s.advisor.today_usd) }}
+    </span>
+  </div>
+  <div class="kpi">
+    <span class="kpi-label">Window ({{ days }}d)</span>
+    <span class="kpi-value">${{ "%.2f"|format(s.total.window_usd) }}</span>
+    <span class="kpi-delta muted">
+      judge ${{ "%.2f"|format(s.judge.window_usd) }} ·
+      advisor ${{ "%.2f"|format(s.advisor.window_usd) }}
+    </span>
+  </div>
+  <div class="kpi">
+    <span class="kpi-label">Lifetime</span>
+    <span class="kpi-value">${{ "%.2f"|format(s.total.lifetime_usd) }}</span>
+    <span class="kpi-delta muted">
+      judge ${{ "%.2f"|format(s.judge.lifetime_usd) }} ({{ s.judge.lifetime_n }}) ·
+      advisor ${{ "%.2f"|format(s.advisor.lifetime_usd) }} ({{ s.advisor.lifetime_n }})
+    </span>
+  </div>
+  <div class="kpi">
+    <span class="kpi-label">Avg cost per call ({{ days }}d)</span>
+    <span class="kpi-value">${{ "%.4f"|format(s.judge.avg_cost_per_review) }}</span>
+    <span class="kpi-delta muted">
+      judge per review · advisor per run ${{ "%.4f"|format(s.advisor.avg_cost_per_run) }}
+    </span>
+  </div>
+</div>
+
+<section class="card chart-card">
+  {{ charts.daily_costs_stacked(daily_series)|safe }}
+</section>
+
+<section class="two-col">
+  <div class="card">
+    <h2>Judge — model breakdown ({{ days }}d)</h2>
+    {% if not s.judge.per_model %}
+      <div class="muted">No judge calls in this window.</div>
+    {% else %}
+    <table class="data-table">
+      <thead><tr><th>Model</th><th>N</th><th>Total $</th><th>Mean $</th></tr></thead>
+      <tbody>
+        {% for model, v in s.judge.per_model.items() %}
+        <tr>
+          <td class="mono">{{ model }}</td>
+          <td class="mono">{{ v.n }}</td>
+          <td class="mono">${{ "%.4f"|format(v.cost_usd) }}</td>
+          <td class="mono">${{ "%.4f"|format(v.cost_usd / v.n) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="muted small">
+      Tokens in {{ "{:,}".format(s.judge.tokens_in) }} ·
+      out {{ "{:,}".format(s.judge.tokens_out) }} ·
+      cache_read {{ "{:,}".format(s.judge.cache_read_tokens) }}
+    </p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Advisor — model breakdown ({{ days }}d)</h2>
+    {% if not s.advisor.per_model %}
+      <div class="muted">No advisor runs in this window.</div>
+    {% else %}
+    <table class="data-table">
+      <thead><tr><th>Model</th><th>N</th><th>Total $</th><th>Mean $</th></tr></thead>
+      <tbody>
+        {% for model, v in s.advisor.per_model.items() %}
+        <tr>
+          <td class="mono">{{ model }}</td>
+          <td class="mono">{{ v.n }}</td>
+          <td class="mono">${{ "%.4f"|format(v.cost_usd) }}</td>
+          <td class="mono">${{ "%.4f"|format(v.cost_usd / v.n) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="muted small">
+      Tokens in {{ "{:,}".format(s.advisor.tokens_in) }} ·
+      out {{ "{:,}".format(s.advisor.tokens_out) }} ·
+      cache_read {{ "{:,}".format(s.advisor.cache_read_tokens) }}
+    </p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="card chart-card">
+  {{ charts.cost_per_review_distribution(top_reviews)|safe }}
+</section>
+
+<section class="card">
+  <h2>Most expensive judge reviews ({{ days }}d)</h2>
+  {% if not top_reviews %}
+    <div class="muted">No reviews yet.</div>
+  {% else %}
+  <table class="data-table">
+    <thead>
+      <tr><th>Review</th><th>When</th><th>Market</th><th>Side</th><th>Verdict</th>
+          <th>Cost $</th><th>Tokens in/out</th><th>Duration</th></tr>
+    </thead>
+    <tbody>
+      {% for r in top_reviews %}
+      <tr>
+        <td class="mono">#{{ r.review_id }}</td>
+        <td class="mono small">{{ (r.ts or '')[:16] }}</td>
+        <td>
+          <div class="city">{{ r.city_resolved or '?' }}</div>
+          {% if r.market_slug %}
+          <div class="slug muted small">
+            <a href="https://polymarket.com/event/{{ r.market_slug }}"
+               target="_blank" rel="noopener" class="market-link">
+              {{ r.market_slug|truncate(34) }} ↗
+            </a>
+          </div>
+          {% endif %}
+        </td>
+        <td><span class="side side-{{ (r.side or '')|lower }}">{{ r.side or '—' }}</span></td>
+        <td class="mono">{{ r.verdict }}</td>
+        <td class="mono">${{ "%.4f"|format(r.cost_usd) }}</td>
+        <td class="mono small">{{ r.tokens_in or 0 }} / {{ r.tokens_out or 0 }}</td>
+        <td class="mono small">{{ ((r.duration_ms or 0) / 1000)|round(1) }}s</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Advisor run history (last 90d)</h2>
+  {% if not advisor_runs %}
+    <div class="muted">No advisor runs yet.</div>
+  {% else %}
+  <table class="data-table">
+    <thead>
+      <tr><th>Run</th><th>When</th><th>Trigger</th><th>Model</th>
+          <th>Suggestions</th><th>Cost $</th><th>Status</th></tr>
+    </thead>
+    <tbody>
+      {% for r in advisor_runs %}
+      <tr>
+        <td class="mono">#{{ r.run_id }}</td>
+        <td class="mono small">{{ (r.ts or '')[:16] }}</td>
+        <td class="mono">{{ r.trigger }}</td>
+        <td class="mono">{{ r.llm_model }}</td>
+        <td class="mono">{{ r.n_suggestions }}</td>
+        <td class="mono">${{ "%.4f"|format(r.cost_usd or 0) }}</td>
+        <td class="mono {% if r.status != 'ok' %}down{% endif %}">{{ r.status }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+
+<p class="muted small">Window: since {{ s.since_iso[:10] }} ({{ days }}d).</p>

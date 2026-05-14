@@ -150,6 +150,47 @@ def cumulative_pnl(series: list[dict],
     return _to_html(data, layout, div_id)
 
 
+def daily_costs_stacked(series: list[dict],
+                         div_id: str = "chart_daily_costs") -> str:
+    """Stacked-bar daily cost split between judge and advisor."""
+    if not series:
+        return '<div class="empty-chart">No API spend recorded yet.</div>'
+    x = [p["date"] for p in series]
+    judge = [p["judge_usd"] for p in series]
+    advisor = [p["advisor_usd"] for p in series]
+    data = [
+        {"type": "bar", "x": x, "y": judge,
+         "name": "Judge", "marker": {"color": "#60a5fa"}},
+        {"type": "bar", "x": x, "y": advisor,
+         "name": "Advisor", "marker": {"color": "#a78bfa"}},
+    ]
+    layout = {"title": "Daily AI agent cost",
+              "yaxis": {"title": "USD"},
+              "xaxis": {"title": ""},
+              "barmode": "stack",
+              "legend": {"orientation": "h", "y": -0.2}}
+    return _to_html(data, layout, div_id)
+
+
+def cost_per_review_distribution(reviews: list[dict],
+                                  div_id: str = "chart_cost_dist") -> str:
+    """Histogram of judge review costs to spot outliers (max_tokens runaways)."""
+    if not reviews:
+        return '<div class="empty-chart">No judge reviews yet.</div>'
+    costs = [r["cost_usd"] for r in reviews if r.get("cost_usd")]
+    if not costs:
+        return '<div class="empty-chart">No cost data.</div>'
+    data = [{
+        "type": "histogram", "x": costs,
+        "marker": {"color": "#60a5fa"},
+        "nbinsx": 20,
+    }]
+    layout = {"title": "Judge cost distribution (per review)",
+              "yaxis": {"title": "Count"},
+              "xaxis": {"title": "USD per review"}}
+    return _to_html(data, layout, div_id)
+
+
 # ---------------------------------------------------------------------------
 # Inline tests
 # ---------------------------------------------------------------------------
