@@ -9,7 +9,7 @@ REJECT / ADJUST verdict back to the DB.
 Default model: claude-sonnet-4-6 (good cost/perf for 24/7 with prompt caching).
 Override via CLAUDE_JUDGE_MODEL env var.
 
-Daily budget cap: JUDGE_DAILY_BUDGET_USD (default $5). When exceeded, judge
+Daily budget cap: JUDGE_DAILY_BUDGET_USD (default $10). When exceeded, judge
 marks remaining proposals as SKIPPED with reason=judge_budget_exceeded.
 
 Required env vars:
@@ -20,7 +20,7 @@ Required env vars:
 Optional:
   CLAUDE_JUDGE_MODEL       (default claude-sonnet-4-6)
   JUDGE_POLL_INTERVAL_SEC  (default 120)
-  JUDGE_DAILY_BUDGET_USD   (default 5)
+  JUDGE_DAILY_BUDGET_USD   (default 10)
 """
 from __future__ import annotations
 
@@ -67,7 +67,7 @@ PROMPT_PATH = REPO_ROOT / "polymarket-analyzer" / "references" / "weather-judge-
 
 DEFAULT_MODEL = os.environ.get("CLAUDE_JUDGE_MODEL", "claude-sonnet-4-6")
 POLL_INTERVAL = int(os.environ.get("JUDGE_POLL_INTERVAL_SEC", "120"))
-DAILY_BUDGET_USD = float(os.environ.get("JUDGE_DAILY_BUDGET_USD", "5.0"))
+DAILY_BUDGET_USD = float(os.environ.get("JUDGE_DAILY_BUDGET_USD", "10.0"))
 
 # Pricing per 1M tokens (Sonnet 4.6 / Opus 4.7 — adjust if model changed)
 PRICING = {
