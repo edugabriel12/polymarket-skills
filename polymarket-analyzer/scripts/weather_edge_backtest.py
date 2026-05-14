@@ -36,6 +36,9 @@ class BacktestParams:
     trailing_drawdown_pct: float = 30.0
     trailing_min_gain_pp: float = 20.0
     convergence_pp: float = 5.0
+    # Friction model (v5). Defaults 0/0 preserve old behavior.
+    bid_slippage_pct: float = 0.0    # haircut on bid at cashout exits
+    fee_rate: float = 0.0            # deducted from gross proceeds
 
 
 def replay_entry(entry: dict, monitor_checks: list[dict],
@@ -77,10 +80,16 @@ def replay_entry(entry: dict, monitor_checks: list[dict],
             convergence_pp=params.convergence_pp,
         )
         if verdict["decision"] == "CASHOUT":
-            sim_pnl = (bid - entry_price) * shares
+            # Apply friction: bid haircut (slippage) + fee deduction on
+            # gross proceeds. Defaults 0/0 reduce to (bid - entry) * shares.
+            effective_bid = bid * (1.0 - params.bid_slippage_pct / 100.0)
+            gross = effective_bid * shares
+            fee = gross * params.fee_rate
+            net_proceeds = gross - fee
+            sim_pnl = net_proceeds - entry_price * shares
             return {
                 "sim_exit_ts": check.get("ts"),
-                "sim_exit_bid": round(bid, 4),
+                "sim_exit_bid": round(effective_bid, 4),
                 "sim_trigger": verdict["trigger"],
                 "sim_pnl_usd": round(sim_pnl, 2),
             }
@@ -88,7 +97,10 @@ def replay_entry(entry: dict, monitor_checks: list[dict],
     # No cashout fired — fall through to resolution outcome
     if resolution and resolution.get("payout_per_share") is not None:
         payout = float(resolution["payout_per_share"])
-        sim_pnl = payout * shares - size_usd
+        gross = payout * shares
+        fee = gross * params.fee_rate
+        net_proceeds = gross - fee
+        sim_pnl = net_proceeds - size_usd
         return {
             "sim_exit_ts": None,
             "sim_exit_bid": None,
@@ -179,8 +191,11 @@ def grid_search(replay_data: list[dict],
     return results
 
 
-def default_param_grid() -> list[BacktestParams]:
-    """4 × 3 × 3 = 36 combos centered around current production defaults."""
+def default_param_grid(bid_slippage_pct: float = 0.0,
+                        fee_rate: float = 0.0) -> list[BacktestParams]:
+    """4 × 3 × 3 = 36 combos centered around current production defaults.
+    Friction params (slippage, fee) are constant across the grid — only
+    the cashout-policy thresholds vary."""
     grid = []
     for pl in (30, 40, 50, 60):
         for td in (20, 30, 40):
@@ -189,6 +204,8 @@ def default_param_grid() -> list[BacktestParams]:
                     profit_lock_pp=pl,
                     trailing_drawdown_pct=td,
                     convergence_pp=cv,
+                    bid_slippage_pct=bid_slippage_pct,
+                    fee_rate=fee_rate,
                 ))
     return grid
 
@@ -220,6 +237,12 @@ def main() -> int:
                    help="Max entries to replay (default 200).")
     p.add_argument("--top-k", type=int, default=10,
                    help="Print top K configurations (default 10).")
+    p.add_argument("--slippage-pct", type=float, default=0.0,
+                   help="Bid haircut applied at cashout exits (default 0; "
+                        "e.g. 2.0 simulates a 2%% slippage on the bid).")
+    p.add_argument("--fee-rate", type=float, default=0.0,
+                   help="Fee deducted from gross proceeds (default 0; "
+                        "e.g. 0.02 simulates a 2%% fee).")
     p.add_argument("--output", choices=("text", "json"), default="text",
                    help="Output format (default text).")
     args = p.parse_args()
@@ -236,7 +259,8 @@ def main() -> int:
               file=sys.stderr)
         return 0
 
-    grid = default_param_grid()
+    grid = default_param_grid(bid_slippage_pct=args.slippage_pct,
+                                fee_rate=args.fee_rate)
     results = grid_search(data, grid)
 
     if args.output == "json":
@@ -325,6 +349,28 @@ def _run_tests() -> int:
     g = default_param_grid()
     assert len(g) == 36, len(g)
     print(f"Test 5 PASS: default_param_grid → {len(g)} combos")
+
+    # Test 6: slippage 10% on a cashout. profit_lock=30 → cashout at first
+    # bid >= 0.43. With 10% slippage, effective_bid = 0.50*0.9 = 0.45.
+    r = replay_entry(entry, checks, resolution=None,
+                     params=BacktestParams(profit_lock_pp=30,
+                                            bid_slippage_pct=10.0))
+    assert r["sim_trigger"] == "profit_lock", r
+    assert abs(r["sim_exit_bid"] - 0.45) < 0.001, r
+    # sim_pnl = (0.45 - 0.13) * 100 = 32.0
+    assert abs(r["sim_pnl_usd"] - 32.0) < 0.01, r
+    print(f"Test 6 PASS: slippage=10% → effective_bid {r['sim_exit_bid']}, "
+          f"P&L ${r['sim_pnl_usd']}")
+
+    # Test 7: fee 2% on hold_to_resolution. payout=1.0, shares=100, cost=13.
+    # gross = 100.0, fee = 2.0, net = 98.0, pnl = 98 - 13 = 85.
+    r = replay_entry(entry, checks, resolution=res,
+                     params=BacktestParams(profit_lock_pp=80,
+                                            trailing_drawdown_pct=50,
+                                            fee_rate=0.02))
+    assert r["sim_trigger"] == "hold_to_resolution", r
+    assert abs(r["sim_pnl_usd"] - 85.0) < 0.01, r
+    print(f"Test 7 PASS: fee=2% on hold → P&L ${r['sim_pnl_usd']} (was 87 w/o fee)")
 
     print("\nAll backtest tests PASS")
     return 0

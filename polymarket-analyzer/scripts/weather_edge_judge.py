@@ -406,6 +406,22 @@ def main():
     signal.signal(signal.SIGINT, _handle_sig)
 
     db.init_db()
+    # PID file for dashboard-driven restart.
+    from pathlib import Path as _P
+    pid_file = _P.home() / ".polymarket-paper" / "judge.pid.json"
+    try:
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = pid_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps({
+            "pid": os.getpid(),
+            "argv": [sys.executable] + sys.argv,
+            "cwd": str(_P.cwd()),
+            "started_at": _now_iso(),
+        }))
+        tmp.replace(pid_file)
+    except OSError as e:
+        log_event("warn", {"where": "judge_pidfile_write", "err": str(e)},
+                  level="WARN")
     system_prompt = _load_system_prompt()
     log_event("judge_startup", {"model": DEFAULT_MODEL,
                                  "poll_sec": POLL_INTERVAL,
@@ -489,6 +505,10 @@ def main():
         time.sleep(POLL_INTERVAL)
 
     log_event("judge_shutdown_clean", {})
+    try:
+        pid_file.unlink(missing_ok=True)
+    except (NameError, OSError):
+        pass
 
 
 if __name__ == "__main__":

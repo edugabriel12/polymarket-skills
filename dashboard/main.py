@@ -10,15 +10,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Form, Request
 from fastapi.responses import (HTMLResponse, PlainTextResponse,
                                 RedirectResponse, StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from . import settings as S
-from .services import (advisor, analytics, charts, costs, events,
-                        portfolio, positions, suggestion_applier)
+from .services import (advisor, advisor_jobs, analytics, charts, costs,
+                        events, portfolio, positions, process_manager,
+                        suggestion_applier)
 
 app = FastAPI(title="Polymarket Weather Dashboard")
 
@@ -88,7 +89,8 @@ def api_advisor_run(request: Request, run_id: int):
 
 @app.post("/api/advisor/apply/{run_id}/{suggestion_id}",
           response_class=HTMLResponse)
-def api_advisor_apply(request: Request, run_id: int, suggestion_id: str):
+def api_advisor_apply(request: Request, run_id: int, suggestion_id: str,
+                       auto_restart: bool = False):
     run = advisor.get_run(run_id)
     if not run or not run.get("payload"):
         return HTMLResponse(
@@ -104,13 +106,83 @@ def api_advisor_apply(request: Request, run_id: int, suggestion_id: str):
             'Suggestion not found in this run.</div>',
             status_code=404)
     applier = suggestion_applier.SuggestionApplier()
-    result = applier.apply(run_id=run_id, suggestion=suggestion)
-    # Re-render the card with the new applied state
+    result = applier.apply(run_id=run_id, suggestion=suggestion,
+                            auto_restart=auto_restart)
+    # Re-render the card with the new applied state. Pass restart_info
+    # via the suggestion dict so the template can show feedback.
     fresh_applies = advisor.list_applies_for_run(run_id)
     return templates.TemplateResponse(
         request, "partials/suggestion_card.html",
         {"s": suggestion, "applied": fresh_applies.get(suggestion_id),
-         "run": run})
+         "run": run, "restart_info": result.get("restart")})
+
+
+@app.get("/api/advisor/judge-prompt-editor/{run_id}/{suggestion_id}",
+         response_class=HTMLResponse)
+def api_judge_prompt_editor(request: Request, run_id: int,
+                              suggestion_id: str):
+    """Render a modal with current weather-judge-prompt.md content +
+    suggestion's rationale/proposed_value as guidance. Operator edits
+    the textarea + clicks Save."""
+    run = advisor.get_run(run_id)
+    suggestion = next(
+        (s for s in ((run or {}).get("payload") or {}).get("suggestions") or []
+         if s.get("id") == suggestion_id), None)
+    if not run or not suggestion:
+        return HTMLResponse(
+            '<div class="modal-error">Run or suggestion not found.</div>',
+            status_code=404)
+    current_text = suggestion_applier.JUDGE_PROMPT_MD.read_text(
+        encoding="utf-8") if suggestion_applier.JUDGE_PROMPT_MD.exists() else ""
+    return templates.TemplateResponse(
+        request, "partials/judge_prompt_modal.html",
+        {"run": run, "s": suggestion, "current_text": current_text})
+
+
+@app.post("/api/advisor/apply/{run_id}/{suggestion_id}/judge-prompt",
+          response_class=HTMLResponse)
+def api_apply_judge_prompt(request: Request, run_id: int,
+                              suggestion_id: str,
+                              operator_text: str = Form(...),
+                              auto_restart: bool = Form(False)):
+    """Custom apply path for judge_prompt: receives the full new file
+    content from the modal's textarea."""
+    run = advisor.get_run(run_id)
+    suggestion = next(
+        (s for s in ((run or {}).get("payload") or {}).get("suggestions") or []
+         if s.get("id") == suggestion_id), None)
+    if not run or not suggestion:
+        return HTMLResponse(
+            '<div class="suggestion-card failed">Run or suggestion missing.</div>',
+            status_code=404)
+    applier = suggestion_applier.SuggestionApplier()
+    result = applier.apply(run_id=run_id, suggestion=suggestion,
+                            auto_restart=auto_restart,
+                            operator_text=operator_text)
+    fresh_applies = advisor.list_applies_for_run(run_id)
+    return templates.TemplateResponse(
+        request, "partials/suggestion_card.html",
+        {"s": suggestion, "applied": fresh_applies.get(suggestion_id),
+         "run": run, "restart_info": result.get("restart")})
+
+
+@app.post("/api/advisor/run-now", response_class=HTMLResponse)
+def api_advisor_run_now(request: Request,
+                         since_days: int = Form(30),
+                         per_trade_limit: int = Form(200)):
+    """Spawn the advisor as a detached subprocess + return polling
+    partial."""
+    job = advisor_jobs.start_job(
+        since_days=since_days, per_trade_limit=per_trade_limit)
+    return templates.TemplateResponse(
+        request, "partials/advisor_job_status.html", {"job": job})
+
+
+@app.get("/api/advisor/jobs/{job_id}", response_class=HTMLResponse)
+def api_advisor_job_status(request: Request, job_id: int):
+    job = advisor_jobs.get_job(job_id)
+    return templates.TemplateResponse(
+        request, "partials/advisor_job_status.html", {"job": job})
 
 
 @app.get("/costs", response_class=HTMLResponse)

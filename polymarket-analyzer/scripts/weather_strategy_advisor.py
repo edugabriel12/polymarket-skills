@@ -351,6 +351,17 @@ def main() -> int:
                    help="Override model (default ADVISOR_MODEL).")
     p.add_argument("--trigger", default="cli",
                    choices=["scheduled_weekly", "on_demand", "cli"])
+    p.add_argument("--job-id", type=int, default=None,
+                   help="Update advisor_jobs row with this ID at start "
+                        "(status='running') and end (status='done'/'failed' + "
+                        "resulting_run_id). Set by the dashboard when "
+                        "spawning the advisor as a subprocess.")
+    p.add_argument("--slippage-pct", type=float, default=None,
+                   help="Backtest bid haircut (default from "
+                        "ADVISOR_BACKTEST_SLIPPAGE_PCT or 0.0)")
+    p.add_argument("--fee-rate", type=float, default=None,
+                   help="Backtest fee rate (default from "
+                        "ADVISOR_BACKTEST_FEE_RATE or 0.0)")
     args = p.parse_args()
 
     db.init_db()
@@ -402,25 +413,41 @@ def main() -> int:
         strategy_breakdown = helpers.compute_strategy_breakdown(per_trade_rows)
         winner_loser = helpers.compute_winner_loser_patterns(per_trade_rows)
 
-        # Advisor v3: backtest replay of past trades with alternative
-        # cashout policy parameters. Anchors threshold suggestions in
-        # concrete simulated P&L numbers.
+        # Advisor v3+v5: backtest with slippage/fee friction model.
         replay_data = backtest.load_replay_data(
             conn, since_iso, limit=args.per_trade_limit)
         defaults = current_config.get("cli_defaults", {})
+
+        # Friction: CLI flags override env vars; default 0.
+        if args.slippage_pct is not None:
+            slippage_pct = float(args.slippage_pct)
+        else:
+            slippage_pct = float(os.environ.get(
+                "ADVISOR_BACKTEST_SLIPPAGE_PCT", "0") or 0)
+        if args.fee_rate is not None:
+            fee_rate = float(args.fee_rate)
+        else:
+            fee_rate = float(os.environ.get(
+                "ADVISOR_BACKTEST_FEE_RATE", "0") or 0)
+
         baseline_params = backtest.BacktestParams(
             profit_lock_pp=float(defaults.get("--profit-lock-pp", 50.0)),
             trailing_drawdown_pct=float(defaults.get("--trailing-drawdown-pct", 30.0)),
             convergence_pp=float(defaults.get("--convergence-pp", 5.0)),
+            bid_slippage_pct=slippage_pct,
+            fee_rate=fee_rate,
         )
         baseline_results = backtest.grid_search(replay_data, [baseline_params])
         baseline = baseline_results[0] if baseline_results else None
         alt_results = backtest.grid_search(
-            replay_data, backtest.default_param_grid())
+            replay_data,
+            backtest.default_param_grid(
+                bid_slippage_pct=slippage_pct, fee_rate=fee_rate))
         backtest_results = {
             "n_trades_replayed": len(replay_data),
             "current_baseline": baseline,
             "top_alternatives": alt_results[:10],
+            "friction": {"slippage_pct": slippage_pct, "fee_rate": fee_rate},
         }
 
         # Count trades analyzed
@@ -476,6 +503,12 @@ def main() -> int:
                     n_suggestions=0, llm_model=model, status="error",
                     error_msg="API call failed; see weather_edge.jsonl",
                 )
+                if args.job_id is not None:
+                    db.update_advisor_job(
+                        conn, args.job_id, status="failed",
+                        ts_finished=_now_iso(), exit_code=3,
+                        error_msg="API call failed",
+                    )
                 conn.commit()
                 return 3
 
@@ -483,7 +516,7 @@ def main() -> int:
         # Persist
         md_path, json_path = helpers.write_advisor_report(
             response, since_iso, analyzer_md)
-        db.insert_advisor_run(
+        new_run_id = db.insert_advisor_run(
             conn, ts=_now_iso(), trigger=args.trigger,
             since_iso=since_iso, report_path=str(md_path),
             json_path=str(json_path),
@@ -495,6 +528,17 @@ def main() -> int:
             cache_read_tokens=meta.get("cache_read_tokens"),
             status="ok",
         )
+        # If invoked with --job-id (from the dashboard's "Run Advisor Now"),
+        # close the job row by linking the resulting_run_id and flipping
+        # status to 'done'.
+        if args.job_id is not None:
+            db.update_advisor_job(
+                conn, args.job_id,
+                status="done",
+                ts_finished=_now_iso(),
+                resulting_run_id=new_run_id,
+                exit_code=0,
+            )
         conn.commit()
 
         log_event("advisor_completed", {

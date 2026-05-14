@@ -25,6 +25,28 @@
 </section>
 
 <section class="card">
+  <h2>Run advisor on-demand</h2>
+  <div id="advisor-run-zone">
+    {% include "partials/run_advisor_form.html" %}
+  </div>
+</section>
+
+<section class="card">
+  <h2>Global options</h2>
+  <label class="auto-restart-label">
+    <input type="checkbox" id="global-auto-restart" checked
+           onchange="window.AUTO_RESTART = this.checked;">
+    Auto-restart affected processes after Apply
+  </label>
+  <p class="muted small">
+    When ON, applying a suggestion of category
+    <code>threshold</code>/<code>mae_constant</code>/<code>city</code>/<code>risk_limit</code>/<code>judge_prompt</code>
+    triggers a kill+respawn of the affected daemon (bot and/or judge).
+    Operator can toggle per-session.
+  </p>
+</section>
+
+<section class="card">
   <h2>Advisor runs</h2>
   {% if not runs %}
     <div class="muted">No advisor runs yet. Run on-demand:<br>
@@ -68,7 +90,19 @@
 
 {% block scripts %}
 <script>
-  // After a successful apply, swap the card and show a "restart bot" banner.
+  // Global auto-restart preference (default ON). Per-page session state.
+  window.AUTO_RESTART = true;
+
+  // Add ?auto_restart=true to all advisor Apply POSTs based on global toggle.
+  document.body.addEventListener('htmx:configRequest', (e) => {
+    if (e.detail.path && e.detail.path.startsWith('/api/advisor/apply/')) {
+      if (window.AUTO_RESTART && e.detail.verb === 'post') {
+        e.detail.parameters.auto_restart = 'true';
+      }
+    }
+  });
+
+  // After a successful apply, show the restart banner.
   document.body.addEventListener('htmx:afterRequest', (e) => {
     if (e.detail.requestConfig.verb === 'post' &&
         e.detail.requestConfig.path.startsWith('/api/advisor/apply/')) {

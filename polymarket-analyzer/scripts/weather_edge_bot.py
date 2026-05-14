@@ -1083,6 +1083,22 @@ def main():
     signal.signal(signal.SIGINT, _handle_sigterm)
 
     db.init_db()
+    # Write PID file so the dashboard can find + restart us on apply.
+    # Atomic write (tmp → rename) + best-effort cleanup at shutdown.
+    pid_file = Path.home() / ".polymarket-paper" / "bot.pid.json"
+    try:
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = pid_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps({
+            "pid": os.getpid(),
+            "argv": [sys.executable] + sys.argv,
+            "cwd": str(Path.cwd()),
+            "started_at": _now_iso(),
+        }))
+        tmp.replace(pid_file)
+    except OSError as e:
+        log_event("warn", {"where": "pidfile_write", "err": str(e)}, level="WARN")
+
     cities = load_cities()
     log_event("startup", {"args": vars(args), "cities_loaded": len(cities.get("us_top50", [])) +
                           len(cities.get("world", [])) + len(cities.get("europe_top30", [])) +
@@ -1136,6 +1152,10 @@ def main():
         time.sleep(MONITOR_TICK)
 
     log_event("shutdown_clean", {})
+    try:
+        pid_file.unlink(missing_ok=True)
+    except (NameError, OSError):
+        pass
 
 
 if __name__ == "__main__":

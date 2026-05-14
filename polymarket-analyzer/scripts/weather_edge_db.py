@@ -12,10 +12,10 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 DB_PATH = Path.home() / ".polymarket-paper" / "weather_edge.db"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 SCHEMA_V1 = """
@@ -176,6 +176,30 @@ SCHEMA_V4_MIGRATIONS = [
 ]
 
 
+SCHEMA_V5_MIGRATIONS = [
+    # Async advisor jobs spawned from the dashboard "Run Advisor Now" UI.
+    """
+    CREATE TABLE IF NOT EXISTS advisor_jobs (
+      job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts_started TEXT NOT NULL,
+      ts_finished TEXT,
+      trigger TEXT NOT NULL,
+      since_days INTEGER NOT NULL,
+      per_trade_limit INTEGER,
+      status TEXT NOT NULL CHECK(status IN
+          ('pending','running','done','failed','cancelled')),
+      pid INTEGER,
+      exit_code INTEGER,
+      resulting_run_id INTEGER,
+      log_path TEXT,
+      error_msg TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_job_status ON advisor_jobs(status)",
+    "CREATE INDEX IF NOT EXISTS idx_job_ts ON advisor_jobs(ts_started)",
+]
+
+
 def init_db(path: Path = DB_PATH) -> None:
     """Create the DB and tables if missing. Idempotent. Bumps user_version.
     Enables WAL mode so readers + writers don't block each other."""
@@ -205,6 +229,10 @@ def init_db(path: Path = DB_PATH) -> None:
             for stmt in SCHEMA_V4_MIGRATIONS:
                 cur.execute(stmt)
             current = 4
+        if current < 5:
+            for stmt in SCHEMA_V5_MIGRATIONS:
+                cur.execute(stmt)
+            current = 5
         cur.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
 
@@ -317,6 +345,32 @@ def query_applies_for_run(conn, run_id: int) -> list[sqlite3.Row]:
         "WHERE run_id = ? ORDER BY ts ASC",
         (run_id,),
     ).fetchall()
+
+
+def insert_advisor_job(conn, **kwargs) -> int:
+    """Insert a new advisor job row (status usually 'pending' on creation).
+    Returns the new job_id."""
+    cols = list(kwargs.keys())
+    vals = [kwargs[c] for c in cols]
+    placeholders = ",".join("?" * len(cols))
+    q = f"INSERT INTO advisor_jobs ({','.join(cols)}) VALUES ({placeholders})"
+    return conn.execute(q, vals).lastrowid
+
+
+def update_advisor_job(conn, job_id: int, **fields) -> int:
+    """Patch fields on an advisor_jobs row. Returns rows affected."""
+    if not fields:
+        return 0
+    set_clause = ", ".join(f"{k}=?" for k in fields)
+    vals = list(fields.values()) + [job_id]
+    q = f"UPDATE advisor_jobs SET {set_clause} WHERE job_id = ?"
+    return conn.execute(q, vals).rowcount
+
+
+def get_advisor_job(conn, job_id: int) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM advisor_jobs WHERE job_id = ?", (job_id,),
+    ).fetchone()
 
 
 def upsert_counterfactual(conn, entry_id: int, **kwargs) -> int:

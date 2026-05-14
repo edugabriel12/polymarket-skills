@@ -1,0 +1,20 @@
+{# Form to launch the advisor on-demand. Replaced by job_status partial
+   after submit (HTMX swap). #}
+
+<form class="run-advisor-form"
+      hx-post="/api/advisor/run-now"
+      hx-target="#advisor-run-zone"
+      hx-swap="innerHTML"
+      hx-confirm="Run Advisor now? This will use Claude Opus 4.7 (~$1.50 per run).">
+  <div class="form-row">
+    <label>
+      Window (days):
+      <input type="number" name="since_days" value="30" min="1" max="180">
+    </label>
+    <label>
+      Per-trade limit:
+      <input type="number" name="per_trade_limit" value="200" min="10" max="1000">
+    </label>
+    <button type="submit" class="btn btn-apply">Run Advisor Now</button>
+  </div>
+</form>
