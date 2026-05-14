@@ -976,8 +976,17 @@ def _do_cashout(conn, row, bid: float, forecast: dict,
 
 
 def run_resolution_sweep() -> int:
-    """For each EXECUTED position past end_date, fetch outcomePrices and persist."""
+    """For each EXECUTED position past end_date, fetch outcomePrices and persist.
+    On resolution, also close the paper-portfolio position at payout so the
+    slot is freed for new bets."""
     resolved = 0
+    try:
+        import paper_engine
+    except ImportError as e:
+        log_event("error", {"where": "resolution_sweep",
+                            "err": f"paper_engine import: {e}"},
+                  level="ERROR")
+        return 0
     with db.connect() as conn:
         rows = db.query_unresolved_past_end(conn, _now_iso())
         for row in rows:
@@ -1011,6 +1020,41 @@ def run_resolution_sweep() -> int:
                                                    "slug": slug,
                                                    "outcome": final_outcome,
                                                    "payout": payout})
+
+                # Close the corresponding paper-portfolio position at the
+                # resolution payout. This credits proceeds + frees the
+                # max_concurrent_positions slot. If the position was already
+                # cashed out earlier (no paper position open), skip silently.
+                token_id = (row["token_id_yes"] if row["side"] == "YES"
+                            else row["token_id_no"])
+                if token_id:
+                    try:
+                        close_result = paper_engine.close_position(
+                            token_id=token_id, side=row["side"],
+                            reasoning=f"resolution:{final_outcome}",
+                            force_exit_price=payout,
+                        )
+                        log_event("resolution_closed", {
+                            "entry_id": row["entry_id"],
+                            "token_id": token_id,
+                            "side": row["side"],
+                            "payout": payout,
+                            "realized_pnl": close_result.get("realized_pnl"),
+                            "new_balance": close_result.get("new_balance"),
+                        })
+                    except RuntimeError as ce:
+                        # Most common: "No open position for token..."
+                        # Means the position was already closed via cashout
+                        # before resolution. Not an error.
+                        log_event("resolution_close_skipped", {
+                            "entry_id": row["entry_id"],
+                            "reason": str(ce),
+                        })
+                    except Exception as ce:
+                        log_event("error", {
+                            "where": "resolution_close_position",
+                            "entry_id": row["entry_id"], "err": str(ce),
+                        }, level="WARN")
             except Exception as e:
                 log_event("error", {"where": "resolution_sweep",
                                     "slug": slug, "err": str(e)}, level="WARN")

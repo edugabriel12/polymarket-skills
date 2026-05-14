@@ -428,11 +428,15 @@ def query_approved_unexecuted(conn) -> list[sqlite3.Row]:
 
 
 def query_open_positions(conn) -> list[sqlite3.Row]:
-    """Entries that were executed and have no cashout yet."""
+    """Entries that were executed and are still open: no cashout, no resolution.
+    Resolved positions are excluded so the slot is freed for new bets."""
     return conn.execute(
         "SELECT e.* FROM entries e "
         "LEFT JOIN cashouts c ON c.entry_id = e.entry_id "
-        "WHERE e.status IN ('EXECUTED','FAST_PATH') AND c.cashout_id IS NULL"
+        "LEFT JOIN resolutions r ON r.entry_id = e.entry_id "
+        "WHERE e.status IN ('EXECUTED','FAST_PATH') "
+        "AND c.cashout_id IS NULL "
+        "AND r.resolution_id IS NULL"
     ).fetchall()
 
 

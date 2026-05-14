@@ -677,9 +677,18 @@ def close_position(
     portfolio_name: str = "default",
     fee_rate: float = DEFAULT_FEE_RATE,
     reasoning: str = "",
+    force_exit_price: float | None = None,
 ) -> dict:
     """
-    Close an open position at current market price.
+    Close an open position.
+
+    Normal path (force_exit_price=None): walks orderbook bids to simulate
+    a market-sell fill at current prices.
+
+    Resolution path (force_exit_price set): credits all shares at the
+    given price with no orderbook fetch. Used by the bot when a market
+    resolves on Polymarket — the orderbook may be stale/empty and the
+    actual payout is the resolution value, not the bid.
 
     Args:
         token_id: The CLOB token to close
@@ -687,20 +696,27 @@ def close_position(
         portfolio_name: Which portfolio
         fee_rate: Override fee rate
         reasoning: Why closing
+        force_exit_price: When set (0.0 ≤ price ≤ 1.0), bypass orderbook
+            and fill all shares at this exact price.
 
     Returns: Close execution result.
     """
-    # Fetch order book BEFORE acquiring write lock (network I/O)
-    orderbook = fetch_orderbook(token_id)
-
-    # Walk bids to simulate sell fill
-    bids = sorted(
-        orderbook.get("bids", []),
-        key=lambda x: float(x["price"]),
-        reverse=True,
-    )
-    if not bids:
-        raise RuntimeError("No bids in order book — cannot close position")
+    if force_exit_price is None:
+        # Normal path: orderbook walk
+        orderbook = fetch_orderbook(token_id)
+        bids = sorted(
+            orderbook.get("bids", []),
+            key=lambda x: float(x["price"]),
+            reverse=True,
+        )
+        if not bids:
+            raise RuntimeError("No bids in order book — cannot close position")
+    else:
+        if not (0.0 <= force_exit_price <= 1.0):
+            raise ValueError(
+                f"force_exit_price {force_exit_price} out of range [0, 1]"
+            )
+        bids = None  # signal "skip orderbook walk"
 
     conn = _get_db()
     try:
@@ -735,21 +751,27 @@ def close_position(
         for pos in positions:
             pos = dict(pos)
 
-            remaining_shares = pos["shares"]
-            total_proceeds = 0.0
-            for level in bids:
-                lvl_price = float(level["price"])
-                lvl_size = float(level["size"])
-                sell_shares = min(remaining_shares, lvl_size)
-                total_proceeds += sell_shares * lvl_price
-                remaining_shares -= sell_shares
-                if remaining_shares < 0.0001:
-                    break
+            if force_exit_price is not None:
+                # Resolution path: all shares fill at the forced price.
+                shares_sold = pos["shares"]
+                total_proceeds = shares_sold * force_exit_price
+                remaining_shares = 0
+            else:
+                remaining_shares = pos["shares"]
+                total_proceeds = 0.0
+                for level in bids:
+                    lvl_price = float(level["price"])
+                    lvl_size = float(level["size"])
+                    sell_shares = min(remaining_shares, lvl_size)
+                    total_proceeds += sell_shares * lvl_price
+                    remaining_shares -= sell_shares
+                    if remaining_shares < 0.0001:
+                        break
 
-            shares_sold = pos["shares"] - remaining_shares
-            if shares_sold <= 0:
-                conn.rollback()
-                raise RuntimeError("Could not sell any shares at current bids")
+                shares_sold = pos["shares"] - remaining_shares
+                if shares_sold <= 0:
+                    conn.rollback()
+                    raise RuntimeError("Could not sell any shares at current bids")
 
             avg_sell_price = total_proceeds / shares_sold if shares_sold > 0 else 0
             fee = total_proceeds * fee_rate
