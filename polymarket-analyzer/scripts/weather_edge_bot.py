@@ -1046,7 +1046,10 @@ def main():
     p.add_argument("--daemon", action="store_true", default=True)
     p.add_argument("--once", action="store_true",
                    help="Run discovery+monitor once and exit")
-    p.add_argument("--discovery-interval-min", type=float, default=10)
+    p.add_argument("--discovery-interval-min", type=float, default=60,
+                   help="Minutes between discovery cycles (default 60). "
+                        "Discovery scans ~1249 markets which takes 5-15 min; "
+                        "10 min was too tight and starved the judge of DB writes.")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--judge-mode", choices=("sync", "off"), default="sync")
     p.add_argument("--fast-path-ttr-min", type=int, default=60)
