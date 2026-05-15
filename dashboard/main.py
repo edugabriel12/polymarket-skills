@@ -19,8 +19,9 @@ from fastapi.templating import Jinja2Templates
 from . import settings as S
 from .services import (advisor, advisor_jobs, analytics, charts,
                         counterfactual, costs, events, live_trading,
-                        notifier, portfolio, positions, process_manager,
-                        settings_service, suggestion_applier, wallet)
+                        notifier, onchain_history, portfolio, positions,
+                        process_manager, settings_service,
+                        suggestion_applier, wallet)
 
 app = FastAPI(title="Polymarket Weather Dashboard")
 
@@ -388,6 +389,21 @@ def api_wallet_balance(request: Request, refresh: int = 0):
     w = wallet.get_wallet_info(force_refresh=bool(refresh))
     return templates.TemplateResponse(
         request, "partials/wallet_balance.html", {"w": w})
+
+
+@app.get("/api/wallet/onchain", response_class=HTMLResponse)
+def api_wallet_onchain(request: Request, refresh: int = 0, limit: int = 50):
+    """On-chain transaction history via Polygonscan."""
+    w = wallet.get_wallet_info()
+    if not w.get("configured"):
+        return templates.TemplateResponse(
+            request, "partials/onchain_history.html",
+            {"h": {"configured": False,
+                    "reason": w.get("reason", "no wallet")}})
+    h = onchain_history.get_transactions(
+        w["address"], limit=limit, force_refresh=bool(refresh))
+    return templates.TemplateResponse(
+        request, "partials/onchain_history.html", {"h": h})
 
 
 @app.get("/api/live/mode", response_class=HTMLResponse)

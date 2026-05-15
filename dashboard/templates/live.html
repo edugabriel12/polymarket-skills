@@ -49,12 +49,22 @@
 </section>
 
 <section class="card">
-  <h2>Live trades</h2>
+  <h2>Live trades <span class="muted small">(local executor log)</span></h2>
   <div id="live-trades-zone"
        hx-get="/api/live/trades?limit=50"
        hx-trigger="load, every 30s"
        hx-swap="innerHTML">
     <div class="muted">Loading…</div>
+  </div>
+</section>
+
+<section class="card">
+  <h2>On-chain history <span class="muted small">(Polygonscan)</span></h2>
+  <div id="onchain-zone"
+       hx-get="/api/wallet/onchain?limit=50"
+       hx-trigger="load"
+       hx-swap="innerHTML">
+    <div class="muted">Loading on-chain history…</div>
   </div>
 </section>
 
