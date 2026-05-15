@@ -269,6 +269,149 @@ def resolve_station(name: str, cities: dict[str, Any]) -> Optional[dict]:
     return entry
 
 
+# ---------------------------------------------------------------------------
+# v9: Auto-extract resolution station from Polymarket market description.
+# When a city isn't yet in the `stations` dict, we try to parse the rules
+# text via regex + station_names lookup, so the operator doesn't have to
+# manually curate every new city. Falls back to None on failure (caller
+# uses legacy OpenWeather geocoding).
+# ---------------------------------------------------------------------------
+
+# Regex patterns matched against the lowercased description text.
+# Each captures group(1) = the station name phrase. Ordered most-specific
+# to least-specific so we don't trigger false matches.
+_STATION_PATTERNS = [
+    # "recorded at the Hartsfield-Jackson International Airport Station"
+    re.compile(r"recorded\s+at\s+(?:the\s+)?([\w\-'.\s]+?)\s+station\b", re.I),
+    # "as recorded by the Hong Kong Observatory"
+    re.compile(r"recorded\s+by\s+(?:the\s+)?([\w\-'.\s]+?)\b(?:\s+(?:on|in|for|at|during|with|as|per)\b|[.,;])", re.I),
+    # "as reported by Hartsfield-Jackson Airport"
+    re.compile(r"reported\s+(?:by|at|from)\s+(?:the\s+)?([\w\-'.\s]+?)\b(?:\s+(?:on|in|for|at|during|with|as|per)\b|[.,;])", re.I),
+    # "according to the Hong Kong Observatory"
+    re.compile(r"according\s+to\s+(?:the\s+)?([\w\-'.\s]+?)\b(?:\s+(?:on|in|for|at|during|with|as|per)\b|[.,;])", re.I),
+    # "measured at LaGuardia Airport"
+    re.compile(r"measured\s+at\s+(?:the\s+)?([\w\-'.\s]+?)\b(?:\s+(?:on|in|for|at|during|with|as|per)\b|[.,;])", re.I),
+    # "data from the Hong Kong Observatory"
+    re.compile(r"data\s+from\s+(?:the\s+)?([\w\-'.\s]+?)\b(?:\s+(?:on|in|for|at|during|with|as|per)\b|[.,;])", re.I),
+    # "Resolves per the Incheon International Airport" / "based on" / "using"
+    re.compile(r"\bresolves?\s+(?:per|using|based\s+on)\s+(?:the\s+)?([\w\-'.\s]+?)\b(?:\s+(?:on|in|for|at|during|with|as|per|reading|reads?|report|readings)\b|[.,;])", re.I),
+    # Direct ICAO code in parentheses: "(KLGA)" or "(HKO)"
+    re.compile(r"\(([A-Z]{3,4})\)"),
+]
+
+# Normalizer: strip these noise words before matching against station_names
+_STATION_NOISE_WORDS = re.compile(
+    r"\b(?:the|a|an|international|airport|station|observatory|"
+    r"weather|meteorological|service|bureau|center|centre)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_station_phrase(phrase: str) -> str:
+    """Lowercase + strip noise words + collapse whitespace.
+    'The Hartsfield-Jackson International Airport' -> 'hartsfield-jackson'
+    """
+    if not phrase:
+        return ""
+    cleaned = _STATION_NOISE_WORDS.sub(" ", phrase.lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+# Cache: (description_hash, city) -> dict | None. Avoid re-parsing the same
+# rules text per discovery cycle.
+_AUTO_STATION_CACHE: dict = {}
+
+
+def auto_extract_station(name: str, cities: dict[str, Any],
+                          description: Optional[str]) -> Optional[dict]:
+    """v9: try to auto-resolve a station for `name` by parsing `description`
+    (Polymarket market.description text).
+
+    Returns the same shape as resolve_station() — {lat, lon, station,
+    temp_bias_f, _source: "auto"} — or None if no match. `temp_bias_f`
+    is always 0.0 for auto-resolved stations (operator must move the
+    entry to the curated `stations` dict to set a non-zero bias).
+
+    Lookup pipeline:
+      1. Apply each _STATION_PATTERNS regex; collect candidate phrases.
+      2. For each candidate: normalize -> exact match in station_names.
+      3. If station_names returns an ICAO -> reverse-lookup coords in
+         the curated `stations` dict (by station code).
+      4. Direct ICAO match also works: a "(KLGA)" capture short-circuits.
+
+    Caller should log when this fires so operator can decide to add the
+    entry to `stations` permanently (with manual lat/lon verification +
+    optional temp_bias_f).
+    """
+    if not description or not cities:
+        return None
+
+    cache_key = (hash(description), name or "")
+    if cache_key in _AUTO_STATION_CACHE:
+        return _AUTO_STATION_CACHE[cache_key]
+
+    station_names = cities.get("station_names") or {}
+    stations = cities.get("stations") or {}
+
+    # Build reverse-by-icao index of curated stations (icao -> entry).
+    icao_to_entry: dict[str, dict] = {}
+    for entry in stations.values():
+        icao = entry.get("station")
+        if icao and icao not in icao_to_entry:
+            icao_to_entry[icao] = entry
+
+    def _try_icao(icao: str) -> Optional[dict]:
+        entry = icao_to_entry.get(icao)
+        if not entry:
+            return None
+        return {
+            "lat": entry["lat"], "lon": entry["lon"],
+            "station": entry["station"],
+            "temp_bias_f": 0.0,  # auto-resolved entries don't carry bias
+            "_source": "auto",
+        }
+
+    result: Optional[dict] = None
+
+    for pat in _STATION_PATTERNS:
+        for m in pat.finditer(description):
+            raw = m.group(1).strip()
+            # Direct ICAO capture path
+            if len(raw) in (3, 4) and raw.isupper() and raw.isalpha():
+                hit = _try_icao(raw)
+                if hit:
+                    result = hit
+                    break
+                continue
+            # Try raw lowercased FIRST so "hong kong observatory" matches its
+            # full station_names key (the noise-word stripper would remove
+            # "observatory" and lose the signal). Then fall back to
+            # normalized + progressively-shorter prefixes.
+            raw_lower = re.sub(r"\s+", " ", raw.lower()).strip()
+            icao = station_names.get(raw_lower)
+            if not icao:
+                normalized = _normalize_station_phrase(raw)
+                if normalized:
+                    icao = station_names.get(normalized)
+                    if not icao:
+                        tokens = normalized.split()
+                        for cut in range(len(tokens), 0, -1):
+                            prefix = " ".join(tokens[:cut])
+                            icao = station_names.get(prefix)
+                            if icao:
+                                break
+            if icao:
+                hit = _try_icao(icao)
+                if hit:
+                    result = hit
+                    break
+        if result:
+            break
+
+    _AUTO_STATION_CACHE[cache_key] = result
+    return result
+
+
 def _all_known_cities(cities: dict[str, Any]) -> dict[str, str]:
     """Build {lowercase_unaccented_name: canonical_name} including aliases."""
     out: dict[str, str] = {}

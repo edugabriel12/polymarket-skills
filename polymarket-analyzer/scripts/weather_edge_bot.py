@@ -69,6 +69,8 @@ from weather_edge_helpers import (  # noqa: E402
     MAE_TEMP_F, MAE_TEMP_C,
     # v8: resolution stations + Open-Meteo ensemble
     resolve_station, fetch_open_meteo_ensemble,
+    # v9: auto-extract station from market description
+    auto_extract_station,
 )
 import weather_edge_db as db  # noqa: E402
 
@@ -707,8 +709,20 @@ def run_discovery(args, cities: dict) -> int:
 
         # v8: resolve city -> resolution station coords (Polymarket
         # markets resolve at a specific weather station, not the city
-        # center). Falls back to OpenWeather geocoding if no override.
+        # center). v9: if no curated entry, try parsing the market
+        # description for a station phrase. Falls back to OpenWeather
+        # geocoding when both miss.
         station = resolve_station(spec.city, cities)
+        if not station:
+            description = m.get("description")
+            if description:
+                station = auto_extract_station(spec.city, cities, description)
+                if station:
+                    log_event("station_auto_resolved", {
+                        "slug": slug, "city": spec.city,
+                        "station": station["station"],
+                        "lat": station["lat"], "lon": station["lon"],
+                    })
         if station:
             forecast = fetch_forecast(spec.city, days=5,
                                        lat=station["lat"], lon=station["lon"])
