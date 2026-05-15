@@ -1550,12 +1550,11 @@ def main():
                         "net on 24h sample but n is small. Default 0 (OFF) "
                         "until operator validates a thresh on more data.")
     p.add_argument("--fast-path-ttr-min", type=int, default=60)
-    p.add_argument("--profit-lock-pp", type=float, default=30.0,
-                   help="Cashout when bid >= entry + X pp (default 30pp = +$0.30). "
-                        "Lowered from 50pp after 2026-05-15 analysis: only 8/51 "
-                        "trades cashed out under 50pp lock, leaving 84%% to "
-                        "ride to resolution where most lost. 30pp = locks "
-                        "profit on more winners at the cost of some upside.")
+    p.add_argument("--profit-lock-pp", type=float, default=50.0,
+                   help="Cashout when bid >= entry + X pp (default 50pp = "
+                        "+$0.50). Operator preference: keep the original 50pp "
+                        "and use trailing-drawdown-pct=15 as primary exit "
+                        "instead of locking profit early.")
     p.add_argument("--trailing-drawdown-pct", type=float, default=15.0,
                    help="Cashout if bid falls X%% below peak (default 15%% — "
                         "was 30%% but operator analysis 2026-05-15 showed "
