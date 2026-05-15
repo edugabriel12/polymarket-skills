@@ -9,7 +9,7 @@ REJECT / ADJUST verdict back to the DB.
 Default model: claude-sonnet-4-6 (good cost/perf for 24/7 with prompt caching).
 Override via CLAUDE_JUDGE_MODEL env var.
 
-Daily budget cap: JUDGE_DAILY_BUDGET_USD (default $10). When exceeded, judge
+Daily budget cap: JUDGE_DAILY_BUDGET_USD (default $15). When exceeded, judge
 marks remaining proposals as SKIPPED with reason=judge_budget_exceeded.
 
 Required env vars:
@@ -20,7 +20,7 @@ Required env vars:
 Optional:
   CLAUDE_JUDGE_MODEL       (default claude-sonnet-4-6)
   JUDGE_POLL_INTERVAL_SEC  (default 120)
-  JUDGE_DAILY_BUDGET_USD   (default 10)
+  JUDGE_DAILY_BUDGET_USD   (default 15)
 """
 from __future__ import annotations
 
@@ -34,6 +34,17 @@ from pathlib import Path
 from typing import Any, Optional
 
 import requests
+
+# Force UTF-8 stdout/stderr so unicode chars in weather data (°C, ≈, etc)
+# don't crash the print() during JSONL log writes on Windows (cp1252).
+# Without this, the verdict's rationale string can be cut mid-character,
+# corrupting the JSON output and causing silent REJECT verdicts.
+# See log analysis 2026-05-15 (charmap codec errors at lines 5:50, 7:53).
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except (AttributeError, OSError):
+    pass  # older Python or non-tty stream
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "polymarket-analyzer" / "scripts"))
@@ -67,7 +78,7 @@ PROMPT_PATH = REPO_ROOT / "polymarket-analyzer" / "references" / "weather-judge-
 
 DEFAULT_MODEL = os.environ.get("CLAUDE_JUDGE_MODEL", "claude-sonnet-4-6")
 POLL_INTERVAL = int(os.environ.get("JUDGE_POLL_INTERVAL_SEC", "120"))
-DAILY_BUDGET_USD = float(os.environ.get("JUDGE_DAILY_BUDGET_USD", "10.0"))
+DAILY_BUDGET_USD = float(os.environ.get("JUDGE_DAILY_BUDGET_USD", "15.0"))
 
 # Pricing per 1M tokens (Sonnet 4.6 / Opus 4.7 — adjust if model changed)
 PRICING = {
@@ -222,7 +233,7 @@ def call_claude(entry_row: dict, evidence: dict, system_prompt: str) -> Optional
     try:
         response = client.messages.create(
             model=DEFAULT_MODEL,
-            max_tokens=4096,
+            max_tokens=8192,  # was 4096; bumped to absorb longer rationales (3 truncations on 2026-05-14)
             system=[{"type": "text", "text": system_prompt,
                      "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
             messages=[{"role": "user", "content": user_content}],

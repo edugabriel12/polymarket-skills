@@ -346,8 +346,37 @@ def _norm_cdf(z: float) -> float:
     return statistics.NormalDist().cdf(z)
 
 
+# Probability clipping bounds: no 24-48h weather forecast can honestly
+# justify > 90% or < 10% certainty (natural variance of ±2-3°C in the
+# input forecast already implies that level of uncertainty even when
+# the point estimate is far from threshold). Clipping forces the bot
+# to size more conservatively on extreme-edge candidates and prevents
+# the adverse-selection trap where the bot is "98% sure" on bets the
+# market knows are coin-flips. See log analysis 2026-05-15.
+PROB_CLIP_LOW = 0.10
+PROB_CLIP_HIGH = 0.90
+
+
+def _clip_prob(p: Optional[float]) -> Optional[float]:
+    """Clip a forecast probability to [PROB_CLIP_LOW, PROB_CLIP_HIGH].
+    None passes through unchanged so callers can still treat as 'unknown'."""
+    if p is None:
+        return None
+    return max(PROB_CLIP_LOW, min(PROB_CLIP_HIGH, float(p)))
+
+
 def forecast_probability(spec: MarketSpec, forecast: dict) -> Optional[float]:
-    """Compute P(YES) for `spec` given OpenWeather forecast JSON.
+    """Compute P(YES) for `spec` clipped to [0.10, 0.90]. See
+    `_forecast_probability_raw` for the underlying calculation and
+    `_clip_prob` for rationale."""
+    return _clip_prob(_forecast_probability_raw(spec, forecast))
+
+
+def _forecast_probability_raw(spec: MarketSpec, forecast: dict) -> Optional[float]:
+    """Raw probability from the forecast model — uncalibrated.
+    Use forecast_probability() externally; this is only exposed for tests
+    and the analyzer (which can compare raw vs clipped to spot extreme
+    inputs).
 
     forecast shape (from get_weather.py forecast command):
         {"location": ..., "daily_forecast": [

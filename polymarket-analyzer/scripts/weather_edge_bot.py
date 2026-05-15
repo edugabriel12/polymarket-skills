@@ -1198,8 +1198,10 @@ def main():
     p.add_argument("--fast-path-ttr-min", type=int, default=60)
     p.add_argument("--profit-lock-pp", type=float, default=50.0,
                    help="Cashout when bid >= entry + X pp (default 50pp = +$0.50)")
-    p.add_argument("--trailing-drawdown-pct", type=float, default=30.0,
-                   help="Cashout if bid falls X%% below peak (default 30%%)")
+    p.add_argument("--trailing-drawdown-pct", type=float, default=15.0,
+                   help="Cashout if bid falls X%% below peak (default 15%% — "
+                        "was 30%% but operator analysis 2026-05-15 showed "
+                        "84%% of trades held to resolution where they lost)")
     p.add_argument("--convergence-pp", type=float, default=5.0,
                    help="Cashout when bid within X pp of forecast fair value (default 5pp)")
     p.add_argument("--max-market-exposure-usd", type=float, default=50.0,
