@@ -618,7 +618,9 @@ def run_discovery(args, cities: dict) -> int:
         "no_forecast_for_target_date": 0, "low_edge": 0,
         "duplicate_pending": 0, "opposite_side_held": 0,
         "market_exposure_full": 0,
-        "ttr_below_min": 0,  # v8: min-TTR filter
+        "ttr_below_min": 0,           # v8: min-TTR filter
+        "entry_too_cheap": 0,         # v9: cheap long-shot guard
+        "extreme_disagreement": 0,    # v9: adverse selection guard
     }
 
     # Phase 1: build candidate proposals using HTTP-only work (no DB lock held).
@@ -779,6 +781,68 @@ def run_discovery(args, cities: dict) -> int:
         entry_price = implied["yes_ask"] if side == "YES" else implied["no_ask"]
         if not (args.min_price <= entry_price <= args.max_price):
             skipped["price_band_miss"] += 1
+            continue
+
+        # v9 (loss analysis 2026-05-15): block cheap long-shot bets.
+        # Log analysis of entry_price < 0.30 cohort: 0/19 ever profited,
+        # 5/5 resolved lost full stake. Convergence cashout cannot save
+        # these because bid never rises above entry. Filter upstream
+        # rather than try to cashout-engineer the loss.
+        if args.min_entry_price > 0 and entry_price < args.min_entry_price:
+            skipped["entry_too_cheap"] += 1
+            if args.debug:
+                log_event("market_skipped", {"slug": slug,
+                    "reason": "entry_too_cheap",
+                    "entry_price": entry_price, "side": side,
+                    "min_required": args.min_entry_price})
+            try:
+                with db.connect() as _conn:
+                    db.insert_discovery_skip(_conn,
+                        ts=_now_iso(), slug=slug, city=spec.city,
+                        reason="entry_too_cheap",
+                        meta_json={"entry_price": entry_price, "side": side,
+                                    "min_required": args.min_entry_price,
+                                    "edge_pp": edge["edge_pp_at_best"]})
+                    _conn.commit()
+            except Exception:
+                pass
+            continue
+
+        # v9: adverse selection guard. When bot's forecast and market
+        # implied probability disagree by more than X percentage points,
+        # the bot is statistically more likely to be wrong than the
+        # market. Loss analysis 2026-05-14: trades with 80pp+ bot-vs-
+        # market disagreement had a 0% win rate. The bigger the gap,
+        # the more likely we are buying tickets the market knows are
+        # losers.
+        implied_on_side = (implied["yes_ask"] if side == "YES"
+                            else implied["no_ask"])
+        bot_prob_on_side = (forecast_prob if side == "YES"
+                             else 1.0 - forecast_prob)
+        disagreement_pp = abs(bot_prob_on_side - implied_on_side) * 100
+        if args.max_disagreement_pp > 0 and disagreement_pp > args.max_disagreement_pp:
+            skipped["extreme_disagreement"] += 1
+            if args.debug:
+                log_event("market_skipped", {"slug": slug,
+                    "reason": "extreme_disagreement",
+                    "disagreement_pp": round(disagreement_pp, 1),
+                    "bot_prob": round(bot_prob_on_side, 3),
+                    "implied": round(implied_on_side, 3),
+                    "side": side,
+                    "max_allowed": args.max_disagreement_pp})
+            try:
+                with db.connect() as _conn:
+                    db.insert_discovery_skip(_conn,
+                        ts=_now_iso(), slug=slug, city=spec.city,
+                        reason="extreme_disagreement",
+                        meta_json={"disagreement_pp": round(disagreement_pp, 1),
+                                    "bot_prob": round(bot_prob_on_side, 3),
+                                    "implied": round(implied_on_side, 3),
+                                    "side": side,
+                                    "max_allowed": args.max_disagreement_pp})
+                    _conn.commit()
+            except Exception:
+                pass
             continue
 
         candidates.append({
@@ -1465,6 +1529,19 @@ def main():
                    help="Skip markets with TTR < X hours at discovery. "
                         "Article finding: TTR<18h means market has priced in "
                         "fresh forecasts, edge is squeezed. Default 0 (off).")
+    # v9: upstream filters for the cheap-bet adverse-selection trap
+    p.add_argument("--min-entry-price", type=float, default=0.10,
+                   help="Skip trades with entry_price < X. Loss analysis "
+                        "2026-05-15 showed 0/19 wins on entry < 0.30 cohort: "
+                        "convergence cashout cannot save these (bid never "
+                        "rises above entry). Default 0.10. Set 0 to disable.")
+    p.add_argument("--max-disagreement-pp", type=float, default=0.0,
+                   help="Skip trades where |bot_prob - market_implied| > X pp. "
+                        "Adverse selection guard. Loss analysis 2026-05-15 "
+                        "sensitivity: thresh=50 is net-zero (blocks Karachi "
+                        "winners equal to Lucknow losers); thresh=70 is +$46 "
+                        "net on 24h sample but n is small. Default 0 (OFF) "
+                        "until operator validates a thresh on more data.")
     p.add_argument("--fast-path-ttr-min", type=int, default=60)
     p.add_argument("--profit-lock-pp", type=float, default=50.0,
                    help="Cashout when bid >= entry + X pp (default 50pp = +$0.50)")
