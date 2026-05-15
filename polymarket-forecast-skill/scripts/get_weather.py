@@ -709,10 +709,23 @@ def main():
             
         elif mode == "forecast":
             if len(sys.argv) < 3:
-                raise ValueError("Usage: get_weather.py forecast <location> [days]")
+                raise ValueError("Usage: get_weather.py forecast <location> [days] [--lat X --lon Y]")
             location = sys.argv[2]
-            days = int(sys.argv[3]) if len(sys.argv) > 3 else 5
-            result = get_weather_forecast_detailed(location, days, api_key)
+            # v8: parse optional --lat / --lon flags (anywhere after location)
+            lat_arg = None
+            lon_arg = None
+            positional = []
+            i = 3
+            while i < len(sys.argv):
+                tok = sys.argv[i]
+                if tok == "--lat" and i + 1 < len(sys.argv):
+                    lat_arg = sys.argv[i + 1]; i += 2; continue
+                if tok == "--lon" and i + 1 < len(sys.argv):
+                    lon_arg = sys.argv[i + 1]; i += 2; continue
+                positional.append(tok); i += 1
+            days = int(positional[0]) if positional else 5
+            result = get_weather_forecast_detailed(location, days, api_key,
+                                                     lat=lat_arg, lon=lon_arg)
             
         elif mode == "compare":
             if len(sys.argv) < 4:
@@ -801,17 +814,29 @@ def get_current_weather_detailed(location, api_key):
         }
 
 
-def get_weather_forecast_detailed(location, days, api_key):
-    """Get detailed weather forecast"""
+def get_weather_forecast_detailed(location, days, api_key,
+                                    lat=None, lon=None):
+    """Get detailed weather forecast.
+
+    v8: if lat/lon explicitly passed, skip the geocode() call and use
+    them directly. This lets the bot pull forecasts for the specific
+    weather station that resolves a Polymarket market (e.g. KLGA
+    instead of "New York" center), avoiding 1-3 degree C systematic
+    offset that costs the entire bin stake when missed.
+    """
     try:
-        lat, lon, resolved = geocode(location, api_key)
-        forecast = get_forecast(lat, lon, api_key)
-        
+        if lat is not None and lon is not None:
+            resolved = location  # caller-provided label
+            forecast = get_forecast(float(lat), float(lon), api_key)
+        else:
+            lat_geo, lon_geo, resolved = geocode(location, api_key)
+            forecast = get_forecast(lat_geo, lon_geo, api_key)
+
         if "error" in forecast:
             return forecast
-        
+
         forecast_data = get_multi_day_forecast(forecast, days)
-        
+
         return {
             "location": resolved,
             "analysis_type": "weather_forecast",
@@ -819,7 +844,7 @@ def get_weather_forecast_detailed(location, days, api_key):
             "daily_forecast": forecast_data,
             "generated_at": datetime.datetime.now().isoformat()
         }
-        
+
     except Exception as e:
         return {
             "error": "forecast_failed",

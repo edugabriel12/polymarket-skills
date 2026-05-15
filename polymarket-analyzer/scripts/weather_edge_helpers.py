@@ -124,6 +124,88 @@ def fetch_visual_crossing(city: str,
 
 
 # ---------------------------------------------------------------------------
+# v8: Open-Meteo multi-model ensemble (ICON + GFS + ECMWF in one call).
+# No API key required. Free tier 10k req/day non-commercial.
+# Article reference: when 2 of 3 models agree within 1C the third is
+# treated as outlier; if spread > 3C the bot inflates MAE x 1.5.
+# ---------------------------------------------------------------------------
+
+_OM_CACHE: dict = {}              # (lat, lon, target_iso) -> (ts_unix, dict)
+_OM_CACHE_TTL_SEC = 6 * 3600      # 6h
+
+
+def fetch_open_meteo_ensemble(lat: float, lon: float,
+                                target_date,  # date or YYYY-MM-DD string
+                                force_refresh: bool = False
+                                ) -> Optional[dict]:
+    """Pull ICON+GFS+ECMWF max temp (C) for `target_date` at (lat, lon).
+
+    Returns:
+      {"icon_max_c": 25.3, "gfs_max_c": 24.8, "ecmwf_max_c": 26.1,
+       "spread_c": 1.3, "agree": True}
+    or None on HTTP failure / malformed response.
+
+    `agree=True` when max-min spread <= 3C (article rule). Cached 6h
+    per (lat, lon, target_iso).
+    """
+    target_iso = (target_date.isoformat()
+                   if hasattr(target_date, "isoformat") else str(target_date))
+    cache_key = (round(float(lat), 4), round(float(lon), 4), target_iso)
+    now = time.time()
+    if not force_refresh and cache_key in _OM_CACHE:
+        cached_ts, cached_data = _OM_CACHE[cache_key]
+        if now - cached_ts < _OM_CACHE_TTL_SEC:
+            return cached_data
+
+    try:
+        r = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "models": "icon_seamless,gfs_seamless,ecmwf_ifs025",
+                "hourly": "temperature_2m",
+                "temperature_unit": "celsius",
+                "start_date": target_iso,
+                "end_date": target_iso,
+            },
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        hourly = data.get("hourly") or {}
+    except Exception:
+        return None
+
+    def _max_of(model_key: str) -> Optional[float]:
+        series = hourly.get(f"temperature_2m_{model_key}")
+        if not series:
+            return None
+        clean = [v for v in series if v is not None]
+        return max(clean) if clean else None
+
+    icon_v = _max_of("icon_seamless")
+    gfs_v = _max_of("gfs_seamless")
+    ecmwf_v = _max_of("ecmwf_ifs025")
+    present = [v for v in (icon_v, gfs_v, ecmwf_v) if v is not None]
+    if not present:
+        return None
+
+    spread_c = max(present) - min(present)
+    result = {
+        "icon_max_c": icon_v,
+        "gfs_max_c": gfs_v,
+        "ecmwf_max_c": ecmwf_v,
+        "spread_c": round(spread_c, 2),
+        "agree": spread_c <= 3.0,
+        "n_models": len(present),
+    }
+    _OM_CACHE[cache_key] = (now, result)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Market parsing
 # ---------------------------------------------------------------------------
 
@@ -150,8 +232,41 @@ def load_cities(path: Path = CITY_LOOKUP_PATH) -> dict[str, Any]:
     handles cities not in the list, just with lower confidence)."""
     if not path.exists():
         return {"world": [], "europe_top30": [], "north_america_extra": [],
-                "us_top50": [], "aliases": {}}
+                "us_top50": [], "aliases": {}, "stations": {}}
     return json.loads(path.read_text())
+
+
+def resolve_station(name: str, cities: dict[str, Any]) -> Optional[dict]:
+    """v8: lookup resolution-station override for a canonical city name.
+
+    Returns {"lat", "lon", "station", "temp_bias_f"} or None. None means
+    the city has no override and the bot should fall back to OpenWeather
+    geocoding by name (legacy behavior).
+
+    Polymarket weather markets resolve at a specific weather station
+    (e.g. KLGA for NYC, HKO for HK, VILK for Lucknow). Pulling forecast
+    for the wrong location is the most common systematic loss cause
+    (see article scar #1 / loss analysis 2026-05-14).
+    """
+    if not name:
+        return None
+    stations = cities.get("stations") if cities else None
+    if not stations:
+        return None
+    # Try exact match first, then case-insensitive
+    entry = stations.get(name)
+    if entry is None:
+        target = name.lower()
+        for k, v in stations.items():
+            if k.lower() == target:
+                entry = v
+                break
+    if not entry:
+        return None
+    # Sanity: require lat + lon, others optional
+    if entry.get("lat") is None or entry.get("lon") is None:
+        return None
+    return entry
 
 
 def _all_known_cities(cities: dict[str, Any]) -> dict[str, str]:
@@ -451,19 +566,29 @@ def _clip_prob(p: Optional[float]) -> Optional[float]:
 
 
 def forecast_probability(spec: MarketSpec, forecast: dict,
-                          mae_override: Optional[float] = None) -> Optional[float]:
+                          mae_override: Optional[float] = None,
+                          bias_override: Optional[float] = None
+                          ) -> Optional[float]:
     """Compute P(YES) for `spec` clipped to [0.10, 0.90].
 
-    `mae_override` (v7): if provided, replaces the static MAE_TEMP_F/C
-    or MAE_PRECIP_MM constant for this single call. Use to inject
-    dynamic MAE computed from forecast volatility history.
+    `mae_override` (v7): replaces the static MAE_TEMP_F/C or
+    MAE_PRECIP_MM constant for this call (dynamic MAE from history).
+
+    `bias_override` (v8): added to the forecast `ref` value before the
+    z-score. Per-city systematic offset to compensate for residual
+    error between our forecast source and the resolution station even
+    after fixing coordinates. Only applied to `metric=='temp'`. Units
+    match `spec.threshold_unit` (operator sets temp_bias_f in cities
+    JSON; bot converts on lookup if market is in C).
     """
-    return _clip_prob(_forecast_probability_raw(spec, forecast,
-                                                  mae_override=mae_override))
+    return _clip_prob(_forecast_probability_raw(
+        spec, forecast, mae_override=mae_override,
+        bias_override=bias_override))
 
 
 def _forecast_probability_raw(spec: MarketSpec, forecast: dict,
-                                mae_override: Optional[float] = None
+                                mae_override: Optional[float] = None,
+                                bias_override: Optional[float] = None
                                 ) -> Optional[float]:
     """Raw probability from the forecast model — uncalibrated.
     Use forecast_probability() externally; this is only exposed for tests
@@ -512,6 +637,11 @@ def _forecast_probability_raw(spec: MarketSpec, forecast: dict,
         ref = day.get(f"temp_high_{spec.threshold_unit.lower()}")
         if ref is None:
             return None
+        # v8: per-city systematic bias correction. Added to the forecast
+        # ref so the z-score is computed against a station-equivalent
+        # value. Only applied to temp markets; precip ignores.
+        if bias_override:
+            ref = float(ref) + float(bias_override)
         mae = (mae_override if mae_override is not None
                else (MAE_TEMP_F if spec.threshold_unit == "F" else MAE_TEMP_C))
         if spec.comparison == "range" and spec.threshold_value_high is not None:

@@ -67,6 +67,8 @@ from weather_edge_helpers import (  # noqa: E402
     # v7: dynamic MAE + multi-source consensus
     compute_dynamic_mae, fetch_visual_crossing,
     MAE_TEMP_F, MAE_TEMP_C,
+    # v8: resolution stations + Open-Meteo ensemble
+    resolve_station, fetch_open_meteo_ensemble,
 )
 import weather_edge_db as db  # noqa: E402
 
@@ -362,8 +364,15 @@ _FORECAST_KEY_WARNED = False
 _FORECAST_UNKNOWN_CITIES: set[str] = set()
 
 
-def fetch_forecast(city: str, days: int = 5) -> Optional[dict]:
+def fetch_forecast(city: str, days: int = 5,
+                    lat: Optional[float] = None,
+                    lon: Optional[float] = None) -> Optional[dict]:
     """Subprocess get_weather.py forecast and return parsed JSON, or None.
+
+    v8: when `lat`/`lon` are provided, passes --lat/--lon flags to
+    get_weather.py so it skips geocoding by city name and pulls
+    forecast for those exact coordinates (used for resolution-station
+    lookups).
 
     Caches the set of cities OpenWeather couldn't resolve, so repeat
     discovery cycles don't waste API calls on the same bad names.
@@ -377,7 +386,9 @@ def fetch_forecast(city: str, days: int = 5) -> Optional[dict]:
             _FORECAST_KEY_WARNED = True
         return None
 
-    if city in _FORECAST_UNKNOWN_CITIES:
+    # Lat/lon overrides skip the "unknown city" cache (coords always work
+    # regardless of whether OW knows the city name).
+    if lat is None and city in _FORECAST_UNKNOWN_CITIES:
         return None
 
     if not FORECAST_SCRIPT.exists():
@@ -386,11 +397,14 @@ def fetch_forecast(city: str, days: int = 5) -> Optional[dict]:
                   level="ERROR")
         return None
 
+    cmd = [sys.executable, str(FORECAST_SCRIPT), "forecast", city, str(days)]
+    if lat is not None and lon is not None:
+        cmd += ["--lat", str(lat), "--lon", str(lon)]
+
     try:
         env = {**os.environ}  # ensure subprocess inherits OPENWEATHER_API_KEY
         result = subprocess.run(
-            [sys.executable, str(FORECAST_SCRIPT), "forecast", city, str(days)],
-            capture_output=True, text=True, timeout=30, env=env,
+            cmd, capture_output=True, text=True, timeout=30, env=env,
         )
         if result.returncode != 0:
             # If OpenWeather doesn't recognize the city, cache it so we don't
@@ -425,20 +439,24 @@ def fetch_forecast(city: str, days: int = 5) -> Optional[dict]:
 
 
 def _compute_mae_for_market(spec: MarketSpec, ow_forecast: dict,
-                              args) -> tuple[Optional[float], dict]:
-    """v7: returns (mae_override, meta) for a given market spec.
+                              args,
+                              station: Optional[dict] = None
+                              ) -> tuple[Optional[float], Optional[float], dict]:
+    """v7+v8: returns (mae_override, bias_override, meta) for a market spec.
 
-    Side effects: writes OpenWeather (and optionally Visual Crossing)
+    Side effects: writes OpenWeather / Visual Crossing / Open-Meteo
     forecast snapshots to forecast_history. Reads recent history to
-    compute volatility-based MAE. When multi-source enabled and OW vs
-    VC disagree by > 2°C (or 3.6°F), inflates MAE × 1.5 as proxy for
-    forecast uncertainty.
+    compute volatility-based MAE. Disagreement penalties:
+      - OW vs VC > 2C/3.6F -> MAE x 1.5
+      - Open-Meteo 3-model spread > 3C -> MAE x 1.5
+    Bias override: comes from station["temp_bias_f"] (v8 cities JSON);
+    applied additively to the forecast reference value before z-score.
 
-    Returns (None, {}) on any failure path so caller can fall back to
-    static MAE constant cleanly.
+    Returns (None, None, {}) on any failure path so caller can fall back
+    cleanly. Bias is in spec.threshold_unit (F if market is F, C if C).
     """
     if not spec.target_date:
-        return None, {}
+        return None, None, {}
 
     metric = "temp_high_f" if spec.threshold_unit == "F" else "temp_high_c"
     target_iso = spec.target_date.isoformat()
@@ -447,10 +465,10 @@ def _compute_mae_for_market(spec: MarketSpec, ow_forecast: dict,
     days = ow_forecast.get("daily_forecast") or ow_forecast.get("forecasts") or []
     ow_day = next((d for d in days if d.get("date") == target_iso), None)
     if ow_day is None:
-        return None, {}
+        return None, None, {}
     ow_value = ow_day.get(metric)
     if ow_value is None:
-        return None, {}
+        return None, None, {}
 
     now_iso = _now_iso()
     try:
@@ -492,7 +510,39 @@ def _compute_mae_for_market(spec: MarketSpec, ow_forecast: dict,
                     log_event("warn", {"where": "fh_insert_vc",
                                         "err": str(e)}, level="WARN")
 
-    # Read history for dynamic MAE
+    # v8: Open-Meteo ensemble (ICON+GFS+ECMWF) — requires station lat/lon
+    om_data = None
+    om_enabled = getattr(args, "open_meteo", False) and station and (
+        station.get("lat") is not None and station.get("lon") is not None)
+    if om_enabled:
+        try:
+            om_data = fetch_open_meteo_ensemble(
+                station["lat"], station["lon"], spec.target_date)
+        except Exception as e:
+            log_event("warn", {"where": "fetch_open_meteo",
+                                "city": spec.city, "err": str(e)},
+                       level="WARN")
+            om_data = None
+        if om_data:
+            for model in ("icon", "gfs", "ecmwf"):
+                val_c = om_data.get(f"{model}_max_c")
+                if val_c is None:
+                    continue
+                # Convert to spec.threshold_unit if market is F
+                val = (float(val_c) if spec.threshold_unit == "C"
+                       else float(val_c) * 9.0 / 5.0 + 32.0)
+                try:
+                    with db.connect() as conn:
+                        db.insert_forecast_history(
+                            conn, city=spec.city, target_date=target_iso,
+                            metric=metric, source=f"open_meteo_{model}",
+                            predicted_value=val, ts=now_iso,
+                        )
+                except Exception as e:
+                    log_event("warn", {"where": "fh_insert_om",
+                                        "err": str(e)}, level="WARN")
+
+    # Read history for dynamic MAE (now includes OW+VC+OM models)
     try:
         with db.connect() as conn:
             rows = db.query_forecast_history(
@@ -504,24 +554,44 @@ def _compute_mae_for_market(spec: MarketSpec, ow_forecast: dict,
     history_values = [float(r["predicted_value"]) for r in rows]
     mae_dyn = compute_dynamic_mae(history_values, base_mae=base_mae)
 
-    # Disagreement penalty (v7): if OW and VC differ significantly
+    # Disagreement penalty (v7): OW vs VC
     disagreement = 0.0
     if vc_value is not None:
         disagreement = abs(float(ow_value) - vc_value)
-        threshold = 3.6 if spec.threshold_unit == "F" else 2.0  # ~2°C
+        threshold = 3.6 if spec.threshold_unit == "F" else 2.0  # ~2C
         if disagreement > threshold:
             mae_dyn *= 1.5
+
+    # v8: additional penalty if Open-Meteo 3-model spread > 3C
+    om_spread_penalty = False
+    if om_data and not om_data.get("agree"):
+        mae_dyn *= 1.5
+        om_spread_penalty = True
+
+    # v8: per-city temperature bias (in spec.threshold_unit)
+    bias = None
+    if station and station.get("temp_bias_f") is not None:
+        bias_f = float(station["temp_bias_f"])
+        if bias_f != 0.0:
+            bias = (bias_f if spec.threshold_unit == "F"
+                    else bias_f * 5.0 / 9.0)  # F delta -> C delta
 
     meta = {
         "ow_value": float(ow_value),
         "vc_value": vc_value,
+        "om_spread_c": (om_data or {}).get("spread_c"),
+        "om_n_models": (om_data or {}).get("n_models"),
+        "om_spread_penalty": om_spread_penalty,
         "disagreement": round(disagreement, 2),
         "history_n": len(history_values),
         "base_mae": base_mae,
         "mae_dynamic": round(mae_dyn, 2),
+        "bias": bias,
         "multi_source": multi_source,
+        "open_meteo": om_enabled,
+        "station": (station or {}).get("station"),
     }
-    return mae_dyn, meta
+    return mae_dyn, bias, meta
 
 
 def run_discovery(args, cities: dict) -> int:
@@ -546,6 +616,7 @@ def run_discovery(args, cities: dict) -> int:
         "no_forecast_for_target_date": 0, "low_edge": 0,
         "duplicate_pending": 0, "opposite_side_held": 0,
         "market_exposure_full": 0,
+        "ttr_below_min": 0,  # v8: min-TTR filter
     }
 
     # Phase 1: build candidate proposals using HTTP-only work (no DB lock held).
@@ -573,6 +644,18 @@ def run_discovery(args, cities: dict) -> int:
                                               "ttr_h": round((end_date - now).total_seconds() / 3600, 1)})
             continue
         ttr_hours = (end_date - now).total_seconds() / 3600.0
+
+        # v8: skip markets with TTR below the operator-configured minimum.
+        # Article finding: TTR < 18h means market has priced in fresh
+        # forecasts; edge is squeezed. Filter early (before orderbook fetch).
+        if args.min_ttr_hours > 0 and ttr_hours < args.min_ttr_hours:
+            skipped["ttr_below_min"] += 1
+            if args.debug:
+                log_event("market_skipped", {"slug": slug,
+                    "reason": "ttr_below_min",
+                    "ttr_h": round(ttr_hours, 1),
+                    "min_required": args.min_ttr_hours})
+            continue
 
         if m.get("acceptingOrders") is False:
             skipped["orderbook_unavailable"] = skipped.get("orderbook_unavailable", 0) + 1
@@ -622,19 +705,30 @@ def run_discovery(args, cities: dict) -> int:
                                               "no_ask": implied["no_ask"]})
             continue
 
-        forecast = fetch_forecast(spec.city, days=5)
+        # v8: resolve city -> resolution station coords (Polymarket
+        # markets resolve at a specific weather station, not the city
+        # center). Falls back to OpenWeather geocoding if no override.
+        station = resolve_station(spec.city, cities)
+        if station:
+            forecast = fetch_forecast(spec.city, days=5,
+                                       lat=station["lat"], lon=station["lon"])
+        else:
+            forecast = fetch_forecast(spec.city, days=5)
         if not forecast:
             skipped["forecast_unavailable"] += 1
             log_event("market_skipped", {"slug": slug, "reason": "forecast_unavailable",
-                                          "city": spec.city})
+                                          "city": spec.city,
+                                          "station": (station or {}).get("station")})
             continue
 
-        # v7: Persist OW forecast + (optionally) Visual Crossing for
-        # multi-source consensus + dynamic MAE.
-        mae_dynamic, mae_meta = _compute_mae_for_market(spec, forecast, args)
+        # v7+v8: Persist OW + (optionally) VC + Open-Meteo ensemble for
+        # multi-source consensus + dynamic MAE; also extract per-city bias.
+        mae_dynamic, bias, mae_meta = _compute_mae_for_market(
+            spec, forecast, args, station=station)
 
         forecast_prob = forecast_probability(spec, forecast,
-                                              mae_override=mae_dynamic)
+                                              mae_override=mae_dynamic,
+                                              bias_override=bias)
         if forecast_prob is None:
             skipped["no_forecast_for_target_date"] += 1
             log_event("market_skipped", {"slug": slug, "reason": "no_forecast_for_target_date"})
@@ -1014,18 +1108,26 @@ def _do_monitor_check(conn, row, cities: dict, args) -> None:
     entry_id = row["entry_id"]
     side = row["side"]
     spec = parse_market(row["market_question"], row["end_date"], cities)
+    # v8: use resolution-station coords if available
+    station = resolve_station(spec.city, cities) if spec else None
     # HTTP — no DB lock
-    forecast = fetch_forecast(spec.city) if spec else None
+    if spec and station:
+        forecast = fetch_forecast(spec.city,
+                                    lat=station["lat"], lon=station["lon"])
+    else:
+        forecast = fetch_forecast(spec.city) if spec else None
     if not spec or not forecast:
         log_event("monitor_check", {"entry_id": entry_id, "decision": "HOLD",
                                     "reason": "no_forecast_or_spec"})
         return
-    # v7: dynamic MAE (also writes new forecast snapshot to history,
-    # which feeds future MAE calculations across positions in the
+    # v7+v8: dynamic MAE + per-city bias (also writes new forecast snapshot
+    # to history, feeding future MAE calculations across positions in the
     # same city).
-    mae_dyn, _ = _compute_mae_for_market(spec, forecast, args)
+    mae_dyn, bias, _ = _compute_mae_for_market(spec, forecast, args,
+                                                  station=station)
     forecast_prob_yes = forecast_probability(spec, forecast,
-                                               mae_override=mae_dyn)
+                                               mae_override=mae_dyn,
+                                               bias_override=bias)
     if forecast_prob_yes is None:
         return
 
@@ -1318,6 +1420,19 @@ def main():
     p.add_argument("--no-multi-source", dest="multi_source",
                    action="store_false",
                    help="Disable multi-source consensus (overrides auto-detect).")
+    # v8: Open-Meteo ensemble + station coords + bias + min-TTR
+    p.add_argument("--open-meteo", dest="open_meteo",
+                   action="store_true", default=True,
+                   help="Cross-check with Open-Meteo ICON+GFS+ECMWF ensemble "
+                        "(free, no API key). Inflates MAE x1.5 if 3-model "
+                        "spread > 3C. Default ON. Requires station coords "
+                        "in weather-cities.json 'stations' dict.")
+    p.add_argument("--no-open-meteo", dest="open_meteo", action="store_false",
+                   help="Disable Open-Meteo ensemble fetch.")
+    p.add_argument("--min-ttr-hours", type=float, default=0.0,
+                   help="Skip markets with TTR < X hours at discovery. "
+                        "Article finding: TTR<18h means market has priced in "
+                        "fresh forecasts, edge is squeezed. Default 0 (off).")
     p.add_argument("--fast-path-ttr-min", type=int, default=60)
     p.add_argument("--profit-lock-pp", type=float, default=50.0,
                    help="Cashout when bid >= entry + X pp (default 50pp = +$0.50)")

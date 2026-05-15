@@ -40,6 +40,22 @@ two sources disagree by > 3.6°F (~2°C), MAE is multiplied by 1.5 as a
 proxy for forecast uncertainty. VC responses cached 6h to fit free
 tier (1000 req/day shared).
 
+**v8: Resolution station coordinates + per-city bias + min-TTR +
+Open-Meteo ensemble.** Polymarket weather markets resolve at a specific
+station (KLGA for NYC, HKO for HK, VILK for Lucknow) — not the city
+center. `weather-cities.json` now has a `"stations"` dict with
+lat/lon/station/temp_bias_f for ~20 curated cities; the bot passes
+these coords to OpenWeather (skipping geocoding) and to Open-Meteo
+(ICON+GFS+ECMWF ensemble in one call, free, no API key). 3-model
+spread > 3°C inflates MAE by 1.5× (composes with VC disagreement
+penalty for up to 2.25× total when both fire). Per-city
+`temp_bias_f` is added to the forecast ref before z-score to
+compensate residual offset (e.g. Hong Kong subtropical bias).
+`--min-ttr-hours N` skips markets with TTR < N (article: when
+TTR<18h the market has already priced in fresh forecasts and edge is
+squeezed). Cities not in `stations` dict fall back to legacy
+OpenWeather geocoding (best-effort).
+
 ### Precipitation
 - Binary "will it rain" → use `precip_probability / 100` directly.
 - "More than X mm" → normal CDF on `precip_mm` with `MAE_PRECIP = 3mm`.
