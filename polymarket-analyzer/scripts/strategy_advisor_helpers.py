@@ -506,7 +506,7 @@ def read_current_config() -> dict:
 
     # MAE constants from weather_edge_helpers.py
     if HELPERS_PATH.exists():
-        text = HELPERS_PATH.read_text()
+        text = HELPERS_PATH.read_text(encoding="utf-8")
         for name in ("MAE_TEMP_F", "MAE_TEMP_C", "MAE_PRECIP_MM", "MAE_WIND_KPH"):
             m = re.search(rf"^{name}\s*=\s*([0-9.]+)", text, re.MULTILINE)
             if m:
@@ -514,7 +514,7 @@ def read_current_config() -> dict:
 
     # CLI defaults from weather_edge_bot.py
     if BOT_PATH.exists():
-        text = BOT_PATH.read_text()
+        text = BOT_PATH.read_text(encoding="utf-8")
         for flag in ("--min-edge-pp", "--min-price", "--max-price",
                      "--profit-lock-pp", "--trailing-drawdown-pct",
                      "--convergence-pp", "--fast-path-ttr-min"):
@@ -528,7 +528,7 @@ def read_current_config() -> dict:
     # Cities count
     if CITIES_PATH.exists():
         try:
-            cities = json.loads(CITIES_PATH.read_text())
+            cities = json.loads(CITIES_PATH.read_text(encoding="utf-8"))
             if isinstance(cities, dict):
                 cfg["cities_count"] = sum(
                     len(v) if isinstance(v, list) else 0
@@ -541,7 +541,7 @@ def read_current_config() -> dict:
 
     # Judge prompt excerpt (first 800 chars for brevity)
     if JUDGE_PROMPT_PATH.exists():
-        cfg["judge_prompt_excerpt"] = JUDGE_PROMPT_PATH.read_text()[:800]
+        cfg["judge_prompt_excerpt"] = JUDGE_PROMPT_PATH.read_text(encoding="utf-8")[:800]
 
     return cfg
 

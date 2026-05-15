@@ -36,7 +36,7 @@ def _load_dotenv() -> None:
     env_path = REPO_ROOT / "agent" / ".env"
     if not env_path.exists():
         return
-    for raw in env_path.read_text().splitlines():
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -512,7 +512,7 @@ def main() -> int:
                                     "err": f"missing {PROMPT_PATH}"},
                           level="ERROR")
                 return 2
-            system_prompt = PROMPT_PATH.read_text()
+            system_prompt = PROMPT_PATH.read_text(encoding="utf-8")
             response = call_advisor_llm(system_prompt, user_payload,
                                          model=model, budget_usd=budget_usd)
             if response is None:

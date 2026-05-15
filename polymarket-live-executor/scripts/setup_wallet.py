@@ -141,7 +141,7 @@ def verify_config():
     # Check .gitignore
     gitignore_path = Path(__file__).parent.parent.parent / ".gitignore"
     if gitignore_path.exists():
-        content = gitignore_path.read_text()
+        content = gitignore_path.read_text(encoding="utf-8")
         if ".env" in content:
             checks.append((".gitignore", "OK", ".env is gitignored"))
         else:

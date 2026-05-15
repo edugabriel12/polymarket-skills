@@ -62,7 +62,7 @@ def _load_rate_limit() -> dict:
     if not _RATE_LIMIT_FILE.exists():
         return {}
     try:
-        return json.loads(_RATE_LIMIT_FILE.read_text())
+        return json.loads(_RATE_LIMIT_FILE.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return {}
 

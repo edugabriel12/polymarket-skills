@@ -233,7 +233,7 @@ def load_cities(path: Path = CITY_LOOKUP_PATH) -> dict[str, Any]:
     if not path.exists():
         return {"world": [], "europe_top30": [], "north_america_extra": [],
                 "us_top50": [], "aliases": {}, "stations": {}}
-    return json.loads(path.read_text())
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def resolve_station(name: str, cities: dict[str, Any]) -> Optional[dict]:

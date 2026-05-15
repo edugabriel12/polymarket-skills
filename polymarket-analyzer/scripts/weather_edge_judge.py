@@ -154,7 +154,7 @@ def get_visual_crossing(city: str, date_iso: Optional[str] = None) -> Optional[d
 def _load_system_prompt() -> str:
     if not PROMPT_PATH.exists():
         return "You are a weather forecast verification assistant. Respond with JSON."
-    return PROMPT_PATH.read_text()
+    return PROMPT_PATH.read_text(encoding="utf-8")
 
 
 _VERDICT_SCHEMA = {

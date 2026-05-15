@@ -64,7 +64,7 @@ def _load_constitution() -> str:
     path = ROOT / "CLAUDE.md"
     if not path.exists():
         sys.exit(f"CLAUDE.md not found at {path} — set POLYMARKET_SKILLS_ROOT")
-    return path.read_text()
+    return path.read_text(encoding="utf-8")
 
 
 SYSTEM_PROMPT = f"""You are the Polymarket autonomous trading agent. You run on a recurring
@@ -186,7 +186,7 @@ def tool_read_file(path: str) -> dict:
         return {"error": "not found"}
     if p.stat().st_size > 200_000:
         return {"error": "file too large (>200KB)"}
-    return {"content": p.read_text()}
+    return {"content": p.read_text(encoding="utf-8")}
 
 
 def dispatch_tool(name: str, args: dict) -> str:
