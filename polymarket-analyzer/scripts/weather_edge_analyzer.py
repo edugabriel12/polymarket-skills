@@ -257,6 +257,201 @@ def aggregate_judge(conn, since_iso: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def compute_discovery_meta_breakdown(conn, since_iso: str) -> dict:
+    """v8: cohort win-rate breakdown by discovery metadata (mae_dynamic,
+    bias, station, multi_source, open_meteo, om_spread_penalty).
+
+    Lets the advisor answer questions like:
+      - Did v7 dynamic MAE help? Compare win_rate of trades where
+        mae_dynamic > base × 1.5 vs trades where mae_dynamic == base.
+      - Did v8 station coords help? Compare win_rate per station (KLGA
+        vs auto-resolved vs legacy-geocoded).
+      - Is the Open-Meteo disagreement penalty too aggressive? Compare
+        win_rate of om_spread_penalty=True vs False.
+      - Is the min-TTR filter actually saving us from losses? Compare
+        recent discovery_skips with reason='ttr_below_min' against
+        accepted trades in similar TTR ranges.
+
+    Returns a nested dict:
+      {
+        "n_total_resolved": int,
+        "by_station": {"KLGA": {"n": 12, "wins": 8, "win_rate": 0.67}, ...},
+        "by_mae_bucket": {"base": {...}, "1.5x": {...}, "2x+": {...}},
+        "by_multi_source": {"true": {...}, "false": {...}},
+        "by_om_penalty": {"true": {...}, "false": {...}},
+        "by_bias_applied": {"true": {...}, "false": {...}},
+        "auto_station_resolves": {"n": int, "wins": int, "win_rate": float},
+        "skips_breakdown": {
+            "ttr_below_min": {"n": int, "avg_ttr_h": float, "min_ttr": float}
+        },
+        "interpretation": [str, ...],  # human-readable flags
+      }
+    """
+    # Helper: bucket label for mae_dynamic / base_mae ratio
+    def _mae_bucket(ratio: float) -> str:
+        if ratio is None or ratio <= 1.05:
+            return "base"
+        if ratio <= 1.5:
+            return "1.5x"
+        if ratio <= 2.0:
+            return "2x"
+        return "2x+"
+
+    # Pull resolved entries with discovery_meta_json + resolution outcome
+    try:
+        rows = conn.execute(
+            """
+            SELECT e.entry_id, e.side, e.city_resolved, e.ts,
+                   e.discovery_meta_json,
+                   r.payout_per_share,
+                   CASE WHEN r.payout_per_share > 0 THEN 1 ELSE 0 END AS won
+            FROM entries e
+            JOIN resolutions r USING(entry_id)
+            WHERE e.ts >= ? AND e.status = 'EXECUTED'
+              AND e.discovery_meta_json IS NOT NULL
+            """,
+            (since_iso,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []  # discovery_meta_json column missing pre-v8
+
+    by_station: dict[str, dict] = defaultdict(lambda: {"n": 0, "wins": 0})
+    by_mae: dict[str, dict] = defaultdict(lambda: {"n": 0, "wins": 0})
+    by_multi: dict[str, dict] = defaultdict(lambda: {"n": 0, "wins": 0})
+    by_om_pen: dict[str, dict] = defaultdict(lambda: {"n": 0, "wins": 0})
+    by_bias: dict[str, dict] = defaultdict(lambda: {"n": 0, "wins": 0})
+    auto_n = 0
+    auto_wins = 0
+
+    for r in rows:
+        try:
+            meta = json.loads(r["discovery_meta_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            meta = {}
+        won = int(r["won"])
+
+        station = meta.get("station") or "geocoded"
+        by_station[station]["n"] += 1
+        by_station[station]["wins"] += won
+
+        base = float(meta.get("base_mae") or 0)
+        dyn = float(meta.get("mae_dynamic") or 0)
+        ratio = (dyn / base) if base > 0 else None
+        bk = _mae_bucket(ratio)
+        by_mae[bk]["n"] += 1
+        by_mae[bk]["wins"] += won
+
+        ms_key = "true" if meta.get("multi_source") else "false"
+        by_multi[ms_key]["n"] += 1
+        by_multi[ms_key]["wins"] += won
+
+        om_pen_key = "true" if meta.get("om_spread_penalty") else "false"
+        by_om_pen[om_pen_key]["n"] += 1
+        by_om_pen[om_pen_key]["wins"] += won
+
+        bias_applied = meta.get("bias") is not None and meta.get("bias") != 0
+        bk_key = "true" if bias_applied else "false"
+        by_bias[bk_key]["n"] += 1
+        by_bias[bk_key]["wins"] += won
+
+        # v9: auto-extract resolved entries carry _source="auto" inside
+        # the station entry dict; if not propagated to meta, skip.
+        if meta.get("station_source") == "auto":
+            auto_n += 1
+            auto_wins += won
+
+    def _finalize(d: dict) -> dict:
+        out = {}
+        for k, v in d.items():
+            n = v["n"]
+            out[k] = {
+                "n": n, "wins": v["wins"],
+                "win_rate": round(v["wins"] / n, 3) if n else None,
+            }
+        return out
+
+    # Discovery skips breakdown
+    skips_breakdown: dict[str, dict] = {}
+    try:
+        skip_rows = conn.execute(
+            """
+            SELECT reason, COUNT(*) AS n, meta_json
+            FROM discovery_skips
+            WHERE ts >= ?
+            GROUP BY reason
+            """,
+            (since_iso,),
+        ).fetchall()
+        for sr in skip_rows:
+            skips_breakdown[sr["reason"]] = {"n": sr["n"]}
+        # For ttr_below_min, compute avg_ttr_h from meta
+        ttr_meta_rows = conn.execute(
+            "SELECT meta_json FROM discovery_skips "
+            "WHERE reason = 'ttr_below_min' AND ts >= ?",
+            (since_iso,),
+        ).fetchall()
+        ttrs = []
+        for mr in ttr_meta_rows:
+            try:
+                m = json.loads(mr["meta_json"] or "{}")
+                if m.get("ttr_h") is not None:
+                    ttrs.append(float(m["ttr_h"]))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+        if ttrs:
+            skips_breakdown.setdefault("ttr_below_min", {})["avg_ttr_h"] = (
+                round(sum(ttrs) / len(ttrs), 2))
+            skips_breakdown["ttr_below_min"]["min_ttr_h"] = round(min(ttrs), 2)
+            skips_breakdown["ttr_below_min"]["max_ttr_h"] = round(max(ttrs), 2)
+    except sqlite3.OperationalError:
+        pass  # discovery_skips table missing pre-v8
+
+    # Interpretation: human-readable flags for the advisor LLM
+    interpretation: list[str] = []
+    fmt = _finalize(by_station)
+    if len(fmt) >= 3:
+        worst = min((k for k in fmt if fmt[k]["win_rate"] is not None),
+                    key=lambda k: fmt[k]["win_rate"], default=None)
+        best = max((k for k in fmt if fmt[k]["win_rate"] is not None),
+                    key=lambda k: fmt[k]["win_rate"], default=None)
+        if worst and best and worst != best:
+            gap = fmt[best]["win_rate"] - fmt[worst]["win_rate"]
+            if gap > 0.15:
+                interpretation.append(
+                    f"Station gap: best={best} ({fmt[best]['win_rate']*100:.0f}%) "
+                    f"vs worst={worst} ({fmt[worst]['win_rate']*100:.0f}%). "
+                    f"Investigate worst-station coords/bias.")
+
+    fm = _finalize(by_mae)
+    if "base" in fm and "2x+" in fm and fm["base"]["n"] >= 5 and fm["2x+"]["n"] >= 5:
+        base_wr = fm["base"]["win_rate"]
+        high_wr = fm["2x+"]["win_rate"]
+        if base_wr is not None and high_wr is not None and high_wr > base_wr + 0.10:
+            interpretation.append(
+                f"Dynamic MAE working: 2x+ inflation cohort win_rate "
+                f"{high_wr*100:.0f}% > base {base_wr*100:.0f}% — volatile "
+                f"forecasts ARE less reliable; v7 correctly down-weights them.")
+        elif base_wr is not None and high_wr is not None and high_wr < base_wr - 0.10:
+            interpretation.append(
+                f"Dynamic MAE possibly over-cautious: 2x+ cohort {high_wr*100:.0f}% < "
+                f"base {base_wr*100:.0f}%. Re-check std_multiplier (currently 1.5).")
+
+    return {
+        "n_total_resolved": len(rows),
+        "by_station": _finalize(by_station),
+        "by_mae_bucket": _finalize(by_mae),
+        "by_multi_source": _finalize(by_multi),
+        "by_om_penalty": _finalize(by_om_pen),
+        "by_bias_applied": _finalize(by_bias),
+        "auto_station_resolves": {
+            "n": auto_n, "wins": auto_wins,
+            "win_rate": round(auto_wins / auto_n, 3) if auto_n else None,
+        },
+        "skips_breakdown": skips_breakdown,
+        "interpretation": interpretation,
+    }
+
+
 def compute_judge_accuracy(conn, since_iso: str) -> dict:
     """v6: Judge accuracy + hallucination signals.
 

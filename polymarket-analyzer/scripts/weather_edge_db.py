@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 DB_PATH = Path.home() / ".polymarket-paper" / "weather_edge.db"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 SCHEMA_V1 = """
@@ -232,6 +232,30 @@ SCHEMA_V7_MIGRATIONS = [
 ]
 
 
+# Schema v8: observability for v7+v8+v9 features. entries gains a
+# `discovery_meta_json` column carrying the mae_meta dict captured at
+# proposal time (mae_dynamic, bias, station code, OW/VC/Open-Meteo
+# values, om_spread_penalty etc). discovery_skips persists per-market
+# skip events that previously only incremented in-memory counters
+# (ttr_below_min, outside_window, etc) so the advisor can analyze
+# WHY proposals were filtered, not just count them.
+SCHEMA_V8_MIGRATIONS = [
+    "ALTER TABLE entries ADD COLUMN discovery_meta_json TEXT",
+    """
+    CREATE TABLE IF NOT EXISTS discovery_skips (
+      skip_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      slug TEXT,
+      city TEXT,
+      reason TEXT NOT NULL,
+      meta_json TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_ds_ts ON discovery_skips(ts)",
+    "CREATE INDEX IF NOT EXISTS idx_ds_reason ON discovery_skips(reason)",
+]
+
+
 def init_db(path: Path = DB_PATH) -> None:
     """Create the DB and tables if missing. Idempotent. Bumps user_version.
     Enables WAL mode so readers + writers don't block each other."""
@@ -278,6 +302,16 @@ def init_db(path: Path = DB_PATH) -> None:
             for stmt in SCHEMA_V7_MIGRATIONS:
                 cur.execute(stmt)
             current = 7
+        if current < 8:
+            for stmt in SCHEMA_V8_MIGRATIONS:
+                try:
+                    cur.execute(stmt)
+                except sqlite3.OperationalError as e:
+                    # ALTER TABLE ADD COLUMN tolerates "already exists" in
+                    # case of a partially-applied migration.
+                    if "duplicate column name" not in str(e).lower():
+                        raise
+            current = 8
         cur.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
 
@@ -314,6 +348,9 @@ def insert_entry(conn, **kwargs) -> int:
     """
     if isinstance(kwargs.get("forecast_snapshot_json"), (dict, list)):
         kwargs["forecast_snapshot_json"] = json.dumps(kwargs["forecast_snapshot_json"])
+    # v8: same treatment for discovery_meta_json (mae_meta from bot)
+    if isinstance(kwargs.get("discovery_meta_json"), (dict, list)):
+        kwargs["discovery_meta_json"] = json.dumps(kwargs["discovery_meta_json"])
     cols = list(kwargs.keys())
     vals = [kwargs[c] for c in cols]
     placeholders = ",".join("?" * len(cols))
@@ -345,6 +382,20 @@ def query_forecast_history(conn, city: str, target_date: str,
         "ORDER BY ts DESC LIMIT ?",
         (city, target_date, metric, limit),
     ).fetchall()
+
+
+def insert_discovery_skip(conn, **kwargs) -> int:
+    """v8: persist a discovery-phase skip event (e.g. ttr_below_min,
+    outside_window) so the advisor can analyze why proposals were
+    filtered, not just count them. Auto-serializes dict meta_json."""
+    if isinstance(kwargs.get("meta_json"), (dict, list)):
+        kwargs["meta_json"] = json.dumps(kwargs["meta_json"])
+    cols = list(kwargs.keys())
+    vals = [kwargs[c] for c in cols]
+    placeholders = ",".join("?" * len(cols))
+    q = (f"INSERT INTO discovery_skips ({','.join(cols)}) "
+         f"VALUES ({placeholders})")
+    return conn.execute(q, vals).lastrowid
 
 
 def insert_monitor_check(conn, entry_id: int, **kwargs) -> int:

@@ -657,6 +657,19 @@ def run_discovery(args, cities: dict) -> int:
                     "reason": "ttr_below_min",
                     "ttr_h": round(ttr_hours, 1),
                     "min_required": args.min_ttr_hours})
+            # v8 observability: persist per-skip detail so the advisor
+            # can analyze the time-to-resolution distribution that we
+            # filter (e.g. "are we filtering too aggressively?").
+            try:
+                with db.connect() as _conn:
+                    db.insert_discovery_skip(_conn,
+                        ts=_now_iso(), slug=slug, reason="ttr_below_min",
+                        meta_json={"ttr_h": round(ttr_hours, 2),
+                                    "min_required": args.min_ttr_hours,
+                                    "end_date": end_date_str})
+                    _conn.commit()
+            except Exception:
+                pass  # never block discovery on observability write
             continue
 
         if m.get("acceptingOrders") is False:
@@ -777,6 +790,7 @@ def run_discovery(args, cities: dict) -> int:
             "token_id_yes": token_id_yes, "token_id_no": token_id_no,
             "implied": implied,
             "condition_id": m.get("conditionId", ""),
+            "discovery_meta": mae_meta,  # v8 observability
         })
 
     # Phase 2 + 3: snapshot existing (slug, side) pairs, then insert candidates
@@ -866,6 +880,10 @@ def run_discovery(args, cities: dict) -> int:
                 comparison=spec.comparison,
                 ttr_hours_at_entry=c["ttr_hours"],
                 status="PROPOSED",
+                # v8 observability: stash mae_meta dict (mae_dynamic,
+                # bias, station, OW/VC/Open-Meteo values, penalties)
+                # so the advisor can cohort-analyze trades.
+                discovery_meta_json=c.get("discovery_meta") or {},
             )
             conn.commit()  # release writer lock so judge can interleave
             # Update in-memory state so subsequent iterations in this same

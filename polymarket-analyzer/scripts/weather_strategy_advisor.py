@@ -58,6 +58,7 @@ from weather_edge_analyzer import (  # noqa: E402
     aggregate_cashout_triggers,
     compute_counterfactuals,
     compute_judge_accuracy,
+    compute_discovery_meta_breakdown,  # v8 observability
     format_report_md,
 )
 
@@ -463,6 +464,11 @@ def main() -> int:
         divergent_judge_samples = helpers.compute_divergent_judge_samples(
             conn, since_iso, limit=10)
 
+        # Advisor v8: discovery_meta cohort breakdown (per-station,
+        # per-mae-bucket, per-multi-source, per-om-penalty, per-bias)
+        # so the LLM can recommend tuning specific features.
+        discovery_meta = compute_discovery_meta_breakdown(conn, since_iso)
+
         user_payload = {
             "since_iso": since_iso,
             "n_trades_analyzed": n_trades,
@@ -481,6 +487,10 @@ def main() -> int:
             # Advisor v6: judge accuracy + divergent rationale samples
             "judge_accuracy": judge_accuracy,
             "divergent_judge_samples": divergent_judge_samples,
+            # Advisor v8: per-cohort win rate breakdown by discovery meta
+            # (station, mae_dynamic ratio, multi_source on/off, OM penalty,
+            # bias applied) + discovery_skips breakdown
+            "discovery_meta_breakdown": discovery_meta,
         }
 
         if args.dry_run:

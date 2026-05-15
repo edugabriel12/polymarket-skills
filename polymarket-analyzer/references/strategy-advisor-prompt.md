@@ -313,6 +313,82 @@ then other APPROVE→loss.
 6. **Do not propose changes if `n_resolved < 10`** — the metrics are
    too noisy. Note the limitation in `research_notes` instead.
 
+## Discovery meta cohort breakdown (Advisor v8)
+
+The user message contains `discovery_meta_breakdown` populated by
+`compute_discovery_meta_breakdown(conn, since_iso)`. It lets you
+attribute wins/losses to specific v7+v8+v9 features.
+
+### `discovery_meta_breakdown`
+
+```json
+{
+  "n_total_resolved": 30,
+  "by_station": {"KLGA": {"n": 12, "wins": 8, "win_rate": 0.667},
+                  "HKO":  {"n": 6,  "wins": 1, "win_rate": 0.167},
+                  "geocoded": {"n": 12, "wins": 3, "win_rate": 0.250}},
+  "by_mae_bucket": {"base": {"n": 18, ...}, "1.5x": {"n": 8, ...},
+                     "2x": {"n": 3, ...}, "2x+": {"n": 1, ...}},
+  "by_multi_source": {"true": {...}, "false": {...}},
+  "by_om_penalty":   {"true": {...}, "false": {...}},
+  "by_bias_applied": {"true": {...}, "false": {...}},
+  "auto_station_resolves": {"n": 4, "wins": 2, "win_rate": 0.5},
+  "skips_breakdown": {"ttr_below_min": {"n": 23, "avg_ttr_h": 11.2}},
+  "interpretation": ["Station gap: best=KLGA vs worst=HKO ..."]
+}
+```
+
+### How to use
+
+1. **Read `interpretation` first** — heuristic-generated flags that
+   highlight clear cohort gaps (≥15pp station win-rate spread,
+   ≥10pp mae-bucket gap). These are baseline suggestions you can
+   anchor your own findings to.
+
+2. **Station-specific findings** (`by_station`):
+   - If a station has n≥5 and win_rate < global − 20pp, suggest
+     adding a per-city temp_bias_f entry OR moving the city to a
+     deny-list. Cite the data: "HKO 1/6 = 17% vs global 40%."
+   - If `geocoded` cohort win_rate is much lower than named stations,
+     it confirms v8 station coords are providing edge. Suggest
+     curating the cities currently falling back to geocoding (look
+     in `auto_station_resolves` to see which auto-resolves are
+     happening but not yet in the curated `stations` dict).
+
+3. **Dynamic MAE validation** (`by_mae_bucket`):
+   - If `2x+` cohort win_rate > `base` cohort, dynamic MAE is
+     working — keep std_multiplier=1.5. Praise in `research_notes`.
+   - If `2x+` cohort win_rate < `base`, dynamic MAE may be
+     over-cautious. Suggest tightening std_multiplier to 1.2 (would
+     require a code change category: `code_param`).
+
+4. **Multi-source / Open-Meteo validation** (`by_multi_source`,
+   `by_om_penalty`):
+   - `multi_source=true` win_rate > `false`: VC+OM are helping.
+   - `om_penalty=true` cohort with very low n (<3) and tiny win_rate
+     IS expected — penalty fires on high-uncertainty trades where
+     bot SHOULD be more conservative. Only flag if cohort n≥5.
+
+5. **Bias correction** (`by_bias_applied`):
+   - If bias=true cohort has higher win_rate than bias=false,
+     existing biases (currently only HK +1.0F) are working. Suggest
+     applying bias to other systematically-losing cities (cross-ref
+     with `by_station`).
+
+6. **Min-TTR filter tuning** (`skips_breakdown.ttr_below_min`):
+   - If many skips with avg_ttr_h ≥ 15h, the filter might be too
+     aggressive (recommend lowering --min-ttr-hours to 12).
+   - If skips are concentrated near the threshold (avg close to
+     min_required), filter is well-tuned.
+
+7. **Auto-station leverage** (`auto_station_resolves`):
+   - If n≥5 and win_rate is good, auto-extract (v9) is paying off
+     without manual curation work. If win_rate is poor, suggest
+     manual review of the stations being auto-resolved.
+
+When you cite `discovery_meta_breakdown` in `evidence`, use the
+key path (e.g. `"discovery_meta.by_station.HKO.win_rate"`).
+
 ## Process
 
 1. Read the user message — it contains: aggregate analyzer report (markdown),
