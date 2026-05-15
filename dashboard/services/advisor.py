@@ -67,10 +67,13 @@ def list_applies_for_run(run_id: int) -> dict:
         return {}
     conn = _ro_conn(S.WEATHER_EDGE_DB)
     try:
-        rows = conn.execute(
-            "SELECT * FROM advisor_suggestion_applies WHERE run_id = ?",
-            (run_id,),
-        ).fetchall()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM advisor_suggestion_applies WHERE run_id = ?",
+                (run_id,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {}  # table missing → DB on schema < v4
         return {r["suggestion_id"]: dict(r) for r in rows}
     finally:
         conn.close()
@@ -87,19 +90,26 @@ def get_acceptance_stats() -> dict:
         return {"available": False}
     conn = _ro_conn(S.WEATHER_EDGE_DB)
     try:
-        total = conn.execute(
-            "SELECT COALESCE(SUM(n_suggestions), 0) FROM advisor_runs"
-        ).fetchone()[0] or 0
-        applied = conn.execute(
-            "SELECT COUNT(*) FROM advisor_suggestion_applies "
-            "WHERE status = 'applied'"
-        ).fetchone()[0] or 0
-        # By category
-        by_cat_rows = conn.execute(
-            "SELECT category, status, COUNT(*) as n "
-            "FROM advisor_suggestion_applies "
-            "GROUP BY category, status"
-        ).fetchall()
+        try:
+            total = conn.execute(
+                "SELECT COALESCE(SUM(n_suggestions), 0) FROM advisor_runs"
+            ).fetchone()[0] or 0
+        except sqlite3.OperationalError:
+            total = 0
+        try:
+            applied = conn.execute(
+                "SELECT COUNT(*) FROM advisor_suggestion_applies "
+                "WHERE status = 'applied'"
+            ).fetchone()[0] or 0
+            by_cat_rows = conn.execute(
+                "SELECT category, status, COUNT(*) as n "
+                "FROM advisor_suggestion_applies "
+                "GROUP BY category, status"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # advisor_suggestion_applies missing → DB on schema < v4
+            applied = 0
+            by_cat_rows = []
     finally:
         conn.close()
 
@@ -120,20 +130,31 @@ def get_acceptance_stats() -> dict:
 
 
 def get_summary_kpis() -> dict:
-    """Top-level numbers for the Advisor tab header."""
+    """Top-level numbers for the Advisor tab header.
+
+    Defensive against missing tables (e.g., DB on schema < v4 because
+    bot/judge/advisor haven't been restarted since the v4+ deploy).
+    """
+    empty = {"n_runs": 0, "total_cost_usd": 0.0, "last_run_ts": None,
+              "n_applies": 0}
     if not S.WEATHER_EDGE_DB.exists():
-        return {"n_runs": 0, "total_cost_usd": 0.0, "last_run_ts": None,
-                "n_applies": 0}
+        return empty
     conn = _ro_conn(S.WEATHER_EDGE_DB)
     try:
-        r = conn.execute(
-            "SELECT COUNT(*), COALESCE(SUM(cost_usd), 0), MAX(ts) "
-            "FROM advisor_runs",
-        ).fetchone()
-        n_applies = conn.execute(
-            "SELECT COUNT(*) FROM advisor_suggestion_applies "
-            "WHERE status = 'applied'",
-        ).fetchone()[0]
+        try:
+            r = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(cost_usd), 0), MAX(ts) "
+                "FROM advisor_runs",
+            ).fetchone()
+        except sqlite3.OperationalError:
+            r = (0, 0.0, None)
+        try:
+            n_applies = conn.execute(
+                "SELECT COUNT(*) FROM advisor_suggestion_applies "
+                "WHERE status = 'applied'",
+            ).fetchone()[0]
+        except sqlite3.OperationalError:
+            n_applies = 0  # table missing — DB on schema < v4
         return {
             "n_runs": int(r[0]),
             "total_cost_usd": round(float(r[1] or 0), 4),

@@ -123,9 +123,12 @@ def get_job(job_id: int) -> Optional[dict]:
         return None
     conn = _conn()
     try:
-        row = conn.execute(
-            "SELECT * FROM advisor_jobs WHERE job_id = ?", (job_id,),
-        ).fetchone()
+        try:
+            row = conn.execute(
+                "SELECT * FROM advisor_jobs WHERE job_id = ?", (job_id,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None  # table missing → DB on schema < v5
         return dict(row) if row else None
     finally:
         conn.close()
@@ -136,10 +139,13 @@ def list_jobs(limit: int = 20) -> list[dict]:
         return []
     conn = _conn()
     try:
-        rows = conn.execute(
-            "SELECT * FROM advisor_jobs ORDER BY ts_started DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM advisor_jobs ORDER BY ts_started DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []  # table missing → DB on schema < v5
         return [dict(r) for r in rows]
     finally:
         conn.close()

@@ -221,37 +221,42 @@ def get_queue_health() -> dict:
 
     conn = _ro_conn(S.WEATHER_EDGE_DB)
     try:
-        # Queue depths
-        proposed = conn.execute(
-            "SELECT COUNT(*) FROM entries WHERE status = 'PROPOSED'"
-        ).fetchone()[0]
-        approved = conn.execute(
-            "SELECT COUNT(*) FROM entries "
-            "WHERE status IN ('APPROVED', 'ADJUSTED')"
-        ).fetchone()[0]
+        try:
+            # Queue depths
+            proposed = conn.execute(
+                "SELECT COUNT(*) FROM entries WHERE status = 'PROPOSED'"
+            ).fetchone()[0]
+            approved = conn.execute(
+                "SELECT COUNT(*) FROM entries "
+                "WHERE status IN ('APPROVED', 'ADJUSTED')"
+            ).fetchone()[0]
 
-        # Age of oldest pending (PROPOSED or APPROVED/ADJUSTED)
-        oldest = conn.execute(
-            "SELECT MIN(ts) FROM entries "
-            "WHERE status IN ('PROPOSED', 'APPROVED', 'ADJUSTED')"
-        ).fetchone()[0]
-        oldest_age_min = None
-        if oldest:
-            try:
-                ts = datetime.fromisoformat(oldest.replace("Z", "+00:00"))
-                oldest_age_min = int(
-                    (datetime.now(timezone.utc) - ts).total_seconds() / 60)
-            except (ValueError, TypeError):
-                pass
+            # Age of oldest pending (PROPOSED or APPROVED/ADJUSTED)
+            oldest = conn.execute(
+                "SELECT MIN(ts) FROM entries "
+                "WHERE status IN ('PROPOSED', 'APPROVED', 'ADJUSTED')"
+            ).fetchone()[0]
+            oldest_age_min = None
+            if oldest:
+                try:
+                    ts = datetime.fromisoformat(oldest.replace("Z", "+00:00"))
+                    oldest_age_min = int(
+                        (datetime.now(timezone.utc) - ts).total_seconds() / 60)
+                except (ValueError, TypeError):
+                    pass
 
-        # Skipped breakdown today (UTC)
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        skipped_rows = conn.execute(
-            "SELECT COALESCE(skip_reason, 'unknown') as reason, COUNT(*) as n "
-            "FROM entries WHERE status = 'SKIPPED' AND DATE(ts) = ? "
-            "GROUP BY reason ORDER BY n DESC",
-            (today,),
-        ).fetchall()
+            # Skipped breakdown today (UTC)
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            skipped_rows = conn.execute(
+                "SELECT COALESCE(skip_reason, 'unknown') as reason, "
+                "COUNT(*) as n "
+                "FROM entries WHERE status = 'SKIPPED' AND DATE(ts) = ? "
+                "GROUP BY reason ORDER BY n DESC",
+                (today,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # entries table missing or schema older than v1 — degrade
+            return {"available": False, "reason": "entries table missing"}
         by_reason = [{"reason": r["reason"], "n": r["n"]} for r in skipped_rows]
         n_skipped_today = sum(r["n"] for r in by_reason)
 

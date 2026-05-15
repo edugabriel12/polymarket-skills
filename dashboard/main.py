@@ -266,6 +266,30 @@ def api_notify_status(request: Request):
 
 
 @app.on_event("startup")
+async def _migrate_db_schema():
+    """Run weather_edge_db.init_db() at startup so the schema is auto-
+    migrated to the latest version. Without this, a dashboard launched
+    against a DB last touched by an older bot/judge would crash on
+    queries against newer tables (e.g., advisor_suggestion_applies in
+    v4, advisor_jobs in v5)."""
+    try:
+        import sys as _sys
+        _analyzer = (Path(__file__).resolve().parent.parent
+                      / "polymarket-analyzer" / "scripts")
+        if str(_analyzer) not in _sys.path:
+            _sys.path.insert(0, str(_analyzer))
+        import weather_edge_db
+        weather_edge_db.init_db()
+        print("[dashboard] weather_edge.db migrated to schema v"
+              f"{weather_edge_db.SCHEMA_VERSION}", flush=True)
+    except Exception as e:
+        # Don't crash dashboard if migration fails — services are
+        # defensive against missing tables.
+        print(f"[dashboard] warning: schema migration failed: {e}",
+              flush=True)
+
+
+@app.on_event("startup")
 async def _start_crash_watcher():
     """Background task: every 60s, check if bot/judge PID files claim a
     process that's no longer alive → notify ONCE per crash event."""
