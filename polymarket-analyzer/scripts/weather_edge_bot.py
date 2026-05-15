@@ -1482,13 +1482,18 @@ def _check_portfolio_thresholds() -> None:
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("--min-edge-pp", type=float, default=10.0)
-    p.add_argument("--execute-min-edge-pp", type=float, default=None,
+    p.add_argument("--min-edge-pp", type=float, default=25.0,
+                   help="Minimum edge_pp required at DISCOVERY time. "
+                        "Default 25 (raised from 10 after 2026-05-15 loss "
+                        "analysis: cohort with edge_pp 10-20 had near-zero "
+                        "win rate; 25+ is where the bot's signal starts to "
+                        "actually beat market consensus).")
+    p.add_argument("--execute-min-edge-pp", type=float, default=12.0,
                    help="Minimum edge_pp required at EXECUTION time. "
-                        "Defaults to --min-edge-pp (same threshold as "
-                        "discovery). Set higher to enforce stricter "
-                        "re-check on queued entries that may have aged "
-                        "while waiting on position-limit or judge backlog.")
+                        "Default 12 (lower than --min-edge-pp 25 because "
+                        "edge naturally decays between proposal and execute "
+                        "while the entry waits on judge/position-limit; 12 "
+                        "is the floor below which we'd rather skip than fill).")
     p.add_argument("--min-volume", type=float, default=100,
                    help="Min market USD volume; sub-bracket markets have low volume each")
     p.add_argument("--min-price", type=float, default=0.05,
@@ -1525,10 +1530,12 @@ def main():
                         "in weather-cities.json 'stations' dict.")
     p.add_argument("--no-open-meteo", dest="open_meteo", action="store_false",
                    help="Disable Open-Meteo ensemble fetch.")
-    p.add_argument("--min-ttr-hours", type=float, default=0.0,
+    p.add_argument("--min-ttr-hours", type=float, default=18.0,
                    help="Skip markets with TTR < X hours at discovery. "
                         "Article finding: TTR<18h means market has priced in "
-                        "fresh forecasts, edge is squeezed. Default 0 (off).")
+                        "fresh forecasts, edge is squeezed. Default 18 "
+                        "(raised from 0 after operator review). Set 0 to "
+                        "disable.")
     # v9: upstream filters for the cheap-bet adverse-selection trap
     p.add_argument("--min-entry-price", type=float, default=0.10,
                    help="Skip trades with entry_price < X. Loss analysis "
@@ -1543,8 +1550,12 @@ def main():
                         "net on 24h sample but n is small. Default 0 (OFF) "
                         "until operator validates a thresh on more data.")
     p.add_argument("--fast-path-ttr-min", type=int, default=60)
-    p.add_argument("--profit-lock-pp", type=float, default=50.0,
-                   help="Cashout when bid >= entry + X pp (default 50pp = +$0.50)")
+    p.add_argument("--profit-lock-pp", type=float, default=30.0,
+                   help="Cashout when bid >= entry + X pp (default 30pp = +$0.30). "
+                        "Lowered from 50pp after 2026-05-15 analysis: only 8/51 "
+                        "trades cashed out under 50pp lock, leaving 84%% to "
+                        "ride to resolution where most lost. 30pp = locks "
+                        "profit on more winners at the cost of some upside.")
     p.add_argument("--trailing-drawdown-pct", type=float, default=15.0,
                    help="Cashout if bid falls X%% below peak (default 15%% — "
                         "was 30%% but operator analysis 2026-05-15 showed "
