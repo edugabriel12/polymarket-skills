@@ -64,6 +64,9 @@ from weather_edge_helpers import (  # noqa: E402
     parse_market, forecast_probability, compute_max_size_for_slippage,
     implied_probabilities, compute_edge, load_cities, MarketSpec,
     evaluate_cashout_triggers,
+    # v7: dynamic MAE + multi-source consensus
+    compute_dynamic_mae, fetch_visual_crossing,
+    MAE_TEMP_F, MAE_TEMP_C,
 )
 import weather_edge_db as db  # noqa: E402
 
@@ -421,6 +424,106 @@ def fetch_forecast(city: str, days: int = 5) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 
+def _compute_mae_for_market(spec: MarketSpec, ow_forecast: dict,
+                              args) -> tuple[Optional[float], dict]:
+    """v7: returns (mae_override, meta) for a given market spec.
+
+    Side effects: writes OpenWeather (and optionally Visual Crossing)
+    forecast snapshots to forecast_history. Reads recent history to
+    compute volatility-based MAE. When multi-source enabled and OW vs
+    VC disagree by > 2°C (or 3.6°F), inflates MAE × 1.5 as proxy for
+    forecast uncertainty.
+
+    Returns (None, {}) on any failure path so caller can fall back to
+    static MAE constant cleanly.
+    """
+    if not spec.target_date:
+        return None, {}
+
+    metric = "temp_high_f" if spec.threshold_unit == "F" else "temp_high_c"
+    target_iso = spec.target_date.isoformat()
+
+    # Extract OW high temp from forecast snapshot
+    days = ow_forecast.get("daily_forecast") or ow_forecast.get("forecasts") or []
+    ow_day = next((d for d in days if d.get("date") == target_iso), None)
+    if ow_day is None:
+        return None, {}
+    ow_value = ow_day.get(metric)
+    if ow_value is None:
+        return None, {}
+
+    now_iso = _now_iso()
+    try:
+        with db.connect() as conn:
+            db.insert_forecast_history(
+                conn, city=spec.city, target_date=target_iso,
+                metric=metric, source="openweather",
+                predicted_value=float(ow_value), ts=now_iso,
+            )
+    except Exception as e:
+        log_event("warn", {"where": "fh_insert_ow", "err": str(e)},
+                   level="WARN")
+
+    vc_value = None
+    multi_source = getattr(args, "multi_source", False)
+    if multi_source:
+        try:
+            vc = fetch_visual_crossing(spec.city, target_iso)
+        except Exception as e:
+            log_event("warn", {"where": "fetch_vc", "city": spec.city,
+                                "err": str(e)}, level="WARN")
+            vc = None
+        if vc and vc.get("days"):
+            vc_day = vc["days"][0]
+            # VC always returns Fahrenheit when unitGroup="us"
+            vc_value_f = vc_day.get("tempmax")
+            if vc_value_f is not None:
+                # Convert to spec.threshold_unit if needed
+                vc_value = (float(vc_value_f) if spec.threshold_unit == "F"
+                            else (float(vc_value_f) - 32) * 5.0 / 9.0)
+                try:
+                    with db.connect() as conn:
+                        db.insert_forecast_history(
+                            conn, city=spec.city, target_date=target_iso,
+                            metric=metric, source="visual_crossing",
+                            predicted_value=vc_value, ts=now_iso,
+                        )
+                except Exception as e:
+                    log_event("warn", {"where": "fh_insert_vc",
+                                        "err": str(e)}, level="WARN")
+
+    # Read history for dynamic MAE
+    try:
+        with db.connect() as conn:
+            rows = db.query_forecast_history(
+                conn, spec.city, target_iso, metric, limit=5)
+    except Exception:
+        rows = []
+
+    base_mae = MAE_TEMP_F if spec.threshold_unit == "F" else MAE_TEMP_C
+    history_values = [float(r["predicted_value"]) for r in rows]
+    mae_dyn = compute_dynamic_mae(history_values, base_mae=base_mae)
+
+    # Disagreement penalty (v7): if OW and VC differ significantly
+    disagreement = 0.0
+    if vc_value is not None:
+        disagreement = abs(float(ow_value) - vc_value)
+        threshold = 3.6 if spec.threshold_unit == "F" else 2.0  # ~2°C
+        if disagreement > threshold:
+            mae_dyn *= 1.5
+
+    meta = {
+        "ow_value": float(ow_value),
+        "vc_value": vc_value,
+        "disagreement": round(disagreement, 2),
+        "history_n": len(history_values),
+        "base_mae": base_mae,
+        "mae_dynamic": round(mae_dyn, 2),
+        "multi_source": multi_source,
+    }
+    return mae_dyn, meta
+
+
 def run_discovery(args, cities: dict) -> int:
     """Run one discovery scan. Returns count of new proposals inserted."""
     log_event("discovery_start", {"min_edge_pp": args.min_edge_pp,
@@ -526,7 +629,12 @@ def run_discovery(args, cities: dict) -> int:
                                           "city": spec.city})
             continue
 
-        forecast_prob = forecast_probability(spec, forecast)
+        # v7: Persist OW forecast + (optionally) Visual Crossing for
+        # multi-source consensus + dynamic MAE.
+        mae_dynamic, mae_meta = _compute_mae_for_market(spec, forecast, args)
+
+        forecast_prob = forecast_probability(spec, forecast,
+                                              mae_override=mae_dynamic)
         if forecast_prob is None:
             skipped["no_forecast_for_target_date"] += 1
             log_event("market_skipped", {"slug": slug, "reason": "no_forecast_for_target_date"})
@@ -542,6 +650,7 @@ def run_discovery(args, cities: dict) -> int:
                 "forecast_prob": forecast_prob,
                 "yes_ask": implied["yes_ask"],
                 "no_ask": implied["no_ask"],
+                "mae_meta": mae_meta,
             })
             continue
 
@@ -911,7 +1020,12 @@ def _do_monitor_check(conn, row, cities: dict, args) -> None:
         log_event("monitor_check", {"entry_id": entry_id, "decision": "HOLD",
                                     "reason": "no_forecast_or_spec"})
         return
-    forecast_prob_yes = forecast_probability(spec, forecast)
+    # v7: dynamic MAE (also writes new forecast snapshot to history,
+    # which feeds future MAE calculations across positions in the
+    # same city).
+    mae_dyn, _ = _compute_mae_for_market(spec, forecast, args)
+    forecast_prob_yes = forecast_probability(spec, forecast,
+                                               mae_override=mae_dyn)
     if forecast_prob_yes is None:
         return
 
@@ -1195,6 +1309,15 @@ def main():
                         "10 min was too tight and starved the judge of DB writes.")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--judge-mode", choices=("sync", "off"), default="sync")
+    # v7: multi-source forecast consensus during discovery
+    p.add_argument("--multi-source", dest="multi_source",
+                   action="store_true", default=None,
+                   help="Cross-check OpenWeather with Visual Crossing during "
+                        "discovery; inflates MAE on disagreement. Auto-ON if "
+                        "VISUAL_CROSSING_API_KEY env is set.")
+    p.add_argument("--no-multi-source", dest="multi_source",
+                   action="store_false",
+                   help="Disable multi-source consensus (overrides auto-detect).")
     p.add_argument("--fast-path-ttr-min", type=int, default=60)
     p.add_argument("--profit-lock-pp", type=float, default=50.0,
                    help="Cashout when bid >= entry + X pp (default 50pp = +$0.50)")
@@ -1212,6 +1335,10 @@ def main():
                    help="Write JSONL log here (default ~/.polymarket-paper/weather_edge.jsonl)")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args()
+
+    # v7: auto-detect multi-source if user didn't pass either flag
+    if args.multi_source is None:
+        args.multi_source = bool(os.environ.get("VISUAL_CROSSING_API_KEY"))
 
     # Override log file if user asked
     global LOG_FILE

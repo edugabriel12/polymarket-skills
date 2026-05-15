@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 DB_PATH = Path.home() / ".polymarket-paper" / "weather_edge.db"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 SCHEMA_V1 = """
@@ -209,6 +209,29 @@ SCHEMA_V6_MIGRATIONS = [
 ]
 
 
+# Schema v7: per-(city, target_date, metric, source) forecast snapshots.
+# Used by the bot's discovery loop to (1) compute dynamic MAE from
+# forecast volatility history, (2) cross-check OpenWeather vs Visual
+# Crossing during proposal — instead of waiting for the judge to filter.
+# See plan in /root/.claude/plans/quero-configurar-para-que-rustling-dragonfly.md
+SCHEMA_V7_MIGRATIONS = [
+    """
+    CREATE TABLE IF NOT EXISTS forecast_history (
+      history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      city TEXT NOT NULL,
+      target_date TEXT NOT NULL,
+      metric TEXT NOT NULL,
+      source TEXT NOT NULL,
+      predicted_value REAL NOT NULL,
+      ts TEXT NOT NULL,
+      UNIQUE(city, target_date, metric, source, ts)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_fh_lookup "
+    "ON forecast_history(city, target_date, metric)",
+]
+
+
 def init_db(path: Path = DB_PATH) -> None:
     """Create the DB and tables if missing. Idempotent. Bumps user_version.
     Enables WAL mode so readers + writers don't block each other."""
@@ -251,6 +274,10 @@ def init_db(path: Path = DB_PATH) -> None:
                     if "duplicate column name" not in str(e).lower():
                         raise
             current = 6
+        if current < 7:
+            for stmt in SCHEMA_V7_MIGRATIONS:
+                cur.execute(stmt)
+            current = 7
         cur.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
 
@@ -293,6 +320,31 @@ def insert_entry(conn, **kwargs) -> int:
     q = f"INSERT INTO entries ({','.join(cols)}) VALUES ({placeholders})"
     cur = conn.execute(q, vals)
     return cur.lastrowid
+
+
+def insert_forecast_history(conn, **kwargs) -> Optional[int]:
+    """v7: store one (city, target_date, metric, source, ts) snapshot.
+    UNIQUE(city, target_date, metric, source, ts) → silent no-op on dupes.
+    Returns last_insert_rowid or None if dupe was rejected."""
+    cols = list(kwargs.keys())
+    vals = [kwargs[c] for c in cols]
+    placeholders = ",".join("?" * len(cols))
+    q = (f"INSERT OR IGNORE INTO forecast_history "
+         f"({','.join(cols)}) VALUES ({placeholders})")
+    cur = conn.execute(q, vals)
+    return cur.lastrowid if cur.rowcount else None
+
+
+def query_forecast_history(conn, city: str, target_date: str,
+                            metric: str, limit: int = 5) -> list[sqlite3.Row]:
+    """v7: most recent N forecast snapshots for (city, target_date, metric).
+    Used to compute dynamic MAE from forecast volatility."""
+    return conn.execute(
+        "SELECT predicted_value, source, ts FROM forecast_history "
+        "WHERE city = ? AND target_date = ? AND metric = ? "
+        "ORDER BY ts DESC LIMIT ?",
+        (city, target_date, metric, limit),
+    ).fetchall()
 
 
 def insert_monitor_check(conn, entry_id: int, **kwargs) -> int:

@@ -138,24 +138,12 @@ def get_nws_forecast(lat: float, lon: float) -> Optional[dict]:
 
 
 def get_visual_crossing(city: str, date_iso: Optional[str] = None) -> Optional[dict]:
-    """Visual Crossing API. date_iso = YYYY-MM-DD or None for today."""
-    api_key = os.environ.get("VISUAL_CROSSING_API_KEY")
-    if not api_key:
-        return None
-    base = "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline"
-    url = f"{base}/{city}/{date_iso}" if date_iso else f"{base}/{city}"
-    try:
-        r = requests.get(url, params={"key": api_key, "unitGroup": "us",
-                                       "include": "days", "elements":
-                                       "tempmax,tempmin,precip,precipprob,conditions"},
-                         timeout=15)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        # Return just the days array
-        return {"days": data.get("days", [])[:5]}
-    except Exception:
-        return None
+    """v7: thin wrapper over weather_edge_helpers.fetch_visual_crossing,
+    which is now the canonical implementation (cached + shared with the
+    bot's discovery loop). Kept here as `get_visual_crossing` for
+    name-stability with prior judge code."""
+    from weather_edge_helpers import fetch_visual_crossing
+    return fetch_visual_crossing(city, date_iso)
 
 
 # ---------------------------------------------------------------------------

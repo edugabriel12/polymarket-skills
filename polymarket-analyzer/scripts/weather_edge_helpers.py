@@ -13,13 +13,17 @@ Three responsibility groups:
 from __future__ import annotations
 
 import json
+import os
 import re
 import statistics
+import time
 import unicodedata
 from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+import requests
 
 
 def _strip_accents(s: str) -> str:
@@ -32,10 +36,91 @@ def _strip_accents(s: str) -> str:
 # Constants — calibrated MAEs for normal-CDF probability conversion
 # ---------------------------------------------------------------------------
 
-MAE_TEMP_F = 5.0      # OpenWeather 3-5d temp forecast MAE in °F
+MAE_TEMP_F = 5.0      # OpenWeather 3-5d temp forecast MAE in °F (fallback)
 MAE_TEMP_C = 2.78     # = MAE_TEMP_F converted
 MAE_PRECIP_MM = 3.0   # precip total MAE
 MAE_WIND_KPH = 8.0    # wind speed MAE
+
+
+# ---------------------------------------------------------------------------
+# v7: Dynamic MAE from forecast volatility history
+# ---------------------------------------------------------------------------
+
+def compute_dynamic_mae(history_values: list[float],
+                        base_mae: float,
+                        min_samples: int = 2,
+                        std_multiplier: float = 1.5) -> float:
+    """Compute MAE from observed forecast revisions.
+
+    Returns max(base_mae, std_dev(history) * std_multiplier). Falls back
+    to base_mae when fewer than min_samples are available (typical for
+    fresh cities). The multiplier compensates for std_dev underestimating
+    true future MAE when the sample is small.
+
+    Rationale: cities like Lucknow showed forecast revisions of ±5°F
+    between updates on 2026-05-14 — using the static MAE_TEMP_F=5.0
+    underestimated the true uncertainty and inflated edge_pp, causing
+    the bot to take losing trades. Dynamic MAE based on observed
+    volatility gives the bot per-city realism.
+    """
+    if not history_values or len(history_values) < min_samples:
+        return base_mae
+    try:
+        sd = statistics.stdev(history_values)
+    except statistics.StatisticsError:
+        return base_mae
+    return max(base_mae, sd * std_multiplier)
+
+
+# ---------------------------------------------------------------------------
+# v7: Multi-source forecast fetch (Visual Crossing) — moved from judge.py
+# so the bot's discovery loop can cross-check before proposing.
+# ---------------------------------------------------------------------------
+
+_VC_CACHE: dict = {}                 # (city, date_iso) → (ts_unix, response)
+_VC_CACHE_TTL_SEC = 6 * 3600         # 6h — caps free-tier API calls
+
+
+def fetch_visual_crossing(city: str,
+                           date_iso: Optional[str] = None,
+                           force_refresh: bool = False) -> Optional[dict]:
+    """Visual Crossing timeline API. date_iso = YYYY-MM-DD or None for today.
+
+    Returns {"days": [...]} (max 5) or None if API key missing / HTTP fail.
+    Cached in-memory per (city, date_iso) for 6h to fit the free tier
+    (1000 req/day shared).
+    """
+    api_key = os.environ.get("VISUAL_CROSSING_API_KEY")
+    if not api_key:
+        return None
+
+    cache_key = (city.lower(), date_iso or "")
+    now = time.time()
+    if not force_refresh and cache_key in _VC_CACHE:
+        cached_ts, cached_data = _VC_CACHE[cache_key]
+        if now - cached_ts < _VC_CACHE_TTL_SEC:
+            return cached_data
+
+    base = ("https://weather.visualcrossing.com/VisualCrossingWebServices"
+            "/rest/services/timeline")
+    url = f"{base}/{city}/{date_iso}" if date_iso else f"{base}/{city}"
+    try:
+        r = requests.get(
+            url,
+            params={"key": api_key, "unitGroup": "us",
+                    "include": "days",
+                    "elements": "tempmax,tempmin,precip,precipprob,conditions"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        result = {"days": data.get("days", [])[:5]}
+    except Exception:
+        return None
+
+    _VC_CACHE[cache_key] = (now, result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -365,14 +450,21 @@ def _clip_prob(p: Optional[float]) -> Optional[float]:
     return max(PROB_CLIP_LOW, min(PROB_CLIP_HIGH, float(p)))
 
 
-def forecast_probability(spec: MarketSpec, forecast: dict) -> Optional[float]:
-    """Compute P(YES) for `spec` clipped to [0.10, 0.90]. See
-    `_forecast_probability_raw` for the underlying calculation and
-    `_clip_prob` for rationale."""
-    return _clip_prob(_forecast_probability_raw(spec, forecast))
+def forecast_probability(spec: MarketSpec, forecast: dict,
+                          mae_override: Optional[float] = None) -> Optional[float]:
+    """Compute P(YES) for `spec` clipped to [0.10, 0.90].
+
+    `mae_override` (v7): if provided, replaces the static MAE_TEMP_F/C
+    or MAE_PRECIP_MM constant for this single call. Use to inject
+    dynamic MAE computed from forecast volatility history.
+    """
+    return _clip_prob(_forecast_probability_raw(spec, forecast,
+                                                  mae_override=mae_override))
 
 
-def _forecast_probability_raw(spec: MarketSpec, forecast: dict) -> Optional[float]:
+def _forecast_probability_raw(spec: MarketSpec, forecast: dict,
+                                mae_override: Optional[float] = None
+                                ) -> Optional[float]:
     """Raw probability from the forecast model — uncalibrated.
     Use forecast_probability() externally; this is only exposed for tests
     and the analyzer (which can compare raw vs clipped to spot extreme
@@ -420,7 +512,8 @@ def _forecast_probability_raw(spec: MarketSpec, forecast: dict) -> Optional[floa
         ref = day.get(f"temp_high_{spec.threshold_unit.lower()}")
         if ref is None:
             return None
-        mae = MAE_TEMP_F if spec.threshold_unit == "F" else MAE_TEMP_C
+        mae = (mae_override if mae_override is not None
+               else (MAE_TEMP_F if spec.threshold_unit == "F" else MAE_TEMP_C))
         if spec.comparison == "range" and spec.threshold_value_high is not None:
             # P(low ≤ temp < high) under N(ref, mae)
             z_low = (ref - spec.threshold_value) / mae
@@ -442,7 +535,7 @@ def _forecast_probability_raw(spec: MarketSpec, forecast: dict) -> Optional[floa
             return None
         threshold_mm = spec.threshold_value if spec.threshold_unit == "mm" \
             else spec.threshold_value * 25.4
-        z = (forecast_mm - threshold_mm) / MAE_PRECIP_MM
+        z = (forecast_mm - threshold_mm) / (mae_override or MAE_PRECIP_MM)
         if spec.comparison in ("exceed", "at_least"):
             return _norm_cdf(z)
         return _norm_cdf(-z)

@@ -25,6 +25,21 @@ P(YES) = norm.cdf(-z)  # for "below" / "at_most"
 ```
 Default `MAE_TEMP = 5°F` (typical 3-5 day OpenWeather error). Tune via the analyzer's calibration output.
 
+**v7: Dynamic MAE per (city, target_date).** The bot stores every
+forecast snapshot in `forecast_history` table during discovery. When
+computing P(YES), it queries the last 5 snapshots for the same city +
+target date and uses `mae_dynamic = max(MAE_static, std_dev × 1.5)`.
+This means cities with volatile forecasts (Lucknow, Hong Kong) get
+larger MAE → more conservative probabilities → fewer false-edge trades.
+Falls back to static MAE when fewer than 2 history samples exist.
+
+**v7: Multi-source consensus** (CLI `--multi-source`, auto-ON if
+`VISUAL_CROSSING_API_KEY` is set). Discovery fetches Visual Crossing
+alongside OpenWeather, persists both to `forecast_history`. When the
+two sources disagree by > 3.6°F (~2°C), MAE is multiplied by 1.5 as a
+proxy for forecast uncertainty. VC responses cached 6h to fit free
+tier (1000 req/day shared).
+
 ### Precipitation
 - Binary "will it rain" → use `precip_probability / 100` directly.
 - "More than X mm" → normal CDF on `precip_mm` with `MAE_PRECIP = 3mm`.
