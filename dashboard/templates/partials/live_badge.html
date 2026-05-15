@@ -1,0 +1,7 @@
+{# Tiny inline badge for the nav bar. #}
+
+{% if mode.mode == 'LIVE_AUTONOMOUS' %}
+  <span class="live-badge live-badge-autonomous" title="LIVE AUTONOMOUS — real money, no per-trade prompt">⚡ LIVE</span>
+{% elif mode.mode == 'LIVE_MANUAL' %}
+  <span class="live-badge live-badge-manual" title="LIVE manual — per-trade prompts required">LIVE</span>
+{% endif %}

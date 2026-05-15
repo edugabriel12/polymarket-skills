@@ -22,6 +22,14 @@
       <a href="/advisor" class="{% if active_tab == 'advisor' %}active{% endif %}">Advisor</a>
       <a href="/costs" class="{% if active_tab == 'costs' %}active{% endif %}">Costs</a>
       <a href="/events" class="{% if active_tab == 'events' %}active{% endif %}">Live Events</a>
+      <a href="/live" class="{% if active_tab == 'live' %}active{% endif %}">
+        Live Trading
+        <span id="live-badge"
+              hx-get="/api/live/badge"
+              hx-trigger="load, every 30s"
+              hx-swap="innerHTML"></span>
+      </a>
+      <a href="/settings" class="{% if active_tab == 'settings' %}active{% endif %}">Settings</a>
     </nav>
   </header>
   <main>

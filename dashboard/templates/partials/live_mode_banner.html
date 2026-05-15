@@ -1,0 +1,33 @@
+{# Mode banner — color-coded. #}
+
+{% if mode.mode == 'PAPER' %}
+<div class="card mode-banner mode-paper">
+  <strong>📋 PAPER MODE</strong> — simulated trades against real prices, zero risk.
+  <p class="muted small">
+    To go live: set <code>POLYMARKET_PRIVATE_KEY</code> and
+    <code>POLYMARKET_CONFIRM=true</code> in Settings.
+    {% if not mode.has_key %}<br>Missing: private key.{% endif %}
+    {% if mode.has_key and not mode.confirm %}<br>Missing: <code>POLYMARKET_CONFIRM=true</code>.{% endif %}
+  </p>
+</div>
+{% elif mode.mode == 'LIVE_MANUAL' %}
+<div class="card mode-banner mode-live-manual">
+  <strong>🟡 LIVE MODE — manual confirmation per trade</strong>
+  <p class="small">
+    Live trades require interactive prompt (CLAUDE.md §1 rule 4).
+    Per-trade cap: <strong>${{ "%.2f"|format(mode.max_size_usd or 0) }}</strong> ·
+    Daily limit: <strong>${{ "%.2f"|format(mode.daily_loss_limit_usd or 0) }}</strong>
+  </p>
+</div>
+{% elif mode.mode == 'LIVE_AUTONOMOUS' %}
+<div class="card mode-banner mode-live-autonomous">
+  <strong>🚨 LIVE AUTONOMOUS MODE — REAL MONEY, NO PER-TRADE PROMPT</strong>
+  <p class="small">
+    CLAUDE.md §4.1 carve-out active. Per-trade cap:
+    <strong>${{ "%.2f"|format(mode.max_size_usd or 0) }}</strong> ·
+    Daily limit: <strong>${{ "%.2f"|format(mode.daily_loss_limit_usd or 0) }}</strong>.
+    <br><strong>Use the killswitch below or <code>touch ~/halt-trading</code>
+    to halt immediately.</strong>
+  </p>
+</div>
+{% endif %}

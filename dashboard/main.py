@@ -18,9 +18,9 @@ from fastapi.templating import Jinja2Templates
 
 from . import settings as S
 from .services import (advisor, advisor_jobs, analytics, charts,
-                        counterfactual, costs, events, notifier,
-                        portfolio, positions, process_manager,
-                        suggestion_applier)
+                        counterfactual, costs, events, live_trading,
+                        notifier, portfolio, positions, process_manager,
+                        settings_service, suggestion_applier, wallet)
 
 app = FastAPI(title="Polymarket Weather Dashboard")
 
@@ -347,6 +347,106 @@ async def api_counterfactual_replay(request: Request):
     )
     return templates.TemplateResponse(
         request, "partials/counterfactual_result.html", {"result": result})
+
+
+# ---------------------------------------------------------------------------
+# Settings + Live trading pages
+# ---------------------------------------------------------------------------
+
+@app.get("/settings", response_class=HTMLResponse)
+def page_settings(request: Request):
+    ctx = _common_ctx("settings")
+    ctx["settings"] = settings_service.get_displayable_settings()
+    return templates.TemplateResponse(request, "settings.html", ctx)
+
+
+@app.post("/api/settings/env", response_class=HTMLResponse)
+def api_settings_update(request: Request,
+                          key: str = Form(...),
+                          value: str = Form("")):
+    """Update a single env var. Returns the re-rendered settings form."""
+    try:
+        settings_service.update_env_var(key, value)
+        # Re-render the whole form so the row's "Current" column updates
+        ctx = {"settings": settings_service.get_displayable_settings()}
+        return templates.TemplateResponse(
+            request, "partials/settings_form.html", ctx)
+    except ValueError as e:
+        return HTMLResponse(
+            f'<form><div class="modal-error">⚠ {str(e)}</div></form>',
+            status_code=400)
+
+
+@app.get("/live", response_class=HTMLResponse)
+def page_live(request: Request):
+    ctx = _common_ctx("live")
+    return templates.TemplateResponse(request, "live.html", ctx)
+
+
+@app.get("/api/wallet/balance", response_class=HTMLResponse)
+def api_wallet_balance(request: Request, refresh: int = 0):
+    w = wallet.get_wallet_info(force_refresh=bool(refresh))
+    return templates.TemplateResponse(
+        request, "partials/wallet_balance.html", {"w": w})
+
+
+@app.get("/api/live/mode", response_class=HTMLResponse)
+def api_live_mode(request: Request):
+    mode = live_trading.get_live_mode()
+    return templates.TemplateResponse(
+        request, "partials/live_mode_banner.html", {"mode": mode})
+
+
+@app.get("/api/live/badge", response_class=HTMLResponse)
+def api_live_badge(request: Request):
+    mode = live_trading.get_live_mode()
+    return templates.TemplateResponse(
+        request, "partials/live_badge.html", {"mode": mode})
+
+
+@app.get("/api/live/killswitch-status", response_class=HTMLResponse)
+def api_killswitch_status(request: Request):
+    armed = live_trading.is_killswitch_armed()
+    return templates.TemplateResponse(
+        request, "partials/killswitch_toggle.html",
+        {"armed": armed, "path": str(live_trading._halt_file())})
+
+
+@app.post("/api/live/killswitch", response_class=HTMLResponse)
+def api_killswitch_toggle(request: Request, action: str):
+    if action == "arm":
+        live_trading.arm_killswitch()
+    elif action == "disarm":
+        live_trading.disarm_killswitch()
+    else:
+        return HTMLResponse(
+            '<div class="modal-error">action must be arm|disarm</div>',
+            status_code=400)
+    armed = live_trading.is_killswitch_armed()
+    return templates.TemplateResponse(
+        request, "partials/killswitch_toggle.html",
+        {"armed": armed, "path": str(live_trading._halt_file())})
+
+
+@app.get("/api/live/readiness", response_class=HTMLResponse)
+def api_live_readiness(request: Request, refresh: int = 0):
+    r = live_trading.get_readiness(force_refresh=bool(refresh))
+    return templates.TemplateResponse(
+        request, "partials/live_readiness.html", {"r": r})
+
+
+@app.get("/api/live/trades", response_class=HTMLResponse)
+def api_live_trades(request: Request, limit: int = 50):
+    trades = live_trading.read_live_trades(limit=limit)
+    return templates.TemplateResponse(
+        request, "partials/live_trades_table.html", {"trades": trades})
+
+
+@app.get("/api/live/daily-spend", response_class=HTMLResponse)
+def api_live_daily_spend(request: Request):
+    s = live_trading.get_daily_spent_usd()
+    return templates.TemplateResponse(
+        request, "partials/daily_spend.html", {"s": s})
 
 
 @app.get("/api/skipped-entries", response_class=HTMLResponse)

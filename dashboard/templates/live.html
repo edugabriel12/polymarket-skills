@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section id="live-mode-banner"
+         hx-get="/api/live/mode"
+         hx-trigger="load, every 30s"
+         hx-swap="innerHTML">
+  <div class="muted">Loading mode…</div>
+</section>
+
+<section class="card">
+  <h2>Killswitch</h2>
+  <div id="killswitch-zone"
+       hx-get="/api/live/killswitch-status"
+       hx-trigger="load"
+       hx-swap="innerHTML">
+    <div class="muted">Loading killswitch state…</div>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Pre-flight readiness <span class="muted small">(CLAUDE.md §4)</span></h2>
+  <div id="readiness-zone"
+       hx-get="/api/live/readiness"
+       hx-trigger="load"
+       hx-swap="innerHTML">
+    <div class="muted">Running backtest --live-check… (may take 5-10s)</div>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Wallet</h2>
+  <div id="wallet-card"
+       hx-get="/api/wallet/balance"
+       hx-trigger="load"
+       hx-swap="innerHTML">
+    <div class="muted">Loading wallet…</div>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Daily spend</h2>
+  <div id="daily-spend"
+       hx-get="/api/live/daily-spend"
+       hx-trigger="load, every 60s"
+       hx-swap="innerHTML">
+    <div class="muted">Loading…</div>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Live trades</h2>
+  <div id="live-trades-zone"
+       hx-get="/api/live/trades?limit=50"
+       hx-trigger="load, every 30s"
+       hx-swap="innerHTML">
+    <div class="muted">Loading…</div>
+  </div>
+</section>
+
+{% endblock %}
