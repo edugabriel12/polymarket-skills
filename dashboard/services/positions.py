@@ -226,6 +226,49 @@ def get_open_positions(sort_by: str = "entry_id") -> list[dict]:
         conn.close()
 
 
+def get_recent_skipped(limit: int = 20) -> list[dict]:
+    """v6: Recently SKIPPED entries with reason, for the dashboard panel.
+
+    Highlight actionable reasons (edge_stale, judge_*) in the UI via
+    `actionable` flag.
+    """
+    if not S.WEATHER_EDGE_DB.exists():
+        return []
+    conn = _ro_conn(S.WEATHER_EDGE_DB)
+    try:
+        rows = conn.execute(
+            "SELECT entry_id, ts, market_slug, market_question, side, "
+            "       entry_price, edge_pp_at_entry, "
+            "       COALESCE(skip_reason, judge_skipped_reason, 'unknown') "
+            "       AS reason, "
+            "       city_resolved "
+            "FROM entries "
+            "WHERE status = 'SKIPPED' "
+            "ORDER BY ts DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    actionable = {"edge_stale", "judge_unavailable", "judge_budget_exceeded"}
+    out = []
+    for r in rows:
+        reason = r["reason"]
+        out.append({
+            "entry_id": r["entry_id"],
+            "ts": (r["ts"] or "")[:16],
+            "market_slug": r["market_slug"],
+            "market_question": r["market_question"],
+            "side": r["side"],
+            "entry_price": r["entry_price"],
+            "edge_pp": r["edge_pp_at_entry"],
+            "reason": reason,
+            "city": r["city_resolved"],
+            "actionable": reason in actionable,
+        })
+    return out
+
+
 def _humanize_duration(seconds: int) -> str:
     if seconds < 60:
         return f"{seconds}s"

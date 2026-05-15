@@ -17,12 +17,38 @@
     <span class="kpi-value">{{ (kpis.last_run_ts or '—')[:16] }}</span>
     <span class="kpi-delta muted">UTC</span>
   </div>
-  <div class="kpi">
-    <span class="kpi-label">Suggestions applied</span>
-    <span class="kpi-value">{{ kpis.n_applies }}</span>
-    <span class="kpi-delta muted">across all runs</span>
+  <div class="kpi" title="Total suggestions applied across all runs vs total emitted by the LLM. Higher = more recommendations adopted.">
+    <span class="kpi-label">Acceptance rate</span>
+    {% if acceptance and acceptance.available and acceptance.total_suggestions > 0 %}
+      <span class="kpi-value">{{ "%.0f"|format(acceptance.acceptance_rate * 100) }}%</span>
+      <span class="kpi-delta muted">{{ acceptance.applied }} of {{ acceptance.total_suggestions }}</span>
+    {% else %}
+      <span class="kpi-value muted">—</span>
+      <span class="kpi-delta muted">{{ kpis.n_applies }} applied</span>
+    {% endif %}
   </div>
 </section>
+
+{% if acceptance and acceptance.available and acceptance.by_category %}
+<section class="card">
+  <h2>Acceptance by category</h2>
+  <table class="data-table">
+    <thead>
+      <tr><th>Category</th><th>Applied ✓</th><th>Failed ✗</th><th>Unsupported</th></tr>
+    </thead>
+    <tbody>
+      {% for cat, counts in acceptance.by_category.items() %}
+      <tr>
+        <td class="mono">{{ cat }}</td>
+        <td class="mono up">{{ counts.applied }}</td>
+        <td class="mono {% if counts.failed > 0 %}down{% endif %}">{{ counts.failed }}</td>
+        <td class="mono muted">{{ counts.unsupported }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
 
 <section class="card">
   <h2>Run advisor on-demand</h2>
@@ -44,6 +70,25 @@
     triggers a kill+respawn of the affected daemon (bot and/or judge).
     Operator can toggle per-session.
   </p>
+
+  <hr style="border-color: var(--border); margin: 14px 0;">
+
+  <h3 style="font-size: 13px; color: var(--text-muted); margin: 0 0 8px 0;">
+    Notifications (Tier 4A)
+  </h3>
+  <div id="notify-status"
+       hx-get="/api/notify/status"
+       hx-trigger="load"
+       hx-swap="innerHTML">
+    <div class="muted small">Loading…</div>
+  </div>
+  <button class="btn btn-apply" style="margin-top: 8px;"
+          hx-post="/api/notify/test"
+          hx-target="#notify-test-result"
+          hx-swap="innerHTML">
+    Send test notification
+  </button>
+  <div id="notify-test-result"></div>
 </section>
 
 <section class="card">

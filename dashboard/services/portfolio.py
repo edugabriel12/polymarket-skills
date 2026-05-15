@@ -7,7 +7,7 @@ hammering the upstream API on each dashboard refresh).
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -137,6 +137,143 @@ def _empty_kpis() -> dict:
         "cash_usd": 0.0,
         "positions_value_usd": 0.0,
         "starting_balance_usd": 0.0,
+    }
+
+
+def get_judge_kpis(days: int = 30) -> dict:
+    """v6: Surface judge accuracy metrics on the overview page.
+
+    Returns 4 numbers + status flags so the kpi_cards template can color
+    them. Empty/error gracefully when there are no judge reviews yet.
+    """
+    if not S.WEATHER_EDGE_DB.exists():
+        return {"available": False, "reason": "weather_edge.db not found"}
+
+    # Lazy import — analyzer module isn't always on the path during tests
+    import sys
+    analyzer_path = Path(__file__).resolve().parent.parent.parent \
+        / "polymarket-analyzer" / "scripts"
+    if str(analyzer_path) not in sys.path:
+        sys.path.insert(0, str(analyzer_path))
+    try:
+        from weather_edge_analyzer import compute_judge_accuracy
+    except ImportError as e:
+        return {"available": False, "reason": f"import failed: {e}"}
+
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    conn = _ro_conn(S.WEATHER_EDGE_DB)
+    try:
+        acc = compute_judge_accuracy(conn, since)
+    finally:
+        conn.close()
+
+    if acc.get("n_reviews", 0) == 0:
+        return {"available": False,
+                "reason": acc.get("note", "no judge reviews in window")}
+
+    brier = acc.get("brier_score")
+    appr = acc.get("approval_rate") or 0
+    fpr = acc.get("false_positive_rate")
+    fnr = acc.get("false_negative_rate")
+
+    # Color coding
+    def _brier_color(b):
+        if b is None: return "muted"
+        if b < 0.20: return "up"
+        if b < 0.30: return "warn"
+        return "down"
+
+    def _approval_color(a):
+        if a > 0.70 or a < 0.20: return "warn"
+        return ""
+
+    def _fpr_color(f):
+        if f is None: return "muted"
+        if f > 0.50: return "down"
+        if f > 0.30: return "warn"
+        return ""
+
+    return {
+        "available": True,
+        "days": days,
+        "n_reviews": acc["n_reviews"],
+        "n_resolved": acc.get("n_resolved", 0),
+        "brier": brier,
+        "brier_color": _brier_color(brier),
+        "approval_rate": appr,
+        "approval_color": _approval_color(appr),
+        "false_positive_rate": fpr,
+        "fpr_color": _fpr_color(fpr),
+        "false_negative_rate": fnr,
+        "missed_pnl_usd": acc.get("missed_pnl_from_rejects_usd", 0),
+        "n_flags": len(acc.get("interpretation", [])),
+    }
+
+
+def get_queue_health() -> dict:
+    """v6: Queue depth + aging + skipped reasons today (UTC).
+
+    Critical observability after edge-recheck v6: operator needs to see
+    if entries are aging in the queue or being skipped en masse.
+    """
+    if not S.WEATHER_EDGE_DB.exists():
+        return {"available": False}
+
+    conn = _ro_conn(S.WEATHER_EDGE_DB)
+    try:
+        # Queue depths
+        proposed = conn.execute(
+            "SELECT COUNT(*) FROM entries WHERE status = 'PROPOSED'"
+        ).fetchone()[0]
+        approved = conn.execute(
+            "SELECT COUNT(*) FROM entries "
+            "WHERE status IN ('APPROVED', 'ADJUSTED')"
+        ).fetchone()[0]
+
+        # Age of oldest pending (PROPOSED or APPROVED/ADJUSTED)
+        oldest = conn.execute(
+            "SELECT MIN(ts) FROM entries "
+            "WHERE status IN ('PROPOSED', 'APPROVED', 'ADJUSTED')"
+        ).fetchone()[0]
+        oldest_age_min = None
+        if oldest:
+            try:
+                ts = datetime.fromisoformat(oldest.replace("Z", "+00:00"))
+                oldest_age_min = int(
+                    (datetime.now(timezone.utc) - ts).total_seconds() / 60)
+            except (ValueError, TypeError):
+                pass
+
+        # Skipped breakdown today (UTC)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        skipped_rows = conn.execute(
+            "SELECT COALESCE(skip_reason, 'unknown') as reason, COUNT(*) as n "
+            "FROM entries WHERE status = 'SKIPPED' AND DATE(ts) = ? "
+            "GROUP BY reason ORDER BY n DESC",
+            (today,),
+        ).fetchall()
+        by_reason = [{"reason": r["reason"], "n": r["n"]} for r in skipped_rows]
+        n_skipped_today = sum(r["n"] for r in by_reason)
+
+    finally:
+        conn.close()
+
+    # Aging severity
+    age_color = ""
+    if oldest_age_min is not None:
+        if oldest_age_min > 120:
+            age_color = "down"   # > 2h old
+        elif oldest_age_min > 30:
+            age_color = "warn"
+
+    return {
+        "available": True,
+        "n_proposed": proposed,
+        "n_approved_waiting": approved,
+        "oldest_age_min": oldest_age_min,
+        "age_color": age_color,
+        "n_skipped_today": n_skipped_today,
+        "skipped_by_reason": by_reason,
     }
 
 

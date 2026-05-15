@@ -1,0 +1,77 @@
+{# Result panel for counterfactual replay — re-rendered every slider change. #}
+{% if not result %}
+  <div class="muted">No data.</div>
+{% elif result.error %}
+  <div class="modal-error">{{ result.error }}</div>
+{% else %}
+<div class="cf-result-grid">
+  <div class="cf-stat">
+    <span class="muted small">Simulated trigger</span>
+    <strong>{{ result.simulated.trigger or '—' }}</strong>
+  </div>
+  <div class="cf-stat">
+    <span class="muted small">Simulated exit</span>
+    <strong>
+      {% if result.simulated.exit_price %}
+        ${{ "%.3f"|format(result.simulated.exit_price) }}
+      {% else %}—{% endif %}
+    </strong>
+  </div>
+  <div class="cf-stat">
+    <span class="muted small">Simulated P&L</span>
+    <strong class="{% if result.simulated.pnl_usd is not none and result.simulated.pnl_usd >= 0 %}up{% elif result.simulated.pnl_usd is not none %}down{% endif %}">
+      {% if result.simulated.pnl_usd is not none %}
+        ${{ "%+.2f"|format(result.simulated.pnl_usd) }}
+      {% else %}—{% endif %}
+    </strong>
+  </div>
+  <div class="cf-stat">
+    <span class="muted small">Δ vs realized</span>
+    <strong class="{% if result.delta_usd is not none and result.delta_usd > 0 %}up{% elif result.delta_usd is not none and result.delta_usd < 0 %}down{% endif %}">
+      {% if result.delta_usd is not none %}
+        ${{ "%+.2f"|format(result.delta_usd) }}
+      {% else %}—{% endif %}
+    </strong>
+  </div>
+</div>
+
+{% if result.chart_points %}
+<div id="cf-chart" style="height: 240px; margin-top: 12px;"></div>
+<script>
+(function () {
+  var pts = {{ result.chart_points | tojson }};
+  var realized_ts = {{ result.realized.exit_ts | tojson }};
+  var sim_ts = {{ result.simulated.exit_ts | tojson }};
+  var trace = {
+    x: pts.map(p => p.ts),
+    y: pts.map(p => p.bid),
+    type: 'scatter', mode: 'lines+markers',
+    name: 'bid', line: {color: '#58a6ff'}
+  };
+  var shapes = [];
+  if (realized_ts) {
+    shapes.push({type: 'line', x0: realized_ts, x1: realized_ts,
+                  y0: 0, y1: 1, yref: 'paper',
+                  line: {color: '#4ade80', dash: 'dash', width: 2}});
+  }
+  if (sim_ts) {
+    shapes.push({type: 'line', x0: sim_ts, x1: sim_ts,
+                  y0: 0, y1: 1, yref: 'paper',
+                  line: {color: '#fbbf24', dash: 'dot', width: 2}});
+  }
+  Plotly.newPlot('cf-chart', [trace], {
+    margin: {l: 40, r: 10, t: 10, b: 30},
+    paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
+    font: {color: '#cdd6dc', size: 11},
+    xaxis: {gridcolor: '#2a2f38'}, yaxis: {gridcolor: '#2a2f38'},
+    shapes: shapes, showlegend: false,
+    annotations: [
+      {x: 0.02, y: 1.1, xref: 'paper', yref: 'paper', showarrow: false,
+        text: 'green dash = realized exit · yellow dot = simulated exit',
+        font: {color: '#7d8590', size: 10}}
+    ]
+  }, {displayModeBar: false, responsive: true});
+})();
+</script>
+{% endif %}
+{% endif %}

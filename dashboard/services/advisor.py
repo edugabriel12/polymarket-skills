@@ -76,6 +76,49 @@ def list_applies_for_run(run_id: int) -> dict:
         conn.close()
 
 
+def get_acceptance_stats() -> dict:
+    """v6: Acceptance rate = applied / total_suggestions across all runs.
+    Returns overall rate + per-category breakdown.
+
+    'total_suggestions' comes from summing n_suggestions per advisor_runs row.
+    'applied' counts rows in advisor_suggestion_applies with status='applied'.
+    """
+    if not S.WEATHER_EDGE_DB.exists():
+        return {"available": False}
+    conn = _ro_conn(S.WEATHER_EDGE_DB)
+    try:
+        total = conn.execute(
+            "SELECT COALESCE(SUM(n_suggestions), 0) FROM advisor_runs"
+        ).fetchone()[0] or 0
+        applied = conn.execute(
+            "SELECT COUNT(*) FROM advisor_suggestion_applies "
+            "WHERE status = 'applied'"
+        ).fetchone()[0] or 0
+        # By category
+        by_cat_rows = conn.execute(
+            "SELECT category, status, COUNT(*) as n "
+            "FROM advisor_suggestion_applies "
+            "GROUP BY category, status"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    by_cat: dict[str, dict] = {}
+    for r in by_cat_rows:
+        cat = r["category"] or "unknown"
+        by_cat.setdefault(cat, {"applied": 0, "failed": 0, "unsupported": 0})
+        if r["status"] in by_cat[cat]:
+            by_cat[cat][r["status"]] = r["n"]
+
+    return {
+        "available": True,
+        "total_suggestions": total,
+        "applied": applied,
+        "acceptance_rate": (applied / total) if total > 0 else 0.0,
+        "by_category": by_cat,
+    }
+
+
 def get_summary_kpis() -> dict:
     """Top-level numbers for the Advisor tab header."""
     if not S.WEATHER_EDGE_DB.exists():

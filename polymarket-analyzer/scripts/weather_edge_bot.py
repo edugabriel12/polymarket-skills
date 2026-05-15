@@ -1113,6 +1113,61 @@ def _handle_sigterm(signum, frame):
     _shutdown = True
 
 
+def _check_portfolio_thresholds() -> None:
+    """v6 Tier 4A: emit notifications when portfolio crosses risk thresholds.
+
+    Lazy-imports the dashboard's portfolio service + notifier so this is a
+    no-op when neither is available (e.g. during pure-bot deploys without
+    the dashboard installed).
+
+    Thresholds (CLAUDE.md §2):
+      - drawdown > 10% → warning
+      - drawdown > 15% → critical
+      - daily realized loss > 3% of starting → warning
+      - daily realized loss > 5% of starting → critical
+    """
+    try:
+        sys.path.insert(0, str(REPO_ROOT))
+        from dashboard.services import portfolio as pf_svc, notifier
+    except ImportError:
+        return  # dashboard not on this host, skip silently
+
+    if not notifier.is_configured():
+        return
+
+    try:
+        kpis = pf_svc.get_kpis()
+    except Exception:
+        return
+
+    dd = kpis.get("drawdown_pct_from_peak", 0)
+    starting = kpis.get("starting_balance_usd", 0) or 0
+    realized = kpis.get("realized_pnl_today_usd", 0) or 0
+    daily_loss_pct = -(realized / starting * 100) if starting > 0 else 0
+    total = kpis.get("portfolio_total_usd", 0)
+
+    body_template = (
+        f"Portfolio: ${total:.2f}\n"
+        f"Drawdown from peak: {dd:.2f}%\n"
+        f"Realized today: ${realized:+.2f} ({-daily_loss_pct:+.2f}%)"
+    )
+
+    if dd <= -15:
+        notifier.send("critical", "Drawdown CRITICAL > 15%", body_template,
+                       rate_limit_key="dd_critical")
+    elif dd <= -10:
+        notifier.send("warning", "Drawdown warning > 10%", body_template,
+                       rate_limit_key="dd_warning")
+
+    if daily_loss_pct >= 5:
+        notifier.send("critical",
+                       "Daily loss CRITICAL > 5% — entries blocked",
+                       body_template, rate_limit_key="dl_critical")
+    elif daily_loss_pct >= 3:
+        notifier.send("warning", "Daily loss warning > 3%",
+                       body_template, rate_limit_key="dl_warning")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--min-edge-pp", type=float, default=10.0)
@@ -1233,6 +1288,13 @@ def main():
                 log_event("heartbeat", {"open_positions": open_count,
                                          "pending_proposals": pending_count})
                 last_heartbeat = now_mono
+                # v6 Tier 4A: portfolio threshold checks for notifications.
+                # Wrapped in try so notifier failures never crash the bot.
+                try:
+                    _check_portfolio_thresholds()
+                except Exception as e:
+                    log_event("error", {"where": "notify_thresholds",
+                                         "err": str(e)}, level="WARN")
         except Exception as e:
             log_event("error", {"where": "main_loop", "err": str(e),
                                 "type": type(e).__name__}, level="ERROR")

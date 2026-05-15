@@ -1,0 +1,56 @@
+{# Recent SKIPPED entries panel — Tier 1D (v6).
+   Surfaces edge_stale + judge_* reasons so operator notices patterns. #}
+
+{% if not skipped %}
+  <div class="empty-state">
+    <div class="empty-icon">✓</div>
+    <div class="empty-title">No skipped entries</div>
+    <div class="empty-msg">Queue is healthy — no entries blocked by edge decay,
+      judge issues, or capacity. Skipped entries appear here when the bot
+      decides not to execute a proposal.</div>
+  </div>
+{% else %}
+<div class="table-filter">
+  <input type="text" data-filter-target="skipped-table"
+         placeholder="Filter by market, city, reason…">
+  <span class="filter-count" id="skipped-table-filter-count"></span>
+</div>
+<table class="data-table data-table-compact" id="skipped-table">
+  <thead>
+    <tr>
+      <th>When (UTC)</th>
+      <th>Entry</th>
+      <th>Market</th>
+      <th>City</th>
+      <th>Side</th>
+      <th>Edge @ entry</th>
+      <th>Reason</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for s in skipped %}
+    <tr class="{% if s.actionable %}row-warn{% endif %}">
+      <td class="mono small">{{ s.ts }}</td>
+      <td class="mono small">#{{ s.entry_id }}</td>
+      <td class="small">{{ s.market_question[:60] }}{% if s.market_question|length > 60 %}…{% endif %}</td>
+      <td class="mono small">{{ s.city or '—' }}</td>
+      <td class="mono small">{{ s.side }}</td>
+      <td class="mono small">{% if s.edge_pp is not none %}{{ "%.1f"|format(s.edge_pp) }}pp{% else %}—{% endif %}</td>
+      <td class="mono small">
+        <span class="reason-tag reason-{{ s.reason }}">{{ s.reason }}</span>
+      </td>
+      <td>
+        <button class="period-btn"
+                hx-get="/api/counterfactual/modal/{{ s.entry_id }}"
+                hx-target="body"
+                hx-swap="beforeend"
+                title="What if different cashout params?">
+          ↻ replay
+        </button>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}

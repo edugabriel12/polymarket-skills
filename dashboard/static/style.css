@@ -73,6 +73,49 @@ footer {
 
 .up { color: var(--up); }
 .down { color: var(--down); }
+.warn { color: var(--warn); }
+
+/* v6: judge + queue KPI grid variants — visually distinct row from
+   the main portfolio KPIs so operator can scan "main → judge → queue". */
+.kpi-grid-judge,
+.kpi-grid-queue {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+  margin-bottom: 14px;
+  padding-top: 4px;
+  border-top: 1px dashed var(--border);
+}
+.kpi-grid-judge .kpi { background: rgba(74, 222, 128, 0.03); }
+.kpi-grid-queue .kpi { background: rgba(96, 165, 250, 0.03); }
+@media (max-width: 900px) {
+  .kpi-grid-judge,
+  .kpi-grid-queue { grid-template-columns: repeat(2, 1fr); }
+}
+
+/* v6: skipped-entries panel highlights actionable rows (edge_stale, etc.) */
+.row-warn td { background: rgba(251, 191, 36, 0.06); }
+.reason-tag {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  background: var(--bg);
+  border: 1px solid var(--border);
+}
+.reason-tag.reason-edge_stale,
+.reason-tag.reason-judge_unavailable,
+.reason-tag.reason-judge_budget_exceeded {
+  background: rgba(251, 191, 36, 0.15);
+  border-color: var(--warn);
+  color: var(--warn);
+}
+.data-table-compact td,
+.data-table-compact th {
+  padding: 4px 8px;
+  font-size: 12px;
+}
 .muted { color: var(--text-muted); }
 .small { font-size: 11px; }
 .mono { font-family: var(--mono); }
@@ -396,4 +439,157 @@ footer {
   background: var(--err); color: white;
   padding: 12px; border-radius: 4px;
   position: fixed; top: 20px; right: 20px; z-index: 300;
+}
+
+/* === Tier 3 (UX polish) === */
+
+/* 3A. Toast notifications — bottom-right stack */
+#toast-container {
+  position: fixed; bottom: 20px; right: 20px; z-index: 400;
+  display: flex; flex-direction: column-reverse; gap: 8px;
+  pointer-events: none;
+}
+.toast {
+  background: var(--bg-card-2); color: var(--text);
+  border: 1px solid var(--border); border-left-width: 4px;
+  border-radius: 6px; padding: 10px 14px;
+  font-size: 13px; min-width: 250px; max-width: 400px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  opacity: 0; transform: translateX(40px);
+  transition: opacity 0.25s, transform 0.25s;
+  pointer-events: auto;
+}
+.toast-show { opacity: 1; transform: translateX(0); }
+.toast-success { border-left-color: var(--up); }
+.toast-error   { border-left-color: var(--err); }
+.toast-warn    { border-left-color: var(--warn); }
+.toast-info    { border-left-color: var(--info); }
+
+/* 3B. Tooltip macro — uses the standard `title` attr but with help icon */
+.help-icon {
+  display: inline-block; width: 14px; height: 14px;
+  border-radius: 50%; background: var(--bg-card-2);
+  color: var(--text-muted); text-align: center; line-height: 14px;
+  font-size: 10px; font-weight: 700; cursor: help;
+  margin-left: 4px; vertical-align: middle;
+  border: 1px solid var(--border);
+}
+.help-icon:hover { color: var(--accent); border-color: var(--accent); }
+
+/* 3C. Table filter input */
+.table-filter {
+  display: flex; gap: 8px; align-items: center;
+  margin-bottom: 8px;
+}
+.table-filter input {
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 6px 10px; font-size: 13px; flex: 1; max-width: 300px;
+}
+.table-filter input:focus {
+  outline: none; border-color: var(--accent);
+}
+.table-filter .filter-count {
+  font-size: 11px; color: var(--text-muted); font-family: var(--mono);
+}
+
+/* 3D. Empty states — reusable class for "no data yet" cards */
+.empty-state {
+  text-align: center; padding: 40px 20px;
+  color: var(--text-muted);
+}
+.empty-state .empty-icon {
+  font-size: 36px; margin-bottom: 12px; opacity: 0.5;
+}
+.empty-state .empty-title {
+  font-size: 14px; font-weight: 600; color: var(--text); margin-bottom: 6px;
+}
+.empty-state .empty-msg { font-size: 12px; line-height: 1.5; }
+.empty-state code {
+  background: var(--bg); padding: 2px 6px; border-radius: 3px;
+  font-size: 11px; color: var(--accent);
+}
+
+/* 3E. Mobile positions cards (< 768px the data-table becomes vertical cards) */
+@media (max-width: 768px) {
+  .data-table.mobile-cards {
+    display: block;
+  }
+  .data-table.mobile-cards thead { display: none; }
+  .data-table.mobile-cards tbody,
+  .data-table.mobile-cards tbody tr {
+    display: block; width: 100%;
+  }
+  .data-table.mobile-cards tbody tr {
+    background: var(--bg-card-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-bottom: 8px;
+    padding: 10px 12px;
+  }
+  .data-table.mobile-cards td {
+    display: flex; justify-content: space-between;
+    border: none; padding: 4px 0;
+    font-size: 13px;
+  }
+  .data-table.mobile-cards td::before {
+    content: attr(data-label);
+    color: var(--text-muted); font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.3px;
+    flex-shrink: 0; margin-right: 8px;
+  }
+}
+
+/* 3F. Scroll-to-top button — fixed bottom-right, appears on scroll */
+#scroll-top {
+  position: fixed; bottom: 20px; left: 20px; z-index: 200;
+  width: 40px; height: 40px; border-radius: 50%;
+  background: var(--accent); color: var(--bg);
+  border: none; font-size: 18px; font-weight: 700;
+  cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  opacity: 0; pointer-events: none;
+  transition: opacity 0.2s;
+}
+#scroll-top.show { opacity: 0.85; pointer-events: auto; }
+#scroll-top:hover { opacity: 1; }
+
+/* === Tier 4B: Counterfactual replay modal === */
+.cf-context {
+  background: var(--bg);
+  padding: 8px 12px; border-radius: 4px;
+  margin: 12px 0;
+}
+.cf-realized {
+  background: rgba(74, 222, 128, 0.05);
+  border-left: 3px solid var(--up);
+  padding: 8px 14px; border-radius: 4px;
+  margin: 12px 0;
+}
+.cf-realized h3 { margin: 0 0 4px 0; font-size: 12px; color: var(--text-muted); }
+.cf-sliders {
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px 24px;
+  margin: 12px 0;
+}
+.cf-sliders label {
+  display: flex; flex-direction: column; gap: 4px;
+  font-family: var(--mono); font-size: 12px;
+}
+.cf-sliders input[type="range"] { width: 100%; accent-color: var(--accent); }
+.cf-sliders output {
+  font-family: var(--mono); font-weight: 700; color: var(--accent);
+  font-size: 14px;
+}
+.cf-result-grid {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+  margin-top: 12px; padding: 12px;
+  background: var(--bg); border-radius: 6px;
+}
+.cf-stat {
+  display: flex; flex-direction: column; gap: 2px;
+  font-family: var(--mono);
+}
+.cf-stat strong { font-size: 16px; }
+@media (max-width: 700px) {
+  .cf-sliders { grid-template-columns: 1fr; }
+  .cf-result-grid { grid-template-columns: repeat(2, 1fr); }
 }

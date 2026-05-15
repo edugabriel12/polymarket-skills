@@ -39,4 +39,14 @@
   </div>
 </section>
 
+<section class="card">
+  <h2>Recently SKIPPED <span class="muted small">(stale edge, judge issues, capacity)</span></h2>
+  <div id="skipped-entries"
+       hx-get="/api/skipped-entries?limit=20"
+       hx-trigger="load, every 60s"
+       hx-swap="innerHTML">
+    <div class="muted">Loading skipped entries…</div>
+  </div>
+</section>
+
 {% endblock %}

@@ -30,6 +30,14 @@
   <footer>
     <span>Read-only · 127.0.0.1:8765 · refresh KPI {{ refresh_kpi_sec }}s · events {{ refresh_events_sec }}s · positions {{ refresh_positions_sec }}s</span>
   </footer>
+
+  {# Tier 3A: toast container — global notifications bottom-right #}
+  <div id="toast-container" aria-live="polite"></div>
+
+  {# Tier 3F: scroll-to-top button — appears after scrolling > 500px #}
+  <button id="scroll-top" aria-label="Scroll to top" title="Scroll to top">↑</button>
+
+  <script src="/static/dashboard.js" defer></script>
   {% block scripts %}{% endblock %}
 </body>
 </html>

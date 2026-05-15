@@ -17,8 +17,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from . import settings as S
-from .services import (advisor, advisor_jobs, analytics, charts, costs,
-                        events, portfolio, positions, process_manager,
+from .services import (advisor, advisor_jobs, analytics, charts,
+                        counterfactual, costs, events, notifier,
+                        portfolio, positions, process_manager,
                         suggestion_applier)
 
 app = FastAPI(title="Polymarket Weather Dashboard")
@@ -75,6 +76,7 @@ def page_advisor(request: Request):
     ctx = _common_ctx("advisor")
     ctx["kpis"] = advisor.get_summary_kpis()
     ctx["runs"] = advisor.list_runs(limit=50)
+    ctx["acceptance"] = advisor.get_acceptance_stats()
     return templates.TemplateResponse(request, "advisor.html", ctx)
 
 
@@ -215,8 +217,144 @@ def api_kpis(request: Request):
         kpis = portfolio.get_kpis()
     except FileNotFoundError:
         kpis = {"error": "portfolio.db not found — bot has not run yet"}
+    # v6: judge accuracy + queue health (best-effort, no-op if no data)
+    try:
+        judge = portfolio.get_judge_kpis(days=30)
+    except Exception as e:
+        judge = {"available": False, "reason": str(e)}
+    try:
+        queue = portfolio.get_queue_health()
+    except Exception as e:
+        queue = {"available": False, "reason": str(e)}
     return templates.TemplateResponse(
-        request, "partials/kpi_cards.html", {"k": kpis})
+        request, "partials/kpi_cards.html",
+        {"k": kpis, "judge": judge, "queue": queue})
+
+
+# ---------------------------------------------------------------------------
+# v6 Tier 4A: Notifications endpoints + crash detection
+# ---------------------------------------------------------------------------
+
+@app.post("/api/notify/test", response_class=HTMLResponse)
+def api_notify_test(request: Request):
+    """Send a test notification — operator wires creds, hits this once
+    to confirm Telegram/email works, then trusts the bot to fire alerts."""
+    result = notifier.send(
+        "info", "Polymarket dashboard test",
+        f"This is a test from /api/notify/test at {portfolio._ro_conn.__module__}. "
+        f"If you see this, the notifier backend is wired correctly.",
+        rate_limit_key="manual_test",
+    )
+    status_class = "toast-success" if result["status"] == "sent" else "toast-warn"
+    msg = (f"Test → {result['status']}"
+            + (f": {result.get('reason', '')}" if result.get("reason") else ""))
+    return HTMLResponse(
+        f'<div class="toast {status_class} toast-show inline">{msg}</div>'
+    )
+
+
+@app.get("/api/notify/status", response_class=HTMLResponse)
+def api_notify_status(request: Request):
+    s = notifier.get_status()
+    return HTMLResponse(
+        f'<div class="muted small">Backend: <code>{s["backend"]}</code> · '
+        f'configured: <strong>{"yes" if s["configured"] else "no"}</strong> · '
+        f'rate-limit window: {s["rate_limit_window_min"]}min · '
+        f'recent keys: {len(s["recent_sent_keys"])}</div>'
+    )
+
+
+@app.on_event("startup")
+async def _start_crash_watcher():
+    """Background task: every 60s, check if bot/judge PID files claim a
+    process that's no longer alive → notify ONCE per crash event."""
+    import asyncio
+    async def watch():
+        seen_dead = set()
+        while True:
+            try:
+                for target in ("bot", "judge"):
+                    pf = process_manager.read_pidfile(target)
+                    if pf is None:
+                        continue
+                    pid = pf.get("pid")
+                    if not pid:
+                        continue
+                    if process_manager.is_alive(pid):
+                        seen_dead.discard((target, pid))
+                        continue
+                    if (target, pid) in seen_dead:
+                        continue
+                    seen_dead.add((target, pid))
+                    notifier.send(
+                        "critical", f"{target} process crashed (PID {pid})",
+                        f"PID file {target}.pid.json claims pid={pid}, "
+                        f"but the process is no longer alive. Check logs at "
+                        f"~/.polymarket-paper/{target}.out.log",
+                        rate_limit_key=f"crash_{target}_{pid}",
+                    )
+            except Exception:
+                pass
+            await asyncio.sleep(60)
+    asyncio.create_task(watch())
+
+
+# ---------------------------------------------------------------------------
+# v6 Tier 4B: Counterfactual replay UI
+# ---------------------------------------------------------------------------
+
+@app.get("/api/counterfactual/modal/{entry_id}", response_class=HTMLResponse)
+def api_counterfactual_modal(request: Request, entry_id: int):
+    """Open the counterfactual replay modal for a given entry."""
+    initial = counterfactual.replay_with_params(entry_id)
+    return templates.TemplateResponse(
+        request, "partials/counterfactual_modal.html",
+        {"entry_id": entry_id, "initial": initial})
+
+
+@app.api_route("/api/counterfactual/replay", methods=["GET", "POST"],
+                response_class=HTMLResponse)
+async def api_counterfactual_replay(request: Request):
+    """Re-render the result panel with the current slider values.
+    Accepts both GET (initial load with defaults) and POST (form submit)."""
+    if request.method == "POST":
+        data = await request.form()
+    else:
+        data = request.query_params
+    try:
+        entry_id = int(data.get("entry_id"))
+    except (TypeError, ValueError):
+        return HTMLResponse(
+            '<div class="modal-error">Missing entry_id.</div>', status_code=400)
+
+    def _f(name: str, default: float) -> float:
+        v = data.get(name)
+        if v is None or v == "":
+            return default
+        try:
+            return float(v)
+        except ValueError:
+            return default
+
+    result = counterfactual.replay_with_params(
+        entry_id,
+        profit_lock_pp=_f("profit_lock_pp", 50.0),
+        trailing_drawdown_pct=_f("trailing_drawdown_pct", 30.0),
+        trailing_min_gain_pp=_f("trailing_min_gain_pp", 20.0),
+        convergence_pp=_f("convergence_pp", 5.0),
+        bid_slippage_pct=_f("bid_slippage_pct", 0.0),
+        fee_rate=_f("fee_rate", 0.0),
+    )
+    return templates.TemplateResponse(
+        request, "partials/counterfactual_result.html", {"result": result})
+
+
+@app.get("/api/skipped-entries", response_class=HTMLResponse)
+def api_skipped_entries(request: Request, limit: int = 20):
+    """v6: Recently SKIPPED entries panel for the overview page."""
+    skipped = positions.get_recent_skipped(limit=limit)
+    return templates.TemplateResponse(
+        request, "partials/skipped_entries.html", {"skipped": skipped})
 
 
 @app.get("/api/recent-events", response_class=HTMLResponse)

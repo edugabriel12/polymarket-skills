@@ -1,0 +1,97 @@
+{# Counterfactual replay modal — Tier 4B.
+   Operator clicks an entry_id to open this; sliders trigger live re-render
+   of /api/counterfactual/replay (debounced 500ms). #}
+
+<div class="modal-backdrop" id="counterfactual-modal"
+     onclick="if(event.target.id==='counterfactual-modal') closeCounterfactualModal()">
+  <div class="modal-content modal-wide">
+    <button class="modal-close" onclick="closeCounterfactualModal()">×</button>
+    <h2>Counterfactual replay — entry #{{ entry_id }}</h2>
+
+    {% if not initial %}
+      <div class="modal-error">Entry not found.</div>
+    {% else %}
+    <div class="cf-context muted small">
+      <strong>{{ initial.entry_meta.market_question }}</strong>
+      ({{ initial.entry_meta.city or '?' }}, {{ initial.entry_meta.side }})
+      · entry ${{ "%.3f"|format(initial.entry_meta.entry_price or 0) }}
+      · stake ${{ "%.2f"|format(initial.entry_meta.size_usd or 0) }}
+    </div>
+
+    <div class="cf-realized">
+      <h3>Realized</h3>
+      <p class="mono">
+        Trigger: <strong>{{ initial.realized.trigger or '—' }}</strong>
+        {% if initial.realized.exit_price %}
+          · exit @ ${{ "%.3f"|format(initial.realized.exit_price) }}
+        {% endif %}
+        · P&L:
+        {% if initial.realized.pnl_usd is not none %}
+          <strong class="{% if initial.realized.pnl_usd >= 0 %}up{% else %}down{% endif %}">
+            ${{ "%+.2f"|format(initial.realized.pnl_usd) }}</strong>
+        {% else %}
+          —
+        {% endif %}
+      </p>
+    </div>
+
+    <form id="cf-form" hx-post="/api/counterfactual/replay"
+          hx-target="#cf-result" hx-swap="innerHTML"
+          hx-trigger="input from:input changed delay:500ms"
+          hx-include="this">
+      <input type="hidden" name="entry_id" value="{{ entry_id }}">
+
+      <h3>Try alternative parameters</h3>
+      <div class="cf-sliders">
+        <label>profit_lock_pp <span class="muted small">(0-100)</span>
+          <input type="range" name="profit_lock_pp" min="0" max="100"
+                 step="5" value="50"
+                 oninput="this.nextElementSibling.textContent=this.value">
+          <output>50</output>
+        </label>
+        <label>trailing_drawdown_pct <span class="muted small">(0-50)</span>
+          <input type="range" name="trailing_drawdown_pct" min="0" max="50"
+                 step="5" value="30"
+                 oninput="this.nextElementSibling.textContent=this.value">
+          <output>30</output>
+        </label>
+        <label>convergence_pp <span class="muted small">(0-15)</span>
+          <input type="range" name="convergence_pp" min="0" max="15"
+                 step="1" value="5"
+                 oninput="this.nextElementSibling.textContent=this.value">
+          <output>5</output>
+        </label>
+        <label>bid_slippage_pct <span class="muted small">(0-10)</span>
+          <input type="range" name="bid_slippage_pct" min="0" max="10"
+                 step="0.5" value="0"
+                 oninput="this.nextElementSibling.textContent=this.value">
+          <output>0</output>
+        </label>
+        <label>fee_rate <span class="muted small">(0-0.05)</span>
+          <input type="range" name="fee_rate" min="0" max="0.05"
+                 step="0.005" value="0"
+                 oninput="this.nextElementSibling.textContent=this.value">
+          <output>0</output>
+        </label>
+      </div>
+    </form>
+
+    <div id="cf-result"
+         hx-get="/api/counterfactual/replay?entry_id={{ entry_id }}"
+         hx-trigger="load">
+      <div class="muted">Replaying with default params…</div>
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+<script>
+  function closeCounterfactualModal() {
+    var m = document.getElementById('counterfactual-modal');
+    if (m) m.remove();
+  }
+  // ESC to close (one-shot listener)
+  document.addEventListener('keydown', function escClose(e) {
+    if (e.key === 'Escape') closeCounterfactualModal();
+  }, { once: true });
+</script>

@@ -1,7 +1,21 @@
 {% if not positions %}
-  <div class="muted">No open positions.</div>
+  <div class="empty-state">
+    <div class="empty-icon">○</div>
+    <div class="empty-title">No open positions</div>
+    <div class="empty-msg">When the bot opens a paper position, it shows here
+      with live bid, P&L, and trigger progress. New to the system? Check that
+      the bot daemon is running:
+      <br><code>python polymarket-analyzer/scripts/weather_edge_bot.py --daemon --min-edge-pp 10</code></div>
+  </div>
 {% else %}
-<table class="data-table positions-table">
+{% if show_full %}
+<div class="table-filter">
+  <input type="text" data-filter-target="positions-table"
+         placeholder="Filter by market, city, side…">
+  <span class="filter-count" id="positions-table-filter-count"></span>
+</div>
+{% endif %}
+<table class="data-table positions-table {% if show_full %}mobile-cards{% endif %}" id="positions-table">
   <thead>
     <tr>
       <th>ID</th><th>Market</th><th>Side</th>
@@ -13,8 +27,8 @@
   <tbody>
     {% for p in positions %}
     <tr {% if show_full %}onclick="openReplay({{ p.entry_id }})"{% endif %} class="{% if show_full %}clickable{% endif %}">
-      <td class="mono">#{{ p.entry_id }}</td>
-      <td>
+      <td class="mono" data-label="ID">#{{ p.entry_id }}</td>
+      <td data-label="Market">
         <div class="city">{{ p.city or '?' }}</div>
         <div class="slug muted small">
           <a href="https://polymarket.com/event/{{ p.market_slug }}"
@@ -26,20 +40,20 @@
           </a>
         </div>
       </td>
-      <td><span class="side side-{{ p.side|lower }}">{{ p.side }}</span></td>
-      <td class="mono">
+      <td data-label="Side"><span class="side side-{{ p.side|lower }}">{{ p.side }}</span></td>
+      <td class="mono" data-label="Stake">
         ${{ "%.2f"|format(p.size_usd) }}
         <span class="small muted">{{ "%.0f"|format(p.size_shares) }}sh</span>
       </td>
-      <td class="mono">${{ "%.3f"|format(p.entry_price) }}</td>
-      <td class="mono">${{ "%.3f"|format(p.current_bid) }}</td>
-      <td class="mono">{% if p.peak_bid %}${{ "%.3f"|format(p.peak_bid) }}{% else %}—{% endif %}</td>
-      <td class="mono {% if p.paper_pnl_usd > 0 %}up{% elif p.paper_pnl_usd < 0 %}down{% endif %}">
+      <td class="mono" data-label="Entry">${{ "%.3f"|format(p.entry_price) }}</td>
+      <td class="mono" data-label="Bid">${{ "%.3f"|format(p.current_bid) }}</td>
+      <td class="mono" data-label="Peak">{% if p.peak_bid %}${{ "%.3f"|format(p.peak_bid) }}{% else %}—{% endif %}</td>
+      <td class="mono {% if p.paper_pnl_usd > 0 %}up{% elif p.paper_pnl_usd < 0 %}down{% endif %}" data-label="P&L">
         {{ "+" if p.paper_pnl_usd >= 0 else "" }}${{ "%.2f"|format(p.paper_pnl_usd) }}
         <span class="small muted">({{ "%.1f"|format(p.paper_pnl_pct) }}%)</span>
       </td>
-      <td class="mono small">{{ p.held_human }}</td>
-      <td>
+      <td class="mono small" data-label="Held">{{ p.held_human }}</td>
+      <td data-label="Triggers">
         {% set t = p.triggers %}
         <div class="trigger-stack">
           {% include "partials/trigger_bar.html" with context %}
