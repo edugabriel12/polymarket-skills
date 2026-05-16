@@ -1506,20 +1506,21 @@ def _check_portfolio_thresholds() -> None:
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("--min-edge-pp", type=float, default=8.0,
+    p.add_argument("--min-edge-pp", type=float, default=20.0,
                    help="Minimum edge_pp required at DISCOVERY time. "
-                        "Default 8 (lowered from 25 on 2026-05-16 for the "
-                        "high-probability strategic pivot: mid-band entries "
-                        "(0.50-0.85) naturally carry smaller edges than "
-                        "long-shots, so 25pp would block almost everything "
-                        "in the target band).")
-    p.add_argument("--execute-min-edge-pp", type=float, default=4.0,
+                        "Default 20 (lowered from 25 on 2026-05-16: snapshot "
+                        "showed 100%% of mid-band [0.30, 0.85] proposals "
+                        "had edge >= 25pp because v6 clipping forces "
+                        "bot_prob to {0.10, 0.90} extremes — so 20pp is "
+                        "ample headroom and stays above the 10-20pp "
+                        "cohort that historically had near-zero win rate).")
+    p.add_argument("--execute-min-edge-pp", type=float, default=8.0,
                    help="Minimum edge_pp required at EXECUTION time. "
-                        "Default 4 (lowered from 12 on 2026-05-16: DB "
-                        "snapshot showed 343 mid-band proposals all skipped "
-                        "as edge_stale at 12pp threshold; the high-prob "
-                        "band edges decay through 12pp during the judge "
-                        "wait, so we have to accept ~4pp at execute time).")
+                        "Default 8 (lowered from 12 on 2026-05-16: snapshot "
+                        "showed 343 mid-band proposals all skipped as "
+                        "edge_stale at 12pp threshold; 8pp is the floor "
+                        "where post-judge edge decay still leaves room "
+                        "above the loss-prone 4-8pp band).")
     p.add_argument("--min-volume", type=float, default=100,
                    help="Min market USD volume; sub-bracket markets have low volume each")
     p.add_argument("--min-price", type=float, default=0.05,
