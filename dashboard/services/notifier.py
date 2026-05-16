@@ -70,7 +70,7 @@ def _load_rate_limit() -> dict:
 def _save_rate_limit(state: dict) -> None:
     try:
         _RATE_LIMIT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _RATE_LIMIT_FILE.write_text(json.dumps(state))
+        _RATE_LIMIT_FILE.write_text(json.dumps(state), encoding="utf-8")
     except OSError:
         pass
 

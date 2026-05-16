@@ -1582,7 +1582,7 @@ def main():
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         # Truncate on --once for a clean per-run file
         if args.once:
-            LOG_FILE.write_text("")
+            LOG_FILE.write_text("", encoding="utf-8")
         print(f"Logging JSONL to: {LOG_FILE}", flush=True)
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
@@ -1600,7 +1600,7 @@ def main():
             "argv": [sys.executable] + sys.argv,
             "cwd": str(Path.cwd()),
             "started_at": _now_iso(),
-        }))
+        }), encoding="utf-8")
         tmp.replace(pid_file)
     except OSError as e:
         log_event("warn", {"where": "pidfile_write", "err": str(e)}, level="WARN")

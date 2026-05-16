@@ -623,7 +623,8 @@ def estimate_pnl(trades: list[dict], winning_token_id: str, current_shares: floa
 
 
 def write_json(report: dict, path: Path) -> None:
-    path.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+    path.write_text(json.dumps(report, indent=2, ensure_ascii=False),
+                     encoding="utf-8")
 
 
 def write_csv(report: dict, path: Path) -> None:
