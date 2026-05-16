@@ -857,7 +857,7 @@ def main():
         text = format_report_md(buckets, judge, suggestions, since_iso, triggers)
 
     if args.out:
-        Path(args.out).write_text(text)
+        Path(args.out).write_text(text, encoding="utf-8")
         print(f"Wrote {args.out}", file=sys.stderr)
     else:
         print(text)

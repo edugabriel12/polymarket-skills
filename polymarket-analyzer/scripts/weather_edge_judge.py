@@ -435,7 +435,7 @@ def main():
             "argv": [sys.executable] + sys.argv,
             "cwd": str(_P.cwd()),
             "started_at": _now_iso(),
-        }))
+        }), encoding="utf-8")
         tmp.replace(pid_file)
     except OSError as e:
         log_event("warn", {"where": "judge_pidfile_write", "err": str(e)},

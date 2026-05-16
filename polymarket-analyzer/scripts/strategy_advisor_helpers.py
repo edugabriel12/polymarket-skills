@@ -582,8 +582,9 @@ def write_advisor_report(payload: dict, since_iso: str,
         json_path = Path(f"{base}_{ts_suffix}.json")
 
     md = _format_markdown(payload, since_iso, analyzer_md)
-    md_path.write_text(md)
-    json_path.write_text(json.dumps(payload, indent=2, default=str))
+    md_path.write_text(md, encoding="utf-8")
+    json_path.write_text(json.dumps(payload, indent=2, default=str),
+                          encoding="utf-8")
     return md_path, json_path
 
 
