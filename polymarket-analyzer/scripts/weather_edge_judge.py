@@ -347,6 +347,45 @@ def apply_verdict(conn, entry_row, verdict: dict) -> None:
     bot_prob = float(entry_row["forecast_prob_at_entry"] or 0)
     judge_prob = float(verdict["judge_prob"])
 
+    # v9: hard-enforce two rules that the prompt asks the LLM to follow
+    # but which it ignores ~30% of the time (loss analysis 2026-05-16:
+    # 116/380 APPROVE+ADJUST verdicts violated Rule 6, including the
+    # London #318 trade that lost $8.65). Override in code so the bot
+    # never executes a verdict that violates these guardrails.
+    original_verdict = verdict["verdict"]
+    confidence = float(verdict.get("confidence") or 0.0)
+    divergence = abs(judge_prob - bot_prob)
+
+    override_reason = None
+    if original_verdict in ("APPROVE", "ADJUST"):
+        if confidence == 0.0:
+            override_reason = (
+                f"confidence=0.0 indicates broken/unparseable LLM output; "
+                f"cannot trust APPROVE/ADJUST with no confidence")
+        elif divergence > 0.20:
+            override_reason = (
+                f"Rule 6 violation: |judge_prob {judge_prob:.2f} - "
+                f"bot_prob {bot_prob:.2f}| = {divergence*100:.0f}pp > 20pp")
+
+    if override_reason:
+        log_event("rule6_override", {
+            "entry_id": entry_row["entry_id"],
+            "original_verdict": original_verdict,
+            "confidence": confidence,
+            "judge_prob": judge_prob,
+            "bot_prob": bot_prob,
+            "divergence_pp": round(divergence * 100, 1),
+            "reason": override_reason,
+        }, level="WARN")
+        verdict["verdict"] = "REJECT"
+        verdict["rationale"] = (
+            f"[SYSTEM OVERRIDE: {override_reason}]\n\n"
+            f"Original LLM verdict was {original_verdict}. Rationale below:\n\n"
+            f"{verdict.get('rationale', '')}")
+        # ADJUST fields no longer apply
+        verdict["adjusted_side"] = None
+        verdict["adjusted_size_usd"] = None
+
     db.insert_judge_review(
         conn,
         entry_id=entry_row["entry_id"],
@@ -529,5 +568,96 @@ def main():
         pass
 
 
+# ---------------------------------------------------------------------------
+# Inline tests for the Rule 6 enforcement in apply_verdict (v9)
+# Run: python weather_edge_judge.py --test-rule6
+# ---------------------------------------------------------------------------
+
+def _test_rule6_enforce():
+    """Standalone tests of the override logic in apply_verdict.
+    We don't actually call apply_verdict (it writes to DB); we re-implement
+    the decision tree here so the test is hermetic and fast."""
+
+    def _decide(verdict_dict: dict, bot_prob: float):
+        """Mirror of the override block in apply_verdict()."""
+        v = dict(verdict_dict)  # copy
+        original_verdict = v["verdict"]
+        confidence = float(v.get("confidence") or 0.0)
+        judge_prob = float(v["judge_prob"])
+        divergence = abs(judge_prob - bot_prob)
+        override_reason = None
+        if original_verdict in ("APPROVE", "ADJUST"):
+            if confidence == 0.0:
+                override_reason = "confidence=0.0"
+            elif divergence > 0.20:
+                override_reason = f"Rule 6 violation ({divergence*100:.0f}pp)"
+        if override_reason:
+            v["verdict"] = "REJECT"
+            v["rationale"] = (f"[SYSTEM OVERRIDE: {override_reason}]\n\n"
+                               f"Original LLM verdict was {original_verdict}. "
+                               f"Rationale below:\n\n{v.get('rationale', '')}")
+            v["adjusted_side"] = None
+            v["adjusted_size_usd"] = None
+        return v
+
+    # Test 1: APPROVE with small Δ passes through
+    r = _decide({"verdict": "APPROVE", "confidence": 0.80,
+                  "judge_prob": 0.85, "rationale": "looks good"},
+                 bot_prob=0.80)
+    assert r["verdict"] == "APPROVE", r
+    assert "OVERRIDE" not in r["rationale"]
+    print(f"Test 1 PASS: APPROVE Δ=5pp not overridden")
+
+    # Test 2: APPROVE with Δ > 20pp gets overridden to REJECT
+    r = _decide({"verdict": "APPROVE", "confidence": 0.82,
+                  "judge_prob": 0.10, "rationale": "I think it's still fine"},
+                 bot_prob=0.90)
+    assert r["verdict"] == "REJECT", r
+    assert "Rule 6 violation (80pp)" in r["rationale"]
+    assert "I think it's still fine" in r["rationale"]  # original preserved
+    print(f"Test 2 PASS: APPROVE Δ=80pp → REJECT (rationale preserved)")
+
+    # Test 3: ADJUST with confidence=0.0 gets overridden
+    r = _decide({"verdict": "ADJUST", "confidence": 0.0,
+                  "judge_prob": 0.10, "rationale": "data contradicts bot",
+                  "adjusted_side": "YES", "adjusted_size_usd": 5.0},
+                 bot_prob=0.90)
+    assert r["verdict"] == "REJECT", r
+    assert "confidence=0.0" in r["rationale"]
+    assert r["adjusted_side"] is None
+    assert r["adjusted_size_usd"] is None
+    print(f"Test 3 PASS: ADJUST conf=0.0 → REJECT + adjusted fields cleared")
+
+    # Test 4: REJECT unchanged even with Δ=80pp (one-way override)
+    r = _decide({"verdict": "REJECT", "confidence": 0.85,
+                  "judge_prob": 0.10, "rationale": "clearly wrong"},
+                 bot_prob=0.90)
+    assert r["verdict"] == "REJECT", r
+    assert "OVERRIDE" not in r["rationale"]
+    print(f"Test 4 PASS: REJECT Δ=80pp NOT promoted (one-way)")
+
+    # Test 5: edge case Δ exactly 20pp does NOT trigger (> not >=)
+    r = _decide({"verdict": "APPROVE", "confidence": 0.80,
+                  "judge_prob": 0.30, "rationale": "borderline"},
+                 bot_prob=0.50)
+    assert r["verdict"] == "APPROVE", f"exactly 20pp should pass: {r}"
+    print(f"Test 5 PASS: Δ=20pp exactly is not a violation (> 0.20 threshold)")
+
+    # Test 6: ADJUST with Δ=21pp → override
+    r = _decide({"verdict": "ADJUST", "confidence": 0.65,
+                  "judge_prob": 0.69, "rationale": "moderately confident",
+                  "adjusted_size_usd": 8.0},
+                 bot_prob=0.90)
+    assert r["verdict"] == "REJECT", r
+    assert "Rule 6 violation (21pp)" in r["rationale"]
+    print(f"Test 6 PASS: ADJUST Δ=21pp → REJECT")
+
+    print("\nAll Rule 6 enforce tests PASS (6/6)")
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if "--test-rule6" in sys.argv:
+        _test_rule6_enforce()
+    else:
+        main()

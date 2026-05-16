@@ -1537,11 +1537,15 @@ def main():
                         "(raised from 0 after operator review). Set 0 to "
                         "disable.")
     # v9: upstream filters for the cheap-bet adverse-selection trap
-    p.add_argument("--min-entry-price", type=float, default=0.10,
-                   help="Skip trades with entry_price < X. Loss analysis "
-                        "2026-05-15 showed 0/19 wins on entry < 0.30 cohort: "
-                        "convergence cashout cannot save these (bid never "
-                        "rises above entry). Default 0.10. Set 0 to disable.")
+    p.add_argument("--min-entry-price", type=float, default=0.20,
+                   help="Skip trades with entry_price < X. Default 0.20 "
+                        "(raised from 0.10 after 2026-05-16 portfolio "
+                        "analysis: 10 open positions all in price 0.06-"
+                        "0.18 range, ALL with -26 to -100% PnL. The "
+                        "0.10-0.20 cohort had 21% execution rate but "
+                        "0% win rate so far. Higher floor forces the "
+                        "bot away from single-bin long-shots where v6 "
+                        "clipping inflates edge artificially.).")
     p.add_argument("--max-disagreement-pp", type=float, default=0.0,
                    help="Skip trades where |bot_prob - market_implied| > X pp. "
                         "Adverse selection guard. Loss analysis 2026-05-15 "
