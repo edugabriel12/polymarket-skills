@@ -1563,16 +1563,16 @@ def main():
                         "(raised from 0 after operator review). Set 0 to "
                         "disable.")
     # v9: upstream filters for the cheap-bet adverse-selection trap
-    p.add_argument("--min-entry-price", type=float, default=0.50,
-                   help="Skip trades with entry_price < X. Default 0.50 "
+    p.add_argument("--min-entry-price", type=float, default=0.30,
+                   help="Skip trades with entry_price < X. Default 0.30 "
                         "(raised from 0.20 on 2026-05-16 for high-prob "
                         "strategic pivot: operator chose mid-to-low payoff "
                         "/ high-probability bets over the long-shot pattern "
                         "that produced -53%% unrealized loss in the 0.06-"
                         "0.20 band. Combined with --max-entry-price 0.85 "
-                        "this forces entries into the 0.50-0.85 band where "
-                        "the bot is betting on outcomes the market already "
-                        "considers likely but mispriced.).")
+                        "this targets the 0.30-0.85 band where the bot is "
+                        "betting on outcomes the market already considers "
+                        "plausible but mispriced.).")
     p.add_argument("--max-entry-price", type=float, default=0.85,
                    help="Skip trades with entry_price > X. Default 0.85 "
                         "(added 2026-05-16 with the strategic pivot: above "
