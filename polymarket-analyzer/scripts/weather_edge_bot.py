@@ -808,6 +808,30 @@ def run_discovery(args, cities: dict) -> int:
                 pass
             continue
 
+        # v10 (strategic pivot 2026-05-16): block extreme-high-price bets
+        # where payoff asymmetry collapses. Above 0.85 a winning ticket
+        # only pays out 18% even after a perfect read; combined with the
+        # bot's typical MAE this is structurally negative-EV.
+        if args.max_entry_price > 0 and entry_price > args.max_entry_price:
+            skipped["entry_too_expensive"] += 1
+            if args.debug:
+                log_event("market_skipped", {"slug": slug,
+                    "reason": "entry_too_expensive",
+                    "entry_price": entry_price, "side": side,
+                    "max_allowed": args.max_entry_price})
+            try:
+                with db.connect() as _conn:
+                    db.insert_discovery_skip(_conn,
+                        ts=_now_iso(), slug=slug, city=spec.city,
+                        reason="entry_too_expensive",
+                        meta_json={"entry_price": entry_price, "side": side,
+                                    "max_allowed": args.max_entry_price,
+                                    "edge_pp": edge["edge_pp_at_best"]})
+                    _conn.commit()
+            except Exception:
+                pass
+            continue
+
         # v9: adverse selection guard. When bot's forecast and market
         # implied probability disagree by more than X percentage points,
         # the bot is statistically more likely to be wrong than the
@@ -1482,18 +1506,21 @@ def _check_portfolio_thresholds() -> None:
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("--min-edge-pp", type=float, default=25.0,
+    p.add_argument("--min-edge-pp", type=float, default=20.0,
                    help="Minimum edge_pp required at DISCOVERY time. "
-                        "Default 25 (raised from 10 after 2026-05-15 loss "
-                        "analysis: cohort with edge_pp 10-20 had near-zero "
-                        "win rate; 25+ is where the bot's signal starts to "
-                        "actually beat market consensus).")
-    p.add_argument("--execute-min-edge-pp", type=float, default=12.0,
+                        "Default 20 (lowered from 25 on 2026-05-16: snapshot "
+                        "showed 100%% of mid-band [0.30, 0.85] proposals "
+                        "had edge >= 25pp because v6 clipping forces "
+                        "bot_prob to {0.10, 0.90} extremes — so 20pp is "
+                        "ample headroom and stays above the 10-20pp "
+                        "cohort that historically had near-zero win rate).")
+    p.add_argument("--execute-min-edge-pp", type=float, default=8.0,
                    help="Minimum edge_pp required at EXECUTION time. "
-                        "Default 12 (lower than --min-edge-pp 25 because "
-                        "edge naturally decays between proposal and execute "
-                        "while the entry waits on judge/position-limit; 12 "
-                        "is the floor below which we'd rather skip than fill).")
+                        "Default 8 (lowered from 12 on 2026-05-16: snapshot "
+                        "showed 343 mid-band proposals all skipped as "
+                        "edge_stale at 12pp threshold; 8pp is the floor "
+                        "where post-judge edge decay still leaves room "
+                        "above the loss-prone 4-8pp band).")
     p.add_argument("--min-volume", type=float, default=100,
                    help="Min market USD volume; sub-bracket markets have low volume each")
     p.add_argument("--min-price", type=float, default=0.05,
@@ -1537,11 +1564,24 @@ def main():
                         "(raised from 0 after operator review). Set 0 to "
                         "disable.")
     # v9: upstream filters for the cheap-bet adverse-selection trap
-    p.add_argument("--min-entry-price", type=float, default=0.10,
-                   help="Skip trades with entry_price < X. Loss analysis "
-                        "2026-05-15 showed 0/19 wins on entry < 0.30 cohort: "
-                        "convergence cashout cannot save these (bid never "
-                        "rises above entry). Default 0.10. Set 0 to disable.")
+    p.add_argument("--min-entry-price", type=float, default=0.30,
+                   help="Skip trades with entry_price < X. Default 0.30 "
+                        "(raised from 0.20 on 2026-05-16 for high-prob "
+                        "strategic pivot: operator chose mid-to-low payoff "
+                        "/ high-probability bets over the long-shot pattern "
+                        "that produced -53%% unrealized loss in the 0.06-"
+                        "0.20 band. Combined with --max-entry-price 0.85 "
+                        "this targets the 0.30-0.85 band where the bot is "
+                        "betting on outcomes the market already considers "
+                        "plausible but mispriced.).")
+    p.add_argument("--max-entry-price", type=float, default=0.85,
+                   help="Skip trades with entry_price > X. Default 0.85 "
+                        "(added 2026-05-16 with the strategic pivot: above "
+                        "0.85 the payoff asymmetry collapses — a winning "
+                        "$0.90 ticket only earns $0.10 so even a 5%% miss "
+                        "rate eats the edge. 0.85 keeps payoff floor at "
+                        "+18%% per ticket while still preferring high-prob "
+                        "outcomes.).")
     p.add_argument("--max-disagreement-pp", type=float, default=0.0,
                    help="Skip trades where |bot_prob - market_implied| > X pp. "
                         "Adverse selection guard. Loss analysis 2026-05-15 "
