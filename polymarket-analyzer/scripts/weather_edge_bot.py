@@ -1047,19 +1047,17 @@ def run_execute(args) -> int:
         # Re-validate edge at current market prices. The entry was approved
         # at proposal time T0; by the time we get here (queued behind the
         # position-limit cap, judge backlog, etc.) the market may have moved.
-        # forecast_prob_at_entry is P(YES) per forecast_probability(); the
-        # current implied prob for our side is sizing["avg_fill"] (volume-
-        # weighted fill price for target size).
+        # By DB convention, forecast_prob_at_entry stores P(side) — NOT P(YES)
+        # — and fill_price is the current ask for the chosen side (= implied
+        # P(side) under the market). Edge is therefore P(side) - fill_price
+        # without any side-conditional flip.
         fill_price = float(sizing["avg_fill"])
         forecast_prob = row["forecast_prob_at_entry"]
         if forecast_prob is None:
             current_edge_pp = None
-        elif side == "YES":
-            current_edge_pp = round(
-                (float(forecast_prob) - fill_price) * 100.0, 4)
         else:
             current_edge_pp = round(
-                ((1.0 - float(forecast_prob)) - fill_price) * 100.0, 4)
+                (float(forecast_prob) - fill_price) * 100.0, 4)
 
         min_edge_pp_for_execute = getattr(args, "execute_min_edge_pp", None)
         if min_edge_pp_for_execute is None:

@@ -82,9 +82,12 @@ DAILY_BUDGET_USD = float(os.environ.get("JUDGE_DAILY_BUDGET_USD", "15.0"))
 # Pre-judge edge re-check threshold (pp). If the entry's current
 # top-of-book edge has decayed below this floor between proposal and
 # judge pickup, skip the LLM call entirely (saves ~$0.04/skip).
-# Default 8.0 matches the bot's --execute-min-edge-pp default. Set
-# to a large negative number (e.g. -100) to disable the recheck.
-PREJUDGE_MIN_EDGE_PP = float(os.environ.get("JUDGE_PREJUDGE_MIN_EDGE_PP", "8.0"))
+# Default 15.0 sits between the bot's --min-edge-pp 20 (discovery floor)
+# and --execute-min-edge-pp 8 (execution floor) — aggressive enough to
+# bound LLM cost when the market clearly moved, loose enough to let
+# small-decay proposals reach the judge. Set to a large negative
+# number (e.g. -100) to disable the recheck.
+PREJUDGE_MIN_EDGE_PP = float(os.environ.get("JUDGE_PREJUDGE_MIN_EDGE_PP", "15.0"))
 
 # Pricing per 1M tokens (Sonnet 4.6 / Opus 4.7 — adjust if model changed)
 PRICING = {
@@ -386,6 +389,10 @@ def _recheck_edge_prejudge(row: dict) -> Optional[dict]:
     walks volume-weighted into the book so its actual fill price is at or
     above the best ask. If even the best ask leaves edge below the floor,
     the trade has no chance of executing.
+
+    DB convention: forecast_prob_at_entry stores P(side), not P(YES). See
+    weather_edge_bot.py:959-960 (insert_entry). The recheck therefore uses
+    fp directly without any side-conditional flip.
     """
     side = row.get("side")
     if side not in ("YES", "NO"):
@@ -405,8 +412,7 @@ def _recheck_edge_prejudge(row: dict) -> Optional[dict]:
         return None
     best_ask = float(book["asks"][0]["price"])
     fp = float(forecast_prob)
-    p_side = fp if side == "YES" else (1.0 - fp)
-    edge_pp = round((p_side - best_ask) * 100.0, 4)
+    edge_pp = round((fp - best_ask) * 100.0, 4)
     if edge_pp >= PREJUDGE_MIN_EDGE_PP:
         return None
     return {
@@ -759,20 +765,26 @@ def _test_prejudge_recheck():
 
     saved_fetch = mod._fetch_orderbook
     saved_threshold = mod.PREJUDGE_MIN_EDGE_PP
-    mod.PREJUDGE_MIN_EDGE_PP = 8.0
+    mod.PREJUDGE_MIN_EDGE_PP = 15.0
     try:
-        # Test 1: YES side, fresh edge well above threshold → None (proceed)
+        # DB convention: forecast_prob_at_entry is P(side), and the recheck's
+        # best_ask is the ask of the chosen side's token (= implied P(side)).
+        # Edge math is therefore P(side) - best_ask, with NO side-flip.
+
+        # Test 1: YES side, fresh edge well above 15pp threshold → proceed
+        # fp=0.90 (P(YES)=0.90), ask=0.55 → edge = 35pp
         mod._fetch_orderbook = lambda tid: {"asks": [{"price": 0.55, "size": 100}]}
         r = mod._recheck_edge_prejudge({
             "entry_id": 1, "side": "YES",
             "token_id_yes": "tokY", "token_id_no": "tokN",
             "forecast_prob_at_entry": 0.90, "edge_pp_at_entry": 35.0,
         })
-        assert r is None, f"expected None (edge=35pp >= 8pp), got {r}"
-        print("Test 1 PASS: YES side fresh edge above threshold proceeds to judge")
+        assert r is None, f"expected None (edge=35pp >= 15pp), got {r}"
+        print("Test 1 PASS: YES side fresh edge 35pp proceeds to judge")
 
-        # Test 2: YES side, decayed edge below threshold → skip payload
-        mod._fetch_orderbook = lambda tid: {"asks": [{"price": 0.86, "size": 100}]}
+        # Test 2: YES side, decayed below threshold → skip
+        # fp=0.90, ask=0.80 → edge = 10pp < 15pp
+        mod._fetch_orderbook = lambda tid: {"asks": [{"price": 0.80, "size": 100}]}
         r = mod._recheck_edge_prejudge({
             "entry_id": 2, "side": "YES",
             "token_id_yes": "tokY", "token_id_no": "tokN",
@@ -780,65 +792,53 @@ def _test_prejudge_recheck():
         })
         assert r is not None, "expected skip payload"
         assert r["reason"] == "edge_decay_prejudge"
-        assert abs(r["current_edge_pp"] - 4.0) < 0.01, r
-        assert r["best_ask"] == 0.86
+        assert abs(r["current_edge_pp"] - 10.0) < 0.01, r
+        assert r["best_ask"] == 0.80
         assert r["side"] == "YES"
-        print("Test 2 PASS: YES side decayed edge (4pp < 8pp) → skip payload")
+        print("Test 2 PASS: YES side decayed edge 10pp → skip")
 
-        # Test 3: NO side edge math: edge = (1 - forecast) - best_ask
-        # forecast 0.30 → p_side(NO) = 0.70, best_ask 0.55 → edge = 15pp (proceed)
-        mod._fetch_orderbook = lambda tid: {"asks": [{"price": 0.55, "size": 100}]}
+        # Test 3: NO side uses fp directly (P(side) convention).
+        # Discovery stored fp=0.90 meaning P(NO)=0.90. ask of NO token=0.69.
+        # Edge = 0.90 - 0.69 = 21pp >= 15pp → proceed.
+        # This matches the snapshot pattern (#716: fp=0.90 NO, entry=0.69, edge=21pp).
+        mod._fetch_orderbook = lambda tid: {"asks": [{"price": 0.69, "size": 100}]}
         r = mod._recheck_edge_prejudge({
             "entry_id": 3, "side": "NO",
             "token_id_yes": "tokY", "token_id_no": "tokN",
-            "forecast_prob_at_entry": 0.30, "edge_pp_at_entry": 20.0,
+            "forecast_prob_at_entry": 0.90, "edge_pp_at_entry": 21.0,
         })
-        assert r is None, f"NO side edge=15pp should proceed: {r}"
-        # Now make it decay below floor: best_ask 0.65 → edge = 5pp (skip)
-        mod._fetch_orderbook = lambda tid: {"asks": [{"price": 0.65, "size": 100}]}
-        r = mod._recheck_edge_prejudge({
-            "entry_id": 3, "side": "NO",
-            "token_id_yes": "tokY", "token_id_no": "tokN",
-            "forecast_prob_at_entry": 0.30, "edge_pp_at_entry": 20.0,
-        })
-        assert r is not None and abs(r["current_edge_pp"] - 5.0) < 0.01, r
-        print("Test 3 PASS: NO side edge math (1-fp)-best_ask correct")
+        assert r is None, f"NO side edge=21pp should proceed (got {r})"
+        print("Test 3 PASS: NO side P(side) convention — edge 21pp proceeds")
 
-        # Test 4: Empty orderbook → None (fail-open)
+        # Test 4: NO side decayed → skip. ask moved 0.69 → 0.80.
+        mod._fetch_orderbook = lambda tid: {"asks": [{"price": 0.80, "size": 100}]}
+        r = mod._recheck_edge_prejudge({
+            "entry_id": 4, "side": "NO",
+            "token_id_yes": "tokY", "token_id_no": "tokN",
+            "forecast_prob_at_entry": 0.90, "edge_pp_at_entry": 21.0,
+        })
+        assert r is not None, "expected skip"
+        assert abs(r["current_edge_pp"] - 10.0) < 0.01, r
+        print("Test 4 PASS: NO side decay (21pp -> 10pp) → skip")
+
+        # Test 5: Empty / missing orderbook → fail-open (proceed to judge)
         mod._fetch_orderbook = lambda tid: {"asks": []}
         r = mod._recheck_edge_prejudge({
-            "entry_id": 4, "side": "YES",
+            "entry_id": 5, "side": "YES",
             "token_id_yes": "tokY", "token_id_no": "tokN",
             "forecast_prob_at_entry": 0.90, "edge_pp_at_entry": 35.0,
         })
         assert r is None, "empty orderbook should fail-open"
-        # Also: fetch returns None
         mod._fetch_orderbook = lambda tid: None
         r = mod._recheck_edge_prejudge({
-            "entry_id": 4, "side": "YES",
+            "entry_id": 5, "side": "YES",
             "token_id_yes": "tokY", "token_id_no": "tokN",
             "forecast_prob_at_entry": 0.90, "edge_pp_at_entry": 35.0,
         })
         assert r is None, "fetch failure should fail-open"
-        print("Test 4 PASS: empty/missing orderbook → fail-open (proceed to judge)")
+        print("Test 5 PASS: missing orderbook → fail-open")
 
-        # Test 5: Uses row['side'] not adjusted_side (latter is null pre-judge)
-        # If we accidentally used judge_adjusted_side="YES" while row["side"]="NO",
-        # the math would invert. Confirm we use row["side"].
-        mod._fetch_orderbook = lambda tid: {"asks": [{"price": 0.55, "size": 100}]}
-        r = mod._recheck_edge_prejudge({
-            "entry_id": 5, "side": "NO",
-            "judge_adjusted_side": "YES",  # ignored
-            "token_id_yes": "tokY", "token_id_no": "tokN",
-            "forecast_prob_at_entry": 0.90,  # high forecast → NO side has 10% prob
-            "edge_pp_at_entry": 35.0,
-        })
-        # Per NO math: (1 - 0.90) - 0.55 = -45pp → skip
-        assert r is not None and r["side"] == "NO", r
-        assert r["current_edge_pp"] < 0, r
-        print("Test 5 PASS: uses row['side'], ignores judge_adjusted_side")
-
-        # Test 6: Missing forecast_prob_at_entry → None (fail-open, can't compute)
+        # Test 6: Missing forecast_prob_at_entry → fail-open
         mod._fetch_orderbook = lambda tid: {"asks": [{"price": 0.55, "size": 100}]}
         r = mod._recheck_edge_prejudge({
             "entry_id": 6, "side": "YES",
@@ -848,7 +848,18 @@ def _test_prejudge_recheck():
         assert r is None, "missing forecast should fail-open"
         print("Test 6 PASS: missing forecast_prob_at_entry → fail-open")
 
-        print("\nAll pre-judge recheck tests PASS (6/6)")
+        # Test 7: Threshold boundary — exactly at threshold passes (>= comparison)
+        mod._fetch_orderbook = lambda tid: {"asks": [{"price": 0.75, "size": 100}]}
+        r = mod._recheck_edge_prejudge({
+            "entry_id": 7, "side": "YES",
+            "token_id_yes": "tokY", "token_id_no": "tokN",
+            "forecast_prob_at_entry": 0.90, "edge_pp_at_entry": 20.0,
+        })
+        # edge = 0.90 - 0.75 = 15pp, threshold = 15pp → proceeds (>=)
+        assert r is None, f"edge exactly at threshold should proceed: {r}"
+        print("Test 7 PASS: edge = threshold proceeds (>=)")
+
+        print("\nAll pre-judge recheck tests PASS (7/7)")
     finally:
         mod._fetch_orderbook = saved_fetch
         mod.PREJUDGE_MIN_EDGE_PP = saved_threshold
