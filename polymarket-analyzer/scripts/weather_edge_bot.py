@@ -634,15 +634,40 @@ def _build_ladder_candidates(candidates: list[dict], args) -> list[dict]:
         groups.setdefault(es, []).append(c)
 
     out: list[dict] = []
-    out.extend(singles)
+
+    # v9.1: orphan single-bin legs (no event_slug at all) must pass the
+    # higher --min-entry-price single-bin floor. Discovery uses the lower
+    # --ladder-min-leg-price floor in ladder mode; here we enforce the
+    # stricter check for legs that won't benefit from Kelly-capped ladder
+    # coordination.
+    single_floor = float(args.min_entry_price or 0.0)
+    for s in singles:
+        if single_floor > 0 and float(s["entry_price"]) < single_floor:
+            log_event("market_skipped", {
+                "slug": s.get("slug"), "reason": "single_bin_too_cheap",
+                "entry_price": s["entry_price"],
+                "min_required": single_floor})
+            continue
+        out.append(s)
 
     total_ladder_budget = float(args.max_market_exposure_usd)
     split_mode = getattr(args, "ladder_stake_split", "kelly")
 
     for event_slug, group in groups.items():
         if len(group) < 2:
-            # Lone bracket in an event — treat as single-bin
-            out.extend(group)
+            # Lone bracket in an event — treat as single-bin and enforce
+            # the higher single-bin floor (cheap orphans are the
+            # historical loser cohort, not protected by ladder Kelly).
+            for s in group:
+                if single_floor > 0 and float(s["entry_price"]) < single_floor:
+                    log_event("market_skipped", {
+                        "slug": s.get("slug"),
+                        "reason": "ladder_orphan_too_cheap",
+                        "entry_price": s["entry_price"],
+                        "min_required": single_floor,
+                        "event_slug": event_slug})
+                    continue
+                out.append(s)
             continue
 
         # Pick central/below/above
@@ -889,25 +914,32 @@ def run_discovery(args, cities: dict) -> int:
             skipped["price_band_miss"] += 1
             continue
 
-        # v9 (loss analysis 2026-05-15): block cheap long-shot bets.
-        # Log analysis of entry_price < 0.30 cohort: 0/19 ever profited,
-        # 5/5 resolved lost full stake. Convergence cashout cannot save
-        # these because bid never rises above entry. Filter upstream
-        # rather than try to cashout-engineer the loss.
-        if args.min_entry_price > 0 and entry_price < args.min_entry_price:
+        # v9 (loss analysis 2026-05-15 + ladder strategy 2026-05-17):
+        # In ladder mode, use the lower --ladder-min-leg-price floor at
+        # discovery — cheap legs that end up in multi-leg ladders are
+        # protected by Kelly proportional sizing (auto-caps stake at 0
+        # for negative-EV cheap legs). In single-bin / off mode, the
+        # higher --min-entry-price floor applies uniformly.
+        # _build_ladder_candidates enforces --min-entry-price on orphan
+        # legs (would-be single-bin) after grouping.
+        in_ladder_mode = getattr(args, "ladder_mode", "3bin") != "off"
+        discovery_floor = (args.ladder_min_leg_price if in_ladder_mode
+                            else args.min_entry_price)
+        if discovery_floor > 0 and entry_price < discovery_floor:
             skipped["entry_too_cheap"] += 1
             if args.debug:
                 log_event("market_skipped", {"slug": slug,
                     "reason": "entry_too_cheap",
                     "entry_price": entry_price, "side": side,
-                    "min_required": args.min_entry_price})
+                    "min_required": discovery_floor,
+                    "mode": "ladder" if in_ladder_mode else "single_bin"})
             try:
                 with db.connect() as _conn:
                     db.insert_discovery_skip(_conn,
                         ts=_now_iso(), slug=slug, city=spec.city,
                         reason="entry_too_cheap",
                         meta_json={"entry_price": entry_price, "side": side,
-                                    "min_required": args.min_entry_price,
+                                    "min_required": discovery_floor,
                                     "edge_pp": edge["edge_pp_at_best"]})
                     _conn.commit()
             except Exception:
@@ -2087,6 +2119,17 @@ def main():
                         "'kelly' (default) weights by per-leg Kelly fraction "
                         "(more $ where edge x prob is biggest). 'equal' "
                         "divides 1/N for A/B comparison against kelly.")
+    p.add_argument("--ladder-min-leg-price", type=float, default=0.10,
+                   help="Minimum entry_price for a leg to enter ladder "
+                        "discovery (default 0.10). Lower than "
+                        "--min-entry-price (default 0.30) because cheap "
+                        "ladder legs are protected by Kelly proportional "
+                        "sizing (auto-caps stake at $0 for negative-EV "
+                        "legs). Orphan legs that end up alone in an event "
+                        "still must pass --min-entry-price (the higher "
+                        "single-bin floor). In --ladder-mode off, this "
+                        "flag is ignored and --min-entry-price applies "
+                        "uniformly.")
     p.add_argument("--fast-path-ttr-min", type=int, default=60)
     p.add_argument("--profit-lock-pp", type=float, default=50.0,
                    help="Cashout when bid >= entry + X pp (default 50pp = "
@@ -2293,9 +2336,69 @@ def _test_atomic_execution():
         db.connect = saved_connect
 
 
+def _test_ladder_orphan_floor():
+    """v9.1: orphan single-bin legs must pass --min-entry-price even
+    when discovery used --ladder-min-leg-price (lower floor)."""
+    import weather_edge_bot as mod
+    from types import SimpleNamespace
+
+    spec_stub = SimpleNamespace(threshold_value=70, confidence=1.0)
+    base_args = SimpleNamespace(
+        max_market_exposure_usd=50.0,
+        min_entry_price=0.30,
+        ladder_min_leg_price=0.10,
+        ladder_mode="3bin",
+        ladder_stake_split="kelly",
+    )
+
+    # Test 1: orphan cheap leg (no event_slug) blocked by single_floor
+    cands = [{"slug": "s1", "event_slug": "",
+              "entry_price": 0.15, "spec": spec_stub,
+              "forecast_prob": 0.50}]
+    out = mod._build_ladder_candidates(cands, base_args)
+    assert len(out) == 0, f"orphan at 0.15 < min 0.30 should drop, got {out}"
+    print("Test O1 PASS: orphan single-bin below 0.30 dropped")
+
+    # Test 2: orphan above floor kept
+    cands = [{"slug": "s2", "event_slug": "",
+              "entry_price": 0.40, "spec": spec_stub,
+              "forecast_prob": 0.50}]
+    out = mod._build_ladder_candidates(cands, base_args)
+    assert len(out) == 1
+    print("Test O2 PASS: orphan single-bin above 0.30 kept")
+
+    # Test 3: lone leg in an event_slug group also enforced (ladder orphan)
+    cands = [{"slug": "s3", "event_slug": "evX",
+              "entry_price": 0.20, "spec": spec_stub,
+              "forecast_prob": 0.50}]
+    out = mod._build_ladder_candidates(cands, base_args)
+    assert len(out) == 0
+    print("Test O3 PASS: lone leg in event below 0.30 dropped (orphan)")
+
+    # Test 4: 2-leg ladder with one cheap leg keeps both (Kelly protects)
+    spec_a = SimpleNamespace(threshold_value=70, confidence=1.0)
+    spec_b = SimpleNamespace(threshold_value=75, confidence=1.0)
+    cands = [{"slug": "s4a", "event_slug": "evY",
+              "entry_price": 0.55, "spec": spec_a,
+              "forecast_prob": 0.70},
+             {"slug": "s4b", "event_slug": "evY",
+              "entry_price": 0.18, "spec": spec_b,
+              "forecast_prob": 0.30}]
+    out = mod._build_ladder_candidates(cands, base_args)
+    # Both legs should make it through with shared ladder_group_id
+    assert len(out) == 2, f"expected 2 legs, got {len(out)}"
+    assert all(c.get("ladder_group_id") for c in out)
+    assert out[0]["ladder_group_id"] == out[1]["ladder_group_id"]
+    print("Test O4 PASS: 2-leg ladder admits cheap leg under Kelly")
+
+    print("\nAll ladder orphan-floor tests PASS (4/4)")
+
+
 if __name__ == "__main__":
     import sys
     if "--test-atomic" in sys.argv:
         _test_atomic_execution()
+    elif "--test-orphan" in sys.argv:
+        _test_ladder_orphan_floor()
     else:
         main()
