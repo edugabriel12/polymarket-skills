@@ -642,8 +642,11 @@ def _build_ladder_candidates(candidates: list[dict], args) -> list[dict]:
     # coordination.
     # v9.2: same logic for edge — orphans must pass --min-edge-pp, while
     # multi-leg ladder legs only need --ladder-min-leg-edge-pp.
+    # v9.3: same logic for TTR — orphans must pass --min-ttr-hours, while
+    # multi-leg ladder legs only need --ladder-min-ttr-hours.
     single_floor = float(args.min_entry_price or 0.0)
     single_edge_floor = float(args.min_edge_pp or 0.0)
+    single_ttr_floor = float(args.min_ttr_hours or 0.0)
 
     def _orphan_passes(s: dict, reason_label: str,
                         event_slug: str = None) -> bool:
@@ -662,6 +665,15 @@ def _build_ladder_candidates(candidates: list[dict], args) -> list[dict]:
                 "reason": f"{reason_label}_edge_too_low",
                 "edge_pp": s.get("edge_pp"),
                 "min_required": single_edge_floor,
+                **({"event_slug": event_slug} if event_slug else {})})
+            return False
+        if (single_ttr_floor > 0
+                and float(s.get("ttr_hours") or 0.0) < single_ttr_floor):
+            log_event("market_skipped", {
+                "slug": s.get("slug"),
+                "reason": f"{reason_label}_ttr_too_short",
+                "ttr_h": s.get("ttr_hours"),
+                "min_required": single_ttr_floor,
                 **({"event_slug": event_slug} if event_slug else {})})
             return False
         return True
@@ -794,15 +806,22 @@ def run_discovery(args, cities: dict) -> int:
         ttr_hours = (end_date - now).total_seconds() / 3600.0
 
         # v8: skip markets with TTR below the operator-configured minimum.
-        # Article finding: TTR < 18h means market has priced in fresh
-        # forecasts; edge is squeezed. Filter early (before orderbook fetch).
-        if args.min_ttr_hours > 0 and ttr_hours < args.min_ttr_hours:
+        # v9.3: in ladder mode use the lower --ladder-min-ttr-hours floor
+        # at discovery (forecast accuracy peaks in the 6-12h band; ladder
+        # coverage of ±5°F captures that quality without depending on
+        # point precision). _build_ladder_candidates enforces the higher
+        # --min-ttr-hours on orphan lone-bracket events.
+        in_ladder_mode = getattr(args, "ladder_mode", "3bin") != "off"
+        ttr_floor = (args.ladder_min_ttr_hours if in_ladder_mode
+                      else args.min_ttr_hours)
+        if ttr_floor > 0 and ttr_hours < ttr_floor:
             skipped["ttr_below_min"] += 1
             if args.debug:
                 log_event("market_skipped", {"slug": slug,
                     "reason": "ttr_below_min",
                     "ttr_h": round(ttr_hours, 1),
-                    "min_required": args.min_ttr_hours})
+                    "min_required": ttr_floor,
+                    "mode": "ladder" if in_ladder_mode else "single_bin"})
             # v8 observability: persist per-skip detail so the advisor
             # can analyze the time-to-resolution distribution that we
             # filter (e.g. "are we filtering too aggressively?").
@@ -811,7 +830,7 @@ def run_discovery(args, cities: dict) -> int:
                     db.insert_discovery_skip(_conn,
                         ts=_now_iso(), slug=slug, reason="ttr_below_min",
                         meta_json={"ttr_h": round(ttr_hours, 2),
-                                    "min_required": args.min_ttr_hours,
+                                    "min_required": ttr_floor,
                                     "end_date": end_date_str})
                     _conn.commit()
             except Exception:
@@ -2100,12 +2119,27 @@ def main():
                         "in weather-cities.json 'stations' dict.")
     p.add_argument("--no-open-meteo", dest="open_meteo", action="store_false",
                    help="Disable Open-Meteo ensemble fetch.")
-    p.add_argument("--min-ttr-hours", type=float, default=18.0,
-                   help="Skip markets with TTR < X hours at discovery. "
-                        "Article finding: TTR<18h means market has priced in "
-                        "fresh forecasts, edge is squeezed. Default 18 "
-                        "(raised from 0 after operator review). Set 0 to "
-                        "disable.")
+    p.add_argument("--min-ttr-hours", type=float, default=12.0,
+                   help="Skip markets with TTR < X hours at discovery "
+                        "(single-bin / orphan path). Default 12 (lowered "
+                        "from 18 on 2026-05-17 after snapshot analysis "
+                        "showed 42%% of filtered flow was in the 12-18h "
+                        "band — exactly where forecast accuracy peaks "
+                        "(MAE ~1.5°F vs ~3°F at 48h). Ladder mode uses "
+                        "the lower --ladder-min-ttr-hours floor since "
+                        "ladder coverage (±5°F) doesn't depend on point "
+                        "precision and the convergence cashout works "
+                        "in any TTR. Set 0 to disable.")
+    p.add_argument("--ladder-min-ttr-hours", type=float, default=6.0,
+                   help="Minimum TTR (hours) for a leg to enter ladder "
+                        "discovery (default 6). Lower than --min-ttr-"
+                        "hours 12 because laddering captures forecast "
+                        "improvements in the 6-12h band (more accurate "
+                        "than 24h+) without depending on point precision. "
+                        "Orphan lone-bracket events still must pass "
+                        "--min-ttr-hours to be admitted as single-bin. "
+                        "In --ladder-mode off, --min-ttr-hours applies "
+                        "uniformly.")
     # v9: upstream filters for the cheap-bet adverse-selection trap
     p.add_argument("--min-entry-price", type=float, default=0.30,
                    help="Skip trades with entry_price < X. Default 0.30 "
@@ -2393,8 +2427,10 @@ def _test_ladder_orphan_floor():
         max_market_exposure_usd=50.0,
         min_entry_price=0.30,
         min_edge_pp=20.0,
+        min_ttr_hours=12.0,
         ladder_min_leg_price=0.10,
         ladder_min_leg_edge_pp=10.0,
+        ladder_min_ttr_hours=6.0,
         ladder_mode="3bin",
         ladder_stake_split="kelly",
     )
@@ -2402,60 +2438,75 @@ def _test_ladder_orphan_floor():
     # Test 1: orphan cheap leg (no event_slug) blocked by single_floor
     cands = [{"slug": "s1", "event_slug": "",
               "entry_price": 0.15, "spec": spec_stub,
-              "forecast_prob": 0.50, "edge_pp": 25.0}]
+              "forecast_prob": 0.50, "edge_pp": 25.0, "ttr_hours": 24.0}]
     out = mod._build_ladder_candidates(cands, base_args)
     assert len(out) == 0, f"orphan at 0.15 < min 0.30 should drop, got {out}"
     print("Test O1 PASS: orphan single-bin below 0.30 dropped")
 
-    # Test 2: orphan above price floor + edge floor kept
+    # Test 2: orphan above all floors kept
     cands = [{"slug": "s2", "event_slug": "",
               "entry_price": 0.40, "spec": spec_stub,
-              "forecast_prob": 0.50, "edge_pp": 25.0}]
+              "forecast_prob": 0.50, "edge_pp": 25.0, "ttr_hours": 24.0}]
     out = mod._build_ladder_candidates(cands, base_args)
     assert len(out) == 1
-    print("Test O2 PASS: orphan single-bin above both floors kept")
+    print("Test O2 PASS: orphan single-bin above all floors kept")
 
-    # Test 3: lone leg in an event_slug group also enforced (ladder orphan)
+    # Test 3: lone leg in event_slug below price floor → blocked
     cands = [{"slug": "s3", "event_slug": "evX",
               "entry_price": 0.20, "spec": spec_stub,
-              "forecast_prob": 0.50, "edge_pp": 25.0}]
+              "forecast_prob": 0.50, "edge_pp": 25.0, "ttr_hours": 24.0}]
     out = mod._build_ladder_candidates(cands, base_args)
     assert len(out) == 0
     print("Test O3 PASS: lone leg in event below 0.30 dropped (orphan)")
 
-    # Test 4: 2-leg ladder with one cheap leg keeps both (Kelly protects)
+    # Test 4: 2-leg ladder with one cheap+low-edge leg, both kept (Kelly)
     spec_a = SimpleNamespace(threshold_value=70, confidence=1.0)
     spec_b = SimpleNamespace(threshold_value=75, confidence=1.0)
     cands = [{"slug": "s4a", "event_slug": "evY",
               "entry_price": 0.55, "spec": spec_a,
-              "forecast_prob": 0.70, "edge_pp": 15.0},
+              "forecast_prob": 0.70, "edge_pp": 15.0, "ttr_hours": 8.0},
              {"slug": "s4b", "event_slug": "evY",
               "entry_price": 0.18, "spec": spec_b,
-              "forecast_prob": 0.30, "edge_pp": 12.0}]
+              "forecast_prob": 0.30, "edge_pp": 12.0, "ttr_hours": 8.0}]
     out = mod._build_ladder_candidates(cands, base_args)
-    # Both legs should make it through with shared ladder_group_id
     assert len(out) == 2, f"expected 2 legs, got {len(out)}"
     assert all(c.get("ladder_group_id") for c in out)
     assert out[0]["ladder_group_id"] == out[1]["ladder_group_id"]
-    print("Test O4 PASS: 2-leg ladder admits cheap+low-edge legs under Kelly")
+    print("Test O4 PASS: 2-leg ladder admits cheap+low-edge+8h-TTR legs")
 
-    # Test 5: v9.2 orphan with low edge (15pp < 20pp single floor) blocked
+    # Test 5: orphan with low edge blocked
     cands = [{"slug": "s5", "event_slug": "",
               "entry_price": 0.40, "spec": spec_stub,
-              "forecast_prob": 0.50, "edge_pp": 15.0}]
+              "forecast_prob": 0.50, "edge_pp": 15.0, "ttr_hours": 24.0}]
     out = mod._build_ladder_candidates(cands, base_args)
-    assert len(out) == 0, f"orphan with edge=15pp < 20pp should drop, got {out}"
+    assert len(out) == 0
     print("Test O5 PASS: orphan with edge below --min-edge-pp dropped")
 
-    # Test 6: lone leg in event with edge=15pp also blocked as ladder orphan
+    # Test 6: lone ladder leg with low edge blocked
     cands = [{"slug": "s6", "event_slug": "evZ",
               "entry_price": 0.40, "spec": spec_stub,
-              "forecast_prob": 0.50, "edge_pp": 15.0}]
+              "forecast_prob": 0.50, "edge_pp": 15.0, "ttr_hours": 24.0}]
     out = mod._build_ladder_candidates(cands, base_args)
     assert len(out) == 0
     print("Test O6 PASS: lone ladder leg with low edge dropped")
 
-    print("\nAll ladder orphan-floor tests PASS (6/6)")
+    # Test 7 (v9.3): orphan with short TTR (8h < 12h single floor) blocked
+    cands = [{"slug": "s7", "event_slug": "",
+              "entry_price": 0.40, "spec": spec_stub,
+              "forecast_prob": 0.50, "edge_pp": 25.0, "ttr_hours": 8.0}]
+    out = mod._build_ladder_candidates(cands, base_args)
+    assert len(out) == 0, f"orphan with TTR=8h should drop, got {out}"
+    print("Test O7 PASS: orphan with TTR below --min-ttr-hours dropped")
+
+    # Test 8 (v9.3): lone leg in event_slug with TTR=8h dropped (orphan path)
+    cands = [{"slug": "s8", "event_slug": "evW",
+              "entry_price": 0.40, "spec": spec_stub,
+              "forecast_prob": 0.50, "edge_pp": 25.0, "ttr_hours": 8.0}]
+    out = mod._build_ladder_candidates(cands, base_args)
+    assert len(out) == 0
+    print("Test O8 PASS: lone ladder leg with TTR below 12h dropped")
+
+    print("\nAll ladder orphan-floor tests PASS (8/8)")
 
 
 if __name__ == "__main__":
