@@ -104,7 +104,7 @@ def get_kpis(portfolio_name: str = "default") -> dict:
         # the current configured cap, even if the operator changes it.
         try:
             import paper_engine  # noqa
-            max_pos = int(paper_engine.DEFAULT_RISK.get("max_concurrent_positions", 30))
+            max_pos = int(paper_engine.DEFAULT_RISK.get("max_concurrent_positions", 50))
         except Exception:
             max_pos = 30  # safe fallback matching current default
 
@@ -130,7 +130,7 @@ def _empty_kpis() -> dict:
         "portfolio_total_usd": 0.0,
         "portfolio_delta_today_usd": None,
         "open_positions": 0,
-        "max_positions": 30,
+        "max_positions": 50,
         "realized_pnl_today_usd": 0.0,
         "drawdown_pct_from_peak": 0.0,
         "drawdown_peak_usd": 0.0,
@@ -356,7 +356,7 @@ if __name__ == "__main__":
     # cash 800 + positions (100*0.20 + 50*0.55 = 20 + 27.5 = 47.5) → total 847.5
     assert abs(k["portfolio_total_usd"] - 847.5) < 0.01, k
     assert k["open_positions"] == 2
-    assert k["max_positions"] == 30
+    assert k["max_positions"] == 50
     # today's cashouts: 5.50 + (-2.10) = 3.40
     assert abs(k["realized_pnl_today_usd"] - 3.40) < 0.01, k
     assert abs(k["portfolio_delta_today_usd"] - (-52.5)) < 0.01, k
