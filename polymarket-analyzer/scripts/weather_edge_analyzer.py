@@ -452,6 +452,198 @@ def compute_discovery_meta_breakdown(conn, since_iso: str) -> dict:
     }
 
 
+def compute_ladder_breakdown(conn, since_iso: str) -> dict:
+    """v9: ladder formation + performance cohort analysis.
+
+    Reports:
+      - Formation funnel: events that became 3-bin, 2-bin, single-bin,
+        and how many died in atomic gate (sibling_failed, partial_failure)
+      - Performance: ladder groups vs single-bin orphans — total stake,
+        realized P&L, win rate, P&L per dollar
+      - Short-TTR cohort (6-12h): whether the new admittance band is
+        actually producing edge as predicted
+      - Kelly distribution: % of legs that got non-zero stake (vs Kelly-
+        capped to 0), central vs adjacent share of stake
+
+    Used by the advisor to detect "is laddering paying off?" and tune
+    the per-mode floors if a cohort is underperforming.
+    """
+    # Defensive: pre-v9 schemas don't have ladder columns. Return an
+    # empty-but-well-formed payload so the advisor can degrade gracefully.
+    try:
+        conn.execute("SELECT ladder_group_id FROM entries LIMIT 1")
+    except Exception:
+        return {
+            "schema_status": "pre_v9_no_ladder_columns",
+            "formation_funnel": {"3bin_full": 0, "2bin_partial": 0,
+                                  "single_orphan": 0},
+            "atomic_gate_failures": {},
+            "ladder_groups_performance": {},
+            "single_bin_performance": {},
+            "ttr_cohort_performance": {},
+            "kelly_distribution_by_position": {},
+            "interpretation": ["DB schema is pre-v9 (no ladder_group_id "
+                                "column). Ladder analytics unavailable until "
+                                "schema migrates."],
+        }
+
+    # Formation funnel — count by ladder structure
+    funnel = {"3bin_full": 0, "2bin_partial": 0, "single_orphan": 0}
+    rows = conn.execute(
+        "SELECT ladder_group_id, COUNT(*) n "
+        "FROM entries WHERE ts >= ? AND ladder_group_id IS NOT NULL "
+        "GROUP BY ladder_group_id",
+        (since_iso,)
+    ).fetchall()
+    for r in rows:
+        n = r["n"]
+        if n >= 3:
+            funnel["3bin_full"] += 1
+        elif n == 2:
+            funnel["2bin_partial"] += 1
+    funnel["single_orphan"] = conn.execute(
+        "SELECT COUNT(*) FROM entries WHERE ts >= ? AND ladder_group_id IS NULL "
+        "AND status NOT IN ('REJECTED','SKIPPED')",
+        (since_iso,)
+    ).fetchone()[0]
+
+    # Atomic gate failures
+    atomic_failures = {}
+    for reason in ("ladder_sibling_failed", "ladder_partial_failure"):
+        atomic_failures[reason] = conn.execute(
+            "SELECT COUNT(*) FROM entries WHERE ts >= ? AND skip_reason = ?",
+            (since_iso, reason)
+        ).fetchone()[0]
+    atomic_failures["ladder_aborted_any"] = conn.execute(
+        "SELECT COUNT(*) FROM entries WHERE ts >= ? "
+        "AND skip_reason LIKE 'ladder_aborted:%'",
+        (since_iso,)
+    ).fetchone()[0]
+
+    # Performance: ladder groups vs orphan single-bin (resolved only)
+    # Group-level P&L for ladders: sum across all legs of the group
+    ladder_perf = conn.execute("""
+        SELECT
+          COUNT(DISTINCT e.ladder_group_id) n_groups,
+          SUM(c.realized_pnl_usd) total_pnl,
+          SUM(e.size_usd) total_stake,
+          SUM(CASE WHEN group_pnl > 0 THEN 1 ELSE 0 END) groups_won
+        FROM (
+          SELECT ladder_group_id,
+                 SUM(c2.realized_pnl_usd) group_pnl
+          FROM entries e2
+          LEFT JOIN cashouts c2 ON c2.entry_id = e2.entry_id
+          WHERE e2.ts >= ? AND e2.ladder_group_id IS NOT NULL
+            AND e2.status = 'EXECUTED'
+          GROUP BY ladder_group_id
+          HAVING group_pnl IS NOT NULL
+        ) g
+        JOIN entries e ON e.ladder_group_id = g.ladder_group_id
+        LEFT JOIN cashouts c ON c.entry_id = e.entry_id
+    """, (since_iso,)).fetchone()
+
+    single_perf = conn.execute("""
+        SELECT COUNT(*) n_trades,
+               SUM(c.realized_pnl_usd) total_pnl,
+               SUM(e.size_usd) total_stake,
+               SUM(CASE WHEN c.realized_pnl_usd > 0 THEN 1 ELSE 0 END) wins
+        FROM entries e
+        LEFT JOIN cashouts c ON c.entry_id = e.entry_id
+        WHERE e.ts >= ? AND e.ladder_group_id IS NULL
+          AND e.status = 'EXECUTED' AND c.cashout_id IS NOT NULL
+    """, (since_iso,)).fetchone()
+
+    def _perf_dict(row, label_n: str, label_won: str):
+        n = (row[label_n] or 0) if row else 0
+        won = (row[label_won] or 0) if row else 0
+        pnl = float(row["total_pnl"] or 0) if row else 0.0
+        stake = float(row["total_stake"] or 0) if row else 0.0
+        return {
+            "n": n, "won": won,
+            "win_rate": round(won / n, 3) if n else None,
+            "total_pnl_usd": round(pnl, 2),
+            "total_stake_usd": round(stake, 2),
+            "pnl_per_dollar": round(pnl / stake, 4) if stake else None,
+        }
+
+    # TTR cohort — does the new 6-12h band actually deliver?
+    ttr_cohort = {}
+    for label, lo, hi in (("6-12h", 6, 12), ("12-24h", 12, 24),
+                           ("24-48h", 24, 48), ("48h+", 48, 9999)):
+        r = conn.execute("""
+            SELECT COUNT(*) n,
+                   SUM(c.realized_pnl_usd) pnl,
+                   SUM(e.size_usd) stake,
+                   SUM(CASE WHEN c.realized_pnl_usd > 0 THEN 1 ELSE 0 END) wins
+            FROM entries e
+            LEFT JOIN cashouts c ON c.entry_id = e.entry_id
+            WHERE e.ts >= ? AND e.status = 'EXECUTED'
+              AND c.cashout_id IS NOT NULL
+              AND e.ttr_hours_at_entry >= ? AND e.ttr_hours_at_entry < ?
+        """, (since_iso, lo, hi)).fetchone()
+        ttr_cohort[label] = {
+            "n": r["n"] or 0, "wins": r["wins"] or 0,
+            "win_rate": round((r["wins"] or 0) / r["n"], 3) if r["n"] else None,
+            "total_pnl_usd": round(float(r["pnl"] or 0), 2),
+            "total_stake_usd": round(float(r["stake"] or 0), 2),
+        }
+
+    # Kelly distribution: how often does adjacent leg get non-zero stake?
+    kelly_dist = conn.execute("""
+        SELECT ladder_position,
+               COUNT(*) n_legs,
+               SUM(CASE WHEN ladder_stake_usd > 0 THEN 1 ELSE 0 END) n_nonzero,
+               AVG(ladder_stake_usd) avg_stake_usd
+        FROM entries
+        WHERE ts >= ? AND ladder_position IS NOT NULL
+        GROUP BY ladder_position
+    """, (since_iso,)).fetchall()
+    kelly_by_position = {}
+    for r in kelly_dist:
+        n = r["n_legs"]
+        nz = r["n_nonzero"] or 0
+        kelly_by_position[r["ladder_position"]] = {
+            "n_legs": n,
+            "n_kelly_nonzero": nz,
+            "pct_nonzero": round(nz / n * 100, 1) if n else None,
+            "avg_stake_usd": round(float(r["avg_stake_usd"] or 0), 2),
+        }
+
+    interpretation = []
+    if funnel["3bin_full"] + funnel["2bin_partial"] == 0:
+        interpretation.append("NO LADDERS FORMED in window — check "
+                              "discovery filters or --ladder-mode setting")
+    elif funnel["single_orphan"] > 3 * (funnel["3bin_full"] + funnel["2bin_partial"]):
+        interpretation.append("Single-bin orphans dominate ladders 3:1 — most "
+                              "events have only one bracket surviving filters; "
+                              "consider lowering --ladder-min-leg-edge-pp or "
+                              "--ladder-min-leg-price further")
+    if atomic_failures["ladder_aborted_any"] > funnel["3bin_full"]:
+        interpretation.append("Atomic gate aborting more ladders than "
+                              "completing — most aborts are pre-execution "
+                              "(edge_stale, no_orderbook); check pre-judge "
+                              "threshold or executor floors")
+    if (ttr_cohort["6-12h"]["n"] >= 5
+            and ttr_cohort["6-12h"]["win_rate"] is not None
+            and ttr_cohort["6-12h"]["win_rate"] < 0.45):
+        interpretation.append(
+            f"6-12h TTR cohort win rate {ttr_cohort['6-12h']['win_rate']:.0%} "
+            "is below baseline — the lower --ladder-min-ttr-hours may be "
+            "admitting unprofitable adverse-selection trades")
+
+    return {
+        "formation_funnel": funnel,
+        "atomic_gate_failures": atomic_failures,
+        "ladder_groups_performance": _perf_dict(
+            ladder_perf, "n_groups", "groups_won"),
+        "single_bin_performance": _perf_dict(
+            single_perf, "n_trades", "wins"),
+        "ttr_cohort_performance": ttr_cohort,
+        "kelly_distribution_by_position": kelly_by_position,
+        "interpretation": interpretation,
+    }
+
+
 def compute_judge_accuracy(conn, since_iso: str) -> dict:
     """v6: Judge accuracy + hallucination signals.
 

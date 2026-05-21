@@ -59,6 +59,7 @@ from weather_edge_analyzer import (  # noqa: E402
     compute_counterfactuals,
     compute_judge_accuracy,
     compute_discovery_meta_breakdown,  # v8 observability
+    compute_ladder_breakdown,           # v9 ladder analytics
     format_report_md,
 )
 
@@ -469,6 +470,13 @@ def main() -> int:
         # so the LLM can recommend tuning specific features.
         discovery_meta = compute_discovery_meta_breakdown(conn, since_iso)
 
+        # Advisor v9: ladder formation funnel, ladder-vs-orphan P&L,
+        # 6-12h TTR cohort performance, Kelly distribution. Lets the
+        # LLM evaluate whether laddering is paying off and whether the
+        # per-mode floors (--ladder-min-leg-edge-pp, --ladder-min-ttr-
+        # hours, --ladder-min-leg-price) need tuning.
+        ladder_breakdown = compute_ladder_breakdown(conn, since_iso)
+
         user_payload = {
             "since_iso": since_iso,
             "n_trades_analyzed": n_trades,
@@ -491,6 +499,10 @@ def main() -> int:
             # (station, mae_dynamic ratio, multi_source on/off, OM penalty,
             # bias applied) + discovery_skips breakdown
             "discovery_meta_breakdown": discovery_meta,
+            # Advisor v9: 3-bin laddering formation, ladder-vs-single P&L,
+            # TTR cohort performance (does the 6-12h band pay off?),
+            # Kelly stake distribution by position (central/below/above).
+            "ladder_breakdown": ladder_breakdown,
         }
 
         if args.dry_run:
