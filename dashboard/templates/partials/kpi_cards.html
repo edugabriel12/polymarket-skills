@@ -68,6 +68,49 @@
 </div>
 {% endif %}
 
+{# v9: Ladder strategy KPIs — formation funnel + ladder-vs-single perf #}
+{% if ladder and ladder.available %}
+<div class="kpi-grid kpi-grid-ladder">
+  <div class="kpi" title="Ladder groups formed in last {{ ladder.days }} days. 3-bin = full central+below+above, 2-bin = central + one neighbor (extreme bracket).">
+    <span class="kpi-label">Ladders formed ({{ ladder.days }}d)</span>
+    <span class="kpi-value">{{ ladder.n_total_groups }}</span>
+    <span class="kpi-delta muted">{{ ladder.n_3bin }} × 3-bin · {{ ladder.n_2bin }} × 2-bin</span>
+  </div>
+  <div class="kpi" title="Orphan single-bin entries (events with <2 brackets surviving discovery filters). Each must pass --min-entry-price 0.30 + --min-edge-pp 20 + --min-ttr-hours 12.">
+    <span class="kpi-label">Single-bin orphans</span>
+    <span class="kpi-value">{{ ladder.n_orphans }}</span>
+    <span class="kpi-delta muted">no sibling brackets</span>
+  </div>
+  <div class="kpi" title="Realized P&L from RESOLVED ladder groups in the window (sums P&L across all legs of each group).">
+    <span class="kpi-label">Ladder P&L</span>
+    <span class="kpi-value {{ ladder.ladder_pnl_color }}">
+      {% if ladder.ladder_pnl_usd is not none %}
+        {{ "+" if ladder.ladder_pnl_usd >= 0 else "" }}${{ "%.2f"|format(ladder.ladder_pnl_usd) }}
+      {% else %}—{% endif %}
+    </span>
+    <span class="kpi-delta muted">
+      {% if ladder.ladder_pnl_per_dollar is not none %}
+        {{ "%.1f"|format(ladder.ladder_pnl_per_dollar * 100) }}% / $
+      {% else %}no resolved ladders{% endif %}
+    </span>
+  </div>
+  <div class="kpi" title="Win rate of trades with TTR 6-12h — the new admittance band unlocked by lowering --ladder-min-ttr-hours to 6. Should match or beat the 24h+ baseline if the change paid off.">
+    <span class="kpi-label">6-12h TTR cohort</span>
+    <span class="kpi-value {{ ladder.short_ttr_color }}">
+      {% if ladder.short_ttr_win_rate is not none %}
+        {{ "%.0f"|format(ladder.short_ttr_win_rate * 100) }}%
+      {% else %}—{% endif %}
+    </span>
+    <span class="kpi-delta muted">{{ ladder.short_ttr_n }} resolved</span>
+  </div>
+</div>
+{% if ladder.interpretation %}
+  {% for line in ladder.interpretation %}
+    <div class="muted small" style="margin-top:6px;font-size:11px;">⚠ {{ line }}</div>
+  {% endfor %}
+{% endif %}
+{% endif %}
+
 {# v6: Queue health #}
 {% if queue and queue.available %}
 <div class="kpi-grid kpi-grid-queue">

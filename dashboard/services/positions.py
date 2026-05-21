@@ -216,6 +216,16 @@ def get_open_positions(sort_by: str = "entry_id") -> list[dict]:
                 "end_date": row["end_date"],
                 "edge_pp_at_entry": float(row["edge_pp_at_entry"] or 0),
                 "triggers": distances,
+                # v9: ladder grouping (NULL on legacy single-bin entries)
+                "ladder_group_id": (row["ladder_group_id"]
+                                    if "ladder_group_id" in row.keys()
+                                    else None),
+                "ladder_position": (row["ladder_position"]
+                                    if "ladder_position" in row.keys()
+                                    else None),
+                "ladder_event_slug": (row["ladder_event_slug"]
+                                       if "ladder_event_slug" in row.keys()
+                                       else None),
             })
         if sort_by == "size":
             out.sort(key=lambda p: p["size_usd"], reverse=True)

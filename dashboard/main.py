@@ -227,9 +227,15 @@ def api_kpis(request: Request):
         queue = portfolio.get_queue_health()
     except Exception as e:
         queue = {"available": False, "reason": str(e)}
+    # v9: ladder strategy KPIs (formation funnel + perf cohorts)
+    try:
+        from .services import ladders
+        ladder = ladders.get_ladder_kpis(days=7)
+    except Exception as e:
+        ladder = {"available": False, "reason": str(e)}
     return templates.TemplateResponse(
         request, "partials/kpi_cards.html",
-        {"k": kpis, "judge": judge, "queue": queue})
+        {"k": kpis, "judge": judge, "queue": queue, "ladder": ladder})
 
 
 # ---------------------------------------------------------------------------

@@ -29,7 +29,15 @@
     <tr {% if show_full %}onclick="openReplay({{ p.entry_id }})"{% endif %} class="{% if show_full %}clickable{% endif %}">
       <td class="mono" data-label="ID">#{{ p.entry_id }}</td>
       <td data-label="Market">
-        <div class="city">{{ p.city or '?' }}</div>
+        <div class="city">
+          {{ p.city or '?' }}
+          {% if p.ladder_group_id %}
+            <span class="ladder-badge ladder-pos-{{ p.ladder_position }}"
+                  title="Ladder group {{ p.ladder_group_id[:8] }} · position {{ p.ladder_position }}. All legs cashout together via the atomic gate.">
+              ⛓ {{ p.ladder_position }}
+            </span>
+          {% endif %}
+        </div>
         <div class="slug muted small">
           <a href="https://polymarket.com/event/{{ p.market_slug }}"
              target="_blank" rel="noopener"
