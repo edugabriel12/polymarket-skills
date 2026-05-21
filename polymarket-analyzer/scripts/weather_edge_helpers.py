@@ -988,6 +988,91 @@ def compute_edge(forecast_prob: float, implied: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# v9: 3-bin laddering — bracket selection + Kelly proportional stake split
+# ---------------------------------------------------------------------------
+
+
+def select_ladder_brackets(parsed: list[dict]) -> dict:
+    """Pick central + below + above brackets from a list of per-bracket dicts.
+
+    Input `parsed`: list of dicts, each shaped:
+        {"spec": MarketSpec, "forecast_prob": float, "raw_market": dict,
+         "implied": dict, ...}
+    The spec.threshold_value is used to order brackets (numeric ascending).
+    The forecast_prob picks the central bracket (argmax). Below = bracket
+    immediately below central in sorted order; above = immediately above.
+
+    Returns dict {central: dict, below: dict|None, above: dict|None}.
+    Brackets at table extremes return None for the missing neighbour;
+    callers can fall back to 2-bin or single-bin.
+
+    Returns None for the whole ladder if `parsed` is empty or no spec has
+    a valid forecast_prob.
+    """
+    if not parsed:
+        return None
+    # Filter to entries with a usable forecast_prob and threshold_value
+    usable = [p for p in parsed
+              if p.get("forecast_prob") is not None
+              and p.get("spec") is not None
+              and getattr(p["spec"], "threshold_value", None) is not None]
+    if not usable:
+        return None
+    # Sort ascending by threshold_value
+    ordered = sorted(usable, key=lambda p: float(p["spec"].threshold_value))
+    # Pick central = max forecast_prob (the bracket the model believes most).
+    # Ties broken by lower threshold_value (already from stable sort).
+    central_idx = max(range(len(ordered)),
+                       key=lambda i: float(ordered[i]["forecast_prob"]))
+    below = ordered[central_idx - 1] if central_idx > 0 else None
+    above = ordered[central_idx + 1] if central_idx < len(ordered) - 1 else None
+    return {"central": ordered[central_idx], "below": below, "above": above}
+
+
+def compute_kelly_split(legs: list[dict], total_usd: float) -> Optional[list[dict]]:
+    """Split `total_usd` across `legs` proportional to each leg's Kelly
+    fraction. Each leg is a dict with at minimum keys "forecast_prob" (p)
+    and "entry_price" (price). Returns the same list of dicts augmented
+    with "stake_usd" and "kelly_frac" keys, in input order.
+
+    Kelly per leg (YES bet convention; bot stores side-aware probs so this
+    holds for NO side too because p and price are P(side) / market(side)):
+        kelly_i = max(0, (p*(1-price) - (1-p)*price) / (1-price))
+
+    Renormalization:
+        weight_i = kelly_i / sum(kelly_j)
+        stake_i = total_usd * weight_i
+
+    Edge cases:
+        - All legs have kelly = 0 (no positive-EV bet) → returns None,
+          signalling the caller to skip the ladder entirely.
+        - One leg has kelly = 0 but others are positive → that leg gets
+          stake = 0, the others share the budget.
+        - 1-leg input → that leg gets the full total_usd.
+    """
+    if not legs or total_usd <= 0:
+        return None
+    enriched = []
+    kelly_sum = 0.0
+    for leg in legs:
+        p = float(leg.get("forecast_prob") or 0.0)
+        price = float(leg.get("entry_price") or 0.0)
+        if price <= 0 or price >= 1:
+            kelly = 0.0
+        else:
+            num = p * (1 - price) - (1 - p) * price
+            kelly = max(0.0, num / (1 - price))
+        enriched.append({**leg, "kelly_frac": kelly})
+        kelly_sum += kelly
+    if kelly_sum <= 0:
+        return None
+    for leg in enriched:
+        weight = leg["kelly_frac"] / kelly_sum
+        leg["stake_usd"] = round(total_usd * weight, 4)
+    return enriched
+
+
+# ---------------------------------------------------------------------------
 # Cashout policy — multi-trigger evaluator
 # ---------------------------------------------------------------------------
 
@@ -1310,5 +1395,119 @@ if __name__ == "__main__":
     # Actually convergence fires first since 0.40 > 0.15. trigger=convergence
     assert v["decision"] == "CASHOUT", v
     print(f"Test H2 PASS: CASHOUT ({v['trigger']}) — forecast turned bad")
+
+    # -----------------------------------------------------------------------
+    # v9: ladder selection tests
+    # -----------------------------------------------------------------------
+    from types import SimpleNamespace
+
+    def _mk(thr, prob):
+        return {"spec": SimpleNamespace(threshold_value=thr),
+                "forecast_prob": prob}
+
+    # Test L1: 5 sequential brackets, forecast peak in middle
+    legs = [_mk(60, 0.05), _mk(65, 0.15), _mk(70, 0.55),
+            _mk(75, 0.20), _mk(80, 0.05)]
+    r = select_ladder_brackets(legs)
+    assert r["central"]["spec"].threshold_value == 70
+    assert r["below"]["spec"].threshold_value == 65
+    assert r["above"]["spec"].threshold_value == 75
+    print("Test L1 PASS: 5 brackets full 3-bin (central=70, below=65, above=75)")
+
+    # Test L2: peak at top bracket → no above
+    legs = [_mk(60, 0.05), _mk(65, 0.10), _mk(70, 0.15),
+            _mk(75, 0.20), _mk(80, 0.50)]
+    r = select_ladder_brackets(legs)
+    assert r["central"]["spec"].threshold_value == 80
+    assert r["below"]["spec"].threshold_value == 75
+    assert r["above"] is None
+    print("Test L2 PASS: peak at top → 2-bin (no above)")
+
+    # Test L3: peak at bottom → no below
+    legs = [_mk(60, 0.50), _mk(65, 0.20), _mk(70, 0.15),
+            _mk(75, 0.10), _mk(80, 0.05)]
+    r = select_ladder_brackets(legs)
+    assert r["central"]["spec"].threshold_value == 60
+    assert r["above"]["spec"].threshold_value == 65
+    assert r["below"] is None
+    print("Test L3 PASS: peak at bottom → 2-bin (no below)")
+
+    # Test L4: 2 brackets only → central + above (or below), but no
+    # both neighbours possible. Verify central is the max-prob one.
+    legs = [_mk(60, 0.40), _mk(65, 0.50)]
+    r = select_ladder_brackets(legs)
+    assert r["central"]["spec"].threshold_value == 65
+    assert r["below"]["spec"].threshold_value == 60
+    assert r["above"] is None
+    print("Test L4 PASS: 2 brackets, central=65 + below=60")
+
+    # Test L5: brackets given out of order are sorted
+    legs = [_mk(70, 0.55), _mk(60, 0.05), _mk(75, 0.20),
+            _mk(65, 0.15), _mk(80, 0.05)]
+    r = select_ladder_brackets(legs)
+    assert r["central"]["spec"].threshold_value == 70
+    assert r["below"]["spec"].threshold_value == 65
+    assert r["above"]["spec"].threshold_value == 75
+    print("Test L5 PASS: out-of-order brackets sorted correctly")
+
+    # Test L6: empty / no usable forecast_prob
+    assert select_ladder_brackets([]) is None
+    assert select_ladder_brackets([{"spec": None, "forecast_prob": 0.5}]) is None
+    print("Test L6 PASS: empty/unusable → None")
+
+    # -----------------------------------------------------------------------
+    # v9: Kelly split tests
+    # -----------------------------------------------------------------------
+
+    # Test K1: 3 equal-EV legs → equal stake
+    legs = [{"forecast_prob": 0.50, "entry_price": 0.30},
+            {"forecast_prob": 0.50, "entry_price": 0.30},
+            {"forecast_prob": 0.50, "entry_price": 0.30}]
+    out = compute_kelly_split(legs, total_usd=30.0)
+    assert out is not None
+    assert all(abs(l["stake_usd"] - 10.0) < 0.01 for l in out)
+    print("Test K1 PASS: 3 equal legs → 3 x $10")
+
+    # Test K2: central with larger edge gets more weight
+    legs = [{"forecast_prob": 0.40, "entry_price": 0.30},   # adjacent low-edge
+            {"forecast_prob": 0.70, "entry_price": 0.30},   # central high-edge
+            {"forecast_prob": 0.40, "entry_price": 0.30}]
+    out = compute_kelly_split(legs, total_usd=30.0)
+    assert out[1]["stake_usd"] > out[0]["stake_usd"]
+    assert out[1]["stake_usd"] > out[2]["stake_usd"]
+    print(f"Test K2 PASS: central gets ${out[1]['stake_usd']:.2f} vs "
+          f"adj ${out[0]['stake_usd']:.2f} (more weight where edge bigger)")
+
+    # Test K3: one leg with negative EV → zero stake
+    legs = [{"forecast_prob": 0.20, "entry_price": 0.30},   # negative kelly
+            {"forecast_prob": 0.60, "entry_price": 0.30},
+            {"forecast_prob": 0.50, "entry_price": 0.30}]
+    out = compute_kelly_split(legs, total_usd=30.0)
+    assert out[0]["stake_usd"] == 0.0
+    assert abs(out[1]["stake_usd"] + out[2]["stake_usd"] - 30.0) < 0.01
+    print(f"Test K3 PASS: negative-EV leg gets $0, others split remainder")
+
+    # Test K4: 2-bin still works
+    legs = [{"forecast_prob": 0.60, "entry_price": 0.30},
+            {"forecast_prob": 0.50, "entry_price": 0.30}]
+    out = compute_kelly_split(legs, total_usd=20.0)
+    assert abs(sum(l["stake_usd"] for l in out) - 20.0) < 0.01
+    print("Test K4 PASS: 2-bin preserves budget")
+
+    # Test K5: budget conservation across multiple sizes
+    for total in (10.0, 50.0, 100.0):
+        legs = [{"forecast_prob": 0.50, "entry_price": 0.30},
+                {"forecast_prob": 0.40, "entry_price": 0.30}]
+        out = compute_kelly_split(legs, total_usd=total)
+        s = sum(l["stake_usd"] for l in out)
+        assert abs(s - total) < 0.01, f"total {total} got sum {s}"
+    print("Test K5 PASS: budget preserved across sizes")
+
+    # Test K6: all kelly negative → None (caller skips ladder)
+    legs = [{"forecast_prob": 0.10, "entry_price": 0.30},
+            {"forecast_prob": 0.15, "entry_price": 0.30}]
+    out = compute_kelly_split(legs, total_usd=30.0)
+    assert out is None
+    print("Test K6 PASS: all kelly negative → None")
 
     print("\nAll helper tests PASS")

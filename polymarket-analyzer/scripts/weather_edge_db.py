@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 DB_PATH = Path.home() / ".polymarket-paper" / "weather_edge.db"
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 SCHEMA_V1 = """
@@ -255,6 +255,20 @@ SCHEMA_V8_MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS idx_ds_reason ON discovery_skips(reason)",
 ]
 
+# v9: 3-bin laddering. A ladder is a group of 1-3 entries sharing the same
+# event_slug from Gamma /events. Atomic execution + atomic cashout
+# coordinated by ladder_group_id.
+SCHEMA_V9_MIGRATIONS = [
+    "ALTER TABLE entries ADD COLUMN ladder_group_id TEXT",
+    "ALTER TABLE entries ADD COLUMN ladder_position TEXT",
+    "ALTER TABLE entries ADD COLUMN ladder_event_slug TEXT",
+    # Target stake for this leg (per Kelly proportional split at discovery
+    # time). Executor honors this as size cap, applying slippage limits
+    # and market exposure cap on top. NULL on legacy single-bin entries.
+    "ALTER TABLE entries ADD COLUMN ladder_stake_usd REAL",
+    "CREATE INDEX IF NOT EXISTS idx_entries_ladder_group ON entries(ladder_group_id)",
+]
+
 
 def init_db(path: Path = DB_PATH) -> None:
     """Create the DB and tables if missing. Idempotent. Bumps user_version.
@@ -312,6 +326,14 @@ def init_db(path: Path = DB_PATH) -> None:
                     if "duplicate column name" not in str(e).lower():
                         raise
             current = 8
+        if current < 9:
+            for stmt in SCHEMA_V9_MIGRATIONS:
+                try:
+                    cur.execute(stmt)
+                except sqlite3.OperationalError as e:
+                    if "duplicate column name" not in str(e).lower():
+                        raise
+            current = 9
         cur.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
 
@@ -528,6 +550,19 @@ def query_pending_proposals(conn, limit: int = 50) -> list[sqlite3.Row]:
         "SELECT * FROM entries WHERE status = 'PROPOSED' "
         "ORDER BY ttr_hours_at_entry ASC, ts ASC LIMIT ?",
         (limit,),
+    ).fetchall()
+
+
+def query_ladder_group(conn, ladder_group_id: str) -> list[sqlite3.Row]:
+    """v9: all entries belonging to one ladder group, ordered by ladder
+    position (central, below, above). Used by atomic executor and atomic
+    cashout to coordinate across legs.
+    """
+    return conn.execute(
+        "SELECT * FROM entries WHERE ladder_group_id = ? "
+        "ORDER BY CASE ladder_position WHEN 'central' THEN 0 "
+        "WHEN 'below' THEN 1 WHEN 'above' THEN 2 ELSE 3 END, entry_id",
+        (ladder_group_id,),
     ).fetchall()
 
 

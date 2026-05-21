@@ -173,6 +173,9 @@ def _fetch_weather_events(now: datetime, max_pages: int = 3) -> list[dict]:
                     # Inject parent event context so the parser can resolve city
                     sm["events"] = sm.get("events") or [{"title": ev_title,
                                                           "slug": ev_slug}]
+                    # v9: preserve event slug directly so the ladder builder
+                    # can group sibling brackets after parsing
+                    sm["event_slug"] = ev_slug
                     out.append(sm)
             if len(events) < 100:
                 break
@@ -596,6 +599,109 @@ def _compute_mae_for_market(spec: MarketSpec, ow_forecast: dict,
     return mae_dyn, bias, meta
 
 
+def _build_ladder_candidates(candidates: list[dict], args) -> list[dict]:
+    """v9: transform single-bin candidates into coordinated 3-bin ladders.
+
+    Inputs `candidates` are the per-bracket survivors of all discovery
+    filters (price band, ttr, edge, etc.). We group them by event_slug.
+    Groups of >=2 surviving brackets become a ladder; groups of 1 remain
+    single-bin.
+
+    For each ladder:
+      - call select_ladder_brackets() to pick central/below/above by
+        forecast_prob ordering
+      - compute Kelly proportional stake split across the picked legs
+        using max_market_exposure_usd as the ladder budget
+      - tag each leg with shared ladder_group_id (uuid4), distinct
+        ladder_position, and ladder_event_slug
+
+    Single-bin candidates (no event_slug or alone in their event) pass
+    through untouched.
+    """
+    from weather_edge_helpers import select_ladder_brackets, compute_kelly_split
+    import uuid
+
+    # Group by event_slug. Candidates with empty event_slug remain
+    # single-bin (event_slug "" gets its own pseudo-group treated as
+    # single-bin below).
+    groups: dict[str, list[dict]] = {}
+    singles: list[dict] = []
+    for c in candidates:
+        es = c.get("event_slug") or ""
+        if not es:
+            singles.append(c)
+            continue
+        groups.setdefault(es, []).append(c)
+
+    out: list[dict] = []
+    out.extend(singles)
+
+    total_ladder_budget = float(args.max_market_exposure_usd)
+    split_mode = getattr(args, "ladder_stake_split", "kelly")
+
+    for event_slug, group in groups.items():
+        if len(group) < 2:
+            # Lone bracket in an event — treat as single-bin
+            out.extend(group)
+            continue
+
+        # Pick central/below/above
+        picked = select_ladder_brackets(group)
+        if picked is None:
+            out.extend(group)
+            continue
+        legs = [picked["central"]]
+        if picked["below"] is not None:
+            legs.append(picked["below"])
+        if picked["above"] is not None:
+            legs.append(picked["above"])
+
+        # Compute stake split
+        if split_mode == "equal":
+            per = round(total_ladder_budget / len(legs), 4)
+            split = [{**l, "stake_usd": per,
+                      "kelly_frac": 1.0 / len(legs)} for l in legs]
+        else:
+            split = compute_kelly_split(legs, total_ladder_budget)
+            if split is None:
+                # No positive-EV legs — drop the whole ladder. Log and
+                # continue rather than fall back to single-bin (the
+                # individual legs already failed their own edge filter
+                # would have been caught upstream; reaching here with
+                # all-negative kelly means we'd be skipping for the
+                # same reason).
+                log_event("ladder_dropped", {
+                    "event_slug": event_slug,
+                    "reason": "all_kelly_negative",
+                    "n_legs": len(legs),
+                })
+                continue
+
+        # Tag with shared ladder_group_id and position
+        group_id = str(uuid.uuid4())
+        positions = ["central", "below", "above"][:len(split)]
+        for pos, leg in zip(positions, split):
+            leg["ladder_group_id"] = group_id
+            leg["ladder_position"] = pos
+            leg["ladder_event_slug"] = event_slug
+            # Override the executor's slippage-based sizing with the
+            # ladder's pre-computed stake. The executor reads
+            # "ladder_stake_usd" if present.
+            leg["ladder_stake_usd"] = leg.get("stake_usd")
+            out.append(leg)
+
+        log_event("ladder_built", {
+            "event_slug": event_slug,
+            "ladder_group_id": group_id,
+            "n_legs": len(split),
+            "positions": positions,
+            "stakes_usd": [round(l["stake_usd"], 2) for l in split],
+            "split_mode": split_mode,
+        })
+
+    return out
+
+
 def run_discovery(args, cities: dict) -> int:
     """Run one discovery scan. Returns count of new proposals inserted."""
     log_event("discovery_start", {"min_edge_pp": args.min_edge_pp,
@@ -879,7 +985,16 @@ def run_discovery(args, cities: dict) -> int:
             "implied": implied,
             "condition_id": m.get("conditionId", ""),
             "discovery_meta": mae_meta,  # v8 observability
+            # v9: parent-event grouping for laddering
+            "event_slug": m.get("event_slug") or "",
         })
+
+    # v9: 3-bin laddering — group surviving candidates by event_slug and
+    # transform groups with >=2 siblings into coordinated ladders with
+    # shared ladder_group_id. Candidates without event_slug or with only
+    # one sibling remain single-bin (legacy path).
+    if getattr(args, "ladder_mode", "3bin") != "off":
+        candidates = _build_ladder_candidates(candidates, args)
 
     # Phase 2 + 3: snapshot existing (slug, side) pairs, then insert candidates
     # one-by-one with per-row commits. Each commit releases the writer lock
@@ -972,6 +1087,11 @@ def run_discovery(args, cities: dict) -> int:
                 # bias, station, OW/VC/Open-Meteo values, penalties)
                 # so the advisor can cohort-analyze trades.
                 discovery_meta_json=c.get("discovery_meta") or {},
+                # v9: 3-bin laddering metadata. NULL on single-bin entries.
+                ladder_group_id=c.get("ladder_group_id"),
+                ladder_position=c.get("ladder_position"),
+                ladder_event_slug=c.get("ladder_event_slug"),
+                ladder_stake_usd=c.get("ladder_stake_usd"),
             )
             conn.commit()  # release writer lock so judge can interleave
             # Update in-memory state so subsequent iterations in this same
@@ -998,6 +1118,218 @@ def run_discovery(args, cities: dict) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _ladder_atomic_gate(group_id: str, current_entry_id: int) -> str:
+    """v9: decide whether a ladder group is READY for atomic execution,
+    needs to DEFER (sibling still pending judge), or is DEAD (some
+    sibling failed). Returns one of 'READY', 'DEFER', 'DEAD'."""
+    with db.connect() as conn:
+        legs = db.query_ladder_group(conn, group_id)
+    if not legs:
+        return "DEAD"
+    statuses = {leg["status"] for leg in legs}
+    if statuses & {"REJECTED", "SKIPPED"}:
+        return "DEAD"
+    if "PROPOSED" in statuses:
+        return "DEFER"
+    if statuses <= {"APPROVED", "ADJUSTED", "EXECUTED"}:
+        # EXECUTED in a sibling means we already partially executed (e.g.
+        # earlier crash). Treat as DEAD to avoid double-execution; the
+        # operator can manually inspect.
+        if "EXECUTED" in statuses:
+            return "DEAD"
+        return "READY"
+    return "DEFER"  # mixed unknown — wait
+
+
+def _ladder_mark_dead(group_id: str, reason: str) -> None:
+    """Mark all non-terminal legs of a ladder group as SKIPPED."""
+    with db.connect() as conn:
+        legs = db.query_ladder_group(conn, group_id)
+        marked = []
+        for leg in legs:
+            if leg["status"] in ("APPROVED", "ADJUSTED", "PROPOSED"):
+                db.update_entry_status(conn, leg["entry_id"], "SKIPPED",
+                                        skip_reason=reason)
+                marked.append(leg["entry_id"])
+        conn.commit()
+    log_event("ladder_group_dead", {
+        "ladder_group_id": group_id,
+        "reason": reason,
+        "marked_skipped": marked,
+    })
+
+
+def _execute_ladder_group_atomic(group_id: str, args, engine,
+                                  default_fee_rate: float) -> int:
+    """v9: atomic execution of all legs in a ladder group. Pre-checks
+    all legs (orderbook fetch, slippage compute, edge re-check, market
+    exposure). If ANY pre-check fails, marks all legs SKIPPED with
+    'ladder_partial_failure' and returns 0. Otherwise executes all legs
+    sequentially via paper_engine and returns count of executed legs.
+    """
+    with db.connect() as conn:
+        legs = db.query_ladder_group(conn, group_id)
+    if not legs:
+        return 0
+
+    # Phase 1: pre-check every leg without touching the engine
+    pre_checks = []
+    for leg in legs:
+        entry_id = leg["entry_id"]
+        status = leg["status"]
+        adjusted_side = (leg["judge_adjusted_side"]
+                          if status == "ADJUSTED" else None)
+        side = adjusted_side or leg["side"]
+        token_id = leg["token_id_yes"] if side == "YES" else leg["token_id_no"]
+        book = fetch_orderbook(token_id)
+        if not book or not book.get("asks"):
+            return _ladder_abort(group_id, "no_orderbook", entry_id)
+
+        sizing = compute_max_size_for_slippage(
+            book, "BUY", max_slippage=args.max_slippage)
+        if sizing["max_shares"] == 0:
+            return _ladder_abort(group_id, "zero_max_size", entry_id)
+
+        fill_price = float(sizing["avg_fill"])
+        forecast_prob = leg["forecast_prob_at_entry"]
+        if forecast_prob is not None:
+            current_edge_pp = round(
+                (float(forecast_prob) - fill_price) * 100.0, 4)
+            min_edge = getattr(args, "execute_min_edge_pp", None) or args.min_edge_pp
+            if current_edge_pp < min_edge:
+                return _ladder_abort(group_id, "edge_stale", entry_id)
+
+        # Honor the stake target stored at discovery (ladder_stake_usd) —
+        # the Kelly proportional split target for this leg. Then clamp to
+        # slippage-based max and market exposure cap.
+        target_usd = float(leg["ladder_stake_usd"] or sizing["max_usd"])
+        target_usd = min(target_usd, float(sizing["max_usd"]))
+
+        market_slug = leg["market_slug"]
+        with db.connect() as conn2:
+            cur_exp = db.current_market_exposure_usd(conn2, market_slug)
+        remaining = float(args.max_market_exposure_usd) - cur_exp
+        if remaining <= 0:
+            return _ladder_abort(group_id, "market_exposure_cap_reached", entry_id)
+        target_usd = min(target_usd, remaining)
+
+        if target_usd < 10:
+            return _ladder_abort(group_id, "size_below_min_$10", entry_id)
+
+        pre_checks.append({
+            "leg": leg,
+            "side": side,
+            "token_id": token_id,
+            "sizing": sizing,
+            "target_usd": target_usd,
+        })
+
+    # Phase 2: all pre-checks passed — execute every leg atomically
+    if args.dry_run:
+        with db.connect() as conn:
+            for pc in pre_checks:
+                db.update_entry_status(conn, pc["leg"]["entry_id"], "EXECUTED",
+                                       size_usd=pc["target_usd"],
+                                       size_shares=pc["sizing"]["max_shares"],
+                                       entry_price=pc["sizing"]["avg_fill"])
+            conn.commit()
+        log_event("ladder_executed_dry", {
+            "ladder_group_id": group_id,
+            "n_legs": len(pre_checks),
+            "total_usd": sum(pc["target_usd"] for pc in pre_checks),
+        })
+        return len(pre_checks)
+
+    executed_results = []
+    for pc in pre_checks:
+        leg = pc["leg"]
+        try:
+            result = engine.open_position(
+                token_id=pc["token_id"],
+                side=pc["side"],
+                size_usd=pc["target_usd"],
+                market_question=leg["market_question"][:200],
+                fee_rate=default_fee_rate,
+                confidence=0.65,
+                reasoning=(f"weather_edge_bot ladder leg "
+                            f"entry_id={leg['entry_id']} "
+                            f"group={group_id[:8]}"),
+            )
+        except Exception as e:
+            log_event("error", {"where": "ladder_exec_open_position",
+                                "entry_id": leg["entry_id"],
+                                "ladder_group_id": group_id,
+                                "err": str(e)}, level="ERROR")
+            result = {"status": "failed", "reason": str(e)}
+        executed_results.append((leg, result))
+        if result.get("status") != "executed":
+            # One leg failed mid-flight. Rest of group already executed
+            # legs stay open (paper_engine has no rollback). Mark the
+            # remaining un-executed legs as SKIPPED and surface the
+            # partial-fill state loudly.
+            n_ok = sum(1 for _, r in executed_results
+                       if r.get("status") == "executed")
+            log_event("ladder_partial_execution", {
+                "ladder_group_id": group_id,
+                "failed_entry_id": leg["entry_id"],
+                "failed_reason": result.get("reason"),
+                "n_legs_executed": n_ok,
+                "n_legs_total": len(pre_checks),
+            }, level="ERROR")
+            # Persist statuses for legs we tried, mark untried as SKIPPED
+            with db.connect() as conn:
+                for tried_leg, tried_result in executed_results:
+                    if tried_result.get("status") == "executed":
+                        db.update_entry_status(conn, tried_leg["entry_id"], "EXECUTED",
+                                                size_usd=tried_result.get("cost_usd"),
+                                                size_shares=tried_result.get("shares_filled"),
+                                                entry_price=tried_result.get("avg_price"))
+                    else:
+                        db.update_entry_status(conn, tried_leg["entry_id"], "SKIPPED",
+                                                skip_reason=str(tried_result.get("reason"))[:200])
+                # Remaining legs we didn't try yet
+                tried_ids = {l["entry_id"] for l, _ in executed_results}
+                for pc2 in pre_checks:
+                    if pc2["leg"]["entry_id"] not in tried_ids:
+                        db.update_entry_status(conn, pc2["leg"]["entry_id"], "SKIPPED",
+                                                skip_reason="ladder_partial_failure")
+                conn.commit()
+            return n_ok
+
+    # All legs executed successfully
+    with db.connect() as conn:
+        for leg, result in executed_results:
+            db.update_entry_status(conn, leg["entry_id"], "EXECUTED",
+                                    size_usd=result.get("cost_usd"),
+                                    size_shares=result.get("shares_filled"),
+                                    entry_price=result.get("avg_price"))
+        conn.commit()
+    log_event("ladder_executed", {
+        "ladder_group_id": group_id,
+        "n_legs": len(executed_results),
+        "total_cost_usd": sum(r.get("cost_usd", 0) for _, r in executed_results),
+    })
+    return len(executed_results)
+
+
+def _ladder_abort(group_id: str, reason: str, trigger_entry_id: int) -> int:
+    """Helper: mark the whole ladder group as SKIPPED with the abort
+    reason and log loudly. Returns 0 (no legs executed)."""
+    with db.connect() as conn:
+        legs = db.query_ladder_group(conn, group_id)
+        for leg in legs:
+            if leg["status"] in ("APPROVED", "ADJUSTED", "PROPOSED"):
+                db.update_entry_status(conn, leg["entry_id"], "SKIPPED",
+                                        skip_reason=f"ladder_aborted:{reason}")
+        conn.commit()
+    log_event("ladder_aborted", {
+        "ladder_group_id": group_id,
+        "reason": reason,
+        "trigger_entry_id": trigger_entry_id,
+    })
+    return 0
+
+
 def run_execute(args) -> int:
     """Pick up APPROVED entries and execute them via paper_engine.
 
@@ -1022,9 +1354,44 @@ def run_execute(args) -> int:
 
     engine = PaperEngine(portfolio=args.portfolio)
 
+    # v9: atomic-execution gate. Tracks ladder groups already processed
+    # (either executed atomically OR marked dead) in this single
+    # run_execute call so a 3-leg ladder doesn't get attempted 3 times.
+    groups_handled: set[str] = set()
+
     for row in rows:
         entry_id = row["entry_id"]
         status = row["status"]
+
+        # v9: gate ladder rows. Single-bin rows (no ladder_group_id)
+        # fall through to legacy path unchanged.
+        ladder_group_id = row["ladder_group_id"] if "ladder_group_id" in row.keys() else None
+        if ladder_group_id:
+            if ladder_group_id in groups_handled:
+                continue
+            gate_decision = _ladder_atomic_gate(ladder_group_id, entry_id)
+            if gate_decision == "DEFER":
+                # At least one sibling is still PROPOSED (waiting for
+                # judge). Skip this leg now; retry next executor cycle.
+                continue
+            if gate_decision == "DEAD":
+                # Some sibling was REJECTED/SKIPPED — mark all surviving
+                # APPROVED/ADJUSTED legs as SKIPPED with sibling_failed
+                # reason. They will not execute.
+                _ladder_mark_dead(ladder_group_id, reason="ladder_sibling_failed")
+                groups_handled.add(ladder_group_id)
+                continue
+            if gate_decision == "READY":
+                # All legs APPROVED/ADJUSTED — run atomic execution of
+                # the whole group. If any leg's pre-check fails, roll
+                # back the whole group with ladder_partial_failure.
+                n_ok = _execute_ladder_group_atomic(
+                    ladder_group_id, args, engine, DEFAULT_FEE_RATE)
+                executed += n_ok
+                groups_handled.add(ladder_group_id)
+                continue
+
+        # --- Legacy single-bin path (unchanged from pre-v9) ---
         # ADJUST verdict can override side — if the judge thought the bot
         # picked the wrong direction, use the judge's adjusted_side instead.
         adjusted_side = row["judge_adjusted_side"] if status == "ADJUSTED" else None
@@ -1304,8 +1671,30 @@ def _do_monitor_check(conn, row, cities: dict, args) -> None:
         _do_cashout(None, row, bid, forecast, forecast_prob_now, args, reason)
 
 
+# v9: groups currently mid-cashout. Prevents the monitor from triggering
+# duplicate close_position calls for sibling legs in the same cycle when
+# multiple triggers fire concurrently.
+_ladder_cashing_out: set[str] = set()
+
+
 def _do_cashout(conn, row, bid: float, forecast: dict,
                 forecast_prob_now: float, args, reason: str) -> None:
+    # v9: if this entry is part of a ladder group, cash out ALL legs of
+    # the group atomically. Single-bin entries (ladder_group_id NULL)
+    # fall through to the legacy per-leg path.
+    ladder_group_id = row["ladder_group_id"] if "ladder_group_id" in row.keys() else None
+    if ladder_group_id:
+        if ladder_group_id in _ladder_cashing_out:
+            # A sibling is already handling the group cashout in this cycle
+            return
+        _ladder_cashing_out.add(ladder_group_id)
+        try:
+            _do_ladder_cashout(ladder_group_id, forecast, forecast_prob_now,
+                                args, reason, trigger_entry_id=row["entry_id"])
+        finally:
+            _ladder_cashing_out.discard(ladder_group_id)
+        return
+
     entry_id = row["entry_id"]
     side = row["side"]
     token_id = row["token_id_yes"] if side == "YES" else row["token_id_no"]
@@ -1340,6 +1729,103 @@ def _do_cashout(conn, row, bid: float, forecast: dict,
                                             "reason": result.get("reason")})
     except Exception as e:
         log_event("error", {"where": "cashout", "entry_id": entry_id, "err": str(e)})
+
+
+def _do_ladder_cashout(group_id: str, forecast: dict,
+                        forecast_prob_now: float, args, reason: str,
+                        trigger_entry_id: int) -> None:
+    """v9: atomic cashout of all legs in a ladder group. Triggered by
+    any one leg's cashout signal (convergence/trailing/profit-lock).
+    Closes all legs via paper_engine, then writes all cashouts in a
+    single DB transaction. Partial failures are logged loudly but
+    leave the partial-close state intact (no rollback in paper_engine).
+    """
+    with db.connect() as conn:
+        legs = db.query_ladder_group(conn, group_id)
+    # Only legs that are still open (no cashout row yet)
+    open_legs = []
+    with db.connect() as conn:
+        for leg in legs:
+            r = conn.execute(
+                "SELECT cashout_id FROM cashouts WHERE entry_id = ?",
+                (leg["entry_id"],)).fetchone()
+            if r is None:
+                open_legs.append(leg)
+    if not open_legs:
+        return
+
+    if args.dry_run:
+        log_event("ladder_cashout_dry", {
+            "ladder_group_id": group_id, "n_legs": len(open_legs),
+            "trigger_entry_id": trigger_entry_id, "reason": reason})
+        return
+
+    try:
+        from paper_engine import PaperEngine
+        engine = PaperEngine(portfolio=args.portfolio)
+    except ImportError as e:
+        log_event("error", {"where": "ladder_cashout",
+                             "err": f"paper_engine import: {e}",
+                             "ladder_group_id": group_id}, level="ERROR")
+        return
+
+    # Phase 1: close each leg's position via the engine, accumulating
+    # results in memory. No DB writes until all closes attempted.
+    results = []
+    for leg in open_legs:
+        side = leg["side"]
+        token_id = (leg["token_id_yes"] if side == "YES"
+                     else leg["token_id_no"])
+        try:
+            r = engine.close_position(
+                token_id=token_id, side=side,
+                reasoning=(f"weather_edge_bot ladder group={group_id[:8]} "
+                            f"trigger={reason}"))
+        except Exception as e:
+            log_event("error", {"where": "ladder_cashout_close_position",
+                                "entry_id": leg["entry_id"],
+                                "ladder_group_id": group_id,
+                                "err": str(e)}, level="ERROR")
+            r = {"status": "failed", "reason": str(e)}
+        results.append((leg, r))
+
+    # Phase 2: write all cashout rows in a single transaction. Even if
+    # some closes failed at the engine level, we persist what succeeded
+    # so the DB matches paper_engine state.
+    successes = 0
+    with db.connect() as conn:
+        for leg, r in results:
+            if r.get("status") == "closed":
+                exit_price = r.get("avg_sell_price") or r.get("avg_price")
+                db.insert_cashout(
+                    conn, entry_id=leg["entry_id"],
+                    ts=_now_iso(),
+                    exit_price=exit_price,
+                    exit_shares=r.get("shares_sold"),
+                    realized_pnl_usd=r.get("realized_pnl"),
+                    forecast_prob_at_exit=forecast_prob_now,
+                    forecast_snapshot_json=forecast,
+                    reason=f"ladder_group:{reason}"[:200],
+                )
+                successes += 1
+            else:
+                log_event("ladder_leg_close_rejected", {
+                    "entry_id": leg["entry_id"],
+                    "ladder_group_id": group_id,
+                    "reason": r.get("reason"),
+                }, level="WARN")
+        conn.commit()
+
+    total_pnl = sum(r.get("realized_pnl", 0) or 0
+                     for _, r in results if r.get("status") == "closed")
+    log_event("ladder_cashout_executed", {
+        "ladder_group_id": group_id,
+        "trigger_entry_id": trigger_entry_id,
+        "trigger_reason": reason,
+        "n_legs_total": len(open_legs),
+        "n_legs_closed": successes,
+        "total_pnl_usd": round(total_pnl, 4),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -1587,6 +2073,20 @@ def main():
                         "winners equal to Lucknow losers); thresh=70 is +$46 "
                         "net on 24h sample but n is small. Default 0 (OFF) "
                         "until operator validates a thresh on more data.")
+    # v9: 3-bin laddering
+    p.add_argument("--ladder-mode", choices=("off", "3bin"), default="3bin",
+                   help="When '3bin' (default), discovery groups same-event "
+                        "brackets and emits coordinated 3-leg ladders "
+                        "(central + below + above) with shared "
+                        "ladder_group_id, atomic execution and atomic "
+                        "cashout. Set to 'off' to revert to single-bin "
+                        "(legacy behavior).")
+    p.add_argument("--ladder-stake-split",
+                   choices=("kelly", "equal"), default="kelly",
+                   help="How to split the total ladder stake across legs. "
+                        "'kelly' (default) weights by per-leg Kelly fraction "
+                        "(more $ where edge x prob is biggest). 'equal' "
+                        "divides 1/N for A/B comparison against kelly.")
     p.add_argument("--fast-path-ttr-min", type=int, default=60)
     p.add_argument("--profit-lock-pp", type=float, default=50.0,
                    help="Cashout when bid >= entry + X pp (default 50pp = "
@@ -1709,5 +2209,93 @@ def main():
         pass
 
 
+def _test_atomic_execution():
+    """v9: Hermetic tests for the atomic-execution gate (no network).
+    Stubs db.query_ladder_group + db.update_entry_status."""
+    import weather_edge_bot as mod
+
+    # Build a fake leg dict mimicking sqlite3.Row.keys() behavior.
+    class FakeRow(dict):
+        def keys(self):
+            return super().keys()
+
+    def mk(eid, status):
+        return FakeRow({"entry_id": eid, "status": status,
+                        "ladder_group_id": "g1", "ladder_position": "central"})
+
+    saved_query = db.query_ladder_group
+    saved_update = db.update_entry_status
+    saved_connect = db.connect
+    updates = []
+
+    class FakeConn:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def commit(self): pass
+        def execute(self, *a, **kw): return self
+        def fetchone(self): return None
+
+    db.connect = lambda: FakeConn()
+    db.update_entry_status = lambda conn, eid, status, **kw: updates.append((eid, status, kw))
+
+    try:
+        # Test 1: all legs APPROVED → READY
+        db.query_ladder_group = lambda conn, gid: [
+            mk(1, "APPROVED"), mk(2, "APPROVED"), mk(3, "APPROVED")]
+        assert mod._ladder_atomic_gate("g1", 1) == "READY"
+        print("Test A1 PASS: all APPROVED → READY")
+
+        # Test 2: one PROPOSED → DEFER
+        db.query_ladder_group = lambda conn, gid: [
+            mk(1, "APPROVED"), mk(2, "PROPOSED"), mk(3, "APPROVED")]
+        assert mod._ladder_atomic_gate("g1", 1) == "DEFER"
+        print("Test A2 PASS: any PROPOSED → DEFER")
+
+        # Test 3: one REJECTED → DEAD
+        db.query_ladder_group = lambda conn, gid: [
+            mk(1, "APPROVED"), mk(2, "REJECTED"), mk(3, "APPROVED")]
+        assert mod._ladder_atomic_gate("g1", 1) == "DEAD"
+        print("Test A3 PASS: any REJECTED → DEAD")
+
+        # Test 4: one SKIPPED → DEAD
+        db.query_ladder_group = lambda conn, gid: [
+            mk(1, "APPROVED"), mk(2, "SKIPPED"), mk(3, "APPROVED")]
+        assert mod._ladder_atomic_gate("g1", 1) == "DEAD"
+        print("Test A4 PASS: any SKIPPED → DEAD")
+
+        # Test 5: one already EXECUTED + others APPROVED → DEAD (partial state guard)
+        db.query_ladder_group = lambda conn, gid: [
+            mk(1, "EXECUTED"), mk(2, "APPROVED"), mk(3, "APPROVED")]
+        assert mod._ladder_atomic_gate("g1", 2) == "DEAD"
+        print("Test A5 PASS: partial EXECUTED → DEAD (no double-exec)")
+
+        # Test 6: empty group → DEAD
+        db.query_ladder_group = lambda conn, gid: []
+        assert mod._ladder_atomic_gate("g1", 1) == "DEAD"
+        print("Test A6 PASS: empty group → DEAD")
+
+        # Test 7: mark_dead marks all non-terminal legs SKIPPED
+        updates.clear()
+        db.query_ladder_group = lambda conn, gid: [
+            mk(1, "APPROVED"), mk(2, "SKIPPED"), mk(3, "ADJUSTED")]
+        mod._ladder_mark_dead("g1", "ladder_sibling_failed")
+        # Should update legs 1 (APPROVED) and 3 (ADJUSTED), NOT 2 (already SKIPPED)
+        updated_ids = {u[0] for u in updates}
+        assert updated_ids == {1, 3}, f"expected {{1,3}}, got {updated_ids}"
+        assert all(u[1] == "SKIPPED" for u in updates)
+        assert all(u[2].get("skip_reason") == "ladder_sibling_failed" for u in updates)
+        print("Test A7 PASS: mark_dead marks APPROVED+ADJUSTED, skips terminal")
+
+        print("\nAll atomic-execution gate tests PASS (7/7)")
+    finally:
+        db.query_ladder_group = saved_query
+        db.update_entry_status = saved_update
+        db.connect = saved_connect
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if "--test-atomic" in sys.argv:
+        _test_atomic_execution()
+    else:
+        main()
