@@ -35,6 +35,19 @@
               <option value="false" {% if info.value == 'false' %}selected{% endif %}>false</option>
               <option value="true"  {% if info.value == 'true'  %}selected{% endif %}>true</option>
             </select>
+          {% elif info.key == 'LADDER_MODE' %}
+            <select name="value" class="settings-input">
+              <option value="3bin" {% if info.value == '3bin' %}selected{% endif %}>3bin</option>
+              <option value="off"  {% if info.value == 'off'  %}selected{% endif %}>off</option>
+            </select>
+          {% elif info.key == 'LADDER_STAKE_SPLIT' %}
+            <select name="value" class="settings-input">
+              <option value="kelly" {% if info.value == 'kelly' %}selected{% endif %}>kelly</option>
+              <option value="equal" {% if info.value == 'equal' %}selected{% endif %}>equal</option>
+            </select>
+          {% elif info.key == 'LADDER_MIN_LEG_PRICE' %}
+            <input type="number" name="value" min="0" max="1" step="0.01"
+                   value="{{ info.value }}" class="settings-input">
           {% else %}
             <input type="number" name="value" min="0" step="0.5"
                    value="{{ info.value }}"
@@ -49,6 +62,15 @@
         {% elif info.key == 'POLYMARKET_AUTO_CONFIRM' %}skip per-trade prompt (CLAUDE.md §4.1)
         {% elif info.key == 'POLYMARKET_MAX_SIZE' %}per-trade USD cap
         {% elif info.key == 'POLYMARKET_DAILY_LOSS_LIMIT' %}daily spend USD cap
+        {% elif info.key == 'LADDER_MODE' %}3bin on / off — restart bot to apply
+        {% elif info.key == 'LADDER_STAKE_SPLIT' %}kelly proportional / equal split
+        {% elif info.key == 'LADDER_MIN_LEG_PRICE' %}leg price floor (default 0.10)
+        {% elif info.key == 'LADDER_MIN_LEG_EDGE_PP' %}leg edge floor at discovery (default 10)
+        {% elif info.key == 'LADDER_EXECUTE_MIN_LEG_EDGE_PP' %}leg edge floor at execute (default 4)
+        {% elif info.key == 'LADDER_MIN_TTR_HOURS' %}ladder TTR floor (default 6)
+        {% endif %}
+        {% if info.restart_required %}
+          <br><span class="warn small">↻ restart weather_edge_bot to apply</span>
         {% endif %}
       </td>
     </tr>

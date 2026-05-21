@@ -2231,6 +2231,31 @@ def main():
     p.add_argument("--debug", action="store_true")
     args = p.parse_args()
 
+    # v9: env-var fallback for ladder flags. Lets the dashboard settings
+    # page edit ladder strategy without touching the bot launch script.
+    # Env var overrides argparse default but NOT explicit CLI flag (since
+    # we can't tell argparse "user passed this explicitly" without more
+    # work; in practice operator uses one mechanism or the other).
+    _LADDER_ENV = {
+        "LADDER_MODE": ("ladder_mode", str),
+        "LADDER_STAKE_SPLIT": ("ladder_stake_split", str),
+        "LADDER_MIN_LEG_PRICE": ("ladder_min_leg_price", float),
+        "LADDER_MIN_LEG_EDGE_PP": ("ladder_min_leg_edge_pp", float),
+        "LADDER_EXECUTE_MIN_LEG_EDGE_PP": ("ladder_execute_min_leg_edge_pp", float),
+        "LADDER_MIN_TTR_HOURS": ("ladder_min_ttr_hours", float),
+    }
+    for env_name, (attr, cast) in _LADDER_ENV.items():
+        v = os.environ.get(env_name)
+        if v is not None and v != "":
+            try:
+                setattr(args, attr, cast(v))
+                log_event("ladder_env_override", {
+                    "var": env_name, "value": v, "attr": attr})
+            except (ValueError, TypeError) as e:
+                log_event("error", {"where": "ladder_env_parse",
+                                     "var": env_name, "value": v,
+                                     "err": str(e)}, level="WARN")
+
     # v7: auto-detect multi-source if user didn't pass either flag
     if args.multi_source is None:
         args.multi_source = bool(os.environ.get("VISUAL_CROSSING_API_KEY"))

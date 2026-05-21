@@ -32,10 +32,28 @@ ALLOWED_VARS = {
     "POLYMARKET_MAX_SIZE",
     "POLYMARKET_DAILY_LOSS_LIMIT",
     "POLYMARKET_AUTO_CONFIRM",
+    # v9: ladder strategy env vars (bot picks these up at startup,
+    # overriding argparse defaults).
+    "LADDER_MODE",
+    "LADDER_STAKE_SPLIT",
+    "LADDER_MIN_LEG_PRICE",
+    "LADDER_MIN_LEG_EDGE_PP",
+    "LADDER_EXECUTE_MIN_LEG_EDGE_PP",
+    "LADDER_MIN_TTR_HOURS",
 }
 
 
 SECRET_VARS = {"POLYMARKET_PRIVATE_KEY"}
+
+# v9: ladder vars need restart of weather_edge_bot to take effect.
+RESTART_REQUIRED_VARS = {
+    "LADDER_MODE",
+    "LADDER_STAKE_SPLIT",
+    "LADDER_MIN_LEG_PRICE",
+    "LADDER_MIN_LEG_EDGE_PP",
+    "LADDER_EXECUTE_MIN_LEG_EDGE_PP",
+    "LADDER_MIN_TTR_HOURS",
+}
 
 
 def mask_secret(value: Optional[str]) -> str:
@@ -69,6 +87,29 @@ def _validate(key: str, value: str) -> None:
                 raise ValueError("must be > 0")
         except ValueError as e:
             raise ValueError(f"{key} must be a positive number ({e})")
+    # v9 ladder vars
+    elif key == "LADDER_MODE":
+        if value not in ("off", "3bin"):
+            raise ValueError("LADDER_MODE must be 'off' or '3bin'")
+    elif key == "LADDER_STAKE_SPLIT":
+        if value not in ("kelly", "equal"):
+            raise ValueError("LADDER_STAKE_SPLIT must be 'kelly' or 'equal'")
+    elif key == "LADDER_MIN_LEG_PRICE":
+        try:
+            f = float(value)
+            if not (0 <= f <= 1):
+                raise ValueError("must be in [0, 1]")
+        except ValueError as e:
+            raise ValueError(f"{key} must be a number in [0, 1] ({e})")
+    elif key in ("LADDER_MIN_LEG_EDGE_PP",
+                  "LADDER_EXECUTE_MIN_LEG_EDGE_PP",
+                  "LADDER_MIN_TTR_HOURS"):
+        try:
+            f = float(value)
+            if f < 0:
+                raise ValueError("must be >= 0")
+        except ValueError as e:
+            raise ValueError(f"{key} must be a non-negative number ({e})")
 
 
 def read_env_file(path: Path = None) -> dict[str, str]:
@@ -97,7 +138,10 @@ def get_displayable_settings() -> dict:
     """Return current state of all editable vars, with secrets masked."""
     env = read_env_file()
     out = {}
-    for k in sorted(ALLOWED_VARS):
+    # Order: live trading vars first, then ladder vars
+    live_vars = sorted(v for v in ALLOWED_VARS if v.startswith("POLYMARKET_"))
+    ladder_vars = sorted(v for v in ALLOWED_VARS if v.startswith("LADDER_"))
+    for k in live_vars + ladder_vars:
         v = env.get(k, "")
         out[k] = {
             "key": k,
@@ -105,6 +149,7 @@ def get_displayable_settings() -> dict:
             "is_secret": k in SECRET_VARS,
             "display": mask_secret(v) if k in SECRET_VARS else (v or "(unset)"),
             "is_set": bool(v),
+            "restart_required": k in RESTART_REQUIRED_VARS,
         }
     return out
 

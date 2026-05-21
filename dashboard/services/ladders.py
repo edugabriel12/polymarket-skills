@@ -7,6 +7,7 @@ table. Read-only.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -156,6 +157,146 @@ def get_open_ladder_groups() -> list[dict]:
             g["n_legs"] = len(g["legs"])
             g["leg_label"] = (f"{g['n_legs']}-bin"
                               if g["n_legs"] >= 2 else "1-bin (partial)")
+        return out
+    finally:
+        conn.close()
+
+
+# Event types that constitute the atomic execution + atomic cashout trail.
+# The bot emits these from _execute_ladder_group_atomic, _ladder_atomic_gate
+# (indirectly via gating decisions logged on skip), _do_ladder_cashout, etc.
+_LADDER_EVENT_TYPES = {
+    "ladder_built",
+    "ladder_dropped",
+    "ladder_group_dead",
+    "ladder_aborted",
+    "ladder_partial_execution",
+    "ladder_executed",
+    "ladder_executed_dry",
+    "ladder_cashout_executed",
+    "ladder_cashout_dry",
+    "ladder_leg_close_rejected",
+}
+
+
+def get_atomic_trail(entry_id: int, max_events: int = 200) -> dict:
+    """v9: read the JSONL event log and return all events tied to the
+    ladder group this entry belongs to. Used by the replay modal to
+    show the atomic gate decisions (READY/DEFER/DEAD), atomic execution,
+    atomic cashout for the whole group.
+
+    Returns {"group_id": str|None, "events": [...]}. If the entry has no
+    ladder_group_id, events list is empty.
+    """
+    # First resolve entry → group_id from the DB
+    try:
+        conn = _ro_conn(S.WEATHER_EDGE_DB)
+    except FileNotFoundError:
+        return {"group_id": None, "events": []}
+    try:
+        try:
+            row = conn.execute(
+                "SELECT ladder_group_id FROM entries WHERE entry_id = ?",
+                (entry_id,)).fetchone()
+        except Exception:
+            return {"group_id": None, "events": []}
+        if not row or not row["ladder_group_id"]:
+            return {"group_id": None, "events": []}
+        group_id = row["ladder_group_id"]
+    finally:
+        conn.close()
+
+    # Scan the JSONL log for events whose payload mentions this group_id.
+    # We import settings lazily because S is already loaded above.
+    log_path = getattr(S, "JSONL_PATH", None)
+    if log_path is None or not Path(log_path).exists():
+        return {"group_id": group_id, "events": []}
+
+    matched = []
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or "ladder" not in line:
+                    continue
+                # Cheap pre-filter: skip lines that don't mention the group_id
+                if group_id not in line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if ev.get("event_type") not in _LADDER_EVENT_TYPES:
+                    continue
+                payload = ev.get("payload") or {}
+                if payload.get("ladder_group_id") != group_id:
+                    continue
+                matched.append({
+                    "ts": ev.get("ts", "")[:19].replace("T", " "),
+                    "level": ev.get("level", "INFO"),
+                    "event_type": ev.get("event_type"),
+                    "payload": payload,
+                })
+    except OSError:
+        return {"group_id": group_id, "events": []}
+
+    # Return ordered chronologically, cap to max_events
+    return {"group_id": group_id, "events": matched[:max_events]}
+
+
+def get_resolved_ladder_history(limit: int = 50) -> list[dict]:
+    """Closed ladder groups (all legs have a cashout row) with realized
+    P&L summed across legs. Most recent groups first.
+    """
+    try:
+        conn = _ro_conn(S.WEATHER_EDGE_DB)
+    except FileNotFoundError:
+        return []
+    try:
+        try:
+            conn.execute("SELECT ladder_group_id FROM entries LIMIT 1")
+        except Exception:
+            return []
+
+        # Aggregate by group: sum P&L, count legs, fetch a representative
+        # event metadata (use the central leg).
+        rows = conn.execute("""
+            SELECT e.ladder_group_id,
+                   e.ladder_event_slug,
+                   e.city_resolved,
+                   e.end_date,
+                   COUNT(*) n_legs,
+                   SUM(e.size_usd) total_stake,
+                   SUM(c.realized_pnl_usd) total_pnl,
+                   MAX(c.ts) last_cashout_ts,
+                   MAX(c.reason) reason
+            FROM entries e
+            JOIN cashouts c ON c.entry_id = e.entry_id
+            WHERE e.ladder_group_id IS NOT NULL
+              AND e.status = 'EXECUTED'
+            GROUP BY e.ladder_group_id
+            HAVING COUNT(*) > 0
+            ORDER BY last_cashout_ts DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+
+        out = []
+        for r in rows:
+            stake = float(r["total_stake"] or 0)
+            pnl = float(r["total_pnl"] or 0)
+            out.append({
+                "ladder_group_id": r["ladder_group_id"],
+                "event_slug": r["ladder_event_slug"],
+                "city": r["city_resolved"],
+                "end_date": r["end_date"],
+                "n_legs": r["n_legs"],
+                "total_stake_usd": round(stake, 2),
+                "total_pnl_usd": round(pnl, 2),
+                "pnl_pct": round(pnl / stake * 100, 1) if stake else None,
+                "last_cashout_ts": r["last_cashout_ts"],
+                "reason": (r["reason"] or "").split(":")[0],  # strip prefix
+                "won": pnl > 0,
+            })
         return out
     finally:
         conn.close()

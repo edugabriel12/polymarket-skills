@@ -53,6 +53,30 @@ def page_overview(request: Request):
         request, "overview.html", _common_ctx("overview"))
 
 
+@app.get("/ladders", response_class=HTMLResponse)
+def ladders_view(request: Request):
+    """v9: dedicated 3-bin ladder view — open groups + resolved history."""
+    from .services import ladders as ladder_svc
+    try:
+        kpis = ladder_svc.get_ladder_kpis(days=14)
+    except Exception as e:
+        kpis = {"available": False, "reason": str(e)}
+    try:
+        open_groups = ladder_svc.get_open_ladder_groups()
+    except Exception:
+        open_groups = []
+    try:
+        history = ladder_svc.get_resolved_ladder_history(limit=50)
+    except Exception:
+        history = []
+    return templates.TemplateResponse(
+        request, "ladders.html",
+        {"active_tab": "ladders",
+         "ladder_kpis": kpis,
+         "open_groups": open_groups,
+         "history": history})
+
+
 @app.get("/positions", response_class=HTMLResponse)
 def page_positions(request: Request):
     return templates.TemplateResponse(
@@ -531,9 +555,15 @@ def api_cum_pnl_chart(days: int = 30):
 @app.get("/api/replay/{entry_id}", response_class=HTMLResponse)
 def api_replay(request: Request, entry_id: int):
     md = analytics.replay_entry_md(entry_id)
+    # v9: if entry is part of a ladder, fetch atomic trail
+    try:
+        from .services import ladders
+        ladder_trail = ladders.get_atomic_trail(entry_id)
+    except Exception:
+        ladder_trail = {"group_id": None, "events": []}
     return templates.TemplateResponse(
         request, "partials/replay_modal.html",
-        {"entry_id": entry_id, "md": md})
+        {"entry_id": entry_id, "md": md, "ladder_trail": ladder_trail})
 
 
 # ---------------------------------------------------------------------------

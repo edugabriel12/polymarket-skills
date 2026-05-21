@@ -1,2 +1,56 @@
 <h2>Replay #{{ entry_id }}</h2>
+
+{% if ladder_trail and ladder_trail.events %}
+<details open class="ladder-trail">
+  <summary>
+    <span class="ladder-badge ladder-pos-central">⛓ ladder trail</span>
+    Group <code>{{ ladder_trail.group_id[:8] }}…</code> ·
+    {{ ladder_trail.events|length }} event(s)
+  </summary>
+  <table class="data-table" style="margin-top:8px;">
+    <thead>
+      <tr><th>Time</th><th>Event</th><th>Detail</th></tr>
+    </thead>
+    <tbody>
+      {% for ev in ladder_trail.events %}
+      <tr>
+        <td class="mono small muted">{{ ev.ts }}</td>
+        <td>
+          <span class="event-type
+            {% if 'aborted' in ev.event_type or 'dead' in ev.event_type or 'partial' in ev.event_type or 'rejected' in ev.event_type or 'dropped' in ev.event_type %}down
+            {% elif 'executed' in ev.event_type or 'built' in ev.event_type %}up
+            {% endif %}">{{ ev.event_type }}</span>
+          {% if ev.level == 'ERROR' %}<span class="reason-tag reason-judge_unavailable">ERR</span>
+          {% elif ev.level == 'WARN' %}<span class="reason-tag">WARN</span>
+          {% endif %}
+        </td>
+        <td class="mono small">
+          {% if ev.payload.reason %}<b>{{ ev.payload.reason }}</b><br>{% endif %}
+          {% if ev.payload.positions %}positions: {{ ev.payload.positions|join(',') }}<br>{% endif %}
+          {% if ev.payload.stakes_usd %}stakes: ${{ ev.payload.stakes_usd|join(', $') }}<br>{% endif %}
+          {% if ev.payload.n_legs %}n_legs: {{ ev.payload.n_legs }}<br>{% endif %}
+          {% if ev.payload.n_legs_total and ev.payload.n_legs_closed is defined %}
+            closed: {{ ev.payload.n_legs_closed }}/{{ ev.payload.n_legs_total }}<br>
+          {% endif %}
+          {% if ev.payload.total_pnl_usd is defined %}
+            <span class="{% if ev.payload.total_pnl_usd >= 0 %}up{% else %}down{% endif %}">
+              group P&L: ${{ "%.2f"|format(ev.payload.total_pnl_usd) }}
+            </span><br>
+          {% endif %}
+          {% if ev.payload.trigger_reason %}trigger: {{ ev.payload.trigger_reason }}<br>{% endif %}
+          {% if ev.payload.failed_reason %}fail: {{ ev.payload.failed_reason }}<br>{% endif %}
+          {% if ev.payload.marked_skipped %}marked SKIPPED: {{ ev.payload.marked_skipped|join(', ') }}{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</details>
+{% elif ladder_trail and ladder_trail.group_id %}
+<div class="muted small" style="margin:8px 0;">
+  ⛓ Ladder group <code>{{ ladder_trail.group_id[:8] }}…</code>: no events found
+  in JSONL log (may have been rotated or pruned).
+</div>
+{% endif %}
+
 <pre class="replay-md">{{ md }}</pre>

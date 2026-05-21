@@ -738,3 +738,8 @@ footer {
 
 .kpi-grid-ladder { border-top: 1px dashed var(--border); padding-top: 12px; margin-top: 12px; }
 .kpi-grid-ladder .kpi-label::before { content: "⛓ "; opacity: 0.6; }
+
+/* v9: /ladders page leg breakdown */
+.leg-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
+.leg-row:not(:last-child) { border-bottom: 1px dashed var(--border); }
+.ladders-table td { vertical-align: top; }
