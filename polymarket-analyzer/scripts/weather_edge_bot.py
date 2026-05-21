@@ -640,15 +640,35 @@ def _build_ladder_candidates(candidates: list[dict], args) -> list[dict]:
     # --ladder-min-leg-price floor in ladder mode; here we enforce the
     # stricter check for legs that won't benefit from Kelly-capped ladder
     # coordination.
+    # v9.2: same logic for edge — orphans must pass --min-edge-pp, while
+    # multi-leg ladder legs only need --ladder-min-leg-edge-pp.
     single_floor = float(args.min_entry_price or 0.0)
-    for s in singles:
+    single_edge_floor = float(args.min_edge_pp or 0.0)
+
+    def _orphan_passes(s: dict, reason_label: str,
+                        event_slug: str = None) -> bool:
         if single_floor > 0 and float(s["entry_price"]) < single_floor:
             log_event("market_skipped", {
-                "slug": s.get("slug"), "reason": "single_bin_too_cheap",
+                "slug": s.get("slug"),
+                "reason": f"{reason_label}_too_cheap",
                 "entry_price": s["entry_price"],
-                "min_required": single_floor})
-            continue
-        out.append(s)
+                "min_required": single_floor,
+                **({"event_slug": event_slug} if event_slug else {})})
+            return False
+        if (single_edge_floor > 0
+                and float(s.get("edge_pp") or 0.0) < single_edge_floor):
+            log_event("market_skipped", {
+                "slug": s.get("slug"),
+                "reason": f"{reason_label}_edge_too_low",
+                "edge_pp": s.get("edge_pp"),
+                "min_required": single_edge_floor,
+                **({"event_slug": event_slug} if event_slug else {})})
+            return False
+        return True
+
+    for s in singles:
+        if _orphan_passes(s, "single_bin"):
+            out.append(s)
 
     total_ladder_budget = float(args.max_market_exposure_usd)
     split_mode = getattr(args, "ladder_stake_split", "kelly")
@@ -656,18 +676,11 @@ def _build_ladder_candidates(candidates: list[dict], args) -> list[dict]:
     for event_slug, group in groups.items():
         if len(group) < 2:
             # Lone bracket in an event — treat as single-bin and enforce
-            # the higher single-bin floor (cheap orphans are the
+            # the higher single-bin floors (cheap orphans are the
             # historical loser cohort, not protected by ladder Kelly).
             for s in group:
-                if single_floor > 0 and float(s["entry_price"]) < single_floor:
-                    log_event("market_skipped", {
-                        "slug": s.get("slug"),
-                        "reason": "ladder_orphan_too_cheap",
-                        "entry_price": s["entry_price"],
-                        "min_required": single_floor,
-                        "event_slug": event_slug})
-                    continue
-                out.append(s)
+                if _orphan_passes(s, "ladder_orphan", event_slug):
+                    out.append(s)
             continue
 
         # Pick central/below/above
@@ -895,7 +908,15 @@ def run_discovery(args, cities: dict) -> int:
             continue
 
         edge = compute_edge(forecast_prob, implied)
-        if edge["best_side"] is None or edge["edge_pp_at_best"] < args.min_edge_pp:
+        # v9.2: in ladder mode, use the lower --ladder-min-leg-edge-pp
+        # floor at discovery — adjacent legs (below/above) structurally
+        # have smaller edges than the central, and they're admitted as
+        # hedges (Kelly proportional sizing caps stake on small edges).
+        # _build_ladder_candidates enforces --min-edge-pp on orphans.
+        in_ladder_mode = getattr(args, "ladder_mode", "3bin") != "off"
+        edge_floor = (args.ladder_min_leg_edge_pp if in_ladder_mode
+                       else args.min_edge_pp)
+        if edge["best_side"] is None or edge["edge_pp_at_best"] < edge_floor:
             skipped["low_edge"] += 1
             log_event("market_evaluated", {
                 "slug": slug, "side": edge["best_side"],
@@ -905,6 +926,8 @@ def run_discovery(args, cities: dict) -> int:
                 "yes_ask": implied["yes_ask"],
                 "no_ask": implied["no_ask"],
                 "mae_meta": mae_meta,
+                "edge_floor": edge_floor,
+                "mode": "ladder" if in_ladder_mode else "single_bin",
             })
             continue
 
@@ -1227,7 +1250,11 @@ def _execute_ladder_group_atomic(group_id: str, args, engine,
         if forecast_prob is not None:
             current_edge_pp = round(
                 (float(forecast_prob) - fill_price) * 100.0, 4)
-            min_edge = getattr(args, "execute_min_edge_pp", None) or args.min_edge_pp
+            # v9.2: ladder legs use the lower per-leg execute floor.
+            # Single-bin entries use the standard --execute-min-edge-pp.
+            min_edge = (getattr(args, "ladder_execute_min_leg_edge_pp", None)
+                        or getattr(args, "execute_min_edge_pp", None)
+                        or args.min_edge_pp)
             if current_edge_pp < min_edge:
                 return _ladder_abort(group_id, "edge_stale", entry_id)
 
@@ -2130,6 +2157,25 @@ def main():
                         "single-bin floor). In --ladder-mode off, this "
                         "flag is ignored and --min-entry-price applies "
                         "uniformly.")
+    p.add_argument("--ladder-min-leg-edge-pp", type=float, default=10.0,
+                   help="Minimum edge_pp for a leg to enter ladder "
+                        "discovery (default 10). Lower than --min-edge-pp "
+                        "(default 20) because adjacent legs (below/above) "
+                        "structurally have smaller edges than the central "
+                        "— they're hedges, not standalone bets. Kelly "
+                        "sizing caps stake on small-edge legs. Orphan "
+                        "legs (alone in an event) must still pass "
+                        "--min-edge-pp to be admitted as single-bin. In "
+                        "--ladder-mode off, --min-edge-pp applies "
+                        "uniformly.")
+    p.add_argument("--ladder-execute-min-leg-edge-pp", type=float, default=4.0,
+                   help="Minimum edge_pp at EXECUTION time for ladder "
+                        "legs (default 4). Lower than --execute-min-edge-"
+                        "pp (default 8) because losing any one ladder "
+                        "leg to edge_stale aborts the whole group via "
+                        "atomic gate. Allows the central + adjacents to "
+                        "execute together even when adjacents have "
+                        "decayed into the 4-8pp band.")
     p.add_argument("--fast-path-ttr-min", type=int, default=60)
     p.add_argument("--profit-lock-pp", type=float, default=50.0,
                    help="Cashout when bid >= entry + X pp (default 50pp = "
@@ -2346,7 +2392,9 @@ def _test_ladder_orphan_floor():
     base_args = SimpleNamespace(
         max_market_exposure_usd=50.0,
         min_entry_price=0.30,
+        min_edge_pp=20.0,
         ladder_min_leg_price=0.10,
+        ladder_min_leg_edge_pp=10.0,
         ladder_mode="3bin",
         ladder_stake_split="kelly",
     )
@@ -2354,23 +2402,23 @@ def _test_ladder_orphan_floor():
     # Test 1: orphan cheap leg (no event_slug) blocked by single_floor
     cands = [{"slug": "s1", "event_slug": "",
               "entry_price": 0.15, "spec": spec_stub,
-              "forecast_prob": 0.50}]
+              "forecast_prob": 0.50, "edge_pp": 25.0}]
     out = mod._build_ladder_candidates(cands, base_args)
     assert len(out) == 0, f"orphan at 0.15 < min 0.30 should drop, got {out}"
     print("Test O1 PASS: orphan single-bin below 0.30 dropped")
 
-    # Test 2: orphan above floor kept
+    # Test 2: orphan above price floor + edge floor kept
     cands = [{"slug": "s2", "event_slug": "",
               "entry_price": 0.40, "spec": spec_stub,
-              "forecast_prob": 0.50}]
+              "forecast_prob": 0.50, "edge_pp": 25.0}]
     out = mod._build_ladder_candidates(cands, base_args)
     assert len(out) == 1
-    print("Test O2 PASS: orphan single-bin above 0.30 kept")
+    print("Test O2 PASS: orphan single-bin above both floors kept")
 
     # Test 3: lone leg in an event_slug group also enforced (ladder orphan)
     cands = [{"slug": "s3", "event_slug": "evX",
               "entry_price": 0.20, "spec": spec_stub,
-              "forecast_prob": 0.50}]
+              "forecast_prob": 0.50, "edge_pp": 25.0}]
     out = mod._build_ladder_candidates(cands, base_args)
     assert len(out) == 0
     print("Test O3 PASS: lone leg in event below 0.30 dropped (orphan)")
@@ -2380,18 +2428,34 @@ def _test_ladder_orphan_floor():
     spec_b = SimpleNamespace(threshold_value=75, confidence=1.0)
     cands = [{"slug": "s4a", "event_slug": "evY",
               "entry_price": 0.55, "spec": spec_a,
-              "forecast_prob": 0.70},
+              "forecast_prob": 0.70, "edge_pp": 15.0},
              {"slug": "s4b", "event_slug": "evY",
               "entry_price": 0.18, "spec": spec_b,
-              "forecast_prob": 0.30}]
+              "forecast_prob": 0.30, "edge_pp": 12.0}]
     out = mod._build_ladder_candidates(cands, base_args)
     # Both legs should make it through with shared ladder_group_id
     assert len(out) == 2, f"expected 2 legs, got {len(out)}"
     assert all(c.get("ladder_group_id") for c in out)
     assert out[0]["ladder_group_id"] == out[1]["ladder_group_id"]
-    print("Test O4 PASS: 2-leg ladder admits cheap leg under Kelly")
+    print("Test O4 PASS: 2-leg ladder admits cheap+low-edge legs under Kelly")
 
-    print("\nAll ladder orphan-floor tests PASS (4/4)")
+    # Test 5: v9.2 orphan with low edge (15pp < 20pp single floor) blocked
+    cands = [{"slug": "s5", "event_slug": "",
+              "entry_price": 0.40, "spec": spec_stub,
+              "forecast_prob": 0.50, "edge_pp": 15.0}]
+    out = mod._build_ladder_candidates(cands, base_args)
+    assert len(out) == 0, f"orphan with edge=15pp < 20pp should drop, got {out}"
+    print("Test O5 PASS: orphan with edge below --min-edge-pp dropped")
+
+    # Test 6: lone leg in event with edge=15pp also blocked as ladder orphan
+    cands = [{"slug": "s6", "event_slug": "evZ",
+              "entry_price": 0.40, "spec": spec_stub,
+              "forecast_prob": 0.50, "edge_pp": 15.0}]
+    out = mod._build_ladder_candidates(cands, base_args)
+    assert len(out) == 0
+    print("Test O6 PASS: lone ladder leg with low edge dropped")
+
+    print("\nAll ladder orphan-floor tests PASS (6/6)")
 
 
 if __name__ == "__main__":
