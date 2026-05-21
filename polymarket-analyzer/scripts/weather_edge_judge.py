@@ -6,7 +6,9 @@ forecast sources (NWS, Visual Crossing, web search), calls Claude with the
 versioned judge prompt + structured output schema, and records APPROVE /
 REJECT / ADJUST verdict back to the DB.
 
-Default model: claude-sonnet-4-6 (good cost/perf for 24/7 with prompt caching).
+Default model: claude-haiku-4-5 (3x cheaper than Sonnet for 24/7 use;
+Rule 6 hard-enforce in apply_verdict catches the higher rubber-stamping
+risk of the smaller model).
 Override via CLAUDE_JUDGE_MODEL env var.
 
 Daily budget cap: JUDGE_DAILY_BUDGET_USD (default $15). When exceeded, judge
@@ -18,7 +20,7 @@ Required env vars:
   NWS_USER_AGENT           (per NWS policy: "<app> <contact email>")
 
 Optional:
-  CLAUDE_JUDGE_MODEL       (default claude-sonnet-4-6)
+  CLAUDE_JUDGE_MODEL       (default claude-haiku-4-5)
   JUDGE_POLL_INTERVAL_SEC  (default 120)
   JUDGE_DAILY_BUDGET_USD   (default 15)
 """
@@ -76,7 +78,7 @@ LOG_DIR = Path.home() / ".polymarket-paper"
 LOG_FILE = LOG_DIR / "weather_edge.jsonl"
 PROMPT_PATH = REPO_ROOT / "polymarket-analyzer" / "references" / "weather-judge-prompt.md"
 
-DEFAULT_MODEL = os.environ.get("CLAUDE_JUDGE_MODEL", "claude-sonnet-4-6")
+DEFAULT_MODEL = os.environ.get("CLAUDE_JUDGE_MODEL", "claude-haiku-4-5")
 POLL_INTERVAL = int(os.environ.get("JUDGE_POLL_INTERVAL_SEC", "120"))
 DAILY_BUDGET_USD = float(os.environ.get("JUDGE_DAILY_BUDGET_USD", "15.0"))
 # Pre-judge edge re-check threshold (pp). If the entry's current
@@ -265,7 +267,7 @@ def call_claude(entry_row: dict, evidence: dict, system_prompt: str) -> Optional
 
     # Compute cost
     usage = response.usage
-    pricing = PRICING.get(DEFAULT_MODEL, PRICING["claude-sonnet-4-6"])
+    pricing = PRICING.get(DEFAULT_MODEL, PRICING["claude-haiku-4-5"])
     cost = (
         usage.input_tokens * pricing["input"] / 1_000_000 +
         usage.output_tokens * pricing["output"] / 1_000_000 +
