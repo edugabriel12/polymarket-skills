@@ -39,12 +39,12 @@
           {% endif %}
         </div>
         <div class="slug muted small">
-          <a href="https://polymarket.com/event/{{ p.market_slug }}"
+          <a href="https://polymarket.com/event/{{ p.parent_event_slug or p.market_slug }}"
              target="_blank" rel="noopener"
              onclick="event.stopPropagation()"
              class="market-link"
-             title="Open on Polymarket">
-            {{ p.market_slug|truncate(40) }} ↗
+             title="Open parent event on Polymarket">
+            {{ (p.parent_event_slug or p.market_slug)|truncate(40) }} ↗
           </a>
         </div>
       </td>

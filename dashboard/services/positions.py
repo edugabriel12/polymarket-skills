@@ -8,15 +8,107 @@ modules. Read-only.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+import requests
 
 from .. import settings as S  # noqa: F401 — primes sys.path
 
 import weather_edge_db as wdb  # noqa: E402
 from weather_edge_helpers import evaluate_cashout_triggers  # noqa: E402
+
+
+# v9.7: derive parent-event slug for the Polymarket link. Bracket sub-markets
+# come with a temperature/threshold suffix appended to the parent slug:
+#   parent: "highest-temperature-in-kuala-lumpur-on-may-23-2026"
+#   bracket: "highest-temperature-in-kuala-lumpur-on-may-23-2026-33c"
+#   bracket: "highest-temperature-in-nyc-on-may-25-2026-90f"
+# Match ONLY a trailing "-<digits>(c|f)" to avoid swallowing the year
+# (e.g. "...-2026-33c" must keep "-2026", strip "-33c"). Decimal degrees
+# are rare on Polymarket weather markets and would just leave the
+# decimal portion on the link — harmless.
+_THRESHOLD_SUFFIX_RE = re.compile(r"-\d+(?:c|f|°c|°f)$", re.IGNORECASE)
+
+
+def parent_event_slug(market_slug: str,
+                       ladder_event_slug: Optional[str] = None) -> str:
+    """Return the parent Polymarket event slug for a position's market.
+
+    Preference order:
+      1. `ladder_event_slug` if non-empty — authoritative (from Gamma /events)
+      2. Strip trailing threshold suffix from `market_slug`
+      3. Fall back to `market_slug` as-is
+    """
+    if ladder_event_slug:
+        return ladder_event_slug
+    if not market_slug:
+        return ""
+    stripped = _THRESHOLD_SUFFIX_RE.sub("", market_slug)
+    return stripped or market_slug
+
+
+# v9.7: lightweight CLOB orderbook fetch for live price refresh. Mirrors
+# the bot's fetch_orderbook but kept local so the dashboard doesn't depend
+# on the bot module loading at import time.
+_CLOB_BASE = "https://clob.polymarket.com"
+
+
+def _fetch_best_bid(token_id: str, timeout: float = 4.0) -> Optional[float]:
+    """Single-shot HTTP fetch of the best bid for a token. Returns None on
+    any failure so callers fall back to cached monitor_check bid.
+    """
+    if not token_id:
+        return None
+    try:
+        r = requests.get(f"{_CLOB_BASE}/book",
+                          params={"token_id": str(token_id)},
+                          timeout=timeout)
+        if r.status_code != 200:
+            return None
+        bids = r.json().get("bids") or []
+        if not bids:
+            return None
+        # CLOB returns bids highest-first; the first entry is best.
+        # Defensive: max() in case ordering changes.
+        prices = []
+        for b in bids:
+            try:
+                prices.append(float(b["price"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return max(prices) if prices else None
+    except (requests.RequestException, ValueError, KeyError):
+        return None
+
+
+def _refresh_bids_parallel(positions: list[dict],
+                            max_workers: int = 12) -> dict[int, Optional[float]]:
+    """Fetch live best-bid for each position in parallel. Returns a dict
+    entry_id → best_bid (or None on failure).
+    """
+    if not positions:
+        return {}
+
+    def _one(p):
+        side = p.get("side")
+        token = p.get("token_id_yes") if side == "YES" else p.get("token_id_no")
+        return p["entry_id"], _fetch_best_bid(token)
+
+    out: dict[int, Optional[float]] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_one, p): p["entry_id"] for p in positions}
+        for fut in as_completed(futures, timeout=15.0):
+            try:
+                eid, bid = fut.result(timeout=5.0)
+                out[eid] = bid
+            except Exception:
+                out[futures[fut]] = None
+    return out
 
 
 def _ro_conn(path: Path) -> sqlite3.Connection:
@@ -152,19 +244,36 @@ def trigger_distances(
     }
 
 
-def get_open_positions(sort_by: str = "entry_id") -> list[dict]:
+def get_open_positions(sort_by: str = "entry_id",
+                        refresh_prices: bool = False) -> list[dict]:
     """Return a list of open positions with bid, peak, P&L, trigger
     distances, and time held.
 
     sort_by: 'entry_id' (default, most recent first) or 'size' (largest
     stake first — used by Overview's 'top 5 by size' slot).
+
+    refresh_prices: when True (positions page on tab open / auto-refresh),
+    hit CLOB live for each position's token and use that bid instead of
+    the cached monitor_check value. Lets the operator see real-time P&L
+    independent of the monitor cycle interval. Adds ~1-5s page load
+    depending on position count (parallelized, 12 concurrent fetches).
     """
     try:
         conn = _ro_conn(S.WEATHER_EDGE_DB)
     except FileNotFoundError:
         return []
     try:
-        rows = wdb.query_open_positions(conn)
+        rows = list(wdb.query_open_positions(conn))
+        # v9.7: optional live CLOB refresh — done up-front, in parallel,
+        # so each position uses the freshest possible bid instead of the
+        # cached monitor_check.
+        live_bids: dict[int, Optional[float]] = {}
+        if refresh_prices and rows:
+            mini = [{"entry_id": r["entry_id"], "side": r["side"],
+                      "token_id_yes": r["token_id_yes"],
+                      "token_id_no": r["token_id_no"]}
+                     for r in rows]
+            live_bids = _refresh_bids_parallel(mini)
         out = []
         now = datetime.now(timezone.utc)
         for row in rows:
@@ -175,7 +284,13 @@ def get_open_positions(sort_by: str = "entry_id") -> list[dict]:
             peak = float(row["peak_bid_seen"]) if row["peak_bid_seen"] is not None else None
 
             current_bid, bid_ts = _latest_bid(conn, entry_id)
-            if current_bid is None:
+            # v9.7: prefer live CLOB bid when refresh requested + fetch
+            # succeeded. Fall back through monitor_check → entry_price.
+            live_bid = live_bids.get(entry_id)
+            if live_bid is not None:
+                current_bid = live_bid
+                bid_ts = "live"
+            elif current_bid is None:
                 current_bid = entry_price  # fallback to entry
 
             fcst = _latest_forecast_prob_yes(conn, entry_id)
@@ -196,9 +311,17 @@ def get_open_positions(sort_by: str = "entry_id") -> list[dict]:
             except Exception:
                 held_seconds = 0
 
+            # v9.7: derive the parent-event slug for the Polymarket link.
+            # ladder_event_slug is authoritative when set, else strip the
+            # threshold suffix from market_slug.
+            _les = (row["ladder_event_slug"]
+                     if "ladder_event_slug" in row.keys() else None)
+            parent_slug = parent_event_slug(row["market_slug"], _les)
+
             out.append({
                 "entry_id": entry_id,
                 "market_slug": row["market_slug"],
+                "parent_event_slug": parent_slug,
                 "market_question": row["market_question"],
                 "city": row["city_resolved"],
                 "side": side,

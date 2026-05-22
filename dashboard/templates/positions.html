@@ -5,10 +5,13 @@
   <h2>Open positions</h2>
   <p class="muted small">Click a position row to see its replay (judge verdict, forecast, history, counterfactual).</p>
   <div id="positions-full"
-       hx-get="/api/positions"
+       hx-get="/api/positions?refresh=1"
        hx-trigger="load, every {{ refresh_positions_sec }}s"
        hx-swap="innerHTML">
-    <div class="muted">Loading positions…</div>
+    <div class="muted">Loading live positions…</div>
+  </div>
+  <div class="muted small" style="margin-top:6px;">
+    ⚡ Live CLOB bids · refreshes every {{ refresh_positions_sec }}s
   </div>
 </section>
 

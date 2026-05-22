@@ -535,10 +535,15 @@ def api_recent_events(request: Request, limit: int = 10):
 
 
 @app.get("/api/positions", response_class=HTMLResponse)
-def api_positions(request: Request, top: int = 0, sort: str = "entry_id"):
+def api_positions(request: Request, top: int = 0, sort: str = "entry_id",
+                   refresh: int = 0):
     # Overview's mini-table uses sort=size to show the biggest stakes first;
     # the full Positions page sticks with entry_id (newest first).
-    pos = positions.get_open_positions(sort_by=sort)
+    # v9.7: refresh=1 hits CLOB live for each open position (Positions
+    # page passes this on load + every 30s). Overview mini-table omits
+    # it to keep that page cheap.
+    pos = positions.get_open_positions(
+        sort_by=sort, refresh_prices=bool(refresh))
     if top > 0:
         pos = pos[:top]
     return templates.TemplateResponse(
