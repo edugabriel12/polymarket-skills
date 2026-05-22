@@ -2220,8 +2220,14 @@ def main():
                    help="Cashout if bid falls X%% below peak (default 15%% — "
                         "was 30%% but operator analysis 2026-05-15 showed "
                         "84%% of trades held to resolution where they lost)")
-    p.add_argument("--convergence-pp", type=float, default=5.0,
-                   help="Cashout when bid within X pp of forecast fair value (default 5pp)")
+    p.add_argument("--convergence-pp", type=float, default=0.0,
+                   help="DEPRECATED in v9.5 (2026-05-22). Default 0 "
+                        "(disabled). Under 3-bin laddering the P&L motor "
+                        "is winner-takes-payout-at-resolution, not price "
+                        "discovery — closing on convergence captured ~30% "
+                        "of full payout. Set to a positive value (e.g. 5) "
+                        "only if running single-bin orphan mode "
+                        "exclusively and you want the legacy trigger back.")
     p.add_argument("--max-market-exposure-usd", type=float, default=50.0,
                    help="Total $ exposure cap per market_slug (YES+NO summed, "
                         "across all open positions). Default $50.")

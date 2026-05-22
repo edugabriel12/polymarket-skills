@@ -1131,7 +1131,15 @@ def evaluate_cashout_triggers(
             }
 
     # Trigger 3: convergence
-    if in_profit and forecast_prob_yes is not None:
+    # v9.5 (2026-05-22): under 3-bin laddering this trigger is net-negative
+    # because the P&L motor is winner-takes-payout-at-resolution, NOT price
+    # discovery of a single bracket. Convergence fires exactly when the
+    # bot's edge is being validated by the market, but holding to resolution
+    # extracts ~3x more value than exiting at convergence. Pass
+    # convergence_pp <= 0 to disable (now the default). Kept here so old
+    # callers passing positive values still get the legacy behaviour.
+    if (convergence_pp > 0 and in_profit
+            and forecast_prob_yes is not None):
         fair_value = (forecast_prob_yes if side == "YES"
                       else 1.0 - forecast_prob_yes)
         if current_bid >= fair_value - convergence_pp / 100.0:
@@ -1395,6 +1403,27 @@ if __name__ == "__main__":
     # Actually convergence fires first since 0.40 > 0.15. trigger=convergence
     assert v["decision"] == "CASHOUT", v
     print(f"Test H2 PASS: CASHOUT ({v['trigger']}) — forecast turned bad")
+
+    # Test I (v9.5): convergence_pp=0 disables the trigger entirely.
+    # Setup where ONLY convergence would have fired at 5pp default:
+    #   entry=0.40, bid=0.55, peak=0.55, forecast P(YES)=0.60
+    #   - profit_lock at 50pp: bid 0.55 < 0.40+0.50=0.90 → not fired
+    #   - trailing: peak 0.55 < entry+0.20=0.60 → not armed
+    #   - forecast_reversal: forecast 0.60 >= entry 0.40 → not fired
+    #   - convergence at 5pp: bid 0.55 >= fair 0.60 - 0.05 = 0.55 → FIRE
+    # First assert default still fires:
+    v = evaluate_cashout_triggers(
+        side="YES", entry_price=0.40, current_bid=0.55,
+        peak_bid_seen=0.55, forecast_prob_yes=0.60)
+    assert v["decision"] == "CASHOUT" and v["trigger"] == "convergence", v
+    print(f"Test I-baseline PASS: 5pp default still fires convergence")
+    # Now disable: same setup with convergence_pp=0 → HOLD
+    v = evaluate_cashout_triggers(
+        side="YES", entry_price=0.40, current_bid=0.55,
+        peak_bid_seen=0.55, forecast_prob_yes=0.60,
+        convergence_pp=0.0)
+    assert v["decision"] == "HOLD", v
+    print(f"Test I PASS: convergence_pp=0 disables the trigger (HOLD)")
 
     # -----------------------------------------------------------------------
     # v9: ladder selection tests
