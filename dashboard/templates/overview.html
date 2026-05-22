@@ -30,12 +30,12 @@
 </section>
 
 <section class="card">
-  <h2>Open positions (top 5 by size)</h2>
+  <h2>Open positions (top 5 by size) <span class="muted small">⚡ live</span></h2>
   <div id="mini-positions"
-       hx-get="/api/positions?top=5&sort=size"
+       hx-get="/api/positions?top=5&sort=size&refresh=1"
        hx-trigger="load, every {{ refresh_positions_sec }}s"
        hx-swap="innerHTML">
-    <div class="muted">Loading positions…</div>
+    <div class="muted">Loading live positions…</div>
   </div>
 </section>
 
