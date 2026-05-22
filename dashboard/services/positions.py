@@ -28,11 +28,15 @@ from weather_edge_helpers import evaluate_cashout_triggers  # noqa: E402
 #   parent: "highest-temperature-in-kuala-lumpur-on-may-23-2026"
 #   bracket: "highest-temperature-in-kuala-lumpur-on-may-23-2026-33c"
 #   bracket: "highest-temperature-in-nyc-on-may-25-2026-90f"
-# Match ONLY a trailing "-<digits>(c|f)" to avoid swallowing the year
-# (e.g. "...-2026-33c" must keep "-2026", strip "-33c"). Decimal degrees
-# are rare on Polymarket weather markets and would just leave the
-# decimal portion on the link — harmless.
-_THRESHOLD_SUFFIX_RE = re.compile(r"-\d+(?:c|f|°c|°f)$", re.IGNORECASE)
+#   bracket: "highest-temperature-in-beijing-on-may-23-2026-26corbelow"
+#   bracket: "highest-temperature-in-tokyo-on-may-25-2026-90forhigher"
+# Match a trailing "-<digits>[cf]" with an optional Polymarket modifier
+# ("orbelow", "orhigher", "orabove", "orlower", "ormore", "orless", or
+# any "or<word>" suffix). Tight enough not to eat the year (e.g.
+# "...-2026-33c" must keep "-2026", strip "-33c"; "...-2026" alone stays).
+_THRESHOLD_SUFFIX_RE = re.compile(
+    r"-\d+[cf](?:or\w+)?$", re.IGNORECASE
+)
 
 
 def parent_event_slug(market_slug: str,
