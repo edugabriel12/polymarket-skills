@@ -3,7 +3,9 @@
 {% else %}
 <div class="kpi-grid">
   <div class="kpi" title="Total portfolio value = cash balance + market value of open positions (using last known bid).">
-    <span class="kpi-label">Portfolio</span>
+    <span class="kpi-label">
+      Portfolio{% if k.price_source == 'live' %} <span class="muted small">⚡</span>{% endif %}
+    </span>
     <span class="kpi-value">${{ "%.2f"|format(k.portfolio_total_usd) }}</span>
     {% if k.portfolio_delta_today_usd is not none %}
       {% set d = k.portfolio_delta_today_usd %}

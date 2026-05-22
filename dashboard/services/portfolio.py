@@ -1,7 +1,10 @@
 """Portfolio service — KPIs derived from paper_engine portfolio DB
-and weather_edge DB. Read-only. No live Polymarket API calls (uses
-the most recent bid recorded by the bot's monitor instead, to avoid
-hammering the upstream API on each dashboard refresh).
+and weather_edge DB. Read-only.
+
+v9.8: get_kpis accepts refresh_prices=True to mark all open
+positions to live CLOB best-bid before computing portfolio_total /
+drawdown / delta_today. The API route /api/kpis passes refresh=1 so
+the overview KPI strip matches the live mini-positions table.
 """
 
 from __future__ import annotations
@@ -12,6 +15,8 @@ from pathlib import Path
 from typing import Optional
 
 from .. import settings as S
+# v9.8: reuse the parallel CLOB fetcher built for positions service.
+from .positions import _refresh_bids_parallel
 
 
 def _ro_conn(path: Path) -> sqlite3.Connection:
@@ -33,12 +38,19 @@ def _latest_bid(weather_conn: sqlite3.Connection, entry_id: int) -> Optional[flo
     return float(row[0]) if row and row[0] is not None else None
 
 
-def get_kpis(portfolio_name: str = "default") -> dict:
+def get_kpis(portfolio_name: str = "default",
+              refresh_prices: bool = False) -> dict:
     """Return 4 KPI numbers for the overview header.
 
     Keys: portfolio_total_usd, portfolio_delta_today_usd, open_positions,
           max_positions, realized_pnl_today_usd, drawdown_pct_from_peak,
           drawdown_peak_usd.
+
+    refresh_prices: when True (overview KPI strip on tab open), mark all
+    open paper_engine positions to live CLOB best-bid before computing
+    portfolio_total / delta / drawdown. Adds N parallel HTTP calls
+    (N = open positions, typically <50) bounded at ~1-3s. Falls back to
+    each position's stored current_price on per-token fetch failure.
     """
     # Cash balance + open positions value (using last known bid from monitor_checks)
     pconn = _ro_conn(S.PORTFOLIO_DB)
@@ -52,14 +64,46 @@ def get_kpis(portfolio_name: str = "default") -> dict:
         pid = pf["id"]
         starting = float(pf["starting_balance"])
 
-        # positions columns (paper_engine schema): shares, avg_entry, current_price, closed
+        # positions columns (paper_engine schema): token_id, side, shares,
+        # avg_entry, current_price, closed
         positions = pconn.execute(
             "SELECT * FROM positions WHERE portfolio_id = ? AND closed = 0",
             (pid,),
         ).fetchall()
+
+        # v9.8: optional live CLOB refresh. Build a shim list of dicts in
+        # the shape _refresh_bids_parallel expects. Defensive against
+        # older schemas that lack side/token_id columns — those positions
+        # silently fall back to stored current_price (no refresh attempt).
+        live_bids: dict = {}
+        if refresh_prices and positions:
+            cols = positions[0].keys() if positions else []
+            if "token_id" in cols and "side" in cols:
+                shim = []
+                for p in positions:
+                    eid = p["id"]
+                    side = p["side"]
+                    tok = p["token_id"]
+                    if not tok:
+                        continue
+                    shim.append({
+                        "entry_id": eid, "side": side,
+                        "token_id_yes": tok if side == "YES" else None,
+                        "token_id_no":  tok if side == "NO" else None,
+                    })
+                if shim:
+                    live_bids = _refresh_bids_parallel(shim)
+
+        def _mark_price(p):
+            if refresh_prices:
+                bid = live_bids.get(p["id"])
+                if bid is not None:
+                    return bid
+            # fallback: stored current_price → avg_entry
+            return float(p["current_price"] or p["avg_entry"])
+
         positions_value = sum(
-            float(p["shares"]) * float(p["current_price"] or p["avg_entry"])
-            for p in positions
+            float(p["shares"]) * _mark_price(p) for p in positions
         )
         open_count = len(positions)
 
@@ -120,6 +164,7 @@ def get_kpis(portfolio_name: str = "default") -> dict:
             "cash_usd": round(cash, 2),
             "positions_value_usd": round(positions_value, 2),
             "starting_balance_usd": round(starting, 2),
+            "price_source": "live" if refresh_prices else "cached",
         }
     finally:
         pconn.close()

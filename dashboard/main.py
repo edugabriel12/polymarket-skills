@@ -237,9 +237,12 @@ def api_costs(request: Request, days: int = 30):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/kpis", response_class=HTMLResponse)
-def api_kpis(request: Request):
+def api_kpis(request: Request, refresh: int = 1):
+    # v9.8: refresh=1 (default) marks open positions to live CLOB bid
+    # before computing portfolio_total / delta / drawdown. Aligns with
+    # the live mini-positions table so both surfaces show the same P&L.
     try:
-        kpis = portfolio.get_kpis()
+        kpis = portfolio.get_kpis(refresh_prices=bool(refresh))
     except FileNotFoundError:
         kpis = {"error": "portfolio.db not found — bot has not run yet"}
     # v6: judge accuracy + queue health (best-effort, no-op if no data)
