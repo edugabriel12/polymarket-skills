@@ -229,19 +229,28 @@ def call_claude(entry_row: dict, evidence: dict, system_prompt: str) -> Optional
     }, indent=2, ensure_ascii=False)
 
     t0 = time.monotonic()
-    try:
-        response = client.messages.create(
-            model=DEFAULT_MODEL,
-            max_tokens=8192,  # was 4096; bumped to absorb longer rationales (3 truncations on 2026-05-14)
-            system=[{"type": "text", "text": system_prompt,
+    # v9.6 (2026-05-22): "adaptive" thinking is only supported on Opus and
+    # Sonnet families. Haiku 4.5 rejects with 400 invalid_request_error.
+    # Build kwargs conditionally so the same code path works for any
+    # configured model. Same caution for output_config.effort which is
+    # also extended-thinking-coupled on some models.
+    is_haiku = "haiku" in DEFAULT_MODEL.lower()
+    request_kwargs = {
+        "model": DEFAULT_MODEL,
+        "max_tokens": 8192,
+        "system": [{"type": "text", "text": system_prompt,
                      "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
-            messages=[{"role": "user", "content": user_content}],
-            thinking={"type": "adaptive"},
-            output_config={
-                "effort": "medium",
-                "format": {"type": "json_schema", "schema": _VERDICT_SCHEMA},
-            },
-        )
+        "messages": [{"role": "user", "content": user_content}],
+        "output_config": {
+            "format": {"type": "json_schema", "schema": _VERDICT_SCHEMA},
+        },
+    }
+    if not is_haiku:
+        # Opus / Sonnet: enable adaptive thinking + medium effort
+        request_kwargs["thinking"] = {"type": "adaptive"}
+        request_kwargs["output_config"]["effort"] = "medium"
+    try:
+        response = client.messages.create(**request_kwargs)
         duration_ms = int((time.monotonic() - t0) * 1000)
     except Exception as e:
         log_event("error", {"where": "anthropic_call", "err": str(e),
