@@ -77,6 +77,22 @@ def ladders_view(request: Request):
          "history": history})
 
 
+@app.get("/positions/history", response_class=HTMLResponse)
+def positions_history_view(request: Request, outcome: str = "all", limit: int = 200):
+    """v9.10: positions history — all resolved (cashed out or settled)
+    entries with realized P&L, exit reason, and Polymarket link."""
+    filt = outcome if outcome in ("winner", "loser") else None
+    history = positions.get_positions_history(limit=limit, filter_outcome=filt)
+    summary = positions.get_history_summary()
+    return templates.TemplateResponse(
+        request, "positions_history.html",
+        {"active_tab": "history",
+         "history": history,
+         "summary": summary,
+         "filter_outcome": outcome,
+         "limit": limit})
+
+
 @app.get("/positions", response_class=HTMLResponse)
 def page_positions(request: Request):
     return templates.TemplateResponse(

@@ -408,6 +408,177 @@ def get_recent_skipped(limit: int = 20) -> list[dict]:
     return out
 
 
+def get_positions_history(limit: int = 200,
+                           filter_outcome: Optional[str] = None) -> list[dict]:
+    """v9.10: all resolved positions (cashed out via cashout policy OR
+    settled via resolution sweep). Most recent first.
+
+    A position is in history when EITHER:
+      - cashouts row exists (cashout policy fired pre-resolution), OR
+      - resolutions row exists (market settled past end_date)
+
+    filter_outcome: None (default — all), "winner", or "loser"
+    """
+    try:
+        conn = _ro_conn(S.WEATHER_EDGE_DB)
+    except FileNotFoundError:
+        return []
+    try:
+        # v9.10: defensive against pre-v9 schemas without ladder columns
+        entry_cols = [r[1] for r in conn.execute("PRAGMA table_info(entries)")]
+        has_ladder = "ladder_group_id" in entry_cols
+        ladder_select = (
+            "e.ladder_group_id, e.ladder_position, e.ladder_event_slug,"
+            if has_ladder else
+            "NULL AS ladder_group_id, NULL AS ladder_position, NULL AS ladder_event_slug,"
+        )
+        rows = conn.execute(f"""
+            SELECT
+              e.entry_id, e.ts, e.market_slug, e.market_question,
+              e.city_resolved, e.side, e.entry_price, e.size_shares,
+              e.size_usd, e.threshold_value, e.threshold_unit,
+              e.end_date, e.edge_pp_at_entry,
+              {ladder_select}
+              c.cashout_id, c.ts AS cashout_ts, c.exit_price,
+              c.exit_shares, c.realized_pnl_usd AS cashout_pnl,
+              c.reason AS cashout_reason,
+              r.resolution_id, r.ts_resolved, r.final_outcome,
+              r.payout_per_share
+            FROM entries e
+            LEFT JOIN cashouts c ON c.entry_id = e.entry_id
+            LEFT JOIN resolutions r ON r.entry_id = e.entry_id
+            WHERE e.status IN ('EXECUTED','FAST_PATH')
+              AND (c.cashout_id IS NOT NULL OR r.resolution_id IS NOT NULL)
+            ORDER BY COALESCE(r.ts_resolved, c.ts) DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+
+        out = []
+        for row in rows:
+            entry_price = float(row["entry_price"] or 0)
+            shares = float(row["size_shares"] or 0)
+            stake = float(row["size_usd"] or 0)
+
+            # Decide exit type + P&L
+            if row["resolution_id"]:
+                # Resolution path: settled at payout_per_share
+                exit_kind = "resolution"
+                exit_price = float(row["payout_per_share"] or 0)
+                exit_ts = row["ts_resolved"]
+                # If we also had a cashout earlier, prefer that as the
+                # economic exit (operator already realized P&L there).
+                if row["cashout_id"]:
+                    exit_kind = "cashout"
+                    exit_price = float(row["exit_price"] or 0)
+                    exit_ts = row["cashout_ts"]
+                    realized = float(row["cashout_pnl"] or 0)
+                    reason = row["cashout_reason"] or ""
+                else:
+                    realized = (exit_price - entry_price) * shares
+                    reason = f"resolved {row['final_outcome']}"
+            else:
+                # Cashout-only path (closed before resolution)
+                exit_kind = "cashout"
+                exit_price = float(row["exit_price"] or 0)
+                exit_ts = row["cashout_ts"]
+                realized = float(row["cashout_pnl"] or 0)
+                reason = row["cashout_reason"] or ""
+
+            pnl_pct = (realized / stake * 100) if stake else 0.0
+            is_win = realized > 0
+
+            if filter_outcome == "winner" and not is_win:
+                continue
+            if filter_outcome == "loser" and is_win:
+                continue
+
+            # Time from entry → exit
+            try:
+                t0 = datetime.fromisoformat(row["ts"].replace("Z", "+00:00"))
+                t1 = datetime.fromisoformat(
+                    (exit_ts or row["ts"]).replace("Z", "+00:00"))
+                held_seconds = int((t1 - t0).total_seconds())
+            except Exception:
+                held_seconds = 0
+
+            parent_slug = parent_event_slug(
+                row["market_slug"],
+                row["ladder_event_slug"]
+                if "ladder_event_slug" in row.keys() else None)
+
+            out.append({
+                "entry_id": row["entry_id"],
+                "ts": row["ts"],
+                "exit_ts": exit_ts,
+                "exit_kind": exit_kind,
+                "market_slug": row["market_slug"],
+                "parent_event_slug": parent_slug,
+                "market_question": row["market_question"],
+                "city": row["city_resolved"],
+                "side": row["side"],
+                "entry_price": round(entry_price, 4),
+                "exit_price": round(exit_price, 4),
+                "size_usd": round(stake, 2),
+                "size_shares": round(shares, 2),
+                "realized_pnl_usd": round(realized, 2),
+                "pnl_pct": round(pnl_pct, 2),
+                "is_win": is_win,
+                "reason": reason,
+                "final_outcome": row["final_outcome"],
+                "held_seconds": held_seconds,
+                "held_human": _humanize_duration(held_seconds),
+                "threshold_value": row["threshold_value"],
+                "threshold_unit": row["threshold_unit"],
+                "ladder_group_id": row["ladder_group_id"],
+                "ladder_position": row["ladder_position"],
+                "edge_pp_at_entry": float(row["edge_pp_at_entry"] or 0),
+            })
+        return out
+    finally:
+        conn.close()
+
+
+def get_history_summary() -> dict:
+    """v9.10: aggregate metrics across all resolved positions."""
+    try:
+        conn = _ro_conn(S.WEATHER_EDGE_DB)
+    except FileNotFoundError:
+        return {"available": False}
+    try:
+        row = conn.execute("""
+            SELECT
+              COUNT(*) n_total,
+              SUM(CASE WHEN COALESCE(c.realized_pnl_usd,
+                                       (r.payout_per_share - e.entry_price) * e.size_shares
+                                      ) > 0 THEN 1 ELSE 0 END) n_wins,
+              SUM(COALESCE(c.realized_pnl_usd,
+                           (r.payout_per_share - e.entry_price) * e.size_shares
+                          )) total_pnl,
+              SUM(e.size_usd) total_stake
+            FROM entries e
+            LEFT JOIN cashouts c ON c.entry_id = e.entry_id
+            LEFT JOIN resolutions r ON r.entry_id = e.entry_id
+            WHERE e.status IN ('EXECUTED','FAST_PATH')
+              AND (c.cashout_id IS NOT NULL OR r.resolution_id IS NOT NULL)
+        """).fetchone()
+        n = row["n_total"] or 0
+        wins = row["n_wins"] or 0
+        pnl = float(row["total_pnl"] or 0)
+        stake = float(row["total_stake"] or 0)
+        return {
+            "available": True,
+            "n_total": n,
+            "n_wins": wins,
+            "n_losses": n - wins,
+            "win_rate": round(wins / n, 3) if n else None,
+            "total_pnl_usd": round(pnl, 2),
+            "total_stake_usd": round(stake, 2),
+            "pnl_per_dollar": round(pnl / stake, 4) if stake else None,
+        }
+    finally:
+        conn.close()
+
+
 def _humanize_duration(seconds: int) -> str:
     if seconds < 60:
         return f"{seconds}s"
