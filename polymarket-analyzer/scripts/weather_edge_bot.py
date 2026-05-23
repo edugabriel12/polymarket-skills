@@ -1925,6 +1925,7 @@ def run_resolution_sweep() -> int:
         return 0
     with db.connect() as conn:
         rows = db.query_unresolved_past_end(conn, _now_iso())
+        log_event("resolution_sweep_started", {"unresolved_past_end": len(rows)})
         for row in rows:
             slug = row["market_slug"]
             try:
@@ -1938,10 +1939,39 @@ def run_resolution_sweep() -> int:
                 outcomes = json.loads(m.get("outcomes", "[]"))
                 prices = [float(p) for p in json.loads(m.get("outcomePrices", "[]"))]
                 if not outcomes or not prices or len(outcomes) != len(prices):
+                    log_event("resolution_skipped", {
+                        "entry_id": row["entry_id"], "slug": slug,
+                        "reason": "no_outcomes_or_prices"})
                     continue
-                # YES is index 0, NO is index 1 (Polymarket convention)
-                final_outcome = "YES" if prices[0] >= 0.99 else \
-                                "NO" if prices[1] >= 0.99 else "VOID"
+                # v9.9 (2026-05-24): the prior `prices[N] >= 0.99` threshold
+                # was too strict — Polymarket markets often settle with
+                # 0.97/0.03 final prices well before the official `closed`
+                # flag flips, and our sweep silently held positions open
+                # for hours after resolution. Accept either:
+                #   a) Polymarket marked `closed=True` (authoritative)
+                #   b) winning outcome price >= 0.95 (near-settled)
+                # YES is index 0, NO is index 1 (Polymarket convention).
+                gamma_closed = bool(m.get("closed"))
+                price_threshold = 0.95
+                if gamma_closed or prices[0] >= price_threshold:
+                    final_outcome = "YES"
+                elif gamma_closed or prices[1] >= price_threshold:
+                    final_outcome = "NO"
+                else:
+                    final_outcome = "VOID"
+                # Re-check: if Gamma says closed but neither price clears
+                # 0.95, it's truly VOID/inconclusive.
+                if (final_outcome != "VOID"
+                        and prices[0] < price_threshold
+                        and prices[1] < price_threshold):
+                    final_outcome = "VOID"
+                if final_outcome == "VOID" and not gamma_closed:
+                    # Not yet resolved — try again next sweep cycle.
+                    log_event("resolution_skipped", {
+                        "entry_id": row["entry_id"], "slug": slug,
+                        "reason": "not_yet_settled",
+                        "prices": prices, "closed": gamma_closed})
+                    continue
                 payout = 1.0 if (final_outcome == row["side"]) else 0.0
                 if final_outcome == "VOID":
                     payout = float(row["entry_price"] or 0)  # neutral
