@@ -30,12 +30,14 @@ from weather_edge_helpers import evaluate_cashout_triggers  # noqa: E402
 #   bracket: "highest-temperature-in-nyc-on-may-25-2026-90f"
 #   bracket: "highest-temperature-in-beijing-on-may-23-2026-26corbelow"
 #   bracket: "highest-temperature-in-tokyo-on-may-25-2026-90forhigher"
-# Match a trailing "-<digits>[cf]" with an optional Polymarket modifier
-# ("orbelow", "orhigher", "orabove", "orlower", "ormore", "orless", or
-# any "or<word>" suffix). Tight enough not to eat the year (e.g.
-# "...-2026-33c" must keep "-2026", strip "-33c"; "...-2026" alone stays).
+#   bracket: "highest-temperature-in-miami-on-may-23-2026-88"     (no c/f!)
+#   bracket: "highest-temperature-in-miami-on-may-23-2026-88-89f" (range!)
+# Regex grammar: -<1-3 digits>(-<1-3 digits>)?(c|f)?(or<word>)?$
+# The optional inner "-NN" handles range brackets like "88-89f". The
+# 1-3 digit limit on each part excludes 4-digit years (e.g. "...-2026"
+# stays intact while "...-2026-88-89f" strips "-88-89f").
 _THRESHOLD_SUFFIX_RE = re.compile(
-    r"-\d+[cf](?:or\w+)?$", re.IGNORECASE
+    r"-\d{1,3}(?:-\d{1,3})?[cf]?(?:or\w+)?$", re.IGNORECASE
 )
 
 
