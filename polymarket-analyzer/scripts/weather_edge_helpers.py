@@ -206,6 +206,75 @@ def fetch_open_meteo_ensemble(lat: float, lon: float,
 
 
 # ---------------------------------------------------------------------------
+# v10: Open-Meteo archive (realized weather for past dates).
+# Used by the strategy advisor's loss-forensic step to reconstruct what
+# the temperature actually was on the day a bet settled. Endpoint is free,
+# no auth, ~1-2 day latency after the target date.
+# ---------------------------------------------------------------------------
+
+_OM_ARCHIVE_CACHE: dict = {}
+_OM_ARCHIVE_CACHE_TTL_SEC = 24 * 3600  # 24h — realized values are immutable
+
+
+def fetch_open_meteo_archive(lat: float, lon: float,
+                              target_date,
+                              force_refresh: bool = False
+                              ) -> Optional[dict]:
+    """Pull realized (observed) hourly temperature for `target_date` at
+    (lat, lon) from Open-Meteo's archive endpoint. Returns:
+      {"observed_max_c": 24.8, "observed_min_c": 13.1,
+       "observed_max_f": 76.6, "observed_min_f": 55.6,
+       "n_hours": 24, "source": "open-meteo-archive"}
+    or None on HTTP failure / no data (typical when target_date is too
+    recent — archive lags realtime by ~1-2 days).
+    """
+    target_iso = (target_date.isoformat()
+                   if hasattr(target_date, "isoformat") else str(target_date))
+    cache_key = (round(float(lat), 4), round(float(lon), 4), target_iso)
+    now = time.time()
+    if not force_refresh and cache_key in _OM_ARCHIVE_CACHE:
+        cached_ts, cached_data = _OM_ARCHIVE_CACHE[cache_key]
+        if now - cached_ts < _OM_ARCHIVE_CACHE_TTL_SEC:
+            return cached_data
+
+    try:
+        r = requests.get(
+            "https://archive-api.open-meteo.com/v1/archive",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "start_date": target_iso,
+                "end_date": target_iso,
+                "hourly": "temperature_2m",
+                "temperature_unit": "celsius",
+            },
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        series = (data.get("hourly") or {}).get("temperature_2m") or []
+        clean = [float(v) for v in series if v is not None]
+        if not clean:
+            return None
+    except Exception:
+        return None
+
+    obs_max_c = max(clean)
+    obs_min_c = min(clean)
+    result = {
+        "observed_max_c": round(obs_max_c, 2),
+        "observed_min_c": round(obs_min_c, 2),
+        "observed_max_f": round(obs_max_c * 9 / 5 + 32, 2),
+        "observed_min_f": round(obs_min_c * 9 / 5 + 32, 2),
+        "n_hours": len(clean),
+        "source": "open-meteo-archive",
+    }
+    _OM_ARCHIVE_CACHE[cache_key] = (now, result)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Market parsing
 # ---------------------------------------------------------------------------
 

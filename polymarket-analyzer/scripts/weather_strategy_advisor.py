@@ -477,6 +477,16 @@ def main() -> int:
         # hours, --ladder-min-leg-price) need tuning.
         ladder_breakdown = compute_ladder_breakdown(conn, since_iso)
 
+        # Advisor v10: per-loss forensic reconstruction. For every losing
+        # trade in the window, pulls realized weather from Open-Meteo
+        # archive + Visual Crossing + Polymarket observed_value, plus the
+        # full forecast trajectory from forecast_history between entry
+        # and resolution. The advisor uses this to classify each loss as
+        # (a) forecast was always wrong, (b) forecast turned mid-flight
+        # and we should have exited, or (c) we exited too early on a
+        # forecast that ended up correct.
+        loss_forensics = helpers.compute_loss_forensics(conn, since_iso)
+
         user_payload = {
             "since_iso": since_iso,
             "n_trades_analyzed": n_trades,
@@ -503,6 +513,11 @@ def main() -> int:
             # TTR cohort performance (does the 6-12h band pay off?),
             # Kelly stake distribution by position (central/below/above).
             "ladder_breakdown": ladder_breakdown,
+            # Advisor v10: per-loss forensic reconstruction (realized
+            # weather from Open-Meteo archive + VC + Polymarket observed,
+            # plus forecast trajectory from entry to resolution).
+            "loss_forensics": loss_forensics,
+            "loss_forensics_count": len(loss_forensics),
         }
 
         if args.dry_run:

@@ -489,6 +489,322 @@ def _try_json(s):
         return None
 
 
+# ---------------------------------------------------------------------------
+# v10: Loss forensics — for each losing trade, reconstruct what the weather
+# actually did vs what we forecast. Pulls realized values from multiple
+# sources (Open-Meteo archive, Visual Crossing historical, observed_value
+# if Polymarket reported it) and the full forecast trajectory from
+# forecast_history. Lets the advisor diagnose WHY a bet failed:
+#   - forecast was right but we exited too early?
+#   - forecast was wrong from the start?
+#   - forecast drifted against us during the wait?
+# ---------------------------------------------------------------------------
+
+
+def _is_loser_row(row: dict) -> bool:
+    """A losing trade is one where realized P&L is negative — either
+    because we cashed out at a loss, or because we held to resolution
+    and the side didn't pay out (payout < entry_price)."""
+    cashout_id = row.get("cashout_id")
+    if cashout_id is not None:
+        return float(row.get("realized_pnl_usd") or 0) < -0.01
+    final_outcome = row.get("final_outcome")
+    side = row.get("side")
+    if final_outcome in ("YES", "NO"):
+        return final_outcome != side
+    return False
+
+
+def _summarize_forecast_trajectory(snapshots: list[sqlite3.Row],
+                                     realized_value: Optional[float],
+                                     threshold_value: float,
+                                     comparison: str,
+                                     side: str) -> dict:
+    """Given chronological forecast snapshots (from forecast_history) and
+    the realized value, compute when the forecast started disagreeing with
+    our bet. Returns:
+      {"n_snapshots": int, "first_ts": str, "last_ts": str,
+       "first_value": float, "last_value": float, "drift": float,
+       "would_lose_at_first": bool, "would_lose_at_last": bool,
+       "first_adverse_ts": str|None, "first_adverse_value": float|None,
+       "samples": [{ts, source, value, would_win_if_realized}, ...] (top 8)}
+    `would_lose_at_*` projects the snapshot value as if it were realized
+    and applies the bet's threshold/comparison/side to decide outcome.
+    """
+    if not snapshots:
+        return {"n_snapshots": 0}
+
+    def _resolves_yes(val: float) -> bool:
+        if val is None:
+            return False
+        c = comparison
+        t = threshold_value
+        if c == "exceed":
+            return val > t
+        if c == "below":
+            return val < t
+        if c == "at_least":
+            return val >= t
+        if c == "at_most":
+            return val <= t
+        # range markets: side stored at threshold_value (low end)
+        return False
+
+    def _would_win(val: Optional[float]) -> Optional[bool]:
+        if val is None:
+            return None
+        yes_resolves = _resolves_yes(float(val))
+        return (side == "YES" and yes_resolves) or (side == "NO" and not yes_resolves)
+
+    sorted_snaps = sorted(snapshots, key=lambda r: r["ts"])
+    first = sorted_snaps[0]
+    last = sorted_snaps[-1]
+    first_val = float(first["predicted_value"])
+    last_val = float(last["predicted_value"])
+
+    first_adverse_ts = None
+    first_adverse_value = None
+    for s in sorted_snaps:
+        if _would_win(float(s["predicted_value"])) is False:
+            first_adverse_ts = s["ts"]
+            first_adverse_value = float(s["predicted_value"])
+            break
+
+    samples = []
+    step = max(1, len(sorted_snaps) // 8)
+    for s in sorted_snaps[::step][:8]:
+        v = float(s["predicted_value"])
+        samples.append({
+            "ts": s["ts"][:16],
+            "source": s["source"],
+            "value": round(v, 2),
+            "would_win_if_realized": _would_win(v),
+        })
+
+    return {
+        "n_snapshots": len(sorted_snaps),
+        "first_ts": first["ts"][:16],
+        "last_ts": last["ts"][:16],
+        "first_value": round(first_val, 2),
+        "last_value": round(last_val, 2),
+        "drift": round(last_val - first_val, 2),
+        "would_win_at_first": _would_win(first_val),
+        "would_win_at_last": _would_win(last_val),
+        "first_adverse_ts": first_adverse_ts[:16] if first_adverse_ts else None,
+        "first_adverse_value": (round(first_adverse_value, 2)
+                                  if first_adverse_value is not None else None),
+        "realized_value": (round(realized_value, 2)
+                            if realized_value is not None else None),
+        "would_have_won": _would_win(realized_value),
+        "samples": samples,
+    }
+
+
+def _fetch_realized_multi(city: str, lat: Optional[float], lon: Optional[float],
+                            target_iso: str,
+                            observed_value: Optional[float],
+                            threshold_unit: Optional[str] = None) -> dict:
+    """Pull realized weather from up to 3 sources in parallel:
+      1. Open-Meteo archive (lat/lon required)
+      2. Visual Crossing historical (city name required)
+      3. Polymarket's reported observed_value (already in DB if present)
+    Returns:
+      {"sources": {"open_meteo_archive": {...}, "visual_crossing": {...},
+                    "polymarket_observed": float|None},
+       "consensus_max_c": float|None, "n_sources": int}
+
+    `threshold_unit` is the entry's unit ("F"/"C"); needed to fold
+    `observed_value` (reported in that unit by Polymarket) into the
+    Celsius consensus.
+    """
+    # Import locally so this module stays importable without the
+    # weather_edge_helpers chain being fully loaded.
+    import sys as _sys
+    _sys.path.insert(0, str(SCRIPTS_DIR))
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import weather_edge_helpers as weh  # noqa: E402
+
+    out: dict = {"sources": {}, "consensus_max_c": None, "n_sources": 0}
+    futures = {}
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        if lat is not None and lon is not None:
+            futures[ex.submit(weh.fetch_open_meteo_archive, lat, lon, target_iso)] \
+                = "open_meteo_archive"
+        if city:
+            futures[ex.submit(weh.fetch_visual_crossing, city, target_iso)] \
+                = "visual_crossing"
+        for fut in as_completed(futures):
+            label = futures[fut]
+            try:
+                res = fut.result()
+            except Exception as e:
+                res = {"error": str(e)}
+            if res:
+                out["sources"][label] = res
+
+    # Polymarket observed_value: usually F for US markets, but unit varies.
+    # Store raw; the caller already knows the unit.
+    if observed_value is not None:
+        out["sources"]["polymarket_observed"] = {
+            "value": float(observed_value),
+            "source": "polymarket-resolution",
+        }
+
+    # Consensus: median of max_c across sources where we can extract it.
+    max_cs = []
+    om = out["sources"].get("open_meteo_archive")
+    if isinstance(om, dict) and om.get("observed_max_c") is not None:
+        max_cs.append(float(om["observed_max_c"]))
+    vc = out["sources"].get("visual_crossing")
+    if isinstance(vc, dict) and vc.get("days"):
+        day0 = vc["days"][0]
+        tmax_f = day0.get("tempmax")
+        if tmax_f is not None:
+            # VC returns Fahrenheit in unitGroup=us; convert to C.
+            max_cs.append((float(tmax_f) - 32) * 5 / 9)
+    # Polymarket's observed_value is authoritative when present — fold it
+    # into consensus after converting to Celsius based on the unit the
+    # market was denominated in.
+    if observed_value is not None and threshold_unit:
+        try:
+            ov = float(observed_value)
+        except (TypeError, ValueError):
+            ov = None
+        if ov is not None:
+            u = threshold_unit.upper()
+            if u == "C":
+                max_cs.append(ov)
+            elif u == "F":
+                max_cs.append((ov - 32) * 5 / 9)
+    if max_cs:
+        max_cs.sort()
+        n = len(max_cs)
+        out["consensus_max_c"] = round(
+            max_cs[n // 2] if n % 2 else (max_cs[n // 2 - 1] + max_cs[n // 2]) / 2,
+            2,
+        )
+        out["n_sources"] = n
+    return out
+
+
+def compute_loss_forensics(conn: sqlite3.Connection, since_iso: str
+                            ) -> list[dict]:
+    """v10: For each losing trade in the window, reconstruct the realized
+    weather and the forecast trajectory between entry and resolution. The
+    advisor uses this to classify losses as (a) forecast was always wrong,
+    (b) forecast turned mid-flight and we could have exited, or
+    (c) we exited too early on a forecast that ended up correct.
+
+    Returns one dict per loss, sorted by abs(realized_pnl) desc.
+    """
+    import sys as _sys
+    _sys.path.insert(0, str(SCRIPTS_DIR))
+    import weather_edge_helpers as weh  # noqa: E402
+    cities_cfg = weh.load_cities()
+
+    # Pull per-trade detail (same join used by the per-trade payload).
+    import weather_edge_db as wdb  # noqa: E402
+    rows = [dict(r) for r in wdb.query_per_trade_details(
+        conn, since_iso, limit=10_000)]
+
+    losers: list[dict] = []
+    for t in rows:
+        if not _is_loser_row(t):
+            continue
+        entry_id = t["entry_id"]
+        # Pull entry's full row for end_date, threshold, comparison.
+        e = conn.execute(
+            "SELECT end_date, ts, city_resolved, threshold_value, "
+            "       threshold_unit, comparison, side, entry_price, "
+            "       market_question, forecast_snapshot_json, "
+            "       discovery_meta_json "
+            "FROM entries WHERE entry_id = ?", (entry_id,),
+        ).fetchone()
+        if e is None:
+            continue
+        end_date = (e["end_date"] or "")[:10]
+        city = e["city_resolved"] or ""
+        threshold = e["threshold_value"]
+        comparison = e["comparison"]
+        side = e["side"]
+        if not (end_date and city and threshold is not None and comparison):
+            continue
+
+        # Resolve lat/lon via station override → fallback to discovery_meta.
+        lat = lon = None
+        station = weh.resolve_station(city, cities_cfg)
+        if station:
+            lat = station.get("lat")
+            lon = station.get("lon")
+        if lat is None or lon is None:
+            dm = _try_json(e["discovery_meta_json"])
+            if isinstance(dm, dict):
+                lat = dm.get("lat") or (dm.get("station") or {}).get("lat")
+                lon = dm.get("lon") or (dm.get("station") or {}).get("lon")
+
+        # Look up Polymarket's observed_value if present.
+        obs_row = conn.execute(
+            "SELECT observed_value FROM resolutions WHERE entry_id = ?",
+            (entry_id,)).fetchone()
+        observed_value = obs_row[0] if obs_row else None
+
+        # Pull realized weather from external sources.
+        realized = _fetch_realized_multi(
+            city, lat, lon, end_date, observed_value,
+            threshold_unit=e["threshold_unit"])
+
+        # Pull forecast trajectory from forecast_history for this
+        # (city, target_date) — bot writes per discovery cycle, so this
+        # captures every refresh between entry and resolution.
+        snapshots = conn.execute(
+            "SELECT ts, source, predicted_value "
+            "FROM forecast_history "
+            "WHERE city = ? AND target_date = ? "
+            "  AND ts >= ? "
+            "ORDER BY ts ASC",
+            (city, end_date, t["ts"]),
+        ).fetchall()
+
+        # forecast_history.predicted_value is stored in the market's unit
+        # (see weather_edge_bot:insert_forecast_history). Convert the
+        # Celsius consensus into that same unit so the trajectory's
+        # would_win check uses consistent scale.
+        consensus_max_c = realized.get("consensus_max_c")
+        unit = (e["threshold_unit"] or "").upper()
+        if consensus_max_c is None:
+            consensus_in_unit = None
+        elif unit == "C":
+            consensus_in_unit = float(consensus_max_c)
+        elif unit == "F":
+            consensus_in_unit = float(consensus_max_c) * 9.0 / 5.0 + 32.0
+        else:
+            consensus_in_unit = None  # non-temp metric — skip projection
+        trajectory = _summarize_forecast_trajectory(
+            snapshots, consensus_in_unit, float(threshold), comparison, side)
+
+        losers.append({
+            "entry_id": entry_id,
+            "ts_entry": (t["ts"] or "")[:16],
+            "city": city,
+            "target_date": end_date,
+            "market_question": e["market_question"],
+            "side": side,
+            "comparison": comparison,
+            "threshold": _r(threshold, 2),
+            "entry_price": _r(t.get("entry_price"), 3),
+            "forecast_prob_at_entry": _r(t.get("forecast_prob_at_entry"), 3),
+            "judge_verdict": t.get("judge_verdict"),
+            "judge_prob": _r(t.get("judge_prob"), 3),
+            "exit_strategy": classify_trade(t)["exit_strategy"],
+            "realized_pnl_usd": _r(_resolved_pnl(t), 2),
+            "realized_weather": realized,
+            "forecast_trajectory": trajectory,
+        })
+
+    losers.sort(key=lambda d: -abs(d.get("realized_pnl_usd") or 0))
+    return losers
+
+
 def _r(v, digits: int):
     if v is None:
         return None

@@ -389,6 +389,101 @@ attribute wins/losses to specific v7+v8+v9 features.
 When you cite `discovery_meta_breakdown` in `evidence`, use the
 key path (e.g. `"discovery_meta.by_station.HKO.win_rate"`).
 
+## Loss forensics (Advisor v10 — REQUIRED for `loser_patterns`)
+
+The user message contains `loss_forensics`: one entry per losing trade
+in the window with realized weather pulled from multiple sources and
+the forecast trajectory between entry and resolution. This is the
+ground truth for diagnosing why bets failed.
+
+### Shape
+
+```json
+{
+  "entry_id": 188,
+  "city": "Cape Town",
+  "target_date": "2026-05-25",
+  "side": "NO",
+  "threshold": 21.0,
+  "comparison": "range",
+  "entry_price": 0.63,
+  "forecast_prob_at_entry": 0.881,
+  "judge_verdict": "REJECT",
+  "exit_strategy": "hold_to_resolution",
+  "realized_pnl_usd": -23.40,
+  "realized_weather": {
+    "sources": {
+      "open_meteo_archive": {"observed_max_c": 21.4, "observed_max_f": 70.5, ...},
+      "visual_crossing":   {"days": [{"tempmax": 70.8, ...}]},
+      "polymarket_observed": {"value": 70.5}
+    },
+    "consensus_max_c": 21.4,
+    "n_sources": 2
+  },
+  "forecast_trajectory": {
+    "n_snapshots": 9,
+    "first_ts": "2026-05-22T18:00", "first_value": 19.8,
+    "last_ts":  "2026-05-25T03:00", "last_value": 21.1,
+    "drift": 1.3,
+    "would_win_at_first": true,
+    "would_win_at_last": false,
+    "first_adverse_ts": "2026-05-24T12:00",
+    "first_adverse_value": 20.7,
+    "realized_value": 21.4,
+    "would_have_won": false,
+    "samples": [{"ts": ..., "source": "open_meteo_icon", "value": 20.1,
+                  "would_win_if_realized": true}, ...]
+  }
+}
+```
+
+### How to classify each loss
+
+1. **`would_win_at_first == True` AND `would_have_won == False`** —
+   forecast was correct at entry but drifted against us during the wait.
+   Sub-classify by `first_adverse_ts`:
+   - Adverse turn ≥ 12h before resolution → we should have caught it
+     with a tighter `--trailing-drawdown-pct` or `--convergence-pp`.
+     Cite `entry_id`s and propose a numeric tighten.
+   - Adverse turn < 4h before resolution → unavoidable, the forecast
+     was a coin flip. Do not propose a parameter change for these.
+
+2. **`would_win_at_first == False`** — forecast was wrong from the
+   start. Inspect `realized_weather.consensus_max_c` vs `threshold`
+   and the bot's `forecast_prob_at_entry`:
+   - If gap |forecast_at_entry − realized| > 2 × `MAE_TEMP_C`, the
+     MAE constant for that unit may be too low → suggest tightening.
+   - If gap is small but the bet was on the wrong side of the
+     threshold by < 1°C, this is unavoidable noise. Don't propose
+     a change.
+
+3. **`would_win_at_last == True` AND `would_have_won == True`** —
+   forecast was right, weather agreed, but `exit_strategy` shows
+   we exited early via `profit_lock` or `trailing_stop`. Cite the
+   counterfactual: "we exited at $X via trailing_stop, weather
+   resolved at Y°C which would have paid $1 — left $Z on the table."
+   Propose loosening the exit threshold for that specific cohort.
+
+4. **`realized_weather.n_sources == 0`** — Open-Meteo archive may
+   not yet have the data (1-2 day lag) or city lat/lon missing.
+   Skip this entry from your analysis — note in `research_notes`
+   how many were skipped for missing realized data.
+
+### Anchoring losses to suggestions
+
+For every change you propose under category `threshold` or
+`mae_constant`, you MUST cite at least 2 `entry_id`s from
+`loss_forensics` where the realized weather supports the change
+(e.g. "tighten --trailing-drawdown-pct: entries 142, 168, 188
+all had `first_adverse_ts` ≥ 18h before resolution but we held
+because drawdown was 28% < 30%").
+
+Use `loss_forensics` to populate `loser_patterns` — write 2-4
+sentences classifying losses by the four categories above with
+counts (e.g. "Of 24 losses: 11 forecast-drift catchable, 8
+forecast-wrong-from-start, 3 exit-too-early, 2 missing realized
+data.").
+
 ## Process
 
 1. Read the user message — it contains: aggregate analyzer report (markdown),
