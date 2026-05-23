@@ -1040,13 +1040,25 @@ def select_ladder_brackets(parsed: list[dict]) -> dict:
 
 def compute_kelly_split(legs: list[dict], total_usd: float) -> Optional[list[dict]]:
     """Split `total_usd` across `legs` proportional to each leg's Kelly
-    fraction. Each leg is a dict with at minimum keys "forecast_prob" (p)
-    and "entry_price" (price). Returns the same list of dicts augmented
-    with "stake_usd" and "kelly_frac" keys, in input order.
+    fraction. Each leg is a dict with at minimum keys "forecast_prob"
+    (P(YES) raw), "entry_price" (ask of the chosen side), and "side"
+    ('YES' or 'NO'). Returns the same list of dicts augmented with
+    "stake_usd" and "kelly_frac" keys, in input order.
 
-    Kelly per leg (YES bet convention; bot stores side-aware probs so this
-    holds for NO side too because p and price are P(side) / market(side)):
-        kelly_i = max(0, (p*(1-price) - (1-p)*price) / (1-price))
+    v9.14 (2026-05-24) FIX: previously assumed `forecast_prob` was
+    side-aware P(side). In the discovery candidate dict it's actually
+    P(YES) raw (the side-aware flip only happens at insert_entry time,
+    weather_edge_bot.py:959). For NO-side legs, Kelly was computed
+    against P(YES) vs NO_ask → numerator went deeply negative →
+    max(0, ...) = 0 → below/above legs ALWAYS got $0 stake. Snapshot
+    2026-05-22→23 confirmed: 45 NO-side below legs all got
+    ladder_stake_usd=$0 while 48 YES-side central legs got the full
+    $50. Ladders were de-facto single-bin only. Now converts to
+    p_side based on leg["side"] before Kelly math.
+
+    Kelly per leg (side-aware):
+        p_side = forecast_prob if side=='YES' else 1 - forecast_prob
+        kelly_i = max(0, (p_side*(1-price) - (1-p_side)*price) / (1-price))
 
     Renormalization:
         weight_i = kelly_i / sum(kelly_j)
@@ -1064,12 +1076,16 @@ def compute_kelly_split(legs: list[dict], total_usd: float) -> Optional[list[dic
     enriched = []
     kelly_sum = 0.0
     for leg in legs:
-        p = float(leg.get("forecast_prob") or 0.0)
+        p_yes = float(leg.get("forecast_prob") or 0.0)
+        side = leg.get("side", "YES")
+        # v9.14: convert P(YES) → P(side) so kelly is computed on the
+        # same side that `entry_price` represents.
+        p_side = p_yes if side == "YES" else (1.0 - p_yes)
         price = float(leg.get("entry_price") or 0.0)
         if price <= 0 or price >= 1:
             kelly = 0.0
         else:
-            num = p * (1 - price) - (1 - p) * price
+            num = p_side * (1 - price) - (1 - p_side) * price
             kelly = max(0.0, num / (1 - price))
         enriched.append({**leg, "kelly_frac": kelly})
         kelly_sum += kelly
@@ -1564,5 +1580,39 @@ if __name__ == "__main__":
     out = compute_kelly_split(legs, total_usd=30.0)
     assert out is None
     print("Test K6 PASS: all kelly negative → None")
+
+    # Test K7 (v9.14 regression): NO-side leg gets non-zero Kelly when
+    # bot believes the NO outcome (1 - P(YES)) is high. Snapshot showed
+    # bug where below/above legs always got $0 because forecast_prob was
+    # passed as P(YES) but entry_price was the NO ask.
+    # Setup mirrors snapshot's NO-side below legs:
+    #   forecast_prob (P(YES)) = 0.10, entry_price (NO ask) = 0.70
+    #   Bot's P(NO side) = 1 - 0.10 = 0.90, so Kelly on NO bet:
+    #     kelly = (0.90 * 0.30 - 0.10 * 0.70) / 0.30 = (0.27 - 0.07) / 0.30 = 0.667
+    legs = [{"forecast_prob": 0.10, "entry_price": 0.70, "side": "NO"}]
+    out = compute_kelly_split(legs, total_usd=50.0)
+    assert out is not None, "K7: NO-side leg should produce positive Kelly"
+    assert out[0]["stake_usd"] == 50.0, f"K7: 1-leg → full stake, got {out[0]}"
+    assert out[0]["kelly_frac"] > 0, f"K7: NO-side kelly should be positive"
+    print(f"Test K7 PASS: NO-side leg got stake ${out[0]['stake_usd']:.2f}, "
+          f"kelly_frac={out[0]['kelly_frac']:.3f} (was $0 pre-v9.14)")
+
+    # Test K8: 2-bin mix (central YES + below NO) splits stake correctly
+    # — this is the canonical snapshot pattern that always returned
+    # central=$50, below=$0 in the buggy version.
+    legs = [
+        {"forecast_prob": 0.45, "entry_price": 0.25, "side": "YES"},  # central
+        {"forecast_prob": 0.10, "entry_price": 0.70, "side": "NO"},   # below NO
+    ]
+    out = compute_kelly_split(legs, total_usd=50.0)
+    assert out is not None
+    central_stake = out[0]["stake_usd"]
+    below_stake = out[1]["stake_usd"]
+    assert central_stake > 0 and below_stake > 0, \
+        f"K8: both legs must get positive stake (got C=${central_stake}, B=${below_stake})"
+    assert abs(central_stake + below_stake - 50.0) < 0.01, \
+        f"K8: stake sum must = total ({central_stake + below_stake})"
+    print(f"Test K8 PASS: 2-bin YES+NO splits C=${central_stake:.2f} / "
+          f"B=${below_stake:.2f} (sum=${central_stake+below_stake:.2f})")
 
     print("\nAll helper tests PASS")
