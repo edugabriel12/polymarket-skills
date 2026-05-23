@@ -591,6 +591,20 @@ def _compute_mae_for_market(spec: MarketSpec, ow_forecast: dict,
             mae_dyn *= om_spread_mult
             om_spread_penalty = True
 
+    # v9.13 (2026-05-24): range-bracket MAE penalty.
+    # Snapshot showed 61% of entries are range brackets and ALL of those
+    # picked side=NO — selling the probability of the temp landing in a
+    # specific window. The Gaussian model underestimates how often weather
+    # actually lands in tail brackets (fat-tail real distribution vs
+    # Gaussian assumption). Inflating MAE by 1.5x for range brackets
+    # pushes P(NO) closer to market price, fewer "false edge" NO bets
+    # on tail brackets, fewer 100% losses when the cauda hits.
+    # at_least / at_most directional brackets unaffected.
+    range_penalty_mult = 1.0
+    if spec and spec.comparison == "range":
+        range_penalty_mult = 1.5
+        mae_dyn *= range_penalty_mult
+
     # v8: per-city temperature bias (in spec.threshold_unit)
     bias = None
     if station and station.get("temp_bias_f") is not None:
@@ -606,6 +620,8 @@ def _compute_mae_for_market(spec: MarketSpec, ow_forecast: dict,
         "om_n_models": (om_data or {}).get("n_models"),
         "om_spread_penalty": om_spread_penalty,
         "om_spread_mult": om_spread_mult,   # v9.12: graduated 1.0/1.3/2.0/3.0
+        "range_penalty_mult": range_penalty_mult,  # v9.13: 1.5 for range, 1.0 else
+        "comparison": spec.comparison if spec else None,
         "disagreement": round(disagreement, 2),
         "history_n": len(history_values),
         "base_mae": base_mae,
