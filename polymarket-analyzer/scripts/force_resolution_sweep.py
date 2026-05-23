@@ -42,25 +42,79 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def resolve_one(row: dict, dry_run: bool) -> dict:
-    slug = row["market_slug"]
+# Regex copied from dashboard/services/positions.py — strip the bracket
+# threshold suffix from a market_slug to recover the parent event slug.
+_THRESHOLD_SUFFIX_RE = __import__("re").compile(
+    r"-\d{1,3}(?:-\d{1,3})?[cf]?(?:or\w+)?$",
+    __import__("re").IGNORECASE,
+)
+
+
+def _parent_event_slug(slug: str) -> str:
+    if not slug:
+        return ""
+    stripped = _THRESHOLD_SUFFIX_RE.sub("", slug)
+    return stripped or slug
+
+
+def _fetch_market_by_slug(slug: str) -> dict | None:
+    """Try Gamma /markets first; on miss, fall back to /events?slug=parent
+    and find the sub-market whose slug ends in our threshold suffix."""
+    if not slug:
+        return None
     try:
         r = requests.get(f"{GAMMA}/markets", params={"slug": slug}, timeout=15)
         r.raise_for_status()
         results = r.json()
-    except Exception as e:
-        return {"entry_id": row["entry_id"], "status": "fetch_failed",
-                "err": str(e)}
-    if not isinstance(results, list) or not results:
-        return {"entry_id": row["entry_id"], "status": "not_found"}
-    m = results[0]
+        if isinstance(results, list) and results:
+            return results[0]
+    except Exception:
+        pass
+    # Fallback: hit /events with parent slug and find our bracket
+    parent = _parent_event_slug(slug)
+    if not parent or parent == slug:
+        return None
+    try:
+        r = requests.get(f"{GAMMA}/events",
+                          params={"slug": parent}, timeout=15)
+        r.raise_for_status()
+        events = r.json()
+        if not isinstance(events, list) or not events:
+            return None
+        ev = events[0]
+        for sm in (ev.get("markets") or []):
+            if sm.get("slug") == slug:
+                return sm
+        # No exact slug match — pick the sub-market whose slug ends like ours
+        suffix = slug[len(parent):] if slug.startswith(parent) else ""
+        if suffix:
+            for sm in (ev.get("markets") or []):
+                if (sm.get("slug") or "").endswith(suffix):
+                    return sm
+    except Exception:
+        pass
+    return None
+
+
+def resolve_one(row: dict, dry_run: bool) -> dict:
+    slug = row["market_slug"]
+    # v9.11: pre-populate city/side so even early-return rows show usable info
+    base = {
+        "entry_id": row["entry_id"],
+        "city": row.get("city_resolved") or "?",
+        "side": row["side"],
+        "entry_price": row.get("entry_price"),
+    }
+    m = _fetch_market_by_slug(slug)
+    if m is None:
+        return {**base, "status": "not_found"}
     try:
         outcomes = json.loads(m.get("outcomes", "[]"))
         prices = [float(p) for p in json.loads(m.get("outcomePrices", "[]"))]
     except Exception:
-        return {"entry_id": row["entry_id"], "status": "bad_response"}
+        return {**base, "status": "bad_response"}
     if not outcomes or not prices or len(outcomes) != len(prices):
-        return {"entry_id": row["entry_id"], "status": "no_prices"}
+        return {**base, "status": "no_prices"}
 
     gamma_closed = bool(m.get("closed"))
     if prices[0] >= PRICE_THRESHOLD:
@@ -70,7 +124,7 @@ def resolve_one(row: dict, dry_run: bool) -> dict:
     elif gamma_closed:
         final = "VOID"
     else:
-        return {"entry_id": row["entry_id"], "status": "not_settled",
+        return {**base, "status": "not_settled",
                 "prices": prices, "closed": gamma_closed}
 
     payout = 1.0 if final == row["side"] else 0.0
@@ -79,8 +133,7 @@ def resolve_one(row: dict, dry_run: bool) -> dict:
 
     pnl_est = (payout - float(row["entry_price"] or 0)) * float(row["size_shares"] or 0)
     out = {
-        "entry_id": row["entry_id"], "city": row["city_resolved"],
-        "side": row["side"], "entry_price": row["entry_price"],
+        **base,
         "final_outcome": final, "payout": payout,
         "pnl_estimate_usd": round(pnl_est, 2),
         "closed_flag": gamma_closed, "prices": prices,

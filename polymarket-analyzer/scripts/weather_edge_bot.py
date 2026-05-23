@@ -1911,6 +1911,52 @@ def _do_ladder_cashout(group_id: str, forecast: dict,
 # ---------------------------------------------------------------------------
 
 
+# v9.11.1: Polymarket sometimes archives bracket sub-market URLs after
+# settlement but keeps the parent event live via /events. Try both.
+_RESOLUTION_SUFFIX_RE = _re.compile(
+    r"-\d{1,3}(?:-\d{1,3})?[cf]?(?:or\w+)?$", _re.IGNORECASE)
+
+
+def _fetch_resolved_market(slug: str) -> Optional[dict]:
+    """Return Gamma market dict for `slug`, falling back to /events?slug=parent
+    when /markets?slug= returns empty (typical for archived sub-markets)."""
+    if not slug:
+        return None
+    try:
+        r = requests.get(f"{GAMMA_API}/markets",
+                         params={"slug": slug}, timeout=15)
+        r.raise_for_status()
+        results = r.json()
+        if isinstance(results, list) and results:
+            return results[0]
+    except requests.RequestException:
+        pass
+    # Parent fallback
+    parent = _RESOLUTION_SUFFIX_RE.sub("", slug)
+    if parent == slug or not parent:
+        return None
+    try:
+        r = requests.get(f"{GAMMA_API}/events",
+                         params={"slug": parent}, timeout=15)
+        r.raise_for_status()
+        events = r.json()
+        if not isinstance(events, list) or not events:
+            return None
+        sub_markets = events[0].get("markets") or []
+        for sm in sub_markets:
+            if sm.get("slug") == slug:
+                return sm
+        # Suffix-match in case the canonical slug got rewritten
+        suffix = slug[len(parent):]
+        if suffix:
+            for sm in sub_markets:
+                if (sm.get("slug") or "").endswith(suffix):
+                    return sm
+    except requests.RequestException:
+        pass
+    return None
+
+
 def run_resolution_sweep() -> int:
     """For each EXECUTED position past end_date, fetch outcomePrices and persist.
     On resolution, also close the paper-portfolio position at payout so the
@@ -1929,13 +1975,15 @@ def run_resolution_sweep() -> int:
         for row in rows:
             slug = row["market_slug"]
             try:
-                r = requests.get(f"{GAMMA_API}/markets",
-                                 params={"slug": slug}, timeout=15)
-                r.raise_for_status()
-                results = r.json()
-                if not isinstance(results, list) or not results:
+                # v9.11.1: try /markets first, fall back to /events?slug=parent
+                # because Polymarket sometimes archives the sub-market URL
+                # after settlement but keeps the parent event live.
+                m = _fetch_resolved_market(slug)
+                if m is None:
+                    log_event("resolution_skipped", {
+                        "entry_id": row["entry_id"], "slug": slug,
+                        "reason": "market_not_found_in_gamma"})
                     continue
-                m = results[0]
                 outcomes = json.loads(m.get("outcomes", "[]"))
                 prices = [float(p) for p in json.loads(m.get("outcomePrices", "[]"))]
                 if not outcomes or not prices or len(outcomes) != len(prices):
