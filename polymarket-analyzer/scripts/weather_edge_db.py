@@ -557,11 +557,22 @@ def query_ladder_group(conn, ladder_group_id: str) -> list[sqlite3.Row]:
     """v9: all entries belonging to one ladder group, ordered by ladder
     position (central, below, above). Used by atomic executor and atomic
     cashout to coordinate across legs.
+
+    v9.11 (2026-05-24): joins judge_reviews to expose judge_adjusted_side
+    and judge_adjusted_size_usd. Atomic executor needs these for ADJUSTED
+    legs (mirrors query_approved_unexecuted shape). Without the JOIN,
+    accessing leg["judge_adjusted_side"] raised IndexError every 60s
+    starting 2026-05-22 23:00, blocking monitor and cashout for 15h+.
     """
     return conn.execute(
-        "SELECT * FROM entries WHERE ladder_group_id = ? "
-        "ORDER BY CASE ladder_position WHEN 'central' THEN 0 "
-        "WHEN 'below' THEN 1 WHEN 'above' THEN 2 ELSE 3 END, entry_id",
+        "SELECT e.*, "
+        "       j.adjusted_size_usd AS judge_adjusted_size_usd, "
+        "       j.adjusted_side     AS judge_adjusted_side "
+        "FROM entries e "
+        "LEFT JOIN judge_reviews j ON j.entry_id = e.entry_id "
+        "WHERE e.ladder_group_id = ? "
+        "ORDER BY CASE e.ladder_position WHEN 'central' THEN 0 "
+        "WHEN 'below' THEN 1 WHEN 'above' THEN 2 ELSE 3 END, e.entry_id",
         (ladder_group_id,),
     ).fetchall()
 
@@ -692,7 +703,54 @@ def market_already_proposed(conn, market_slug: str, side: str) -> bool:
     return row is not None
 
 
+def _test_query_ladder_group_judge_join():
+    """v9.11 regression: query_ladder_group must expose judge_adjusted_side
+    so _execute_ladder_group_atomic can read it for ADJUSTED legs without
+    raising IndexError. The pre-v9.11 query did SELECT * with no JOIN —
+    leg["judge_adjusted_side"] crashed the main loop every 60s starting
+    2026-05-22 23:00 until detected on 2026-05-24."""
+    import tempfile
+    from pathlib import Path as P
+    tmp = P(tempfile.mkdtemp()) / "regression_judge_join.db"
+    init_db(tmp)
+    gid = "test-group-001"
+    with connect(tmp) as conn:
+        # Insert a ladder leg with status=ADJUSTED + a judge_reviews row
+        # with adjusted_side set (the exact production shape).
+        ts = "2026-05-24T00:00:00+00:00"
+        conn.execute(
+            "INSERT INTO entries (ts, market_slug, market_question, side, "
+            "status, ladder_group_id, ladder_position, entry_price) "
+            "VALUES (?, 's', 'q', 'YES', 'ADJUSTED', ?, 'central', 0.45)",
+            (ts, gid))
+        eid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "INSERT INTO judge_reviews (entry_id, ts, verdict, confidence, "
+            "judge_prob, bot_prob, rationale, cost_usd, adjusted_side, "
+            "adjusted_size_usd) VALUES (?, ?, 'ADJUST', 0.6, 0.6, 0.7, '', "
+            "0.02, 'NO', 25.0)",
+            (eid, ts))
+        conn.commit()
+        legs = query_ladder_group(conn, gid)
+        assert len(legs) == 1, legs
+        leg = legs[0]
+        # The bug: accessing this raised IndexError. Now should work.
+        adj_side = leg["judge_adjusted_side"]
+        adj_size = leg["judge_adjusted_size_usd"]
+        assert adj_side == "NO", f"expected 'NO', got {adj_side!r}"
+        assert adj_size == 25.0, f"expected 25.0, got {adj_size!r}"
+        # status still accessible
+        assert leg["status"] == "ADJUSTED"
+        print(f"Test PASS: query_ladder_group exposes judge_adjusted_side='{adj_side}' "
+              f"size=${adj_size} (no IndexError)")
+    tmp.unlink()
+
+
 if __name__ == "__main__":
+    import sys
+    if "--test-judge-join" in sys.argv:
+        _test_query_ladder_group_judge_join()
+        sys.exit(0)
     # Smoke test: init DB and print version
     init_db()
     with connect() as conn:
