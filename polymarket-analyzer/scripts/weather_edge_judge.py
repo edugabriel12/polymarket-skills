@@ -304,6 +304,9 @@ def call_claude(entry_row: dict, evidence: dict, system_prompt: str) -> Optional
             "thinking_blocks": thinking_blocks,
             "stop_reason": response.stop_reason,
         }, ensure_ascii=False),
+        # v10: ship the prompt text up so apply_verdict can dedup it
+        # into judge_prompts and record only the sha256 on the review.
+        "system_prompt_text": system_prompt,
     }
     return parsed
 
@@ -482,6 +485,18 @@ def apply_verdict(conn, entry_row, verdict: dict) -> None:
         verdict["adjusted_side"] = None
         verdict["adjusted_size_usd"] = None
 
+    # v10: persist the system prompt by content-hash so this review
+    # remains reproducible even after the prompt file is edited.
+    system_prompt_sha256 = None
+    sp_text = meta.get("system_prompt_text")
+    if sp_text:
+        try:
+            system_prompt_sha256 = db.upsert_judge_prompt(conn, sp_text)
+        except Exception as e:
+            log_event("judge_prompt_persist_failed",
+                      {"err": str(e), "entry_id": entry_row["entry_id"]},
+                      level="WARN")
+
     db.insert_judge_review(
         conn,
         entry_id=entry_row["entry_id"],
@@ -506,6 +521,9 @@ def apply_verdict(conn, entry_row, verdict: dict) -> None:
         # v6: full input + raw response for accuracy / hallucination audit.
         input_context_json=meta.get("input_context_json"),
         raw_response_json=meta.get("raw_response_json"),
+        # v10: hash of the system prompt active at the time of this call.
+        # Resolve text via: SELECT text FROM judge_prompts WHERE sha256=?
+        system_prompt_sha256=system_prompt_sha256,
     )
 
     new_status = {"APPROVE": "APPROVED",

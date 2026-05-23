@@ -11,11 +11,12 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 DB_PATH = Path.home() / ".polymarket-paper" / "weather_edge.db"
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 SCHEMA_V1 = """
@@ -270,6 +271,23 @@ SCHEMA_V9_MIGRATIONS = [
 ]
 
 
+# v10: persist the judge system prompt by content-hash so every
+# judge_reviews row is fully reproducible. The prompt file is mutable
+# (operator tunes it via the dashboard); without hashing+dedup we'd
+# either lose historical prompts or duplicate ~8KB per review.
+SCHEMA_V10_MIGRATIONS = [
+    """
+    CREATE TABLE IF NOT EXISTS judge_prompts (
+      sha256 TEXT PRIMARY KEY,
+      text TEXT NOT NULL,
+      first_seen_ts TEXT NOT NULL,
+      char_count INTEGER NOT NULL
+    )
+    """,
+    "ALTER TABLE judge_reviews ADD COLUMN system_prompt_sha256 TEXT",
+]
+
+
 def init_db(path: Path = DB_PATH) -> None:
     """Create the DB and tables if missing. Idempotent. Bumps user_version.
     Enables WAL mode so readers + writers don't block each other."""
@@ -334,6 +352,14 @@ def init_db(path: Path = DB_PATH) -> None:
                     if "duplicate column name" not in str(e).lower():
                         raise
             current = 9
+        if current < 10:
+            for stmt in SCHEMA_V10_MIGRATIONS:
+                try:
+                    cur.execute(stmt)
+                except sqlite3.OperationalError as e:
+                    if "duplicate column name" not in str(e).lower():
+                        raise
+            current = 10
         cur.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
 
@@ -449,6 +475,19 @@ def insert_resolution(conn, entry_id: int, **kwargs) -> int:
     placeholders = ",".join("?" * len(cols))
     q = f"INSERT INTO resolutions ({','.join(cols)}) VALUES ({placeholders})"
     return conn.execute(q, vals).lastrowid
+
+
+def upsert_judge_prompt(conn, text: str) -> str:
+    """Persist a system prompt by SHA-256 (idempotent). Returns the hash so
+    callers can store it as a foreign-key-ish reference on judge_reviews."""
+    import hashlib
+    sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    conn.execute(
+        "INSERT OR IGNORE INTO judge_prompts "
+        "(sha256, text, first_seen_ts, char_count) VALUES (?, ?, ?, ?)",
+        (sha, text, datetime.now(timezone.utc).isoformat(), len(text)),
+    )
+    return sha
 
 
 def insert_judge_review(conn, entry_id: int, **kwargs) -> int:
