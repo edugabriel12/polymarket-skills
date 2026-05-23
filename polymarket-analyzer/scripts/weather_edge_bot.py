@@ -567,11 +567,29 @@ def _compute_mae_for_market(spec: MarketSpec, ow_forecast: dict,
         if disagreement > threshold:
             mae_dyn *= 1.5
 
-    # v8: additional penalty if Open-Meteo 3-model spread > 3C
+    # v8 / v9.12 (2026-05-24): graduated penalty by Open-Meteo 3-model
+    # spread. Previously a single 1.5x kicked in only at spread > 3C
+    # — too binary, missing the 2-3C "models disagree mildly" band.
+    # Now scales smoothly:
+    #   spread ≤ 2C  → no penalty (forecast is tight)
+    #   2-3C         → 1.3x  (early uncertainty signal)
+    #   3-5C         → 2.0x  (substantial disagreement, was 1.5x)
+    #   > 5C         → 3.0x  (models really diverge)
+    # om_spread_penalty boolean is kept for back-compat (any non-1.0
+    # multiplier sets it True).
     om_spread_penalty = False
-    if om_data and not om_data.get("agree"):
-        mae_dyn *= 1.5
-        om_spread_penalty = True
+    om_spread_mult = 1.0
+    if om_data and (om_spread_c := om_data.get("spread_c")) is not None:
+        spread = float(om_spread_c)
+        if spread > 5.0:
+            om_spread_mult = 3.0
+        elif spread > 3.0:
+            om_spread_mult = 2.0
+        elif spread > 2.0:
+            om_spread_mult = 1.3
+        if om_spread_mult > 1.0:
+            mae_dyn *= om_spread_mult
+            om_spread_penalty = True
 
     # v8: per-city temperature bias (in spec.threshold_unit)
     bias = None
@@ -587,6 +605,7 @@ def _compute_mae_for_market(spec: MarketSpec, ow_forecast: dict,
         "om_spread_c": (om_data or {}).get("spread_c"),
         "om_n_models": (om_data or {}).get("n_models"),
         "om_spread_penalty": om_spread_penalty,
+        "om_spread_mult": om_spread_mult,   # v9.12: graduated 1.0/1.3/2.0/3.0
         "disagreement": round(disagreement, 2),
         "history_n": len(history_values),
         "base_mae": base_mae,

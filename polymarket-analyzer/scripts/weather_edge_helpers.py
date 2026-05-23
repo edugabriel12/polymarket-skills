@@ -696,8 +696,17 @@ def _norm_cdf(z: float) -> float:
 # to size more conservatively on extreme-edge candidates and prevents
 # the adverse-selection trap where the bot is "98% sure" on bets the
 # market knows are coin-flips. See log analysis 2026-05-15.
-PROB_CLIP_LOW = 0.10
-PROB_CLIP_HIGH = 0.90
+# v9.12 (2026-05-24): tightened from 0.10/0.90 → 0.20/0.80.
+# Snapshot analysis showed bot_prob clipped to 0.90 in 32% of verdicts;
+# of those, judge disagreed (judge_prob ≤ 0.40) in 30%. That signals
+# the model is systematically overconfident when the forecast point is
+# far from a bracket boundary. Pulling the ceiling in to 0.80 reduces
+# Kelly stake on those "high confidence" trades (82% → 64% in the
+# canonical p=ceiling/price=0.45 scenario) and roughly halves Rule 6
+# overrides. Trade-off: trades with edge in the 20-30pp band may now
+# fall below --min-edge-pp; only the strongest signals survive.
+PROB_CLIP_LOW = 0.20
+PROB_CLIP_HIGH = 0.80
 
 
 def _clip_prob(p: Optional[float]) -> Optional[float]:
@@ -1222,8 +1231,10 @@ if __name__ == "__main__":
         cities=cities_fixture)
     p2 = forecast_probability(spec2_with_date, forecast2)
     # z = (8 - 5) / 3 = 1.0, norm.cdf(1.0) ≈ 0.8413
-    assert p2 is not None and 0.83 <= p2 <= 0.85, f"got {p2}"
-    print(f"Test 4 PASS: P(YES) = {p2:.4f} for forecast_mm=8, threshold=5mm")
+    # v9.12: PROB_CLIP_HIGH tightened 0.90 → 0.80 so the raw 0.8413
+    # now clips to 0.80. Test asserts the clip is active.
+    assert p2 == 0.80, f"expected 0.80 (clipped from 0.8413), got {p2}"
+    print(f"Test 4 PASS: raw 0.8413 clips to {p2:.4f} (new ceiling 0.80)")
 
     # Test 5: slippage sizing — BUY at most 20% over best ask
     book = {
@@ -1276,8 +1287,9 @@ if __name__ == "__main__":
     # but here z_low = (75-65)/5 = +2 → no, the formula uses (ref - threshold) so
     # z_low = (75-65)/5 = +2, z_high = (75-69)/5 = +1.2.
     # _norm_cdf(z_low) - _norm_cdf(z_high) = cdf(2) - cdf(1.2) = 0.977 - 0.885 = 0.092
-    assert p3 is not None and 0.05 <= p3 <= 0.13, f"got {p3}"
-    print(f"Test 8 PASS: P(65-69°F | high=75) = {p3:.4f}")
+    # v9.12: raw 0.092 now clips UP to PROB_CLIP_LOW (0.20) since 0.092 < 0.20.
+    assert p3 == 0.20, f"expected 0.20 (clipped from ~0.092), got {p3}"
+    print(f"Test 8 PASS: raw ~0.092 clips up to {p3:.4f} (new floor 0.20)")
 
     # Test 9: "70°F or above" pattern
     spec4 = parse_market("Highest temperature in Manhattan on May 11, 2026 70°F or above",
@@ -1424,6 +1436,20 @@ if __name__ == "__main__":
         convergence_pp=0.0)
     assert v["decision"] == "HOLD", v
     print(f"Test I PASS: convergence_pp=0 disables the trigger (HOLD)")
+
+    # -----------------------------------------------------------------------
+    # v9.12: clip ceiling/floor tightened (0.90/0.10 → 0.80/0.20)
+    # -----------------------------------------------------------------------
+    assert _clip_prob(0.99) == 0.80
+    print(f"Test J1 PASS: raw 0.99 clips to {_clip_prob(0.99)} (new ceiling 0.80)")
+    assert _clip_prob(0.02) == 0.20
+    print(f"Test J2 PASS: raw 0.02 clips to {_clip_prob(0.02)} (new floor 0.20)")
+    assert _clip_prob(0.50) == 0.50 and _clip_prob(0.75) == 0.75
+    print("Test J3 PASS: middle prob unchanged (0.50, 0.75)")
+    assert _clip_prob(0.80) == 0.80 and _clip_prob(0.20) == 0.20
+    print("Test J4 PASS: boundary values stay")
+    assert _clip_prob(None) is None
+    print("Test J5 PASS: None passes through")
 
     # -----------------------------------------------------------------------
     # v9: ladder selection tests
