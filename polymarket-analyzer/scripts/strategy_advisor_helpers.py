@@ -833,7 +833,10 @@ def read_current_config() -> dict:
         text = BOT_PATH.read_text(encoding="utf-8")
         for flag in ("--min-edge-pp", "--min-price", "--max-price",
                      "--profit-lock-pp", "--trailing-drawdown-pct",
-                     "--convergence-pp", "--fast-path-ttr-min"):
+                     "--convergence-pp", "--fast-path-ttr-min",
+                     # v11: surface the TTR floor + risk gate to the advisor
+                     "--min-ttr-hours", "--ladder-min-ttr-hours",
+                     "--max-drawdown-halt-pct", "--daily-loss-limit-pct"):
             # Match: p.add_argument("--flag", ..., default=VALUE
             pat = (rf'add_argument\(\s*["\']{re.escape(flag)}["\'][^)]*?'
                    r'default\s*=\s*([0-9.\-]+)')

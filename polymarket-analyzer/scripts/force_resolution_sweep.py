@@ -33,9 +33,48 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO.parent.parent / "polymarket-paper-trader" / "scripts"))
 
 import weather_edge_db as db  # noqa: E402
+import weather_edge_helpers as weh  # noqa: E402
 
 GAMMA = "https://gamma-api.polymarket.com"
 PRICE_THRESHOLD = 0.95
+
+# Lazily-loaded cities/stations lookup (for resolving lat/lon per city so we
+# can pull the realized high temp from the Open-Meteo archive).
+_CITIES_CACHE = None
+
+
+def _cities():
+    global _CITIES_CACHE
+    if _CITIES_CACHE is None:
+        _CITIES_CACHE = weh.load_cities()
+    return _CITIES_CACHE
+
+
+def _observed_value_for(row: dict) -> tuple:
+    """Realized high temp for this entry's target date, in the market's unit.
+
+    Gamma does NOT publish the observed temperature (only YES/NO settlement
+    prices), so we reconstruct it from the Open-Meteo archive using the
+    resolution station's lat/lon. Returns (value, note); value is None when
+    coords are unknown or the archive has no data yet (~1-2 day lag).
+    Populating resolutions.observed_value here builds the ground-truth base
+    the strategy advisor needs to calibrate MAE.
+    """
+    city = row.get("city_resolved")
+    end_date = (row.get("end_date") or "")[:10]
+    unit = (row.get("threshold_unit") or "").upper()
+    if not city or not end_date or unit not in ("C", "F"):
+        return None, "not_temp_market"
+    station = weh.resolve_station(city, _cities())
+    if not station or station.get("lat") is None or station.get("lon") is None:
+        return None, "no_station_coords"
+    arch = weh.fetch_open_meteo_archive(station["lat"], station["lon"], end_date)
+    if not arch:
+        return None, "archive_unavailable"
+    val = arch.get("observed_max_f") if unit == "F" else arch.get("observed_max_c")
+    if val is None:
+        return None, "archive_no_value"
+    return float(val), "open-meteo-archive"
 
 
 def _now_iso() -> str:
@@ -132,11 +171,14 @@ def resolve_one(row: dict, dry_run: bool) -> dict:
         payout = float(row["entry_price"] or 0)
 
     pnl_est = (payout - float(row["entry_price"] or 0)) * float(row["size_shares"] or 0)
+    # Realized temperature (Open-Meteo archive) → resolutions.observed_value.
+    observed_value, observed_note = _observed_value_for(row)
     out = {
         **base,
         "final_outcome": final, "payout": payout,
         "pnl_estimate_usd": round(pnl_est, 2),
         "closed_flag": gamma_closed, "prices": prices,
+        "observed_value": observed_value, "observed_source": observed_note,
         "status": "would_resolve" if dry_run else "resolved",
     }
     if dry_run:
@@ -149,6 +191,7 @@ def resolve_one(row: dict, dry_run: bool) -> dict:
             ts_resolved=_now_iso(),
             final_outcome=final,
             payout_per_share=payout,
+            observed_value=observed_value,
         )
         conn.commit()
 
@@ -190,11 +233,14 @@ def main() -> int:
         r = resolve_one(row, dry_run=args.dry_run)
         results.append(r)
         marker = "DRY" if args.dry_run else "OK"
+        obs = r.get("observed_value")
+        obs_s = f"{obs:.1f}" if obs is not None else (r.get("observed_source") or "-")
         print(f"  #{r['entry_id']:>3} {r.get('city','?'):<14} "
               f"{r.get('side','?'):<3} → {r.get('status'):<20} "
               f"{r.get('final_outcome','-'):<5} "
               f"payout=${r.get('payout',0):.2f} "
-              f"pnl≈${r.get('pnl_estimate_usd',0):+.2f}")
+              f"pnl≈${r.get('pnl_estimate_usd',0):+.2f} "
+              f"obs={obs_s}")
 
     total_pnl = sum(r.get("pnl_estimate_usd", 0)
                      for r in results

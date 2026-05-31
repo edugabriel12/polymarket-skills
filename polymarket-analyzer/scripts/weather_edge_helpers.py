@@ -36,8 +36,14 @@ def _strip_accents(s: str) -> str:
 # Constants — calibrated MAEs for normal-CDF probability conversion
 # ---------------------------------------------------------------------------
 
-MAE_TEMP_F = 5.0      # OpenWeather 3-5d temp forecast MAE in °F (fallback)
-MAE_TEMP_C = 2.78     # = MAE_TEMP_F converted
+# v11 (2026-05-31 post-mortem): widened from 5.0/2.78 after the -$771 / 33%
+# win-rate run. Loss forensics showed range-bracket forecasts erring 2-3°C
+# while the bot priced edge as if MAE were ~2.8°C, inflating confidence on
+# range NO bets (which were 93% of trades and lost 67% of the time). Wider
+# MAE shrinks the computed edge so only genuinely separated forecasts survive
+# --min-edge-pp.
+MAE_TEMP_F = 6.5      # OpenWeather 3-5d temp forecast MAE in °F (fallback)
+MAE_TEMP_C = 3.6      # = MAE_TEMP_F converted (6.5°F ≈ 3.6°C)
 MAE_PRECIP_MM = 3.0   # precip total MAE
 MAE_WIND_KPH = 8.0    # wind speed MAE
 
@@ -774,8 +780,14 @@ def _norm_cdf(z: float) -> float:
 # canonical p=ceiling/price=0.45 scenario) and roughly halves Rule 6
 # overrides. Trade-off: trades with edge in the 20-30pp band may now
 # fall below --min-edge-pp; only the strongest signals survive.
-PROB_CLIP_LOW = 0.20
-PROB_CLIP_HIGH = 0.80
+# v11 (2026-05-31 post-mortem): tightened again 0.20/0.80 → 0.30/0.70 and
+# made the cap actually bind on NO bets. The clip applies to P(YES); a NO
+# bet's confidence is P(NO)=1-P(YES), so it was the LOW bound (0.20 → P(NO)
+# 0.80) that capped NO confidence, not HIGH. In the -$771 run 86% of
+# executions hit a clip and were NO bets pinned at 0.80 confidence. Raising
+# LOW to 0.30 caps P(NO) at 0.70 symmetrically with the YES ceiling.
+PROB_CLIP_LOW = 0.30
+PROB_CLIP_HIGH = 0.70
 
 
 def _clip_prob(p: Optional[float]) -> Optional[float]:
@@ -899,6 +911,36 @@ def _forecast_probability_raw(spec: MarketSpec, forecast: dict,
         return 0.05  # tiny baseline if forecast doesn't show snow at all
 
     return None
+
+
+def forecast_ref_value(spec: MarketSpec, forecast: dict) -> Optional[float]:
+    """Return the scalar forecast reference value (high temp) for a temp
+    market's target date, in the market's threshold_unit. Mirrors the
+    date-matching + temp_high extraction used by _forecast_probability_raw.
+
+    Used by the range_cross cashout trigger and the judge's threshold-
+    proximity override, which need the raw forecast value (not the
+    probability) to compare against the bracket boundaries.
+
+    Returns None for non-temp markets or when no matching day is found.
+    """
+    if not forecast or spec.metric != "temp":
+        return None
+    days = forecast.get("daily_forecast") or forecast.get("forecasts")
+    if not days or not spec.target_date:
+        return None
+    target_str = spec.target_date.isoformat()
+    day = next((d for d in days if d.get("date") == target_str), None)
+    if not day:
+        for delta in (1, -1):
+            alt = (spec.target_date + timedelta(days=delta)).isoformat()
+            day = next((d for d in days if d.get("date") == alt), None)
+            if day:
+                break
+    if not day:
+        return None
+    ref = day.get(f"temp_high_{spec.threshold_unit.lower()}")
+    return float(ref) if ref is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -1182,10 +1224,19 @@ def evaluate_cashout_triggers(
     trailing_drawdown_pct: float = 30.0,
     trailing_min_gain_pp: float = 20.0,
     convergence_pp: float = 5.0,
+    comparison: Optional[str] = None,
+    forecast_value: Optional[float] = None,
+    range_low: Optional[float] = None,
+    range_high: Optional[float] = None,
+    range_cross_margin: float = 0.5,
 ) -> dict:
-    """Decide whether to cash out an open position based on 4 OR'd triggers.
+    """Decide whether to cash out an open position based on OR'd triggers.
 
     Triggers (evaluated in order; first match wins):
+      0. range_cross     — STOP-LOSS. NO bet on a range market whose live
+                           forecast has drifted into [low-margin, high+margin].
+                           Fires regardless of bid (may sell at a loss) to cut
+                           the position before resolution.
       1. profit_lock     — bid >= entry + profit_lock_pp/100
       2. trailing_stop   — peak >= entry + trailing_min_gain_pp/100 AND
                            bid <= peak * (1 - trailing_drawdown_pct/100)
@@ -1196,13 +1247,37 @@ def evaluate_cashout_triggers(
                              (break-even backstop, existing behavior)
 
     Guard: if current_bid < entry_price, triggers 1-3 are suppressed
-    (never sell at a loss on profit-taking logic). forecast_reversal still
-    requires bid >= entry by definition.
+    (never sell at a loss on profit-taking logic). range_cross is the sole
+    exception — it is a stop-loss and deliberately sells at a loss.
+    forecast_reversal still requires bid >= entry by definition.
 
     Returns: {decision: "CASHOUT"|"HOLD", trigger: str, reason: str}
     """
     in_profit = current_bid >= entry_price
     peak = float(peak_bid_seen) if peak_bid_seen is not None else 0.0
+
+    # Trigger 0: range cross (stop-loss for NO bets on range markets).
+    # v11 (2026-05-31 post-mortem): in the -$771 run, 91% of losing range
+    # NO bets had the bot's own forecast drift into the bracket before
+    # resolution (e.g. HK #23: forecast rose to 31.8 inside the 31-32 range).
+    # The existing forecast_reversal never fired because it requires
+    # bid >= entry. This trigger cuts the loss as soon as the forecast
+    # enters the danger zone, independent of the bid.
+    if (side == "NO" and comparison == "range"
+            and forecast_value is not None
+            and range_low is not None and range_high is not None):
+        lo = float(range_low) - range_cross_margin
+        hi = float(range_high) + range_cross_margin
+        if lo <= float(forecast_value) <= hi:
+            return {
+                "decision": "CASHOUT",
+                "trigger": "range_cross",
+                "reason": (f"forecast {float(forecast_value):.2f} entered "
+                           f"[{lo:.2f}, {hi:.2f}] (range "
+                           f"{float(range_low):.2f}-{float(range_high):.2f} "
+                           f"± {range_cross_margin:.1f}); stop-loss before "
+                           f"resolution"),
+            }
 
     # Trigger 1: profit lock
     if in_profit and (current_bid - entry_price) >= profit_lock_pp / 100.0:
@@ -1302,9 +1377,10 @@ if __name__ == "__main__":
          "condition_main": "Clear"}
     ]}
     p = forecast_probability(spec, forecast)
-    # z = (78-75)/5 = 0.6, norm.cdf(0.6) ≈ 0.7257
-    assert p is not None and 0.70 <= p <= 0.74, f"got {p}"
-    print(f"Test 3 PASS: P(YES) = {p:.4f} for forecast_high=78, threshold=75, MAE=5°F")
+    # v11: MAE_TEMP_F widened 5.0 → 6.5. z = (78-75)/6.5 = 0.462,
+    # norm.cdf(0.462) ≈ 0.678.
+    assert p is not None and 0.66 <= p <= 0.70, f"got {p}"
+    print(f"Test 3 PASS: P(YES) = {p:.4f} for forecast_high=78, threshold=75, MAE=6.5°F")
 
     # Test 4: forecast → prob (precipitation, "more than 5mm")
     forecast2 = {"forecasts": [
@@ -1316,10 +1392,10 @@ if __name__ == "__main__":
         cities=cities_fixture)
     p2 = forecast_probability(spec2_with_date, forecast2)
     # z = (8 - 5) / 3 = 1.0, norm.cdf(1.0) ≈ 0.8413
-    # v9.12: PROB_CLIP_HIGH tightened 0.90 → 0.80 so the raw 0.8413
-    # now clips to 0.80. Test asserts the clip is active.
-    assert p2 == 0.80, f"expected 0.80 (clipped from 0.8413), got {p2}"
-    print(f"Test 4 PASS: raw 0.8413 clips to {p2:.4f} (new ceiling 0.80)")
+    # v11: PROB_CLIP_HIGH tightened 0.80 → 0.70 so the raw 0.8413
+    # now clips to 0.70. Test asserts the clip is active.
+    assert p2 == 0.70, f"expected 0.70 (clipped from 0.8413), got {p2}"
+    print(f"Test 4 PASS: raw 0.8413 clips to {p2:.4f} (new ceiling 0.70)")
 
     # Test 5: slippage sizing — BUY at most 20% over best ask
     book = {
@@ -1371,10 +1447,11 @@ if __name__ == "__main__":
     # We want P(low ≤ T < high) = cdf(z_low) - cdf(z_high) where z_low > z_high,
     # but here z_low = (75-65)/5 = +2 → no, the formula uses (ref - threshold) so
     # z_low = (75-65)/5 = +2, z_high = (75-69)/5 = +1.2.
-    # _norm_cdf(z_low) - _norm_cdf(z_high) = cdf(2) - cdf(1.2) = 0.977 - 0.885 = 0.092
-    # v9.12: raw 0.092 now clips UP to PROB_CLIP_LOW (0.20) since 0.092 < 0.20.
-    assert p3 == 0.20, f"expected 0.20 (clipped from ~0.092), got {p3}"
-    print(f"Test 8 PASS: raw ~0.092 clips up to {p3:.4f} (new floor 0.20)")
+    # v11: with MAE_TEMP_F widened to 6.5, z_low=(75-65)/6.5=1.54,
+    # z_high=(75-69)/6.5=0.92 → cdf(1.54)-cdf(0.92) ≈ 0.938-0.822 = 0.116.
+    # Raw 0.116 still clips UP to PROB_CLIP_LOW (0.30) since 0.116 < 0.30.
+    assert p3 == 0.30, f"expected 0.30 (clipped from ~0.116), got {p3}"
+    print(f"Test 8 PASS: raw ~0.116 clips up to {p3:.4f} (new floor 0.30)")
 
     # Test 9: "70°F or above" pattern
     spec4 = parse_market("Highest temperature in Manhattan on May 11, 2026 70°F or above",
@@ -1523,15 +1600,61 @@ if __name__ == "__main__":
     print(f"Test I PASS: convergence_pp=0 disables the trigger (HOLD)")
 
     # -----------------------------------------------------------------------
-    # v9.12: clip ceiling/floor tightened (0.90/0.10 → 0.80/0.20)
+    # v11: range_cross stop-loss trigger
     # -----------------------------------------------------------------------
-    assert _clip_prob(0.99) == 0.80
-    print(f"Test J1 PASS: raw 0.99 clips to {_clip_prob(0.99)} (new ceiling 0.80)")
-    assert _clip_prob(0.02) == 0.20
-    print(f"Test J2 PASS: raw 0.02 clips to {_clip_prob(0.02)} (new floor 0.20)")
-    assert _clip_prob(0.50) == 0.50 and _clip_prob(0.75) == 0.75
-    print("Test J3 PASS: middle prob unchanged (0.50, 0.75)")
-    assert _clip_prob(0.80) == 0.80 and _clip_prob(0.20) == 0.20
+    # Test K1: NO bet on range 31-32, forecast 31.8 inside → CASHOUT range_cross.
+    # Bid below entry (would normally be suppressed) — range_cross overrides.
+    v = evaluate_cashout_triggers(
+        side="NO", entry_price=0.61, current_bid=0.40, peak_bid_seen=0.61,
+        forecast_prob_yes=0.30, comparison="range",
+        forecast_value=31.8, range_low=31.0, range_high=32.0)
+    assert v["decision"] == "CASHOUT" and v["trigger"] == "range_cross", v
+    print("Test K1 PASS: NO+range forecast inside bracket → range_cross (sells at loss)")
+
+    # Test K2: NO bet on range, forecast 29.0 well outside (range 31-32 ±0.5
+    # = [30.5, 32.5]) → no range_cross; bid<entry suppresses others → HOLD.
+    v = evaluate_cashout_triggers(
+        side="NO", entry_price=0.61, current_bid=0.55, peak_bid_seen=0.61,
+        forecast_prob_yes=0.20, comparison="range",
+        forecast_value=29.0, range_low=31.0, range_high=32.0)
+    assert v["decision"] == "HOLD" and v["trigger"] != "range_cross", v
+    print("Test K2 PASS: NO+range forecast outside bracket±margin → no range_cross")
+
+    # Test K3: edge of margin — forecast at low-0.5 boundary still triggers.
+    v = evaluate_cashout_triggers(
+        side="NO", entry_price=0.61, current_bid=0.40, peak_bid_seen=0.61,
+        forecast_prob_yes=0.30, comparison="range",
+        forecast_value=30.5, range_low=31.0, range_high=32.0)
+    assert v["trigger"] == "range_cross", v
+    print("Test K3 PASS: forecast at low-margin boundary fires range_cross")
+
+    # Test K4: YES bet on range with forecast inside → NOT range_cross
+    # (forecast inside the bracket is GOOD for a YES bet).
+    v = evaluate_cashout_triggers(
+        side="YES", entry_price=0.40, current_bid=0.30, peak_bid_seen=0.40,
+        forecast_prob_yes=0.70, comparison="range",
+        forecast_value=31.5, range_low=31.0, range_high=32.0)
+    assert v["trigger"] != "range_cross", v
+    print("Test K5 PASS: YES+range inside bracket does NOT trigger range_cross")
+
+    # Test K5: non-range NO bet never triggers range_cross even if value given.
+    v = evaluate_cashout_triggers(
+        side="NO", entry_price=0.61, current_bid=0.55, peak_bid_seen=0.61,
+        forecast_prob_yes=0.40, comparison="exceed",
+        forecast_value=31.5, range_low=31.0, range_high=None)
+    assert v["trigger"] != "range_cross", v
+    print("Test K6 PASS: non-range comparison does not trigger range_cross")
+
+    # -----------------------------------------------------------------------
+    # v11: clip ceiling/floor tightened (0.80/0.20 → 0.70/0.30)
+    # -----------------------------------------------------------------------
+    assert _clip_prob(0.99) == 0.70
+    print(f"Test J1 PASS: raw 0.99 clips to {_clip_prob(0.99)} (new ceiling 0.70)")
+    assert _clip_prob(0.02) == 0.30
+    print(f"Test J2 PASS: raw 0.02 clips to {_clip_prob(0.02)} (new floor 0.30)")
+    assert _clip_prob(0.50) == 0.50 and _clip_prob(0.60) == 0.60
+    print("Test J3 PASS: middle prob unchanged (0.50, 0.60)")
+    assert _clip_prob(0.70) == 0.70 and _clip_prob(0.30) == 0.30
     print("Test J4 PASS: boundary values stay")
     assert _clip_prob(None) is None
     print("Test J5 PASS: None passes through")

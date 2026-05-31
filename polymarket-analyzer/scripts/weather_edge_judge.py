@@ -440,6 +440,49 @@ def _recheck_edge_prejudge(row: dict) -> Optional[dict]:
     }
 
 
+def _threshold_proximity_reason(entry_row) -> Optional[str]:
+    """v11 (post-mortem): return an override reason if the bot's forecast
+    sits within ~1°C of the threshold — or, for a range market, within ~1°C
+    of entering the bracket. At that distance the temperature is a coin flip
+    and the trade has no real edge. 91% of the -$771 run's losing range NO
+    bets had the forecast within 1°C of the bracket, yet the judge APPROVE'd
+    them. Returns None when not too close / not a temp market / unparseable.
+    """
+    try:
+        from weather_edge_helpers import (parse_market, forecast_ref_value,
+                                          load_cities)
+    except Exception:
+        return None
+    try:
+        spec = parse_market(entry_row["market_question"], entry_row["end_date"],
+                            load_cities())
+    except Exception:
+        return None
+    if not spec or spec.metric != "temp":
+        return None
+    try:
+        forecast = json.loads(entry_row["forecast_snapshot_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    ref = forecast_ref_value(spec, forecast)
+    if ref is None:
+        return None
+    # 1°C tolerance; for F markets that's ~1.8°F.
+    margin = 1.0 if (spec.threshold_unit or "").upper() == "C" else 1.8
+    if spec.comparison == "range" and spec.threshold_value_high is not None:
+        lo, hi = spec.threshold_value, spec.threshold_value_high
+        # Distance from forecast to the bracket: 0 if already inside.
+        if lo - margin <= ref <= hi + margin:
+            return (f"forecast {ref:.2f} within {margin:.1f}° of range "
+                    f"[{lo:.1f}, {hi:.1f}] — too close to call")
+        return None
+    dist = abs(ref - spec.threshold_value)
+    if dist < margin:
+        return (f"forecast {ref:.2f} within {margin:.1f}° of threshold "
+                f"{spec.threshold_value:.1f} (|Δ|={dist:.2f}) — too close to call")
+    return None
+
+
 def apply_verdict(conn, entry_row, verdict: dict) -> None:
     """Persist the verdict to judge_reviews and update entry status."""
     meta = verdict.pop("_meta", {})
@@ -456,6 +499,7 @@ def apply_verdict(conn, entry_row, verdict: dict) -> None:
     divergence = abs(judge_prob - bot_prob)
 
     override_reason = None
+    override_kind = "rule6_override"
     if original_verdict in ("APPROVE", "ADJUST"):
         if confidence == 0.0:
             override_reason = (
@@ -465,9 +509,17 @@ def apply_verdict(conn, entry_row, verdict: dict) -> None:
             override_reason = (
                 f"Rule 6 violation: |judge_prob {judge_prob:.2f} - "
                 f"bot_prob {bot_prob:.2f}| = {divergence*100:.0f}pp > 20pp")
+        else:
+            # v11: threshold-proximity hard-enforce (forecast ~1°C from the
+            # threshold / range edge → coin flip → REJECT). Checked only when
+            # Rule 6 didn't already fire.
+            prox = _threshold_proximity_reason(entry_row)
+            if prox:
+                override_reason = prox
+                override_kind = "threshold_proximity_override"
 
     if override_reason:
-        log_event("rule6_override", {
+        log_event(override_kind, {
             "entry_id": entry_row["entry_id"],
             "original_verdict": original_verdict,
             "confidence": confidence,

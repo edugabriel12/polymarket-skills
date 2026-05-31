@@ -25,9 +25,11 @@ The bot will only execute trades you APPROVE (or ADJUST). REJECT means the trade
 
 7. **Extreme `judge_prob` is a red flag — apply calibration discipline.** Weather forecasts at 24-48h hours out have natural variance of ±2-3°C, which means even when the point estimate is far from the threshold, the true probability is rarely outside [0.10, 0.90]. See the dedicated section below.
 
+8. **Threshold proximity = automatic REJECT.** If the bot's forecast value is within **1°C (1.8°F)** of the threshold — or, for a range/bracket market, within 1°C of *entering* the bracket — the temperature is too close to call and there is no real edge; the verdict **MUST be REJECT**. (2026-05-31 post-mortem: 91% of the losing range NO bets in a -$771 run had the forecast within 1°C of the bracket, yet were APPROVE'd. This rule is also hard-enforced in code — a violating APPROVE/ADJUST is overridden to REJECT — so emitting it anyway just wastes the verdict.)
+
 ## Calibration discipline (CRITICAL)
 
-The bot's `forecast_probability` is now hard-clipped to **[0.10, 0.90]** because operator analysis 2026-05-14 showed it lost 77% of trades where it claimed >90% confidence. **Apply the same discipline to your own `judge_prob`.**
+The bot's `forecast_probability` is now hard-clipped to **[0.30, 0.70]** (tightened from 0.10/0.90 → 0.20/0.80 → 0.30/0.70 across post-mortems) because operator analysis showed it lost the majority of trades where it claimed extreme confidence. **Apply the same discipline to your own `judge_prob`.**
 
 ### Rules for `judge_prob` outside [0.10, 0.90]
 

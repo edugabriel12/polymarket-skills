@@ -63,7 +63,7 @@ _load_dotenv()
 from weather_edge_helpers import (  # noqa: E402
     parse_market, forecast_probability, compute_max_size_for_slippage,
     implied_probabilities, compute_edge, load_cities, MarketSpec,
-    evaluate_cashout_triggers,
+    evaluate_cashout_triggers, forecast_ref_value,
     # v7: dynamic MAE + multi-source consensus
     compute_dynamic_mae, fetch_visual_crossing,
     MAE_TEMP_F, MAE_TEMP_C,
@@ -71,6 +71,8 @@ from weather_edge_helpers import (  # noqa: E402
     resolve_station, fetch_open_meteo_ensemble,
     # v9: auto-extract station from market description
     auto_extract_station,
+    # v11: realized weather for resolutions.observed_value
+    fetch_open_meteo_archive,
 )
 import weather_edge_db as db  # noqa: E402
 
@@ -1443,6 +1445,55 @@ def _ladder_abort(group_id: str, reason: str, trigger_entry_id: int) -> int:
     return 0
 
 
+def _risk_block_reason(engine, args) -> Optional[str]:
+    """v11 (2026-05-31 post-mortem): hard-enforced risk gate. Returns a
+    human-readable reason string if NEW entries must be blocked this cycle,
+    else None.
+
+    Blocks when either:
+      - portfolio drawdown from peak >= --max-drawdown-halt-pct (default 20),
+        or
+      - today's realized loss >= --daily-loss-limit-pct of the starting
+        balance (default 5).
+
+    Scope is entry-blocking only — open positions are left to resolve or
+    cash out normally (operator decision). The drawdown figure comes from
+    PaperEngine.get_portfolio() and reflects both realized and unrealized
+    P&L (open losers depress total_value), so it is the primary guard; the
+    daily realized-loss check is a secondary same-day circuit breaker.
+
+    Fail-open: a portfolio-read error logs a WARN and does NOT block, so a
+    transient price-fetch failure can't wedge the executor.
+    """
+    try:
+        pf = engine.get_portfolio()
+    except Exception as e:
+        log_event("warn", {"where": "risk_gate", "err": str(e)}, level="WARN")
+        return None
+    drawdown_pct = float(pf.get("drawdown_pct") or 0.0)
+    starting = float(pf.get("starting_balance") or 0.0)
+
+    halt_dd = float(getattr(args, "max_drawdown_halt_pct", 20.0) or 0.0)
+    if halt_dd > 0 and drawdown_pct >= halt_dd:
+        return f"drawdown {drawdown_pct:.1f}% >= halt threshold {halt_dd:.1f}%"
+
+    daily_limit = float(getattr(args, "daily_loss_limit_pct", 5.0) or 0.0)
+    if daily_limit > 0 and starting > 0:
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(c.realized_pnl_usd), 0) "
+                "FROM cashouts c JOIN entries e ON c.entry_id = e.entry_id "
+                "WHERE DATE(c.ts) = DATE('now')"
+            ).fetchone()
+        realized_today = float(row[0] or 0.0)
+        if realized_today < 0:
+            daily_loss_pct = -realized_today / starting * 100.0
+            if daily_loss_pct >= daily_limit:
+                return (f"daily realized loss {daily_loss_pct:.1f}% >= limit "
+                        f"{daily_limit:.1f}% (${realized_today:.2f} today)")
+    return None
+
+
 def run_execute(args) -> int:
     """Pick up APPROVED entries and execute them via paper_engine.
 
@@ -1466,6 +1517,16 @@ def run_execute(args) -> int:
         return 0
 
     engine = PaperEngine(portfolio=args.portfolio)
+
+    # v11: hard-enforced risk gate. If the portfolio breached the drawdown
+    # halt or the daily-loss limit, block ALL new entries this cycle. Open
+    # positions are unaffected (they resolve / cash out on their own).
+    block_reason = _risk_block_reason(engine, args)
+    if block_reason:
+        log_event("risk_halt_block",
+                  {"reason": block_reason, "n_pending": len(rows)},
+                  level="WARN")
+        return 0
 
     # v9: atomic-execution gate. Tracks ladder groups already processed
     # (either executed atomically OR marked dead) in this single
@@ -1740,6 +1801,8 @@ def _do_monitor_check(conn, row, cities: dict, args) -> None:
     prev_peak = float(row["peak_bid_seen"] or 0.0)
     peak = max(prev_peak, bid)
 
+    # v11: raw forecast value for the range_cross stop-loss trigger.
+    forecast_ref = forecast_ref_value(spec, forecast)
     verdict = evaluate_cashout_triggers(
         side=side,
         entry_price=entry_price,
@@ -1749,6 +1812,10 @@ def _do_monitor_check(conn, row, cities: dict, args) -> None:
         profit_lock_pp=args.profit_lock_pp,
         trailing_drawdown_pct=args.trailing_drawdown_pct,
         convergence_pp=args.convergence_pp,
+        comparison=spec.comparison,
+        forecast_value=forecast_ref,
+        range_low=spec.threshold_value,
+        range_high=spec.threshold_value_high,
     )
     decision = verdict["decision"]
     trigger = verdict["trigger"]
@@ -1992,11 +2059,35 @@ def _fetch_resolved_market(slug: str) -> Optional[dict]:
     return None
 
 
+def _observed_value_for(row, cities) -> Optional[float]:
+    """v11: realized high temp for this entry's target date, in the market's
+    unit, from the Open-Meteo archive. Returns None when the market isn't a
+    temp market, the station coords are unknown, or the archive has no data
+    yet (~1-2 day lag). Used to populate resolutions.observed_value so the
+    advisor can calibrate MAE against ground truth."""
+    try:
+        city = row["city_resolved"]
+        end_date = (row["end_date"] or "")[:10]
+        unit = (row["threshold_unit"] or "").upper()
+    except Exception:
+        return None
+    if not city or not end_date or unit not in ("C", "F"):
+        return None
+    station = resolve_station(city, cities)
+    if not station or station.get("lat") is None or station.get("lon") is None:
+        return None
+    arch = fetch_open_meteo_archive(station["lat"], station["lon"], end_date)
+    if not arch:
+        return None
+    return arch.get("observed_max_f") if unit == "F" else arch.get("observed_max_c")
+
+
 def run_resolution_sweep() -> int:
     """For each EXECUTED position past end_date, fetch outcomePrices and persist.
     On resolution, also close the paper-portfolio position at payout so the
     slot is freed for new bets."""
     resolved = 0
+    cities = load_cities()
     try:
         import paper_engine
     except ImportError as e:
@@ -2058,17 +2149,20 @@ def run_resolution_sweep() -> int:
                 payout = 1.0 if (final_outcome == row["side"]) else 0.0
                 if final_outcome == "VOID":
                     payout = float(row["entry_price"] or 0)  # neutral
+                observed_value = _observed_value_for(row, cities)
                 db.insert_resolution(
                     conn, entry_id=row["entry_id"],
                     ts_resolved=_now_iso(),
                     final_outcome=final_outcome,
                     payout_per_share=payout,
+                    observed_value=observed_value,
                 )
                 resolved += 1
                 log_event("resolution_observed", {"entry_id": row["entry_id"],
                                                    "slug": slug,
                                                    "outcome": final_outcome,
-                                                   "payout": payout})
+                                                   "payout": payout,
+                                                   "observed_value": observed_value})
 
                 # Close the corresponding paper-portfolio position at the
                 # resolution payout. This credits proceeds + frees the
@@ -2232,17 +2326,17 @@ def main():
                         "in weather-cities.json 'stations' dict.")
     p.add_argument("--no-open-meteo", dest="open_meteo", action="store_false",
                    help="Disable Open-Meteo ensemble fetch.")
-    p.add_argument("--min-ttr-hours", type=float, default=12.0,
+    p.add_argument("--min-ttr-hours", type=float, default=24.0,
                    help="Skip markets with TTR < X hours at discovery "
-                        "(single-bin / orphan path). Default 12 (lowered "
-                        "from 18 on 2026-05-17 after snapshot analysis "
-                        "showed 42%% of filtered flow was in the 12-18h "
-                        "band — exactly where forecast accuracy peaks "
-                        "(MAE ~1.5°F vs ~3°F at 48h). Ladder mode uses "
-                        "the lower --ladder-min-ttr-hours floor since "
-                        "ladder coverage (±5°F) doesn't depend on point "
-                        "precision and the convergence cashout works "
-                        "in any TTR. Set 0 to disable.")
+                        "(single-bin / orphan path). Default 24 (raised "
+                        "from 12 on 2026-05-31 after the -$771 post-mortem: "
+                        "50%% of losing trades had TTR < 18h, where the bot "
+                        "was entering NO range bets with the forecast only "
+                        "~1°C from the bracket — too little time for the "
+                        "forecast to converge. Ladder mode uses the lower "
+                        "--ladder-min-ttr-hours floor since ladder coverage "
+                        "(±5°F) doesn't depend on point precision. "
+                        "Set 0 to disable.")
     p.add_argument("--ladder-min-ttr-hours", type=float, default=6.0,
                    help="Minimum TTR (hours) for a leg to enter ladder "
                         "discovery (default 6). Lower than --min-ttr-"
@@ -2344,6 +2438,18 @@ def main():
     p.add_argument("--max-market-exposure-usd", type=float, default=50.0,
                    help="Total $ exposure cap per market_slug (YES+NO summed, "
                         "across all open positions). Default $50.")
+    # v11 (post-mortem): hard-enforced risk gate in run_execute. CLAUDE.md §2
+    # mandates these but nothing enforced them before — the bot opened 42
+    # positions on the -$771 day and kept trading the next day.
+    p.add_argument("--max-drawdown-halt-pct", type=float, default=20.0,
+                   help="Block ALL new entries when portfolio drawdown from "
+                        "peak >= X%% (default 20, per CLAUDE.md §2). Open "
+                        "positions are left to resolve/cash out. Set 0 to "
+                        "disable the gate.")
+    p.add_argument("--daily-loss-limit-pct", type=float, default=5.0,
+                   help="Block new entries when today's realized loss >= X%% "
+                        "of starting balance (default 5, per CLAUDE.md §2). "
+                        "Set 0 to disable.")
     p.add_argument("--portfolio", default="default")
     p.add_argument("--log-file", default=None,
                    help="Write JSONL log here (default ~/.polymarket-paper/weather_edge.jsonl)")
