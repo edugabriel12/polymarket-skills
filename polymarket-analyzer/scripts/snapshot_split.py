@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sqlite3
 import sys
 from pathlib import Path
@@ -52,17 +53,38 @@ def _default_outdir() -> Path:
     return downloads if downloads.exists() else Path.cwd()
 
 
-def _clone(src: Path, dst: Path) -> None:
-    """Bit-exact copy using SQLite's backup API. Robust against WAL
-    mode and a bot writing concurrently — backup() handles locking."""
-    dst.unlink(missing_ok=True)
-    src_conn = sqlite3.connect(str(src))
-    dst_conn = sqlite3.connect(str(dst))
+def _checkpoint_source(src: Path) -> None:
+    """Best-effort: fold the WAL back into the main .db file so a plain
+    filesystem copy captures the latest committed rows. Safe to fail —
+    if the bot holds a write lock the checkpoint is skipped and the copy
+    simply reflects the last automatic checkpoint, which is still a
+    consistent snapshot."""
     try:
-        src_conn.backup(dst_conn)
-    finally:
-        dst_conn.close()
-        src_conn.close()
+        conn = sqlite3.connect(str(src), timeout=2.0)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _clone(src: Path, dst: Path) -> None:
+    """Filesystem-level copy of the main DB file — mirrors the operator's
+    original `Copy-Item`.
+
+    We deliberately avoid sqlite3.backup(): on Windows it raises
+    "disk I/O error" when the live DB is in WAL mode and its -wal/-shm
+    sidecar files are mapped by the running bot. A byte copy of the main
+    file sidesteps that machinery entirely. We checkpoint first so the
+    copy is as fresh as possible, and we make sure no stale sidecar files
+    are left next to the destination."""
+    _checkpoint_source(src)
+    dst.unlink(missing_ok=True)
+    shutil.copy2(str(src), str(dst))
+    # A previous run's WAL/SHM next to dst would shadow our fresh copy.
+    for suffix in ("-wal", "-shm"):
+        Path(str(dst) + suffix).unlink(missing_ok=True)
 
 
 def _drop_tables(db_path: Path, keep: set[str]) -> None:
