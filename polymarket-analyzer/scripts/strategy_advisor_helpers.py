@@ -433,8 +433,14 @@ def compute_divergent_judge_samples(conn, since_iso: str,
             continue
 
         # Priority: 0 = high-conf APPROVE→loss, 1 = REJECT→win, 2 = other APPROVE→loss
-        conf = (r["confidence"] or "").lower()
-        if is_approve and not won and conf == "high":
+        # judge_reviews.confidence is a float in [0,1]; treat >= 0.7 as high
+        # (tolerate legacy string rows defensively).
+        conf_raw = r["confidence"]
+        if isinstance(conf_raw, (int, float)):
+            is_high_conf = float(conf_raw) >= 0.7
+        else:
+            is_high_conf = str(conf_raw or "").lower() == "high"
+        if is_approve and not won and is_high_conf:
             priority = 0
         elif is_reject and won:
             priority = 1

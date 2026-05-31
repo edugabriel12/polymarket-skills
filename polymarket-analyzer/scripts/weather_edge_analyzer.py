@@ -644,6 +644,20 @@ def compute_ladder_breakdown(conn, since_iso: str) -> dict:
     }
 
 
+HIGH_CONFIDENCE_THRESHOLD = 0.7
+
+
+def _is_high_confidence(conf) -> bool:
+    """judge_reviews.confidence is a float in [0, 1] (schema type REAL).
+    Treat >= 0.7 as 'high'. Tolerate legacy string rows ('high'/'medium'/
+    'low') in case any old DB carried the pre-numeric format."""
+    if conf is None:
+        return False
+    if isinstance(conf, (int, float)):
+        return float(conf) >= HIGH_CONFIDENCE_THRESHOLD
+    return str(conf).lower() == "high"
+
+
 def compute_judge_accuracy(conn, since_iso: str) -> dict:
     """v6: Judge accuracy + hallucination signals.
 
@@ -722,7 +736,7 @@ def compute_judge_accuracy(conn, since_iso: str) -> dict:
             n_approved_resolved += 1
             if not won:
                 approved_lost += 1
-                if (r["confidence"] or "").lower() == "high":
+                if _is_high_confidence(r["confidence"]):
                     high_conf_errors.append({
                         "entry_id": r["entry_id"],
                         "market": r["market_question"],
