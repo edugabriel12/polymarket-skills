@@ -2431,7 +2431,7 @@ def main():
                    help="DEPRECATED in v9.5 (2026-05-22). Default 0 "
                         "(disabled). Under 3-bin laddering the P&L motor "
                         "is winner-takes-payout-at-resolution, not price "
-                        "discovery — closing on convergence captured ~30% "
+                        "discovery — closing on convergence captured ~30%% "
                         "of full payout. Set to a positive value (e.g. 5) "
                         "only if running single-bin orphan mode "
                         "exclusively and you want the legacy trigger back.")
