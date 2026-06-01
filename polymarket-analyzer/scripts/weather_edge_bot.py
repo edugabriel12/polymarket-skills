@@ -814,6 +814,7 @@ def run_discovery(args, cities: dict) -> int:
         "ttr_below_min": 0,           # v8: min-TTR filter
         "entry_too_cheap": 0,         # v9: cheap long-shot guard
         "extreme_disagreement": 0,    # v9: adverse selection guard
+        "range_bin_gap_too_small": 0,  # v12: sug_005 source fix
     }
 
     # Phase 1: build candidate proposals using HTTP-only work (no DB lock held).
@@ -989,6 +990,51 @@ def run_discovery(args, cities: dict) -> int:
 
         side = edge["best_side"]
         entry_price = implied["yes_ask"] if side == "YES" else implied["no_ask"]
+
+        # v12 (advisor sug_005 source fix): on a range/bracket market, a NO
+        # bet means "the temp will NOT land in this ~1°C bin". When the
+        # forecast sits within range_min_bin_gap_mae × MAE of the nearest
+        # bin edge, the Gaussian model still reports a high P(NO) — but that
+        # confidence is illusory: the bin is well inside the forecast's own
+        # uncertainty, so the realized temp lands in it far more often than
+        # the model implies (these lost 92% in the -$740 week). Skip here so
+        # the bot never proposes them and the judge LLM cost is saved. The
+        # judge's ≤1°C REJECT and ≤2×MAE ADJUST remain as backstops for the
+        # 1×–2×MAE band that this filter lets through.
+        if (side == "NO" and spec.comparison == "range"
+                and spec.threshold_value_high is not None):
+            gap_mult = float(getattr(args, "range_min_bin_gap_mae", 1.0) or 0.0)
+            if gap_mult > 0:
+                ref = forecast_ref_value(spec, forecast)
+                if ref is not None:
+                    lo, hi = spec.threshold_value, spec.threshold_value_high
+                    dist = (lo - ref) if ref < lo else (ref - hi) if ref > hi else 0.0
+                    min_gap = gap_mult * mae_dynamic
+                    if dist < min_gap:
+                        skipped["range_bin_gap_too_small"] += 1
+                        log_event("market_skipped", {
+                            "slug": slug, "reason": "range_bin_gap_too_small",
+                            "forecast": round(ref, 2), "bin": [lo, hi],
+                            "dist_to_bin": round(dist, 2),
+                            "mae": round(mae_dynamic, 2),
+                            "min_gap_required": round(min_gap, 2),
+                        })
+                        try:
+                            with db.connect() as _conn:
+                                db.insert_discovery_skip(
+                                    _conn, ts=_now_iso(), slug=slug,
+                                    city=spec.city,
+                                    reason="range_bin_gap_too_small",
+                                    meta_json=json.dumps({
+                                        "forecast": round(ref, 2),
+                                        "bin": [lo, hi],
+                                        "dist_to_bin": round(dist, 2),
+                                        "mae": round(mae_dynamic, 2),
+                                    }))
+                        except Exception:
+                            pass
+                        continue
+
         if not (args.min_price <= entry_price <= args.max_price):
             skipped["price_band_miss"] += 1
             continue
@@ -2283,6 +2329,16 @@ def main():
                         "bot_prob to {0.10, 0.90} extremes — so 20pp is "
                         "ample headroom and stays above the 10-20pp "
                         "cohort that historically had near-zero win rate).")
+    p.add_argument("--range-min-bin-gap-mae", type=float, default=1.0,
+                   help="For range/bracket markets, skip a NO bet at "
+                        "DISCOVERY when the forecast is within X × MAE of the "
+                        "nearest bin edge (default 1.0). In that zone the "
+                        "Gaussian model reports a high P(NO) that is illusory "
+                        "— the ~1°C bin is inside the forecast's own "
+                        "uncertainty and the realized temp lands in it ~92%% "
+                        "of the time (advisor sug_005, -$740 week). Saves the "
+                        "judge LLM cost; the judge's proximity REJECT / range "
+                        "ADJUST remain backstops. Set 0 to disable.")
     p.add_argument("--execute-min-edge-pp", type=float, default=8.0,
                    help="Minimum edge_pp required at EXECUTION time. "
                         "Default 8 (lowered from 12 on 2026-05-16: snapshot "
