@@ -63,7 +63,7 @@ _load_dotenv()
 from weather_edge_helpers import (  # noqa: E402
     parse_market, forecast_probability, compute_max_size_for_slippage,
     implied_probabilities, compute_edge, load_cities, MarketSpec,
-    evaluate_cashout_triggers, forecast_ref_value,
+    evaluate_cashout_triggers, forecast_ref_value, prob_yes_for_sizing,
     # v7: dynamic MAE + multi-source consensus
     compute_dynamic_mae, fetch_visual_crossing,
     MAE_TEMP_F, MAE_TEMP_C,
@@ -815,6 +815,7 @@ def run_discovery(args, cities: dict) -> int:
         "entry_too_cheap": 0,         # v9: cheap long-shot guard
         "extreme_disagreement": 0,    # v9: adverse selection guard
         "range_bin_gap_too_small": 0,  # v12: sug_005 source fix
+        "range_edge_after_cap": 0,    # v12.1: edge gone after sizing-cap
     }
 
     # Phase 1: build candidate proposals using HTTP-only work (no DB lock held).
@@ -991,6 +992,38 @@ def run_discovery(args, cities: dict) -> int:
         side = edge["best_side"]
         entry_price = implied["yes_ask"] if side == "YES" else implied["no_ask"]
 
+        # v12.1: range markets are NOT clipped in forecast_probability (so the
+        # LOW clip can't invert side selection and manufacture a phantom YES
+        # edge). Cap the chosen side's confidence here for storage/sizing, and
+        # recompute the edge on the capped value — a range bet that only had
+        # edge via inflated confidence is dropped now, before the judge.
+        forecast_prob_sized = prob_yes_for_sizing(
+            forecast_prob, side, spec.comparison)
+        p_side = (forecast_prob_sized if side == "YES"
+                  else 1.0 - forecast_prob_sized)
+        if spec.comparison == "range":
+            eff_edge_pp = round((p_side - entry_price) * 100.0, 4)
+            if eff_edge_pp < edge_floor:
+                skipped["range_edge_after_cap"] += 1
+                log_event("market_skipped", {
+                    "slug": slug, "reason": "range_edge_after_cap",
+                    "side": side, "p_side_capped": round(p_side, 3),
+                    "entry_price": entry_price, "edge_pp": eff_edge_pp,
+                    "edge_floor": edge_floor})
+                try:
+                    with db.connect() as _conn:
+                        db.insert_discovery_skip(_conn, ts=_now_iso(),
+                            slug=slug, city=spec.city,
+                            reason="range_edge_after_cap",
+                            meta_json={"side": side, "edge_pp": eff_edge_pp,
+                                       "p_side_capped": round(p_side, 3)})
+                        _conn.commit()
+                except Exception:
+                    pass
+                continue
+        else:
+            eff_edge_pp = edge["edge_pp_at_best"]
+
         # v12 (advisor sug_005 source fix): on a range/bracket market, a NO
         # bet means "the temp will NOT land in this ~1°C bin". When the
         # forecast sits within range_min_bin_gap_mae × MAE of the nearest
@@ -1104,8 +1137,7 @@ def run_discovery(args, cities: dict) -> int:
         # losers.
         implied_on_side = (implied["yes_ask"] if side == "YES"
                             else implied["no_ask"])
-        bot_prob_on_side = (forecast_prob if side == "YES"
-                             else 1.0 - forecast_prob)
+        bot_prob_on_side = p_side  # v12.1: capped P(side) for range
         disagreement_pp = abs(bot_prob_on_side - implied_on_side) * 100
         if args.max_disagreement_pp > 0 and disagreement_pp > args.max_disagreement_pp:
             skipped["extreme_disagreement"] += 1
@@ -1135,8 +1167,8 @@ def run_discovery(args, cities: dict) -> int:
         candidates.append({
             "slug": slug, "question": question,
             "end_date_str": end_date_str, "side": side,
-            "entry_price": entry_price, "forecast_prob": forecast_prob,
-            "edge_pp": edge["edge_pp_at_best"],
+            "entry_price": entry_price, "forecast_prob": forecast_prob_sized,
+            "edge_pp": eff_edge_pp,
             "forecast": forecast, "spec": spec, "ttr_hours": ttr_hours,
             "token_id_yes": token_id_yes, "token_id_no": token_id_no,
             "implied": implied,
@@ -1848,6 +1880,11 @@ def _do_monitor_check(conn, row, cities: dict, args) -> None:
                                                bias_override=bias)
     if forecast_prob_yes is None:
         return
+    # v12.1: range markets return raw P(YES); cap the held side's confidence
+    # for the cashout math so convergence/forecast-reversal use the same
+    # bounded P(side) the entry was sized with (not the raw ~0.9-0.99).
+    forecast_prob_yes = prob_yes_for_sizing(forecast_prob_yes, side,
+                                            spec.comparison)
 
     token_id = row["token_id_yes"] if side == "YES" else row["token_id_no"]
     book = fetch_orderbook(token_id)  # HTTP

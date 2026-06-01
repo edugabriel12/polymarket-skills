@@ -802,7 +802,16 @@ def forecast_probability(spec: MarketSpec, forecast: dict,
                           mae_override: Optional[float] = None,
                           bias_override: Optional[float] = None
                           ) -> Optional[float]:
-    """Compute P(YES) for `spec` clipped to [0.10, 0.90].
+    """Compute P(YES) for `spec`.
+
+    Non-range markets are clipped to [PROB_CLIP_LOW, PROB_CLIP_HIGH] to curb
+    overconfidence. RANGE/bracket markets are returned RAW (unclipped):
+    the symmetric clip inverts side selection for them — a tiny true P(YES)
+    from a far-below forecast gets floored UP to PROB_CLIP_LOW, manufacturing
+    a phantom YES edge (2026-06-01: 371 false YES-range proposals, all
+    rejected, $8.72 of judge spend, 0 executed). Side selection must see the
+    raw value; the chosen side's confidence is capped separately for sizing
+    via `prob_yes_for_sizing()`.
 
     `mae_override` (v7): replaces the static MAE_TEMP_F/C or
     MAE_PRECIP_MM constant for this call (dynamic MAE from history).
@@ -814,9 +823,34 @@ def forecast_probability(spec: MarketSpec, forecast: dict,
     match `spec.threshold_unit` (operator sets temp_bias_f in cities
     JSON; bot converts on lookup if market is in C).
     """
-    return _clip_prob(_forecast_probability_raw(
-        spec, forecast, mae_override=mae_override,
-        bias_override=bias_override))
+    raw = _forecast_probability_raw(
+        spec, forecast, mae_override=mae_override, bias_override=bias_override)
+    if raw is None:
+        return None
+    if spec.comparison == "range":
+        return max(0.0, min(1.0, raw))
+    return _clip_prob(raw)
+
+
+def prob_yes_for_sizing(p_yes: Optional[float], side: str,
+                        comparison: str) -> Optional[float]:
+    """Return the P(YES) value to STORE and SIZE with for the chosen `side`.
+
+    For range markets `forecast_probability()` returns the raw (unclipped)
+    P(YES) so side selection isn't distorted. Here we cap the chosen side's
+    confidence at PROB_CLIP_HIGH (cap only, no floor) so Kelly sizing on a
+    range NO bet isn't overconfident (P(NO) would otherwise be ~0.9-0.99),
+    while a range YES leg keeps its honest low confidence. Non-range probs
+    are already clipped and pass through unchanged.
+
+    Implemented as an asymmetric clip of P(YES) so that, for the chosen side,
+    P(side) = (p for YES, 1-p for NO) never exceeds PROB_CLIP_HIGH.
+    """
+    if p_yes is None or comparison != "range":
+        return p_yes
+    if side == "YES":
+        return min(float(p_yes), PROB_CLIP_HIGH)          # cap P(YES)
+    return max(float(p_yes), 1.0 - PROB_CLIP_HIGH)        # floor P(YES) → cap P(NO)
 
 
 def _forecast_probability_raw(spec: MarketSpec, forecast: dict,
@@ -1447,11 +1481,24 @@ if __name__ == "__main__":
     # We want P(low ≤ T < high) = cdf(z_low) - cdf(z_high) where z_low > z_high,
     # but here z_low = (75-65)/5 = +2 → no, the formula uses (ref - threshold) so
     # z_low = (75-65)/5 = +2, z_high = (75-69)/5 = +1.2.
-    # v11: with MAE_TEMP_F widened to 6.5, z_low=(75-65)/6.5=1.54,
-    # z_high=(75-69)/6.5=0.92 → cdf(1.54)-cdf(0.92) ≈ 0.938-0.822 = 0.116.
-    # Raw 0.116 still clips UP to PROB_CLIP_LOW (0.30) since 0.116 < 0.30.
-    assert p3 == 0.30, f"expected 0.30 (clipped from ~0.116), got {p3}"
-    print(f"Test 8 PASS: raw ~0.116 clips up to {p3:.4f} (new floor 0.30)")
+    # v12.1: range markets are NO LONGER clipped (the clip inverted side
+    # selection). z_low=(75-65)/6.5=1.54, z_high=(75-69)/6.5=0.92 →
+    # cdf(1.54)-cdf(0.92) ≈ 0.938-0.822 = 0.116, returned raw.
+    assert 0.10 <= p3 <= 0.13, f"expected raw ~0.116 (range unclipped), got {p3}"
+    print(f"Test 8 PASS: range returns raw {p3:.4f} (unclipped)")
+
+    # Test 8b (v12.1): prob_yes_for_sizing caps the chosen side, not selection.
+    # Range NO: raw P(YES)=0.116 → floored to 0.30 so P(NO)=0.70 (capped).
+    s_no = prob_yes_for_sizing(0.116, "NO", "range")
+    assert abs(s_no - 0.30) < 1e-9, f"range NO sizing P(YES) should be 0.30, got {s_no}"
+    # Range YES: raw P(YES)=0.116 stays 0.116 (cap only, no floor).
+    s_yes = prob_yes_for_sizing(0.116, "YES", "range")
+    assert abs(s_yes - 0.116) < 1e-9, f"range YES sizing should stay raw, got {s_yes}"
+    # High raw range YES caps at 0.70.
+    assert abs(prob_yes_for_sizing(0.95, "YES", "range") - 0.70) < 1e-9
+    # Non-range passes through unchanged.
+    assert prob_yes_for_sizing(0.42, "NO", "exceed") == 0.42
+    print("Test 8b PASS: prob_yes_for_sizing caps chosen side for range only")
 
     # Test 9: "70°F or above" pattern
     spec4 = parse_market("Highest temperature in Manhattan on May 11, 2026 70°F or above",
