@@ -203,12 +203,26 @@ def _spent_this_week(conn) -> float:
 
 def call_advisor_llm(system_prompt: str, user_payload: dict,
                      model: str, budget_usd: float) -> Optional[dict]:
-    """Call Anthropic API. Returns parsed JSON dict or None on error."""
+    """Call Anthropic API. Returns parsed JSON dict or None on error.
+    On failure the actual reason is stashed on the function attribute
+    `call_advisor_llm.last_error` so main() can put it in
+    advisor_runs.error_msg instead of a generic placeholder."""
+    call_advisor_llm.last_error = None
     try:
         import anthropic
     except ImportError:
         log_event("error", {"where": "call_advisor", "err":
                             "anthropic SDK not installed"}, level="ERROR")
+        call_advisor_llm.last_error = (
+            "anthropic SDK not installed (pip install anthropic)")
+        return None
+
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        log_event("error", {"where": "call_advisor",
+                            "err": "ANTHROPIC_API_KEY missing"}, level="ERROR")
+        call_advisor_llm.last_error = (
+            "ANTHROPIC_API_KEY env var not set — the advisor cannot reach "
+            "the Claude API")
         return None
 
     client = anthropic.Anthropic()
@@ -240,6 +254,10 @@ def call_advisor_llm(system_prompt: str, user_payload: dict,
     except Exception as e:
         log_event("error", {"where": "anthropic_call", "err": str(e),
                             "type": type(e).__name__}, level="ERROR")
+        # Stash so main() can surface the actual reason in advisor_runs.error_msg
+        # (the previous behavior wrote a useless "API call failed; see
+        # weather_edge.jsonl" with no hint of WHY).
+        call_advisor_llm.last_error = f"{type(e).__name__}: {e}"
         return None
 
     text_block = next((b.text for b in response.content
@@ -248,6 +266,8 @@ def call_advisor_llm(system_prompt: str, user_payload: dict,
         log_event("error", {"where": "advisor_response_empty",
                             "stop_reason": response.stop_reason},
                   level="ERROR")
+        call_advisor_llm.last_error = (
+            f"empty response from LLM (stop_reason={response.stop_reason})")
         return None
 
     try:
@@ -255,6 +275,7 @@ def call_advisor_llm(system_prompt: str, user_payload: dict,
     except json.JSONDecodeError as e:
         log_event("error", {"where": "advisor_json_decode", "err": str(e),
                             "text": text_block[:500]}, level="ERROR")
+        call_advisor_llm.last_error = f"JSONDecodeError: {e}"
         return None
 
     usage = response.usage
@@ -543,17 +564,22 @@ def main() -> int:
             response = call_advisor_llm(system_prompt, user_payload,
                                          model=model, budget_usd=budget_usd)
             if response is None:
+                # Surface the ACTUAL failure (set by call_advisor_llm) so the
+                # dashboard's "View" button shows a usable diagnostic instead
+                # of the old generic "API call failed; see weather_edge.jsonl".
+                llm_err = (getattr(call_advisor_llm, "last_error", None)
+                           or "API call failed; see weather_edge.jsonl")
                 db.insert_advisor_run(
                     conn, ts=_now_iso(), trigger=args.trigger,
                     since_iso=since_iso, report_path="", json_path="",
                     n_suggestions=0, llm_model=model, status="error",
-                    error_msg="API call failed; see weather_edge.jsonl",
+                    error_msg=llm_err,
                 )
                 if args.job_id is not None:
                     db.update_advisor_job(
                         conn, args.job_id, status="failed",
                         ts_finished=_now_iso(), exit_code=3,
-                        error_msg="API call failed",
+                        error_msg=llm_err,
                     )
                 conn.commit()
                 return 3
@@ -605,7 +631,60 @@ def _handle_sig(signum, frame):
     sys.exit(130)
 
 
+def _record_collection_failure(args, model: str, err: Exception) -> int:
+    """Persist a status=error advisor_runs row when data collection crashed
+    BEFORE the LLM call (e.g. AttributeError in compute_judge_accuracy,
+    OperationalError on a missing schema column). Without this, an exception
+    here just propagates and the dashboard shows no advisor_runs row at all
+    — or a status=error row with no diagnostic.
+    """
+    import traceback as _tb
+    tb = _tb.format_exc()
+    err_msg = f"{type(err).__name__}: {err}"[:500]
+    log_event("error", {"where": "advisor_collection",
+                        "err": err_msg, "traceback": tb[:2000]},
+              level="ERROR")
+    try:
+        since_iso = (datetime.now(timezone.utc)
+                     - timedelta(days=args.since_days)).isoformat()
+        with db.connect() as conn:
+            db.insert_advisor_run(
+                conn, ts=_now_iso(), trigger=args.trigger,
+                since_iso=since_iso, report_path="", json_path="",
+                n_suggestions=0, llm_model=model, status="error",
+                error_msg=f"collection failed: {err_msg}",
+            )
+            if args.job_id is not None:
+                db.update_advisor_job(
+                    conn, args.job_id, status="failed",
+                    ts_finished=_now_iso(), exit_code=4,
+                    error_msg=f"collection failed: {err_msg}",
+                )
+            conn.commit()
+    except Exception as inner:
+        log_event("error", {"where": "record_collection_failure",
+                            "err": f"{type(inner).__name__}: {inner}"},
+                  level="ERROR")
+    return 4
+
+
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, _handle_sig)
     signal.signal(signal.SIGTERM, _handle_sig)
-    sys.exit(main())
+    # Pre-parse just enough to know which job_id / model / since_days to use
+    # in the failure-record path (full argparse runs inside main()).
+    import argparse as _ap
+    _pre = _ap.ArgumentParser(add_help=False)
+    _pre.add_argument("--since-days", type=int, default=30)
+    _pre.add_argument("--trigger", default="cli")
+    _pre.add_argument("--job-id", type=int, default=None)
+    _pre.add_argument("--model", default=None)
+    _pre_args, _ = _pre.parse_known_args()
+    _pre_args.model = _pre_args.model or DEFAULT_MODEL
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as _e:
+        sys.exit(_record_collection_failure(_pre_args,
+                                              _pre_args.model, _e))
