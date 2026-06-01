@@ -236,26 +236,34 @@ def call_advisor_llm(system_prompt: str, user_payload: dict,
                            ensure_ascii=False)
 
     t0 = time.monotonic()
+    request_kwargs = dict(
+        model=model,
+        max_tokens=MAX_TOKENS,
+        system=[{"type": "text", "text": system_prompt,
+                 "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+        messages=[{"role": "user", "content": user_text}],
+        thinking={"type": "adaptive"},
+        tools=[
+            {"type": "web_search_20250305", "name": "web_search",
+             "max_uses": 5},
+            {"type": "web_fetch_20250910", "name": "web_fetch",
+             "max_uses": 10},
+        ],
+        output_config={
+            "effort": "medium",
+            "format": {"type": "json_schema",
+                       "schema": _SUGGESTIONS_SCHEMA},
+        },
+    )
     try:
-        response = client.messages.create(
-            model=model,
-            max_tokens=MAX_TOKENS,
-            system=[{"type": "text", "text": system_prompt,
-                     "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
-            messages=[{"role": "user", "content": user_text}],
-            thinking={"type": "adaptive"},
-            tools=[
-                {"type": "web_search_20250305", "name": "web_search",
-                 "max_uses": 5},
-                {"type": "web_fetch_20250910", "name": "web_fetch",
-                 "max_uses": 10},
-            ],
-            output_config={
-                "effort": "medium",
-                "format": {"type": "json_schema",
-                           "schema": _SUGGESTIONS_SCHEMA},
-            },
-        )
+        # Streaming is REQUIRED by the SDK for operations that may exceed
+        # 10 minutes — adaptive thinking + up to 15 web tool turns + a 32K
+        # output budget routinely crosses that. We stream and assemble the
+        # final Message, which has the same shape (.content/.usage/
+        # .stop_reason) as a non-streaming response. (operator runs #4/#5,
+        # 2026-06-01: "ValueError: Streaming is required ...".)
+        with client.messages.stream(**request_kwargs) as stream:
+            response = stream.get_final_message()
         duration_ms = int((time.monotonic() - t0) * 1000)
     except Exception as e:
         log_event("error", {"where": "anthropic_call", "err": str(e),
