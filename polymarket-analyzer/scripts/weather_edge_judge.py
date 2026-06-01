@@ -91,6 +91,17 @@ DAILY_BUDGET_USD = float(os.environ.get("JUDGE_DAILY_BUDGET_USD", "15.0"))
 # number (e.g. -100) to disable the recheck.
 PREJUDGE_MIN_EDGE_PP = float(os.environ.get("JUDGE_PREJUDGE_MIN_EDGE_PP", "15.0"))
 
+# v12 (advisor sug_003/004, 2026-06-01): range-market calibration caps.
+# On Polymarket 'range' markets the bin is ~1°C wide, so directional
+# consensus (forecast below the bin) is necessary but NOT sufficient —
+# both bin edges sit within ~2×MAE of the forecast. The judge's 0.8-0.9
+# confidence bucket won only 17% on these. Hard-cap the stored judge_prob
+# and force conservative ADJUST sizing on the marginal ones.
+RANGE_PROB_CAP = float(os.environ.get("JUDGE_RANGE_PROB_CAP", "0.70"))
+RANGE_PROB_CAP_NEAR = float(os.environ.get("JUDGE_RANGE_PROB_CAP_NEAR", "0.65"))
+RANGE_NEAR_MAE_MULT = float(os.environ.get("JUDGE_RANGE_NEAR_MAE_MULT", "2.0"))
+RANGE_ADJUST_SIZE_USD = float(os.environ.get("JUDGE_RANGE_ADJUST_SIZE_USD", "20.0"))
+
 # Pricing per 1M tokens (Sonnet 4.6 / Opus 4.7 — adjust if model changed)
 PRICING = {
     "claude-sonnet-4-6": {"input": 3.00, "output": 15.00, "cache_read": 0.30},
@@ -483,6 +494,54 @@ def _threshold_proximity_reason(entry_row) -> Optional[str]:
     return None
 
 
+def _range_calibration(entry_row) -> Optional[dict]:
+    """v12 (advisor sug_003/004): for a 'range' temp market, return the
+    calibration constraint dict, else None.
+
+    Returns {"cap": float, "near": bool, "dist": float, "mae": float,
+             "lo": float, "hi": float, "ref": float} where:
+      - `cap`  = max allowed judge_prob (RANGE_PROB_CAP_NEAR if the forecast
+                 is within RANGE_NEAR_MAE_MULT × MAE of the nearest bin edge,
+                 else RANGE_PROB_CAP).
+      - `near` = whether the forecast is inside that 2×MAE band (these get
+                 downgraded to ADJUST with a conservative size).
+    None when not a range temp market or unparseable (fail-open).
+    """
+    try:
+        from weather_edge_helpers import (parse_market, forecast_ref_value,
+                                          load_cities, MAE_TEMP_C, MAE_TEMP_F)
+    except Exception:
+        return None
+    try:
+        spec = parse_market(entry_row["market_question"], entry_row["end_date"],
+                            load_cities())
+    except Exception:
+        return None
+    if (not spec or spec.metric != "temp" or spec.comparison != "range"
+            or spec.threshold_value_high is None):
+        return None
+    try:
+        forecast = json.loads(entry_row["forecast_snapshot_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    ref = forecast_ref_value(spec, forecast)
+    if ref is None:
+        return None
+    lo, hi = float(spec.threshold_value), float(spec.threshold_value_high)
+    mae = MAE_TEMP_C if (spec.threshold_unit or "").upper() == "C" else MAE_TEMP_F
+    # Distance from the forecast to the nearest edge of [lo, hi] (0 if inside).
+    if ref < lo:
+        dist = lo - ref
+    elif ref > hi:
+        dist = ref - hi
+    else:
+        dist = 0.0
+    near = dist < RANGE_NEAR_MAE_MULT * mae
+    return {"cap": RANGE_PROB_CAP_NEAR if near else RANGE_PROB_CAP,
+            "near": near, "dist": dist, "mae": mae,
+            "lo": lo, "hi": hi, "ref": ref}
+
+
 def apply_verdict(conn, entry_row, verdict: dict) -> None:
     """Persist the verdict to judge_reviews and update entry status."""
     meta = verdict.pop("_meta", {})
@@ -536,6 +595,38 @@ def apply_verdict(conn, entry_row, verdict: dict) -> None:
         # ADJUST fields no longer apply
         verdict["adjusted_side"] = None
         verdict["adjusted_size_usd"] = None
+
+    # v12 (advisor sug_003/004): range-market calibration. Applies only when
+    # the verdict still stands as APPROVE/ADJUST (a REJECT above skips this).
+    # Caps the stored judge_prob and, for forecasts within 2×MAE of a bin
+    # edge, downgrades APPROVE→ADJUST with a conservative size so per-loss
+    # exposure on these miscalibrated range bets is bounded.
+    if verdict["verdict"] in ("APPROVE", "ADJUST"):
+        rc = _range_calibration(entry_row)
+        if rc is not None:
+            if judge_prob > rc["cap"]:
+                log_event("range_calibration_cap", {
+                    "entry_id": entry_row["entry_id"],
+                    "judge_prob": judge_prob, "capped_to": rc["cap"],
+                    "near_edge": rc["near"], "dist_to_bin": round(rc["dist"], 2),
+                    "mae": rc["mae"],
+                }, level="INFO")
+                judge_prob = rc["cap"]
+                verdict["judge_prob"] = rc["cap"]
+            if rc["near"]:
+                prev_verdict = verdict["verdict"]
+                verdict["verdict"] = "ADJUST"
+                cur_cap = verdict.get("adjusted_size_usd")
+                new_cap = (RANGE_ADJUST_SIZE_USD if not cur_cap
+                           else min(float(cur_cap), RANGE_ADJUST_SIZE_USD))
+                verdict["adjusted_size_usd"] = new_cap
+                log_event("range_calibration_adjust", {
+                    "entry_id": entry_row["entry_id"],
+                    "original_verdict": prev_verdict,
+                    "size_cap_usd": new_cap,
+                    "dist_to_bin": round(rc["dist"], 2),
+                    "bin": [rc["lo"], rc["hi"]], "forecast": round(rc["ref"], 2),
+                }, level="WARN")
 
     # v10: persist the system prompt by content-hash so this review
     # remains reproducible even after the prompt file is edited.

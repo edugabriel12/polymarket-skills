@@ -2427,14 +2427,18 @@ def main():
                    help="Cashout if bid falls X%% below peak (default 15%% — "
                         "was 30%% but operator analysis 2026-05-15 showed "
                         "84%% of trades held to resolution where they lost)")
-    p.add_argument("--convergence-pp", type=float, default=0.0,
-                   help="DEPRECATED in v9.5 (2026-05-22). Default 0 "
-                        "(disabled). Under 3-bin laddering the P&L motor "
-                        "is winner-takes-payout-at-resolution, not price "
-                        "discovery — closing on convergence captured ~30%% "
-                        "of full payout. Set to a positive value (e.g. 5) "
-                        "only if running single-bin orphan mode "
-                        "exclusively and you want the legacy trigger back.")
+    p.add_argument("--convergence-pp", type=float, default=3.0,
+                   help="Cash out when bid converges within X pp of fair "
+                        "value (forecast prob). Default 3 (re-enabled "
+                        "2026-06-01 from 0). Advisor backtest over the 57 "
+                        "trades of the -$740 week: convergence_pp=3 lifts "
+                        "P&L from -$740 to -$320 (+$420) and win rate 35%% "
+                        "→ 54%% by exiting 15-27 hold_to_resolution trades "
+                        "before realized weather lands inside the range bin "
+                        "and zeroes the position. (v9.5 had disabled it on "
+                        "the theory that laddering captures the payout at "
+                        "resolution; the realized data disproved that.) "
+                        "Set 0 to disable.")
     p.add_argument("--max-market-exposure-usd", type=float, default=50.0,
                    help="Total $ exposure cap per market_slug (YES+NO summed, "
                         "across all open positions). Default $50.")

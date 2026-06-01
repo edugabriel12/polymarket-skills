@@ -241,8 +241,9 @@
     "Phoenix":      {"lat": 33.4373, "lon": -112.0078, "station": "KPHX", "temp_bias_f": 0.0},
 
     "Tokyo":        {"lat": 35.5494, "lon": 139.7798, "station": "RJTT", "temp_bias_f": 0.0},
-    "Hong Kong":    {"lat": 22.3022, "lon": 114.1742, "station": "HKO",  "temp_bias_f": 1.0},
-    "Singapore":    {"lat": 1.3502,  "lon": 103.9940, "station": "WSSS", "temp_bias_f": 0.0},
+    "Hong Kong":    {"lat": 22.3022, "lon": 114.1742, "station": "HKO",  "temp_bias_f": 3.6},
+    "Singapore":    {"lat": 1.3502,  "lon": 103.9940, "station": "WSSS", "temp_bias_f": 2.7},
+    "Karachi":      {"lat": 24.9065, "lon": 67.1608,  "station": "OPKC", "temp_bias_f": 5.4},
     "Seoul":        {"lat": 37.4691, "lon": 126.4505, "station": "RKSI", "temp_bias_f": 0.0},
     "Lucknow":      {"lat": 26.7606, "lon": 80.8893,  "station": "VILK", "temp_bias_f": 0.0},
 
