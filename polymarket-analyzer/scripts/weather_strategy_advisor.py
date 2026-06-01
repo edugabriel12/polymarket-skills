@@ -69,6 +69,12 @@ LOG_PATH = Path.home() / ".polymarket-paper" / "weather_edge.jsonl"
 DEFAULT_MODEL = os.environ.get("ADVISOR_MODEL", "claude-opus-4-7")
 WEEKLY_BUDGET_USD = float(os.environ.get("ADVISOR_WEEKLY_BUDGET_USD", "5.0"))
 MIN_TRADES_FOR_REC = int(os.environ.get("ADVISOR_MIN_TRADES_FOR_REC", "10"))
+# Output-token budget. Must be large enough to cover adaptive-thinking
+# tokens + web_search/web_fetch tool turns + the full structured-JSON
+# report. The old 8192 was shared across all three and the JSON got
+# truncated mid-string (operator run #3, 2026-06-01: "JSONDecodeError:
+# Unterminated string ... char 13372"). Opus 4.x supports up to 32K output.
+MAX_TOKENS = int(os.environ.get("ADVISOR_MAX_TOKENS", "32000"))
 
 PRICING = {
     "claude-opus-4-7": {"input": 15.00, "output": 75.00,
@@ -233,7 +239,7 @@ def call_advisor_llm(system_prompt: str, user_payload: dict,
     try:
         response = client.messages.create(
             model=model,
-            max_tokens=8192,
+            max_tokens=MAX_TOKENS,
             system=[{"type": "text", "text": system_prompt,
                      "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
             messages=[{"role": "user", "content": user_text}],
@@ -273,9 +279,22 @@ def call_advisor_llm(system_prompt: str, user_payload: dict,
     try:
         parsed = json.loads(text_block)
     except json.JSONDecodeError as e:
+        # The most common cause is the response being cut off at the output
+        # cap (thinking + tool turns + JSON exceeded max_tokens), leaving an
+        # unterminated string. Detect it and give an actionable message.
+        truncated = getattr(response, "stop_reason", None) == "max_tokens"
         log_event("error", {"where": "advisor_json_decode", "err": str(e),
-                            "text": text_block[:500]}, level="ERROR")
-        call_advisor_llm.last_error = f"JSONDecodeError: {e}"
+                            "stop_reason": getattr(response, "stop_reason", None),
+                            "out_tokens": getattr(response.usage, "output_tokens", None),
+                            "max_tokens": MAX_TOKENS,
+                            "text_tail": text_block[-300:]}, level="ERROR")
+        if truncated:
+            call_advisor_llm.last_error = (
+                f"LLM response truncated at max_tokens={MAX_TOKENS} "
+                f"(output_tokens={getattr(response.usage, 'output_tokens', '?')}). "
+                f"Raise ADVISOR_MAX_TOKENS or lower --per-trade-limit.")
+        else:
+            call_advisor_llm.last_error = f"JSONDecodeError: {e}"
         return None
 
     usage = response.usage

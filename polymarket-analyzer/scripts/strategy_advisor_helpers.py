@@ -761,15 +761,20 @@ def compute_loss_forensics(conn: sqlite3.Connection, since_iso: str
 
         # Pull forecast trajectory from forecast_history for this
         # (city, target_date) — bot writes per discovery cycle, so this
-        # captures every refresh between entry and resolution.
-        snapshots = conn.execute(
-            "SELECT ts, source, predicted_value "
-            "FROM forecast_history "
-            "WHERE city = ? AND target_date = ? "
-            "  AND ts >= ? "
-            "ORDER BY ts ASC",
-            (city, end_date, t["ts"]),
-        ).fetchall()
+        # captures every refresh between entry and resolution. Degrade to an
+        # empty trajectory if the table is absent (e.g. a forecast-split DB)
+        # rather than aborting the whole advisor run.
+        try:
+            snapshots = conn.execute(
+                "SELECT ts, source, predicted_value "
+                "FROM forecast_history "
+                "WHERE city = ? AND target_date = ? "
+                "  AND ts >= ? "
+                "ORDER BY ts ASC",
+                (city, end_date, t["ts"]),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            snapshots = []
 
         # forecast_history.predicted_value is stored in the market's unit
         # (see weather_edge_bot:insert_forecast_history). Convert the
