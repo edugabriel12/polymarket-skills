@@ -1526,12 +1526,25 @@ def _risk_block_reason(engine, args) -> Optional[str]:
     daily_limit = float(getattr(args, "daily_loss_limit_pct", 5.0) or 0.0)
     if daily_limit > 0 and starting > 0:
         with db.connect() as conn:
-            row = conn.execute(
-                "SELECT COALESCE(SUM(c.realized_pnl_usd), 0) "
-                "FROM cashouts c JOIN entries e ON c.entry_id = e.entry_id "
-                "WHERE DATE(c.ts) = DATE('now')"
+            # Today's realized P&L = cashouts + positions resolved today.
+            # The original query summed only cashouts, so the circuit breaker
+            # was blind to hold-to-resolution losses — which were 38 of 41
+            # losses in the -$740 week. Include resolutions (excluding any
+            # entry that also cashed out, to avoid double counting).
+            cash_row = conn.execute(
+                "SELECT COALESCE(SUM(realized_pnl_usd), 0) "
+                "FROM cashouts WHERE DATE(ts) = DATE('now')"
             ).fetchone()
-        realized_today = float(row[0] or 0.0)
+            res_row = conn.execute(
+                "SELECT COALESCE(SUM("
+                "  (r.payout_per_share - e.entry_price) * e.size_shares), 0) "
+                "FROM resolutions r "
+                "JOIN entries e ON e.entry_id = r.entry_id "
+                "LEFT JOIN cashouts c ON c.entry_id = r.entry_id "
+                "WHERE DATE(r.ts_resolved) = DATE('now') "
+                "  AND c.cashout_id IS NULL"
+            ).fetchone()
+        realized_today = float(cash_row[0] or 0.0) + float(res_row[0] or 0.0)
         if realized_today < 0:
             daily_loss_pct = -realized_today / starting * 100.0
             if daily_loss_pct >= daily_limit:

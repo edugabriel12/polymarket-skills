@@ -108,9 +108,14 @@ def get_kpis(portfolio_name: str = "default",
         open_count = len(positions)
 
         # Realized P&L today (UTC) — paper_engine's trades table doesn't store
-        # per-trade realized_pnl, so we pull from weather_edge.db cashouts
-        # (which is what the bot uses for its own monitor cashouts and where
-        # realized_pnl_usd is computed at exit time).
+        # per-trade realized_pnl, so we pull from weather_edge.db. Two
+        # sources, summed:
+        #   (a) monitor-triggered cashouts that closed today, and
+        #   (b) positions HELD to resolution that settled today.
+        # The old code counted ONLY (a). On days dominated by hold-to-
+        # resolution outcomes (e.g. the -$740 week: 38 of 41 losses settled
+        # at resolution, only 3 via cashout) it reported ~$0, hiding the real
+        # daily result. The card's own tooltip already promised both.
         today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         realized_today = 0.0
         if S.WEATHER_EDGE_DB.exists():
@@ -122,6 +127,25 @@ def get_kpis(portfolio_name: str = "default",
                     (today_utc,),
                 ).fetchone()
                 realized_today = float(row[0] or 0)
+                # (b) resolutions settled today. Realized P&L per resolved
+                # position = (payout_per_share - entry_price) * size_shares.
+                # Exclude entries that also have a cashout row so a position
+                # cashed out earlier and later resolved isn't counted twice.
+                try:
+                    rrow = wconn.execute(
+                        "SELECT COALESCE(SUM("
+                        "  (r.payout_per_share - e.entry_price) * e.size_shares"
+                        "), 0) "
+                        "FROM resolutions r "
+                        "JOIN entries e ON e.entry_id = r.entry_id "
+                        "LEFT JOIN cashouts c ON c.entry_id = r.entry_id "
+                        "WHERE DATE(r.ts_resolved) = ? AND c.cashout_id IS NULL",
+                        (today_utc,),
+                    ).fetchone()
+                    realized_today += float(rrow[0] or 0)
+                except sqlite3.OperationalError:
+                    # resolutions/entries tables absent in a minimal DB
+                    pass
             finally:
                 wconn.close()
 
@@ -380,17 +404,32 @@ if __name__ == "__main__":
     c.commit()
     c.close()
 
-    # Seed a minimal weather_edge.db so realized_pnl_today is non-zero
+    # Seed a minimal weather_edge.db so realized_pnl_today is non-zero.
+    # Includes cashouts AND resolutions to verify both are summed and that a
+    # cashed-out-then-resolved entry isn't double counted.
     w_path = tmp / "weather_edge.db"
     w = sqlite3.connect(w_path)
     w.executescript("""
         CREATE TABLE cashouts (cashout_id INTEGER PRIMARY KEY,
-            ts TEXT, realized_pnl_usd REAL);
+            entry_id INTEGER, ts TEXT, realized_pnl_usd REAL);
+        CREATE TABLE entries (entry_id INTEGER PRIMARY KEY,
+            entry_price REAL, size_shares REAL, side TEXT);
+        CREATE TABLE resolutions (resolution_id INTEGER PRIMARY KEY,
+            entry_id INTEGER, ts_resolved TEXT, final_outcome TEXT,
+            payout_per_share REAL);
     """)
     today = datetime.now(timezone.utc).strftime("%Y-%m-%dT12:00:00+00:00")
-    w.execute("INSERT INTO cashouts VALUES (1, ?, 5.50)", (today,))
-    w.execute("INSERT INTO cashouts VALUES (2, ?, -2.10)", (today,))
-    w.execute("INSERT INTO cashouts VALUES (3, '2026-05-10T10:00:00+00:00', 99.0)")
+    # Cashouts: 5.50 + (-2.10) today (#2 belongs to entry 12), 99.0 old.
+    w.execute("INSERT INTO cashouts VALUES (1, NULL, ?, 5.50)", (today,))
+    w.execute("INSERT INTO cashouts VALUES (2, 12, ?, -2.10)", (today,))
+    w.execute("INSERT INTO cashouts VALUES (3, NULL, '2026-05-10T10:00:00+00:00', 99.0)")
+    # Entries held to resolution.
+    w.execute("INSERT INTO entries VALUES (10, 0.60, 100, 'NO')")   # lost -60
+    w.execute("INSERT INTO entries VALUES (11, 0.40, 50, 'YES')")   # won +30
+    w.execute("INSERT INTO entries VALUES (12, 0.50, 20, 'NO')")    # cashed out → excluded
+    w.execute("INSERT INTO resolutions VALUES (1, 10, ?, 'NO', 0.0)", (today,))
+    w.execute("INSERT INTO resolutions VALUES (2, 11, ?, 'YES', 1.0)", (today,))
+    w.execute("INSERT INTO resolutions VALUES (3, 12, ?, 'NO', 1.0)", (today,))
     w.commit()
     w.close()
 
@@ -402,8 +441,11 @@ if __name__ == "__main__":
     assert abs(k["portfolio_total_usd"] - 847.5) < 0.01, k
     assert k["open_positions"] == 2
     assert k["max_positions"] == 50
-    # today's cashouts: 5.50 + (-2.10) = 3.40
-    assert abs(k["realized_pnl_today_usd"] - 3.40) < 0.01, k
+    # today's realized = cashouts (5.50 - 2.10 = 3.40)
+    #   + resolutions held today: entry10 (0-0.60)*100 = -60,
+    #     entry11 (1-0.40)*50 = +30; entry12 excluded (has a cashout)
+    #   → 3.40 - 60 + 30 = -26.60
+    assert abs(k["realized_pnl_today_usd"] - (-26.60)) < 0.01, k
     assert abs(k["portfolio_delta_today_usd"] - (-52.5)) < 0.01, k
     assert abs(k["drawdown_pct_from_peak"] - -15.25) < 0.1, k
     print(f"Test 1 PASS: get_kpis → {k}")
