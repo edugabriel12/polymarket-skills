@@ -12,6 +12,7 @@ Composable [Agent Skills](https://agentskills.io/specification) for Polymarket p
 | **polymarket-paper-trader** | Simulate trades against live prices, portfolio health checks | None | Zero |
 | **polymarket-strategy-advisor** | Trading methodology, recommendations, backtesting | None | Low |
 | **polymarket-live-executor** | Execute real trades (wallet + explicit human opt-in) | L2 Wallet | Medium |
+| **polymarket-wallet-analyzer** | Analyze any public wallet: P&L, win rate, breakdown by category | None | Zero |
 
 ## Install
 
@@ -141,6 +142,16 @@ Scanner --> Analyzer --> Strategy Advisor --> Paper Trader --> Live Executor
 | `execute_live.py` | Place real orders (requires env vars + human "yes") | `--token-id ID --side BUY --size 5 --price 0.60` |
 | `check_positions.py` | Wallet balance, open orders, trade history | `--balance --orders --trades` |
 | `setup_wallet.py` | Create burner wallet, verify config, check balance | `--create / --verify / --check-balance` |
+
+### polymarket-wallet-analyzer/ -- Public Wallet Analysis (Read-Only)
+
+| Script | Purpose | Key Args |
+|--------|---------|----------|
+| `analyze_wallet.py` | P&L, ROI, win rate, and per-category breakdown for any public wallet | `--address 0x... [--output text] [--category "Tennis"] [--enrich-tags]` |
+
+Uses the public Data API (`data-api.polymarket.com`); no private key required. Categories
+include Tennis, Soccer, League of Legends, Counter-Strike, Baseball, Basketball, Crypto,
+Politics, and more.
 
 ## CLAUDE.md Constitution
 

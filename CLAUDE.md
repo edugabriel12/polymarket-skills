@@ -268,12 +268,14 @@ Scanner ──→ Analyzer ──→ Strategy Advisor ──→ Paper Trader ─
 | Get trade recommendations | polymarket-strategy-advisor | `advisor.py`, `daily_review.py` |
 | Simulate trades | polymarket-paper-trader | `paper_engine.py`, `execute_paper.py`, `portfolio_report.py` |
 | Execute real trades | polymarket-live-executor | `execute_live.py`, `check_positions.py` |
+| Analyze any public wallet | polymarket-wallet-analyzer | `analyze_wallet.py` |
 
 All scripts are in `<skill>/scripts/` and require the Python venv: `source ~/.venv/bin/activate`
 
 All API calls use:
 - **Gamma API** (`gamma-api.polymarket.com`) — market metadata, zero auth
 - **CLOB API** (`clob.polymarket.com`) — prices/orderbooks read-only, trading needs L2 auth
+- **Data API** (`data-api.polymarket.com`) — wallet positions/trades/holders, read-only, zero auth
 
 ---
 
