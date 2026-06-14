@@ -42,6 +42,37 @@ import suggest_totals                 # noqa: E402  (MLB model)
 import soccer_predictions as spdb     # noqa: E402  (soccer store; stdlib-only, safe import)
 import soccer_results                  # noqa: E402  (soccer auto-settlement; safe import)
 
+
+def _load_dotenv() -> list[str]:
+    """Load KEY=VALUE lines from a .env file (backend/, webapp/, or repo root).
+
+    Real environment variables take precedence (setdefault), so a shell/IntelliJ
+    var overrides the file. No external dependency. Returns the files loaded.
+    """
+    loaded = []
+    for path in (os.path.join(_BACKEND_DIR, ".env"),
+                 os.path.normpath(os.path.join(_BACKEND_DIR, "..", ".env")),
+                 os.path.join(_REPO_ROOT, ".env")):
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, val = line.partition("=")
+                    key = key.strip()
+                    if key:
+                        os.environ.setdefault(key, val.strip().strip('"').strip("'"))
+            loaded.append(path)
+        except OSError:
+            pass
+    return loaded
+
+
+_DOTENV_FILES = _load_dotenv()
+
 MLB_DB = os.environ.get("PREDICTIONS_DB", pdb.DEFAULT_DB)
 SOCCER_DB = os.environ.get("SOCCER_PREDICTIONS_DB", spdb.DEFAULT_DB)
 SOCCER_RATINGS_CSV = os.environ.get("SOCCER_RATINGS_CSV")
@@ -190,7 +221,10 @@ def _enrich(sport: str, suggestions: list[dict], date: str) -> list[dict]:
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok", "sports": list(SPORTS), "mlb_db": MLB_DB, "soccer_db": SOCCER_DB, "time": _now()}
+    return {"status": "ok", "sports": list(SPORTS), "mlb_db": MLB_DB, "soccer_db": SOCCER_DB,
+            "dotenv_loaded": _DOTENV_FILES,
+            "football_data_token": bool(FOOTBALL_DATA_TOKEN),
+            "soccer_ratings_csv": bool(SOCCER_RATINGS_CSV), "time": _now()}
 
 
 @app.get("/api/analyses")
