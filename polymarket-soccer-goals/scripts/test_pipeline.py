@@ -51,6 +51,18 @@ class TestLeagues(unittest.TestCase):
         self.assertEqual(leagues.game_url("fifwc-nld-jpn-2026-06-14-btts"),
                          "https://polymarket.com/sports/world-cup/fifwc-nld-jpn-2026-06-14")
 
+    def test_brasileirao_serie_b_mapping_and_url(self):
+        # The user's example: a Série B game (bra2-) must map, parse, and link to /sports/bra2/.
+        slug = "bra2-nov-nau-2026-06-14-total-2pt5"
+        self.assertTrue(leagues.is_soccer_slug(slug))
+        self.assertEqual(leagues.league_prefix(slug), "bra2")
+        self.assertFalse(leagues.is_neutral(slug))      # club league, home advantage applies
+        self.assertFalse(leagues.is_international(slug))  # clubs -> Club Elo, not national
+        self.assertEqual(leagues.parse_teams(slug), ("nov", "nau"))
+        self.assertLess(leagues.league_baseline(slug), 2.4)  # lower-scoring league
+        self.assertEqual(leagues.game_url(slug),
+                         "https://polymarket.com/sports/bra2/bra2-nov-nau-2026-06-14")
+
 
 class TestMarketParsing(unittest.TestCase):
     def test_total_and_btts_detection(self):
@@ -121,6 +133,18 @@ class TestAutoRatings(unittest.TestCase):
         self.assertIsNone(rs.national_elo("zzz"))
         self.assertEqual(rs.club_elo_name("ars"), "Arsenal")
         self.assertEqual(rs.club_elo_name("rma"), "RealMadrid")
+        # Expanded big-5 + Eredivisie/Primeira coverage (one per league).
+        self.assertEqual(rs.club_elo_name("nap"), "Napoli")
+        self.assertEqual(rs.club_elo_name("bou"), "Bournemouth")
+        self.assertEqual(rs.club_elo_name("gir"), "Girona")
+        self.assertEqual(rs.club_elo_name("scf"), "Freiburg")
+        self.assertEqual(rs.club_elo_name("psv"), "PSV")
+        self.assertIsNone(rs.club_elo_name("zzz"))
+        # Conflicting 3-letter codes resolved deterministically.
+        self.assertEqual(rs.club_elo_name("mon"), "Monaco")    # not Monza (mnz)
+        self.assertEqual(rs.club_elo_name("mnz"), "Monza")
+        self.assertEqual(rs.club_elo_name("bre"), "Brentford")  # not Bremen (wbr)
+        self.assertEqual(rs.club_elo_name("wbr"), "Bremen")
 
     def test_world_cup_auto_national_elo_no_csv(self):
         import data_inputs as di

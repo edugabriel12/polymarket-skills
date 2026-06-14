@@ -52,7 +52,11 @@ python polymarket-soccer-goals/scripts/test_pipeline.py
   (variance/mean ≈ 1), so Poisson — not Negative Binomial — is correct. Then
   `P(Over X.5) = Σ_{i+j>X} P(i,j)` and `P(BTTS) = Σ_{i≥1,j≥1} P(i,j)`. See `references/model.md`.
 - **λ from data (automatic):** `total` (league baseline × attack/defense) + `supremacy` →
-  `λ_home=(total+sup)/2`, `λ_away=(total−sup)/2`. Strength is resolved automatically, in order:
+  `λ_home=(total+sup)/2`, `λ_away=(total−sup)/2`. The **league baseline** (avg goals/game — the
+  total anchor) is **auto-calibrated** from the current season's finished matches via
+  **football-data.org** (`baselines_source.py`; set `FOOTBALL_DATA_TOKEN`), falling back to the static
+  `LEAGUE_BASELINES` per league when offline or below a min-matches floor. Strength is resolved
+  automatically, in order:
   **(1)** a ratings CSV if given, **(2)** xG via `soccerdata`, **(3)** Elo — **national-team Elo for
   international games (World Cup)** and **Club Elo for club leagues**. No manual input needed for
   covered teams. **BTTS is asymmetric** — governed by the smaller λ (weak attack vs strong defense).
@@ -69,6 +73,8 @@ python polymarket-soccer-goals/scripts/test_pipeline.py
 | `--date YYYY-MM-DD` | today (UTC) | Target day |
 | `--ratings-csv PATH` | — | Team ratings CSV (`team,elo,att_factor,def_factor`) — overrides auto sources |
 | `--no-auto-ratings` | off | Disable automatic ratings (national Elo / Club Elo / xG) → market-implied |
+| `--no-calibrate-baselines` | off | Disable football-data.org baseline calibration → static `LEAGUE_BASELINES` |
+| `--football-data-token TOK` | `$FOOTBALL_DATA_TOKEN` | football-data.org key for baseline calibration |
 | `--rho F` | -0.10 | Dixon-Coles dependence (negative raises draws) |
 | `--home-first / --away-first` | home-first | Which team the slug lists first |
 | `--min-volume N` | 1000 | Volume gate ($/24h) |
@@ -83,6 +89,18 @@ python polymarket-soccer-goals/scripts/test_pipeline.py
 Records each suggestion (status PENDENTE) with the full Dixon-Coles audit (λ_home, λ_away, ρ,
 P(model), edge, sizing) and the Polymarket market link, for later calibration/win-rate analysis.
 
+## Auto-settlement (`track_soccer.py`)
+PENDENTE predictions are settled from a results feed (**football-data.org**, free; set
+`FOOTBALL_DATA_TOKEN` or pass `--token`). Settlement is order-independent — total = sum of goals,
+BTTS = both teams scored — so games are matched by the unordered team pair + date. The dashboard's
+Resultados tab auto-settles soccer on each visit when the token is set.
+
+```bash
+python polymarket-soccer-goals/scripts/track_soccer.py --summary
+python polymarket-soccer-goals/scripts/track_soccer.py --auto-settle           # from football-data.org
+python polymarket-soccer-goals/scripts/track_soccer.py --settle-game fifwc-nld-jpn-2026-06-14 --total 3 --btts yes
+```
+
 ## Honest limitations
 - **Market near-efficient at close; realistic O/U yield ~0.8%** (research). Any model implying >10%
   yield is overfit. Validate with Brier/log-loss + CLV over **~1,000+ entries** before real capital.
@@ -91,6 +109,9 @@ P(model), edge, sizing) and the Polymarket market link, for later calibration/wi
   refresh periodically; Club Elo needs the club in the alias map; xG needs `soccerdata` + a team-name
   map (ToS-flagged). A `--ratings-csv` overrides everything. Teams not covered by any source fall back
   to market-implied (zero edge — no fabrication).
-- **Slug team order** (home/away) and league baselines are best-effort/tunable; the sandbox blocks
-  live egress so only the deterministic core is tested here. Conservative caps (1% first / 2% model).
+- **League baselines auto-calibrate** from football-data.org's current-season finished matches when
+  `FOOTBALL_DATA_TOKEN` is set; without it (or below the min-matches floor) the static
+  `LEAGUE_BASELINES` snapshot is used (refresh periodically). **Slug team order** (home/away) is
+  best-effort/tunable; the sandbox blocks live egress so only the deterministic core is tested here.
+  Conservative caps (1% first / 2% model).
 - Not financial advice; real trading involves risk of loss.

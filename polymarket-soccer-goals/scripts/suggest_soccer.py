@@ -23,6 +23,7 @@ import dixon_coles as dc
 import leagues
 import soccer_market as sm
 import data_inputs
+import baselines_source as bsrc
 import soccer_predictions as spdb
 
 from category_common import (
@@ -162,6 +163,18 @@ def run(args) -> dict:
     ratings = data_inputs.load_ratings(args.ratings_csv) if args.ratings_csv else {}
     kh = advisor_kelly_half()
 
+    # Calibrate league baselines from the live results feed (best-effort; falls back
+    # to the static LEAGUE_BASELINES per league when unavailable). One req/league.
+    calibrated = {}
+    if getattr(args, "calibrate_baselines", True):
+        prefixes = {leagues.league_prefix(k) for k in (set(total_evts) | set(btts_evts))}
+        token = getattr(args, "football_data_token", None)
+        calibrated = bsrc.calibrate_baselines(prefixes, token, debug=args.debug)
+        if calibrated:
+            vlog("  baselines calibrated: " + ", ".join(
+                f"{p}={v:.2f}(was {leagues.LEAGUE_BASELINES.get(p, leagues.DEFAULT_BASELINE):.2f})"
+                for p, v in sorted(calibrated.items())))
+
     suggestions, skipped = [], []
 
     def _skip(slug, reason, **extra):
@@ -174,7 +187,7 @@ def run(args) -> dict:
                                            ratings=ratings, auto=args.auto_ratings,
                                            international=leagues.is_international(slug),
                                            debug=args.debug)
-        total, sup, used = derive_total_supremacy(inp, leagues.league_baseline(slug),
+        total, sup, used = derive_total_supremacy(inp, bsrc.baseline_for(slug, calibrated),
                                                   leagues.is_neutral(slug))
         return inp, total, sup, used
 
@@ -336,6 +349,11 @@ def main() -> None:
     p.add_argument("--ratings-csv", default=None, help="CSV of team elo/att_factor/def_factor (overrides auto)")
     p.add_argument("--no-auto-ratings", dest="auto_ratings", action="store_false", default=True,
                    help="Disable automatic ratings (national Elo / Club Elo / xG) -> market-implied")
+    p.add_argument("--no-calibrate-baselines", dest="calibrate_baselines", action="store_false",
+                   default=True, help="Disable football-data.org league-baseline calibration "
+                                      "(keep the static LEAGUE_BASELINES)")
+    p.add_argument("--football-data-token", default=None,
+                   help="football-data.org key for baseline calibration (default $FOOTBALL_DATA_TOKEN)")
     p.add_argument("--home-first", dest="home_first", action="store_true", default=True,
                    help="Slug lists home team first (default)")
     p.add_argument("--away-first", dest="home_first", action="store_false",

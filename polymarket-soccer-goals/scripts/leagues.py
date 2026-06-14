@@ -32,6 +32,7 @@ LEAGUE_BASELINES: dict[str, float] = {
     "fifwc": 2.55, "world-cup": 2.55, "wc": 2.55,
     "eur'": 2.45, "euro": 2.45,
     "brasileirao": 2.30, "brasil": 2.30,
+    "bra2": 2.20, "serie-b": 2.20,  # Brasileirão Série B (lower-scoring)
 }
 DEFAULT_BASELINE = 2.70
 
@@ -61,6 +62,7 @@ LEAGUE_URL_PATH = {
     "bundesliga": "bundesliga", "ligue1": "ligue-1", "ligue-1": "ligue-1",
     "ucl": "champions-league", "champions-league": "champions-league",
     "uel": "europa-league", "mls": "mls", "eredivisie": "eredivisie",
+    "bra2": "bra2", "serie-b": "bra2",
 }
 
 # Strip a market suffix ("-total-2pt5", "-btts", "-spread-...") to the base game slug.
