@@ -3,7 +3,7 @@
 
 Pipeline: today's soccer games on Polymarket (via the category scanner) -> for
 each full-game total-goals or BTTS market -> Dixon-Coles model of P(Over)/P(BTTS)
--> edge vs the Polymarket price -> 1.60x-3.0x payout filter -> pre-game decision
+-> edge vs the Polymarket price -> 1.50x-3.0x payout filter -> pre-game decision
 tree -> half-Kelly capped per CLAUDE.md -> recommendation(s). Records each
 prediction (status PENDENTE) for later analysis.
 
@@ -262,7 +262,8 @@ def _emit_or_skip(market_type, slug, m, line, chosen, notes, lam_h, lam_a, used,
                   book_sum, price_sane, args, portfolio_value, first_trade, kh,
                   suggestions, _skip, target):
     if not chosen:
-        _skip(slug, "no positive-edge side within 1.60x-3.0x band", market=market_type, sides=notes)
+        _skip(slug, f"no positive-edge side within {args.odds_min:.2f}x-{args.odds_max:.1f}x band",
+              market=market_type, sides=notes)
         return
     passed, reason = decision_tree(chosen, m, book_sum, price_sane,
                                    min_volume=args.min_volume, min_edge=args.min_edge,

@@ -10,15 +10,15 @@ Model: the GAME TOTAL runs T is Negative Binomial. MLB runs are overdispersed
 references/run-model.md and research/mlb-total-runs-deep-research.md). We fit by
 method of moments and read the over/under probability off the tail of the PMF.
 
-Polymarket price == implied probability, so decimal odds = 1/price. The
-1.60x-3.0x payout filter maps to an entry price in [1/3.0, 1/1.6] = [0.3333, 0.625].
+Polymarket price == implied probability, so decimal odds = 1/price. The default
+1.50x-3.0x payout filter maps to an entry price in [1/3.0, 1/1.5] = [0.3333, 0.667].
 """
 
 from __future__ import annotations
 
 import math
 
-# Odds <-> price boundaries for the 1.60x-3.0x payout filter.
+# Odds <-> price boundaries for the default 1.50x-3.0x payout filter.
 ODDS_MIN_DEFAULT = 1.50
 ODDS_MAX_DEFAULT = 3.00
 
@@ -213,7 +213,7 @@ def market_implied_mu(line: float, market_p_over: float,
 
 
 # ---------------------------------------------------------------------------
-# Odds <-> price helpers (the 1.60x-3.0x payout filter)
+# Odds <-> price helpers (the default 1.50x-3.0x payout filter)
 # ---------------------------------------------------------------------------
 
 
@@ -229,7 +229,7 @@ def passes_odds_filter(price: float,
                        odds_max: float = ODDS_MAX_DEFAULT) -> bool:
     """True iff the entry price yields a decimal payout in [odds_min, odds_max].
 
-    payout 1.60x <-> price 0.625 (ceiling); payout 3.0x <-> price 0.3333 (floor).
+    e.g. default band: payout 1.50x <-> price 0.667 (ceiling); 3.0x <-> 0.3333 (floor).
     """
     price_floor = 1.0 / odds_max
     price_ceil = 1.0 / odds_min

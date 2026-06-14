@@ -4,7 +4,7 @@
 Pipeline: today's MLB games (reusing the category-watcher scanner) -> find each
 game's total-runs Over/Under market -> model P(Over)/P(Under) with a Negative
 Binomial run distribution -> edge vs the Polymarket price -> pick a side ->
-filter to a 1.60x-3.0x payout (price in [0.3333, 0.625]) -> entry decision tree
+filter to a 1.50x-3.0x payout (price in [0.3333, 0.667]) -> entry decision tree
 -> half-Kelly size capped per CLAUDE.md -> emit recommendation(s). Optionally
 pipe into the paper trader with --paper (dry-run unless --paper-execute).
 
@@ -377,7 +377,8 @@ def run(args) -> dict:
             f"{n['side']} price={n['price']} p={n['p_model']} edge={n['edge']:+.3f} "
             f"band={n['in_odds_band']}" for n in side_notes))
         if not chosen:
-            _skip(event_slug, "no positive-edge side within 1.60x-3.0x band",
+            _skip(event_slug, f"no positive-edge side within "
+                  f"{args.odds_min:.2f}x-{args.odds_max:.1f}x band",
                   line=line, sides=side_notes)
             continue
 
@@ -503,7 +504,7 @@ def main() -> None:
     p.add_argument("--all-lines", dest="best_line_only", action="store_false", default=True,
                    help="Suggest every qualifying line (default: best-edge line per game only)")
     p.add_argument("--min-edge", type=float, default=0.05, help="Min edge after fees (default 0.05)")
-    p.add_argument("--odds-min", type=float, default=rd.ODDS_MIN_DEFAULT, help="Min decimal payout (default 1.60)")
+    p.add_argument("--odds-min", type=float, default=rd.ODDS_MIN_DEFAULT, help="Min decimal payout (default 1.50)")
     p.add_argument("--odds-max", type=float, default=rd.ODDS_MAX_DEFAULT, help="Max decimal payout (default 3.00)")
     p.add_argument("--dispersion", type=float, default=2.0, help="variance = dispersion*mean (default 2.0)")
     p.add_argument("--league-baseline", type=float, default=8.5, help="Neutral game total (default 8.5)")
