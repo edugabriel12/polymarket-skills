@@ -271,7 +271,8 @@ def _emit_or_skip(market_type, slug, m, line, chosen, notes, lam_h, lam_a, used,
             + f" @ {price:.3f} (payout {odds:.2f}x) edge {chosen['edge']*100:+.1f}% "
             + ("Dixon-Coles" if used else "market-implied (fallback)"))
     stats = {
-        "model": "dixon_coles", "market": market_type, "lam_home": round(lam_h, 4),
+        "model": "dixon_coles", "market": market_type, "chosen_side": chosen["side"],
+        "lam_home": round(lam_h, 4),
         "lam_away": round(lam_a, 4), "rho": args.rho, "line": line,
         "model_prob": round(chosen["p_model"], 4), "entry_price": price,
         "decimal_odds": round(odds, 4), "edge_after_fee": round(chosen["edge"], 4),
@@ -304,10 +305,10 @@ def _emit_or_skip(market_type, slug, m, line, chosen, notes, lam_h, lam_a, used,
     text = (f"Market: {sanitize_text(m.get('question',''))}  [{slug}]\n"
             f"Edge type: news-driven (Dixon-Coles model)\n{desc}\n"
             f"Size: ${size_usd:,.2f} ({size_pct*100:.2f}%)  Confidence: {confidence:.2f}")
-    suggestions.append({"game": slug, "market": market_type, "line": line,
-                        "edge": round(chosen["edge"], 4), "lam_home": round(lam_h, 3),
-                        "lam_away": round(lam_a, 3), "prediction_id": pred_id,
-                        "recommendation": rec, "_text": text})
+    suggestions.append({"game": slug, "market": market_type, "side": chosen["side"],
+                        "line": line, "edge": round(chosen["edge"], 4),
+                        "lam_home": round(lam_h, 3), "lam_away": round(lam_a, 3),
+                        "prediction_id": pred_id, "recommendation": rec, "_text": text})
 
 
 def render_text(result: dict) -> str:

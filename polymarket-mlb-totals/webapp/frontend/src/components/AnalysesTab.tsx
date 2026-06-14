@@ -10,7 +10,7 @@ import {
   ChevronLeft,
   ChevronRight,
 } from "lucide-react";
-import { api } from "@/lib/api";
+import { api, type Sport } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { PredictionCard } from "@/components/PredictionCard";
@@ -23,12 +23,12 @@ function msUntilEndOfDay() {
   return end.getTime() - now.getTime();
 }
 
-export function AnalysesTab() {
+export function AnalysesTab({ sport }: { sport: Sport }) {
   const qc = useQueryClient();
   const [recalculating, setRecalculating] = useState(false);
   const { data, isLoading, isFetching } = useQuery({
-    queryKey: ["analyses"],
-    queryFn: () => api.analyses(),
+    queryKey: ["analyses", sport],
+    queryFn: () => api.analyses(sport),
     staleTime: msUntilEndOfDay(),
     refetchOnWindowFocus: false,
   });
@@ -36,8 +36,8 @@ export function AnalysesTab() {
   const recalc = async () => {
     setRecalculating(true);
     try {
-      await api.analyses(undefined, true);
-      await qc.invalidateQueries({ queryKey: ["analyses"] });
+      await api.analyses(sport, undefined, true);
+      await qc.invalidateQueries({ queryKey: ["analyses", sport] });
     } finally {
       setRecalculating(false);
     }

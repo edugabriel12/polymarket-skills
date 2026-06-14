@@ -207,3 +207,134 @@ def compute_pnl(row: dict) -> float:
     if status == "ERRO":
         return -size
     return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Performance analytics (daily/weekly/monthly) for the dashboard
+# ---------------------------------------------------------------------------
+
+from datetime import date as _date, timedelta as _td  # noqa: E402
+
+
+def _window_bounds(window: str, today: "_date"):
+    if window == "daily":
+        return today, today
+    if window == "weekly":
+        return today - _td(days=today.weekday()), today
+    return today.replace(day=1), today
+
+
+def _in_window(gd, start, end) -> bool:
+    if not gd:
+        return False
+    try:
+        d = _date.fromisoformat(gd)
+    except ValueError:
+        return False
+    return start <= d <= end
+
+
+def _aggregate(rows: list[dict]) -> dict:
+    counts = {"acerto": 0, "erro": 0, "pendente": 0, "anulado": 0}
+    pnl = invested = 0.0
+    over = {"a": 0, "n": 0}
+    under = {"a": 0, "n": 0}
+    for r in rows:
+        st, side = r.get("status"), (r.get("side") or "").upper()
+        pnl += compute_pnl(r)
+        if st == "ACERTO":
+            counts["acerto"] += 1
+        elif st == "ERRO":
+            counts["erro"] += 1
+        elif st == "ANULADO":
+            counts["anulado"] += 1
+        else:
+            counts["pendente"] += 1
+        if st in ("ACERTO", "ERRO"):
+            invested += float(r.get("size_usd") or 0)
+            bucket = over if side == "OVER" else under if side == "UNDER" else None
+            if bucket is not None:
+                bucket["n"] += 1
+                if st == "ACERTO":
+                    bucket["a"] += 1
+    settled = counts["acerto"] + counts["erro"]
+    return {
+        "counts": counts, "settled": settled, "pnl": round(pnl, 2),
+        "invested": round(invested, 2),
+        "roi": round(pnl / invested, 4) if invested > 0 else None,
+        "win_rate": round(counts["acerto"] / settled, 4) if settled else None,
+        "win_rate_over": round(over["a"] / over["n"], 4) if over["n"] else None,
+        "win_rate_under": round(under["a"] / under["n"], 4) if under["n"] else None,
+    }
+
+
+def performance(db_path: str = DEFAULT_DB, today=None) -> dict:
+    today = today or datetime.now(timezone.utc).date()
+    rows = get_predictions(db_path)
+    out = {}
+    for w in ("daily", "weekly", "monthly"):
+        start, end = _window_bounds(w, today)
+        block = _aggregate([r for r in rows if _in_window(r.get("game_date"), start, end)])
+        block.update(window=w, start=start.isoformat(), end=end.isoformat())
+        out[w] = block
+    out["generated_at"] = datetime.now(timezone.utc).isoformat()
+    return out
+
+
+def pnl_by_day(db_path: str = DEFAULT_DB, days: int = 30) -> list[dict]:
+    by_day: dict[str, float] = {}
+    for r in get_predictions(db_path):
+        gd = r.get("game_date")
+        if gd:
+            by_day[gd] = by_day.get(gd, 0.0) + compute_pnl(r)
+    series = [{"date": d, "pnl": round(v, 2)} for d, v in sorted(by_day.items())]
+    return series[-days:]
+
+
+def seed(db_path: str, reset: bool = False) -> int:
+    """Seed demo soccer predictions (TOTAL + BTTS, mixed statuses) for the UI."""
+    if reset:
+        con = connect(db_path)
+        with con:
+            con.execute("DELETE FROM predictions")
+        con.close()
+    today = datetime.now(timezone.utc).date()
+    games = [("epl", "ars", "che"), ("laliga", "rma", "bar"), ("seriea", "int", "juv"),
+             ("bundesliga", "bay", "dor"), ("ligue1", "psg", "mar"), ("epl", "liv", "mci")]
+    plan = [
+        (3, "TOTAL", "OVER", 2.5, 0.52, "ACERTO"), (3, "BTTS", "YES", None, 0.55, "ACERTO"),
+        (2, "TOTAL", "UNDER", 3.5, 0.50, "ERRO"), (2, "BTTS", "NO", None, 0.57, "ACERTO"),
+        (1, "TOTAL", "OVER", 2.5, 0.48, "ACERTO"), (1, "BTTS", "YES", None, 0.53, "ERRO"),
+        (0, "TOTAL", "OVER", 2.5, 0.50, "PENDENTE"), (0, "BTTS", "YES", None, 0.56, "PENDENTE"),
+    ]
+    n = 0
+    for i, (days_ago, market, side, line, price, status) in enumerate(plan):
+        league, home, away = games[i % len(games)]
+        gd = (today - _td(days=days_ago)).isoformat()
+        suffix = f"total-{str(line).replace('.', 'pt')}" if market == "TOTAL" else "btts"
+        slug = f"{league}-{home}-{away}-{gd}-{suffix}"
+        lam_h, lam_a = 1.6, 1.2
+        rid = record_prediction({
+            "game_slug": slug, "game_date": gd, "league": league, "market": market,
+            "market_question": f"{home} vs {away}: {market}", "condition_id": "0x" + slug,
+            "token_id": slug + "-" + side.lower(), "line": line, "side": side,
+            "entry_price": price, "decimal_odds": round(1 / price, 3), "model_prob": 0.6,
+            "edge": round(0.6 - price, 3), "lam_home": lam_h, "lam_away": lam_a, "rho": -0.10,
+            "confidence": 0.6, "size_pct": 0.01, "size_usd": 120.0, "kelly_fraction": 0.18,
+            "used_external": True, "fee_rate": 0.0, "strategy": "soccer-goals-dc",
+            "market_url": f"https://polymarket.com/event/{slug}",
+            "stats": {"model": "dixon_coles", "market": market, "lam_home": lam_h,
+                      "lam_away": lam_a, "rho": -0.10, "line": line, "model_prob": 0.6,
+                      "entry_price": price, "edge_after_fee": round(0.6 - price, 3),
+                      "used_external": True, "confidence": 0.6},
+        }, db_path)
+        if status in ("ACERTO", "ERRO", "ANULADO"):
+            if market == "BTTS":
+                yes = (status == "ACERTO") == (side == "YES")
+                settle_game(slug, db_path, actual_btts=yes)
+            else:
+                actual = (line + 1 if side == "OVER" else line - 1) if status == "ACERTO" else \
+                         (line - 1 if side == "OVER" else line + 1)
+                settle_game(slug, db_path, actual_total=actual)
+        n += 1
+    return n

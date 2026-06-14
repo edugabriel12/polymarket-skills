@@ -1,6 +1,17 @@
-# MLB Totals — Dashboard (web app)
+# Polymarket Sports — Dashboard (web app)
 
-A modern, colorful UI to interact with the `polymarket-mlb-totals` model. Two tabs:
+A modern, colorful UI to interact with the prediction models, with a **sport toggle**
+(⚾ MLB total-runs · ⚽ Futebol total-goals + BTTS). The header switch drives both tabs.
+
+- **MLB** runs in-process (`polymarket-mlb-totals`, Negative Binomial).
+- **Soccer** runs the `polymarket-soccer-goals` Dixon-Coles model via subprocess (the two skills
+  both define a `data_inputs` module, so importing both in one process would collide). Its
+  predictions live in a separate DB.
+
+Relevant env vars (optional): `PREDICTIONS_DB`, `SOCCER_PREDICTIONS_DB`, `SOCCER_RATINGS_CSV`
+(a team-ratings CSV passed to the soccer model). API endpoints take `?sport=mlb|soccer`.
+
+Two tabs:
 
 - **Análises** — the day's Over/Under entry suggestions, rendered as cards with the full NegBin
   math (μ, variance, P(Over)/P(Under), edge, payout, Kelly size). The heavy model calc runs

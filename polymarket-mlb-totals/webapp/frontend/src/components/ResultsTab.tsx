@@ -9,7 +9,7 @@ import {
   ExternalLink,
   RefreshCw,
 } from "lucide-react";
-import { api, type Period } from "@/lib/api";
+import { api, type Period, type Sport } from "@/lib/api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { KpiCard } from "@/components/KpiCard";
@@ -23,12 +23,12 @@ const PERIODS: { key: Period; label: string }[] = [
   { key: "monthly", label: "Mensal" },
 ];
 
-export function ResultsTab() {
+export function ResultsTab({ sport }: { sport: Sport }) {
   const [period, setPeriod] = useState<Period>("monthly");
   // refetchOnMount + always-stale => every visit/interaction triggers backend settlement.
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["results"],
-    queryFn: () => api.results(),
+    queryKey: ["results", sport],
+    queryFn: () => api.results(sport),
     staleTime: 0,
     refetchOnMount: "always",
     refetchOnWindowFocus: true,
@@ -107,24 +107,26 @@ export function ResultsTab() {
                 <thead>
                   <tr className="border-b border-border text-left text-xs uppercase tracking-wider text-muted-foreground">
                     <th className="py-2 pr-3">Jogo</th>
+                    <th className="px-3">Mercado</th>
                     <th className="px-3">Lado</th>
                     <th className="px-3">Linha</th>
                     <th className="px-3">Preço</th>
-                    <th className="px-3">Total</th>
                     <th className="px-3">Status</th>
-                    <th className="px-3">Mercado</th>
+                    <th className="px-3">Link</th>
                   </tr>
                 </thead>
                 <tbody>
                   {data!.recent.slice(0, 15).map((r) => (
                     <tr key={r.id} className="border-b border-border/60">
-                      <td className="py-2 pr-3 font-medium">{r.game_slug.replace(/^mlb-/, "").replace(/-\d{4}-\d{2}-\d{2}$/, "")}</td>
-                      <td className="px-3">
-                        <span className={r.side === "OVER" ? "font-bold text-sky-400" : "font-bold text-violet-400"}>{r.side}</span>
+                      <td className="py-2 pr-3 font-medium">
+                        {r.game_slug.replace(/^[a-z0-9]+-/, "").replace(/-\d{4}-\d{2}-\d{2}.*$/, "")}
                       </td>
-                      <td className="px-3 tabular-nums">{r.line}</td>
+                      <td className="px-3 text-xs text-muted-foreground">{r.market ?? "TOTAL"}</td>
+                      <td className="px-3">
+                        <span className={["OVER", "YES"].includes(r.side) ? "font-bold text-sky-400" : "font-bold text-violet-400"}>{r.side}</span>
+                      </td>
+                      <td className="px-3 tabular-nums">{r.line && r.line > 0 ? r.line : "—"}</td>
                       <td className="px-3 tabular-nums">{r.entry_price?.toFixed(2)}</td>
-                      <td className="px-3 tabular-nums">{r.actual_total ?? "—"}</td>
                       <td className="px-3"><StatusBadge status={r.status} /></td>
                       <td className="px-3">
                         {r.market_url && (
