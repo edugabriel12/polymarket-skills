@@ -249,7 +249,7 @@ def parse_market(m: dict, category_key: str) -> dict:
 
 
 def _fetch_tag_page(api: APIClient, tag_slug: str, offset: int,
-                    include_closed: bool) -> list[dict]:
+                    include_closed: bool, extra_params: dict | None = None) -> list[dict]:
     params = {
         "tag_slug": tag_slug,
         "active": "true",
@@ -259,6 +259,8 @@ def _fetch_tag_page(api: APIClient, tag_slug: str, offset: int,
         "order": "volume24hr",
         "ascending": "false",
     }
+    if extra_params:
+        params.update(extra_params)
     page = api.get(f"{GAMMA_API}/markets", params=params)
     return page if isinstance(page, list) else []
 
@@ -270,12 +272,16 @@ def discover_markets(
     min_volume: float = 0.0,
     max_markets: int | None = None,
     include_closed: bool = False,
+    extra_params: dict | None = None,
 ) -> tuple[str, list[dict]]:
     """Fetch ALL live markets of a category, paginating through Gamma.
 
     Tries each tag-slug candidate; the first that yields any markets wins.
     Returns (tag_used, markets). Falls back to a `q=` text search on the
     canonical category key if no tag candidate produced results.
+
+    `extra_params` are merged into each Gamma query (e.g. a date window so
+    low-volume markets aren't lost behind the volume-ranked offset cap).
     """
     for tag in candidates:
         if not tag:
@@ -284,7 +290,7 @@ def discover_markets(
         offset = 0
         while True:
             try:
-                page = _fetch_tag_page(api, tag, offset, include_closed)
+                page = _fetch_tag_page(api, tag, offset, include_closed, extra_params)
             except requests.exceptions.RequestException as e:
                 log(f"  tag {tag!r} page@{offset} failed: {e}")
                 break
