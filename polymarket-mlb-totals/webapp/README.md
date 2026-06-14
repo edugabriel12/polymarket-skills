@@ -10,7 +10,8 @@ A modern, colorful UI to interact with the prediction models, with a **sport tog
 
 Relevant env vars (optional): `PREDICTIONS_DB`, `SOCCER_PREDICTIONS_DB`, `SOCCER_RATINGS_CSV`
 (team-ratings CSV passed to the soccer model), `FOOTBALL_DATA_TOKEN` (football-data.org key — the
-Resultados tab auto-settles soccer from that results feed when set). API endpoints take
+Resultados tab auto-settles soccer from that results feed when set, and the soccer model
+auto-calibrates each league's baseline goals/game from the current season). API endpoints take
 `?sport=mlb|soccer`.
 
 Two tabs:
