@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""Suggest Over/Under total-runs entries for the day's MLB games on Polymarket.
+
+Pipeline: today's MLB games (reusing the category-watcher scanner) -> find each
+game's total-runs Over/Under market -> model P(Over)/P(Under) with a Negative
+Binomial run distribution -> edge vs the Polymarket price -> pick a side ->
+filter to a 1.60x-3.0x payout (price in [0.3333, 0.625]) -> entry decision tree
+-> half-Kelly size capped per CLAUDE.md -> emit recommendation(s). Optionally
+pipe into the paper trader with --paper (dry-run unless --paper-execute).
+
+Paper trading is the default (CLAUDE.md rule #2). This is a simulation, not
+financial advice; real trading involves risk of loss.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime, timezone
+
+import _bootstrap  # noqa: F401  (wires sys.path for the reused skills)
+
+import run_distribution as rd
+import park_factors as pf
+import totals_market as tm
+import data_inputs
+
+from category_common import (
+    APIClient,
+    discover_markets,
+    fetch_midpoint,
+    game_date,
+    resolve_category,
+    sanitize_text,
+)
+
+STRATEGY = "mlb-totals-negbin"
+
+# CLAUDE.md per-trade caps for this model/news-driven edge.
+CAP_MODEL = 0.02
+CAP_FIRST_TRADE = 0.01
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def fee_for(price: float, fee_rate: float) -> float:
+    """Parabolic taker fee = fee_rate * min(p, 1-p). fee_rate default 0 (sports)."""
+    if not fee_rate or price is None:
+        return 0.0
+    return fee_rate * min(price, 1.0 - price)
+
+
+def group_by_event(markets: list[dict]) -> dict[str, list[dict]]:
+    """Group rich parsed markets by event_slug (keeps decision-tree fields)."""
+    out: dict[str, list[dict]] = {}
+    for m in markets:
+        key = m.get("event_slug") or m.get("slug")
+        if key:
+            out.setdefault(key, []).append(m)
+    return out
+
+
+def model_probabilities(line, over_price, park_factor, inputs, *,
+                        league_baseline, dispersion):
+    """Return (p_over_eff, p_under_eff, mu, used_external).
+
+    With real inputs, mu = park-adjusted baseline + adjustments. Without any
+    input, mu = market-implied (edge ~ 0 by construction — never fabricated).
+    """
+    used_external = bool(inputs)
+    if used_external:
+        base = rd.baseline_mu(park_factor, league_baseline)
+        mu = rd.adjust_mu(base, **inputs)
+    else:
+        mu = rd.market_implied_mu(line, over_price, dispersion)
+    pmf = rd.negbin_total_runs_pmf(mu, rd.variance_from_mu(mu, dispersion))
+    probs = rd.prob_over(line, pmf)
+    return probs["p_over_eff"], probs["p_under_eff"], mu, used_external
+
+
+def pick_side(line, ou, p_over, p_under, fee_rate, odds_min, odds_max):
+    """Choose Over/Under by post-fee edge among odds-filter-eligible sides.
+
+    Returns a dict for the chosen side or None, plus a list of per-side notes.
+    """
+    sides = [
+        ("OVER", ou["over_token"], ou["over_price"], p_over),
+        ("UNDER", ou["under_token"], ou["under_price"], p_under),
+    ]
+    notes = []
+    candidates = []
+    for name, token, price, p_model in sides:
+        if price is None:
+            continue
+        edge = p_model - price - fee_for(price, fee_rate)
+        in_odds = rd.passes_odds_filter(price, odds_min, odds_max)
+        notes.append({"side": name, "price": round(price, 4),
+                      "p_model": round(p_model, 4), "edge": round(edge, 4),
+                      "in_odds_band": in_odds})
+        if edge > 0 and in_odds:
+            candidates.append({"side": name, "token": token, "price": price,
+                               "p_model": p_model, "edge": edge})
+    if not candidates:
+        return None, notes
+    candidates.sort(key=lambda c: c["edge"], reverse=True)
+    return candidates[0], notes
+
+
+def decision_tree(chosen, totals_market, ou, *, min_volume, min_edge,
+                  max_spread=0.10, min_hours=24.0):
+    """Run the entry decision tree. Returns (passed: bool, reason: str|None)."""
+    vol = float(totals_market.get("volume_24h") or 0)
+    if vol < min_volume:
+        return False, f"volume ${vol:,.0f}/24h < ${min_volume:,.0f}"
+
+    # Spread: prefer a real value if present, else a book-overround proxy.
+    spread = totals_market.get("spread")
+    if spread is None:
+        spread = abs(1.0 - ou["book_sum"])
+    if spread >= max_spread:
+        return False, f"spread {spread:.1%} >= {max_spread:.0%}"
+
+    end = totals_market.get("end_date")
+    if end:
+        try:
+            dt = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+            hours = (dt - now_utc()).total_seconds() / 3600.0
+            if hours < min_hours:
+                return False, f"end_date {hours:.1f}h away < {min_hours:.0f}h"
+        except ValueError:
+            pass
+
+    if totals_market.get("accepting_orders") is False:
+        return False, "not accepting orders"
+
+    if chosen["edge"] < min_edge:
+        return False, f"edge {chosen['edge']:.1%} < {min_edge:.0%} after fees"
+
+    if not ou["price_sane"]:
+        return False, f"price sanity failed (book_sum={ou['book_sum']})"
+
+    return True, None
+
+
+def size_position(p_model, price, portfolio_value, first_trade, kelly_half):
+    """Half-Kelly fraction with model/news caps. Returns (size_pct, size_usd, kelly)."""
+    kelly = kelly_half(p_model, price, "YES")
+    cap = CAP_FIRST_TRADE if first_trade else CAP_MODEL
+    size_pct = min(kelly, cap)
+    size_usd = portfolio_value * size_pct
+    return size_pct, size_usd, kelly
+
+
+def build_recommendation(game_slug, totals, line, chosen, mu, used_external,
+                         size_pct, size_usd, confidence, fee_rate, ou):
+    """Assemble the execute_paper-compatible recommendation + a human text block."""
+    side_word = chosen["side"].capitalize()
+    price = chosen["price"]
+    reasoning = (
+        f"NegBin model mu={mu:.2f} vs line {line}; "
+        f"P({side_word})={chosen['p_model']:.3f} vs price {price:.3f}; "
+        f"edge {chosen['edge']*100:+.1f}pts after fee. "
+        f"Payout {rd.decimal_odds(price):.2f}x. "
+        f"{'real inputs' if used_external else 'market-implied (zero-edge fallback)'}."
+    )
+    rec = {
+        "token_id": chosen["token"],
+        "side": "YES",  # betting Over/Under = BUY YES on that side's own token
+        "action": "BUY",
+        "size_pct": round(size_pct, 4),
+        "price": round(price, 4),
+        "confidence": round(confidence, 3),
+        "reasoning": sanitize_text(reasoning),
+        "strategy": STRATEGY,
+        "fee_rate": fee_rate,
+    }
+    text = (
+        f"Market: {sanitize_text(totals.get('question',''))}  [{game_slug}]\n"
+        f"Edge type: news-driven (statistical model)\n"
+        f"Side: {chosen['side']} total {line} at {price:.3f}  "
+        f"(payout {rd.decimal_odds(price):.2f}x)\n"
+        f"Size: ${size_usd:,.2f} ({size_pct*100:.2f}% of portfolio)\n"
+        f"Confidence: {confidence:.2f}\n"
+        f"Edge: {chosen['edge']*100:+.1f}% after fees\n"
+        f"Reasoning: {sanitize_text(reasoning)}"
+    )
+    return rec, text
+
+
+def run(args) -> dict:
+    api = APIClient(rate_limit_ms=args.rate_limit, debug=args.debug)
+    target = args.date or now_utc().date().isoformat()
+    category_key, candidates = resolve_category("baseball")
+
+    try:
+        _tag, markets = discover_markets(api, category_key, candidates,
+                                         min_volume=0.0, include_closed=False)
+    except Exception as e:  # noqa: BLE001 - network failure -> empty, reported
+        return {"date": target, "error": f"discovery failed: {e}",
+                "suggestions": [], "skipped": []}
+
+    on_day = [m for m in markets if game_date(m) == target]
+    games = group_by_event(on_day)
+
+    portfolio_value = float(args.portfolio_value)
+    first_trade = data_inputs.is_first_trade(STRATEGY, args.portfolio_db)
+
+    suggestions, texts, skipped = [], [], []
+
+    for event_slug, gmarkets in games.items():
+        game = {"markets": gmarkets}
+        totals = tm.find_totals_market(game)
+        if not totals:
+            skipped.append({"game": event_slug, "reason": "no total-runs market"})
+            continue
+        line = tm.parse_total_line(totals)
+        if line is None:
+            skipped.append({"game": event_slug, "reason": "could not parse total line"})
+            continue
+        ou = tm.over_under_tokens(totals)
+        if not ou or ou["over_price"] is None or ou["under_price"] is None:
+            skipped.append({"game": event_slug, "reason": "could not map Over/Under tokens"})
+            continue
+
+        # Optional live price refresh (CLOB midpoint), fallback to Gamma price.
+        if args.refresh_prices:
+            for key, tok in (("over_price", ou["over_token"]), ("under_price", ou["under_token"])):
+                mid = fetch_midpoint(api, tok)
+                if mid is not None:
+                    ou[key] = mid
+            ou["book_sum"] = round((ou["over_price"] or 0) + (ou["under_price"] or 0), 4)
+            ou["price_sane"] = 0.90 <= ou["book_sum"] <= 1.10
+
+        park_factor = pf.park_factor_for_slug(event_slug)
+        inputs = {}
+        if args.use_external:
+            inputs = data_inputs.get_game_inputs(
+                api, event_slug, target, projections_csv=args.projections_csv,
+                debug=args.debug) or {}
+
+        p_over, p_under, mu, used_external = model_probabilities(
+            line, ou["over_price"], park_factor, inputs,
+            league_baseline=args.league_baseline, dispersion=args.dispersion)
+
+        chosen, side_notes = pick_side(line, ou, p_over, p_under, args.fee_rate,
+                                       args.odds_min, args.odds_max)
+        if not chosen:
+            skipped.append({"game": event_slug, "line": line,
+                            "reason": "no positive-edge side within 1.60x-3.0x band",
+                            "sides": side_notes})
+            continue
+
+        passed, reason = decision_tree(chosen, totals, ou,
+                                       min_volume=args.min_volume, min_edge=args.min_edge)
+        if not passed:
+            skipped.append({"game": event_slug, "line": line, "side": chosen["side"],
+                            "reason": reason})
+            continue
+
+        size_pct, size_usd, kelly = size_position(
+            chosen["p_model"], chosen["price"], portfolio_value, first_trade,
+            advisor_kelly_half())
+        if kelly <= 0:
+            skipped.append({"game": event_slug, "line": line, "side": chosen["side"],
+                            "reason": "Kelly <= 0"})
+            continue
+        if size_usd < 10:
+            skipped.append({"game": event_slug, "line": line, "side": chosen["side"],
+                            "reason": f"size ${size_usd:.2f} below $10 minimum"})
+            continue
+
+        confidence = max(0.5, min(0.5 + chosen["edge"], 0.65)) if used_external else 0.5
+        rec, text = build_recommendation(event_slug, totals, line, chosen, mu,
+                                         used_external, size_pct, size_usd,
+                                         confidence, args.fee_rate, ou)
+        suggestions.append({"game": event_slug, "line": line, "mu": round(mu, 3),
+                            "recommendation": rec})
+        texts.append(text)
+
+    result = {
+        "date": target,
+        "portfolio_value": portfolio_value,
+        "first_trade_strategy": first_trade,
+        "counts": {"games": len(games), "suggestions": len(suggestions),
+                   "skipped": len(skipped)},
+        "suggestions": suggestions,
+        "skipped": skipped,
+        "disclaimer": "Paper-trading simulation — not financial advice. Real "
+                      "trading involves risk of loss. Edge is reconstructed from a "
+                      "model; without live inputs the engine returns zero edge.",
+    }
+
+    if args.paper and suggestions:
+        result["paper_results"] = execute_paper_batch(
+            [s["recommendation"] for s in suggestions], not args.paper_execute)
+
+    result["_texts"] = texts
+    return result
+
+
+def advisor_kelly_half():
+    from advisor import kelly_half
+    return kelly_half
+
+
+def execute_paper_batch(recs, dry_run):
+    from execute_paper import execute_recommendation
+    out = []
+    for rec in recs:
+        try:
+            out.append(execute_recommendation(rec, dry_run=dry_run))
+        except Exception as e:  # noqa: BLE001
+            out.append({"status": "error", "error": str(e), "token_id": rec.get("token_id")})
+    return out
+
+
+def render_text(result: dict) -> str:
+    lines = [f"MLB total-runs suggestions — {result['date']}",
+             "=" * 64,
+             f"Games: {result['counts']['games']}  "
+             f"Suggestions: {result['counts']['suggestions']}  "
+             f"Skipped: {result['counts']['skipped']}",
+             ""]
+    if not result.get("_texts"):
+        lines.append("No actionable edge found.")
+    for t in result.get("_texts", []):
+        lines.append(t)
+        lines.append("-" * 64)
+    if result.get("paper_results"):
+        lines.append("Paper results: " + json.dumps(result["paper_results"]))
+    lines.append("")
+    lines.append(result["disclaimer"])
+    return "\n".join(lines)
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Suggest MLB total-runs entries on Polymarket.")
+    p.add_argument("--date", default=None, help="Target day YYYY-MM-DD (default today UTC)")
+    p.add_argument("--min-volume", type=float, default=10000.0, help="Min 24h volume (decision tree)")
+    p.add_argument("--min-edge", type=float, default=0.05, help="Min edge after fees (default 0.05)")
+    p.add_argument("--odds-min", type=float, default=rd.ODDS_MIN_DEFAULT, help="Min decimal payout (default 1.60)")
+    p.add_argument("--odds-max", type=float, default=rd.ODDS_MAX_DEFAULT, help="Max decimal payout (default 3.00)")
+    p.add_argument("--dispersion", type=float, default=2.0, help="variance = dispersion*mean (default 2.0)")
+    p.add_argument("--league-baseline", type=float, default=8.5, help="Neutral game total (default 8.5)")
+    p.add_argument("--fee-rate", type=float, default=0.0, help="Taker fee base rate (default 0; sports fee-free)")
+    p.add_argument("--use-external", dest="use_external", action="store_true", default=True,
+                   help="Use external data inputs (default on; falls back gracefully)")
+    p.add_argument("--no-external", dest="use_external", action="store_false",
+                   help="Disable external inputs -> market-implied (zero-edge) model")
+    p.add_argument("--projections-csv", default=None, help="Path to a projections CSV (ToS-clean run-rate source)")
+    p.add_argument("--refresh-prices", action="store_true", help="Refresh prices via CLOB midpoint")
+    p.add_argument("--portfolio-value", type=float, default=10000.0, help="Portfolio USD for sizing")
+    p.add_argument("--portfolio-db", default=None, help="Paper portfolio DB (to detect first trade)")
+    p.add_argument("--paper", action="store_true", help="Pipe suggestions into the paper trader")
+    p.add_argument("--paper-execute", action="store_true", help="Actually place paper trades (default dry-run)")
+    p.add_argument("--output", choices=["json", "text"], default="json")
+    p.add_argument("--rate-limit", type=int, default=100, help="Min ms between API calls")
+    p.add_argument("--debug", action="store_true")
+    args = p.parse_args()
+
+    try:
+        result = run(args)
+    except Exception as e:  # noqa: BLE001
+        print(json.dumps({"error": str(e)}), file=sys.stderr)
+        sys.exit(1)
+
+    if args.output == "text":
+        print(render_text(result))
+    else:
+        result.pop("_texts", None)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

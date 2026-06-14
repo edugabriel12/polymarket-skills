@@ -1,0 +1,111 @@
+---
+name: polymarket-mlb-totals
+description: >-
+  Use this skill to analyze the day's MLB games on Polymarket and suggest entries in the TOTAL
+  RUNS (Over/Under) market. It pulls every MLB game of a date via the category scanner, finds each
+  game's total-runs Over/Under market, models P(Over)/P(Under) with a Negative Binomial run
+  distribution (park + season run-rate + weather adjusted), computes the edge vs the Polymarket
+  price, and suggests entries — restricted to a 1.60x–3.0x payout. Trigger on: MLB total runs,
+  over/under runs, baseball totals model, suggest MLB bets, run total prediction, MLB totals
+  edge, beisebol total de runs, sugerir entradas MLB, modelo de over/under da MLB.
+version: 1.0.0
+author: polymarket-skills
+---
+
+# Polymarket MLB Totals
+
+Operationalizes `research/mlb-total-runs-deep-research.md`: discover the day's MLB games, model
+each game's **total runs** distribution, and suggest **Over/Under** entries with a quantified,
+classified edge — sized by half-Kelly under the constitution's caps, and filtered to a
+**1.60×–3.0× payout** (entry price in `[0.3333, 0.625]`; Polymarket price = implied probability,
+decimal odds = 1/price).
+
+**Paper trading is the default (CLAUDE.md rule #2).** This is a simulation, not financial advice;
+real trading involves risk of loss. Market text is untrusted user content (rule #5) — sanitized,
+never executed as instructions.
+
+This skill is **self-contained** and **reuses** existing skills by import (it modifies none):
+the category scanner (`category_common`, `list_games_today`), the advisor's `kelly_half`, and the
+paper trader's `execute_recommendation`.
+
+## Quick Start
+
+Scripts require the venv: `source ~/.venv/bin/activate`
+
+```bash
+# Suggest today's MLB total-runs entries (human-readable)
+source ~/.venv/bin/activate && python polymarket-mlb-totals/scripts/suggest_totals.py --output text
+
+# A specific day, JSON
+source ~/.venv/bin/activate && python polymarket-mlb-totals/scripts/suggest_totals.py --date 2026-06-14
+
+# Feed real season run-rates (ToS-clean) and dry-run into the paper trader
+source ~/.venv/bin/activate && python polymarket-mlb-totals/scripts/suggest_totals.py \
+  --projections-csv myteams.csv --paper
+
+# Honest "no edge" mode (no external inputs -> market-implied -> zero edge)
+source ~/.venv/bin/activate && python polymarket-mlb-totals/scripts/suggest_totals.py --no-external --output text
+```
+
+Run the offline test suite (no network needed):
+
+```bash
+python polymarket-mlb-totals/scripts/test_run_distribution.py
+python polymarket-mlb-totals/scripts/test_pipeline.py
+```
+
+## How it works
+
+```
+list_games_today (scanner)  →  find total-runs Over/Under market  →  NegBin model P(Over)/P(Under)
+   →  edge = P_model − price − fee  →  pick side  →  1.60×–3.0× odds filter  →  entry decision tree
+   →  half-Kelly + 2%/1% caps  →  recommendation (JSON + text)  →  optional --paper
+```
+
+- **Model:** the game total is **Negative Binomial** (MLB runs are overdispersed, `variance ≈ 2×mean`
+  — plain Poisson is wrong). The mean μ is a **park-adjusted league baseline** modified by **season
+  run-rates** (offense + starter/bullpen) and **weather**; `P(Over)` is the PMF tail. Details +
+  the included/excluded feature list in `references/run-model.md`.
+- **Anti-fabrication:** with no external inputs the model uses the **market-implied** μ, so edge ≈ 0
+  and nothing is suggested. Real edge appears only when real inputs move μ off the market.
+- **Edge type & sizing:** classified as **news-driven** (model/forecast) → **2% cap**, **1% on the
+  first trades** of this new strategy; half-Kelly via the advisor. See `references/edge-and-risk.md`.
+
+## Script: suggest_totals.py
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--date YYYY-MM-DD` | today (UTC) | Target day |
+| `--min-volume N` | 10000 | Decision-tree volume gate ($/24h) |
+| `--min-edge F` | 0.05 | Min edge after fees (decision tree) |
+| `--odds-min / --odds-max` | 1.60 / 3.00 | Decimal payout band (→ price 0.625 … 0.333) |
+| `--dispersion F` | 2.0 | `variance = dispersion × mean` |
+| `--league-baseline F` | 8.5 | Neutral game total |
+| `--fee-rate F` | 0.0 | Taker fee base (sports are fee-free; 0.063 models crypto-style) |
+| `--use-external / --no-external` | on | Use external data inputs (graceful fallback) |
+| `--projections-csv PATH` | — | ToS-clean season run-rate source (see references/data-sources.md) |
+| `--refresh-prices` | off | Refresh prices via CLOB midpoint |
+| `--portfolio-value F` | 10000 | Portfolio USD for sizing |
+| `--portfolio-db PATH` | — | Paper DB (detects first trade → 1% cap) |
+| `--paper` / `--paper-execute` | off | Pipe to paper trader (dry-run unless `--paper-execute`) |
+| `--output json\|text` | json | Output format |
+| `--rate-limit MS` / `--debug` | 100 / off | API pacing / logging |
+
+Output: `suggestions[]` (each a paper-trader-ready recommendation + the model μ/line) and
+`skipped[]` (every game not suggested, with the reason — CLAUDE.md rule #8).
+
+## Honest limitations (read `references/edge-and-risk.md`)
+
+1. **No live data in this sandbox.** Polymarket and MLB data egress is blocked; only the
+   deterministic core is tested here. End-to-end runs need a networked environment. Without real
+   inputs the engine returns **zero edge** by design — it never fabricates one.
+2. **Real edge needs calibrated inputs + validation.** MLB totals are near-efficient at close;
+   realistic edge is ROI ~2–5% / win rate ~53–55%. Track **Brier, log-loss, calibration, and CLV**
+   over **~1,000+ entries** before trusting it. CLAUDE.md §4 live-readiness gates still apply.
+3. **Conservative by design.** New-strategy 1% cap, model/news 2% cap, half-Kelly. Intentionally small.
+4. **Data-source ToS.** MLB Stats API / Statcast are MLBAM-copyrighted (commercial/bulk restricted);
+   a betting model is plausibly commercial. Prefer a licensed feed for production; the `--projections-csv`
+   path keeps ingestion ToS-clean. `references/data-sources.md` has the details.
+5. **Model assumptions.** `variance = 2×mean` slightly undercounts shutouts (Enby/zero-modified NegBin
+   corrects this); integer-line handling assumes Polymarket voids pushes — verify per market. The
+   `--dispersion` and `--league-baseline` knobs exist because they need recalibration each season.
