@@ -40,10 +40,12 @@ import settlement                     # noqa: E402  (MLB settlement)
 import seed_demo                      # noqa: E402  (MLB seed)
 import suggest_totals                 # noqa: E402  (MLB model)
 import soccer_predictions as spdb     # noqa: E402  (soccer store; stdlib-only, safe import)
+import soccer_results                  # noqa: E402  (soccer auto-settlement; safe import)
 
 MLB_DB = os.environ.get("PREDICTIONS_DB", pdb.DEFAULT_DB)
 SOCCER_DB = os.environ.get("SOCCER_PREDICTIONS_DB", spdb.DEFAULT_DB)
 SOCCER_RATINGS_CSV = os.environ.get("SOCCER_RATINGS_CSV")
+FOOTBALL_DATA_TOKEN = os.environ.get("FOOTBALL_DATA_TOKEN")
 
 SPORTS = ("mlb", "soccer")
 
@@ -220,8 +222,10 @@ def results(sport: str = Query("mlb")) -> dict:
     sport = _norm_sport(sport)
     db = _db_for(sport)
     if sport == "soccer":
-        # Soccer settlement needs a results feed (not wired); seed/manual for now.
-        settled = {"checked": 0, "settled": [], "note": "soccer settlement is manual/seed"}
+        try:
+            settled = soccer_results.settle_pending(db, token=FOOTBALL_DATA_TOKEN)
+        except Exception as e:  # noqa: BLE001
+            settled = {"checked": 0, "settled": [], "error": str(e)}
         perf, series, recent = spdb.performance(db), spdb.pnl_by_day(db), spdb.get_predictions(db)[:50]
     else:
         try:

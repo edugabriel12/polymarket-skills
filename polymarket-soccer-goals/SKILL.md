@@ -83,6 +83,18 @@ python polymarket-soccer-goals/scripts/test_pipeline.py
 Records each suggestion (status PENDENTE) with the full Dixon-Coles audit (λ_home, λ_away, ρ,
 P(model), edge, sizing) and the Polymarket market link, for later calibration/win-rate analysis.
 
+## Auto-settlement (`track_soccer.py`)
+PENDENTE predictions are settled from a results feed (**football-data.org**, free; set
+`FOOTBALL_DATA_TOKEN` or pass `--token`). Settlement is order-independent — total = sum of goals,
+BTTS = both teams scored — so games are matched by the unordered team pair + date. The dashboard's
+Resultados tab auto-settles soccer on each visit when the token is set.
+
+```bash
+python polymarket-soccer-goals/scripts/track_soccer.py --summary
+python polymarket-soccer-goals/scripts/track_soccer.py --auto-settle           # from football-data.org
+python polymarket-soccer-goals/scripts/track_soccer.py --settle-game fifwc-nld-jpn-2026-06-14 --total 3 --btts yes
+```
+
 ## Honest limitations
 - **Market near-efficient at close; realistic O/U yield ~0.8%** (research). Any model implying >10%
   yield is overfit. Validate with Brier/log-loss + CLV over **~1,000+ entries** before real capital.
