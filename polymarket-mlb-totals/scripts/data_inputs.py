@@ -11,7 +11,7 @@ Layers (per the approved plan):
   - MLB Stats API (statsapi.mlb.com) — schedule + probable pitchers (free, no auth)
   - Projections / season retrospect — team run-rate + pitcher factors, via a
     ToS-clean CSV (`--projections-csv`); see references/data-sources.md for schema
-  - Weather (api.weather.gov) — temperature + wind for US parks
+  - Weather (Open-Meteo) — temperature + wind for any park (global, no key)
   - Home/away — small home-field run delta (only when a real game is matched)
 
 INCLUDED features: home/away (park + home_field) and season retrospect (run rates).
@@ -32,7 +32,7 @@ import park_factors as pf
 import ballparks
 
 STATSAPI = "https://statsapi.mlb.com/api/v1"
-NWS_API = "https://api.weather.gov"
+OPEN_METEO = "https://api.open-meteo.com/v1/forecast"  # free, no key, global
 
 LEAGUE_RPG = 4.25  # league-average runs per game per team, for rate->factor conversion
 HOME_FIELD_DELTA = 0.10  # small home run-environment nudge when a real game is matched
@@ -131,21 +131,23 @@ def fetch_probables(api, target_date: str, debug: bool = False) -> list[dict]:
 
 
 def fetch_weather(api, lat: float, lon: float, debug: bool = False) -> dict:
-    """Temperature (F) and wind speed (mph) for a park. {} on failure."""
+    """Current temperature (F) and wind speed (mph) for a park. {} on failure.
+
+    Uses Open-Meteo (free, no key, global — covers non-US parks like Toronto).
+    """
     try:
-        point = api.get(f"{NWS_API}/points/{lat},{lon}")
-        url = point["properties"]["forecastHourly"]
-        fc = api.get(url)
-        period = fc["properties"]["periods"][0]
-        temp_f = float(period.get("temperature")) if period.get("temperatureUnit") == "F" else None
-        wind = period.get("windSpeed", "")  # e.g. "10 mph"
-        wind_mph = float(wind.split()[0]) if wind and wind.split()[0].isdigit() else None
+        data = api.get(OPEN_METEO, params={
+            "latitude": lat, "longitude": lon,
+            "current": "temperature_2m,wind_speed_10m",
+            "temperature_unit": "fahrenheit", "wind_speed_unit": "mph",
+        })
+        cur = (data or {}).get("current", {})
         out = {}
-        if temp_f is not None:
-            out["temp_f"] = temp_f
-        if wind_mph is not None:
-            # Direction-agnostic without park orientation; treat as out only at modest weight.
-            out["wind_out_mph"] = wind_mph
+        if cur.get("temperature_2m") is not None:
+            out["temp_f"] = float(cur["temperature_2m"])
+        if cur.get("wind_speed_10m") is not None:
+            # Direction-agnostic without park orientation; modest weight in adjust_mu.
+            out["wind_out_mph"] = float(cur["wind_speed_10m"])
         return out
     except Exception:  # noqa: BLE001
         return {}
@@ -183,7 +185,7 @@ def get_game_inputs(api, event_slug: str, target_date: str, *,
         if h or a:
             inputs["home_field"] = HOME_FIELD_DELTA  # casa/fora nudge
 
-    # Weather (network; best-effort).
+    # Weather (network; best-effort). Open-Meteo is global, so every park works.
     coords = pf.home_coords_for_slug(event_slug)
     if coords:
         wx = fetch_weather(api, coords[0], coords[1], debug=debug)

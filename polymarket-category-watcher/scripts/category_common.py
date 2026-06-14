@@ -30,6 +30,10 @@ CLOB_API = "https://clob.polymarket.com"
 
 MAX_TEXT_LEN = 200
 GAMMA_PAGE_SIZE = 100
+# Gamma rejects very large offsets (HTTP 422) and a broad tag can match thousands
+# of markets; cap how deep we paginate. Markets are volume-sorted, so live game
+# markets (high 24h volume) sit well within this bound.
+MAX_DISCOVERY_OFFSET = 5000
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +197,11 @@ class APIClient:
                 resp.raise_for_status()
                 return resp.json()
             except requests.exceptions.RequestException as e:
-                if attempt == 2:
+                # Don't retry client errors (4xx except 429) — retrying won't help
+                # (e.g. 404 Not Found, 422 bad offset). Fail fast for the caller.
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if (status is not None and 400 <= status < 500 and status != 429) \
+                        or attempt == 2:
                     raise
                 log(f"  attempt {attempt + 1} failed: {e}; retrying")
                 time.sleep(2 ** attempt)
@@ -288,7 +296,7 @@ def discover_markets(
                 markets.append(parse_market(m, category_key))
                 if max_markets is not None and len(markets) >= max_markets:
                     return tag, markets
-            if len(page) < GAMMA_PAGE_SIZE:
+            if len(page) < GAMMA_PAGE_SIZE or offset >= MAX_DISCOVERY_OFFSET:
                 break
             offset += GAMMA_PAGE_SIZE
         if markets:
@@ -318,7 +326,7 @@ def discover_markets(
             markets.append(parse_market(m, category_key))
             if max_markets is not None and len(markets) >= max_markets:
                 return f"text:{query}", markets
-        if len(page) < GAMMA_PAGE_SIZE:
+        if len(page) < GAMMA_PAGE_SIZE or offset >= MAX_DISCOVERY_OFFSET:
             break
         offset += GAMMA_PAGE_SIZE
     return f"text:{query}", markets

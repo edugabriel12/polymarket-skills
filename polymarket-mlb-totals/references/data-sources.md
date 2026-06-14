@@ -35,12 +35,12 @@ col,5.10,4.80
 `off_factor = team runs scored / league avg`; `pitch_factor = team runs allowed / league avg`.
 Unknown teams are skipped (that side stays neutral).
 
-### 3. Weather — `api.weather.gov` (US parks, no key)
-`GET https://api.weather.gov/points/{lat},{lon}` → hourly forecast → temperature (°F) and wind
-(mph), fed to `adjust_mu` (`temp_f`, `wind_out_mph`). Only a `User-Agent` is required. Park
-coordinates are in `scripts/ballparks.py` (Toronto/Rogers Centre is outside NWS coverage — use a
-global API there). Wind **direction** relative to park orientation is not modeled, so wind is
-applied at modest weight.
+### 3. Weather — Open-Meteo (global, no key)
+`GET https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m,wind_speed_10m&temperature_unit=fahrenheit&wind_speed_unit=mph`
+→ current temperature (°F) and wind (mph), fed to `adjust_mu` (`temp_f`, `wind_out_mph`). Free,
+no API key, and **global** — covers non-US parks (e.g. Toronto/Rogers Centre). Park coordinates
+are in `scripts/ballparks.py`. Wind **direction** relative to park orientation is not modeled, so
+wind is applied at modest weight. Best-effort: on any failure the weather factors are omitted.
 
 ### 4. Home/away
 Home team is the second abbreviation in the slug (`mlb-<away>-<home>-DATE`). The home park's run
