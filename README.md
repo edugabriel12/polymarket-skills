@@ -11,6 +11,7 @@ Composable [Agent Skills](https://agentskills.io/specification) for Polymarket p
 | **polymarket-monitor** | Price alerts and position monitoring | None | Zero |
 | **polymarket-category-watcher** | List & continuously listen to all live markets of a category (basketball, tennis, soccer) | None | Zero |
 | **polymarket-mlb-totals** | Model MLB total-runs (Over/Under) and suggest entries at 1.60x–3.0x payout | None | Zero (paper) |
+| **polymarket-soccer-goals** | Model soccer total-goals (O/U) + BTTS with Dixon-Coles and suggest entries | None | Zero (paper) |
 | **polymarket-paper-trader** | Simulate trades against live prices, portfolio health checks | None | Zero |
 | **polymarket-strategy-advisor** | Trading methodology, recommendations, backtesting | None | Low |
 | **polymarket-live-executor** | Execute real trades (wallet + explicit human opt-in) | L2 Wallet | Medium |
