@@ -47,6 +47,28 @@ MAE_TEMP_C = 3.6      # = MAE_TEMP_F converted (6.5°F ≈ 3.6°C)
 MAE_PRECIP_MM = 3.0   # precip total MAE
 MAE_WIND_KPH = 8.0    # wind speed MAE
 
+# v13 (2026-06-14): NGR / EMOS calibration coefficients for ensemble σ.
+# Open-Meteo ICON+GFS+ECMWF spread is documented to be UNDER-DISPERSIVE at
+# 24-48h lead (truth falls outside the ensemble range too often). Calibrate
+# raw spread into a true σ via Non-homogeneous Gaussian Regression:
+#     σ_calibrated = NGR_ALPHA * std(ensemble_members) + NGR_BETA_C
+# Defaults are fixed coefficients from Gneiting et al. 2005 (MWR 133) typical
+# range for short-lead 2m T. Once we have ≥200 paired (forecast, observed)
+# log entries per station we can fit a, b properly per spec.city.
+NGR_ALPHA = 1.5             # inflation factor (corrects under-dispersion)
+NGR_BETA_C = 0.5            # additive floor in °C
+NGR_BETA_F = NGR_BETA_C * 9.0 / 5.0  # = 0.9°F
+# Hard floor on σ so a 3-model ensemble that all agree perfectly doesn't
+# produce σ=0 → P(NO bin)=1 → unbounded Kelly. 1°C is the documented HRES
+# 12h σ floor; below that the discrete forecast precision itself dominates.
+SIGMA_FLOOR_C = 1.0         # °C
+SIGMA_FLOOR_F = SIGMA_FLOOR_C * 9.0 / 5.0  # = 1.8°F
+# When the calibrated ensemble path is in use, the v12.1 P(side) cap of 0.70
+# is replaced by a looser sanity cap — the ensemble itself is now the
+# uncertainty model, not a constant. Caps at 0.95 just to bound the
+# pathological case (all 3 models perfectly agree at the threshold midpoint).
+ENSEMBLE_PROB_CAP = 0.95
+
 
 # ---------------------------------------------------------------------------
 # v7: Dynamic MAE from forecast volatility history
@@ -209,6 +231,64 @@ def fetch_open_meteo_ensemble(lat: float, lon: float,
     }
     _OM_CACHE[cache_key] = (now, result)
     return result
+
+
+def compute_ensemble_calibration(om_data: Optional[dict],
+                                  threshold_unit: str
+                                  ) -> Optional[dict]:
+    """v13: NGR-style calibration of the Open-Meteo ICON+GFS+ECMWF ensemble
+    into a (μ, σ) Gaussian predictive distribution, in `threshold_unit`.
+
+    Replaces the v9.12 "om_spread_mult multiplier on a constant MAE" pattern:
+    we now USE the ensemble spread DIRECTLY as the basis of σ, calibrated by
+    a fixed-coefficient NGR formula (Gneiting et al. 2005, MWR 133). The
+    ensemble mean is also returned as μ — superseding the OpenWeather single-
+    source forecast value when ≥2 models are present.
+
+    Args:
+        om_data: dict returned by fetch_open_meteo_ensemble() — has
+                 {icon_max_c, gfs_max_c, ecmwf_max_c, spread_c, n_models}
+                 or None.
+        threshold_unit: 'C' or 'F'. The returned mu/sigma are in this unit.
+
+    Returns:
+        {"mu": float, "sigma": float, "n_models": int, "members": [...]}
+        in `threshold_unit`. Returns None when om_data is missing or has
+        fewer than 2 present members (a single member can't yield σ).
+    """
+    if not om_data:
+        return None
+    members_c = []
+    for key in ("icon_max_c", "gfs_max_c", "ecmwf_max_c"):
+        v = om_data.get(key)
+        if v is not None:
+            members_c.append(float(v))
+    if len(members_c) < 2:
+        return None  # need ≥2 for spread; fall back to MAE path
+
+    unit = (threshold_unit or "C").upper()
+    if unit == "F":
+        members = [v * 9.0 / 5.0 + 32.0 for v in members_c]
+        beta = NGR_BETA_F
+        sigma_floor = SIGMA_FLOOR_F
+    else:
+        members = list(members_c)
+        beta = NGR_BETA_C
+        sigma_floor = SIGMA_FLOOR_C
+
+    mu = sum(members) / len(members)
+    # Sample stdev (n-1 denominator). For n=2 this just equals |a-b|/√2.
+    var = sum((v - mu) ** 2 for v in members) / (len(members) - 1)
+    sigma_raw = var ** 0.5
+    sigma = max(NGR_ALPHA * sigma_raw + beta, sigma_floor)
+    return {
+        "mu": round(mu, 3),
+        "sigma": round(sigma, 3),
+        "sigma_raw": round(sigma_raw, 3),
+        "n_models": len(members),
+        "members": [round(v, 2) for v in members],
+        "unit": unit,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -800,7 +880,8 @@ def _clip_prob(p: Optional[float]) -> Optional[float]:
 
 def forecast_probability(spec: MarketSpec, forecast: dict,
                           mae_override: Optional[float] = None,
-                          bias_override: Optional[float] = None
+                          bias_override: Optional[float] = None,
+                          mu_override: Optional[float] = None
                           ) -> Optional[float]:
     """Compute P(YES) for `spec`.
 
@@ -822,9 +903,17 @@ def forecast_probability(spec: MarketSpec, forecast: dict,
     after fixing coordinates. Only applied to `metric=='temp'`. Units
     match `spec.threshold_unit` (operator sets temp_bias_f in cities
     JSON; bot converts on lookup if market is in C).
+
+    `mu_override` (v13): replaces the OpenWeather `temp_high_*` reference
+    value with an ensemble-mean forecast (Open-Meteo ICON+GFS+ECMWF). The
+    caller computes mu via compute_ensemble_calibration(). When set,
+    `forecast` is only used to verify the target_date is reachable; the μ
+    used in the z-score comes from the ensemble. Units match
+    `spec.threshold_unit`.
     """
     raw = _forecast_probability_raw(
-        spec, forecast, mae_override=mae_override, bias_override=bias_override)
+        spec, forecast, mae_override=mae_override,
+        bias_override=bias_override, mu_override=mu_override)
     if raw is None:
         return None
     if spec.comparison == "range":
@@ -833,29 +922,38 @@ def forecast_probability(spec: MarketSpec, forecast: dict,
 
 
 def prob_yes_for_sizing(p_yes: Optional[float], side: str,
-                        comparison: str) -> Optional[float]:
+                        comparison: str,
+                        ensemble_calibrated: bool = False
+                        ) -> Optional[float]:
     """Return the P(YES) value to STORE and SIZE with for the chosen `side`.
 
     For range markets `forecast_probability()` returns the raw (unclipped)
     P(YES) so side selection isn't distorted. Here we cap the chosen side's
-    confidence at PROB_CLIP_HIGH (cap only, no floor) so Kelly sizing on a
-    range NO bet isn't overconfident (P(NO) would otherwise be ~0.9-0.99),
-    while a range YES leg keeps its honest low confidence. Non-range probs
-    are already clipped and pass through unchanged.
+    confidence (cap only, no floor) so Kelly sizing on a range NO bet isn't
+    pathologically overconfident, while a range YES leg keeps its honest
+    low confidence. Non-range probs are already clipped and pass through.
 
-    Implemented as an asymmetric clip of P(YES) so that, for the chosen side,
-    P(side) = (p for YES, 1-p for NO) never exceeds PROB_CLIP_HIGH.
+    Two caps:
+      - `ensemble_calibrated=False` (default): cap at PROB_CLIP_HIGH (0.70).
+        Conservative; assumes the underlying σ is the constant MAE which
+        post-mortem showed overstates confidence systematically.
+      - `ensemble_calibrated=True` (v13): cap at ENSEMBLE_PROB_CAP (0.95).
+        When (μ, σ) come from the calibrated NGR/EMOS ensemble path, the
+        model's own uncertainty is the cap; we only bound the pathological
+        case (all 3 models perfectly agree at the far side of the bin).
     """
     if p_yes is None or comparison != "range":
         return p_yes
+    cap = ENSEMBLE_PROB_CAP if ensemble_calibrated else PROB_CLIP_HIGH
     if side == "YES":
-        return min(float(p_yes), PROB_CLIP_HIGH)          # cap P(YES)
-    return max(float(p_yes), 1.0 - PROB_CLIP_HIGH)        # floor P(YES) → cap P(NO)
+        return min(float(p_yes), cap)                    # cap P(YES)
+    return max(float(p_yes), 1.0 - cap)                  # floor P(YES) → cap P(NO)
 
 
 def _forecast_probability_raw(spec: MarketSpec, forecast: dict,
                                 mae_override: Optional[float] = None,
-                                bias_override: Optional[float] = None
+                                bias_override: Optional[float] = None,
+                                mu_override: Optional[float] = None
                                 ) -> Optional[float]:
     """Raw probability from the forecast model — uncalibrated.
     Use forecast_probability() externally; this is only exposed for tests
@@ -899,11 +997,15 @@ def _forecast_probability_raw(spec: MarketSpec, forecast: dict,
         return None
 
     if spec.metric == "temp":
-        # For "highest temperature" markets (typical Polymarket weather event),
-        # we always use temp_high as the reference.
-        ref = day.get(f"temp_high_{spec.threshold_unit.lower()}")
-        if ref is None:
-            return None
+        # v13: prefer the ensemble-mean μ when provided (Open-Meteo
+        # ICON+GFS+ECMWF). Falls back to the OpenWeather single-source
+        # temp_high reference only when no ensemble was available.
+        if mu_override is not None:
+            ref = float(mu_override)
+        else:
+            ref = day.get(f"temp_high_{spec.threshold_unit.lower()}")
+            if ref is None:
+                return None
         # v8: per-city systematic bias correction. Added to the forecast
         # ref so the z-score is computed against a station-equivalent
         # value. Only applied to temp markets; precip ignores.
@@ -1499,6 +1601,53 @@ if __name__ == "__main__":
     # Non-range passes through unchanged.
     assert prob_yes_for_sizing(0.42, "NO", "exceed") == 0.42
     print("Test 8b PASS: prob_yes_for_sizing caps chosen side for range only")
+
+    # Test 8c (v13): ensemble_calibrated=True relaxes the cap to 0.95.
+    # P(YES)=0.02 (very small) NO side → cap at 0.95 means floor at 0.05.
+    s_no_cal = prob_yes_for_sizing(0.02, "NO", "range", ensemble_calibrated=True)
+    assert abs(s_no_cal - 0.05) < 1e-9, f"calibrated NO cap should give 0.05, got {s_no_cal}"
+    # P(YES)=0.98 YES side → cap at 0.95.
+    s_yes_cal = prob_yes_for_sizing(0.98, "YES", "range", ensemble_calibrated=True)
+    assert abs(s_yes_cal - 0.95) < 1e-9, f"calibrated YES cap should give 0.95, got {s_yes_cal}"
+    # Default (False) still caps at 0.70.
+    assert abs(prob_yes_for_sizing(0.02, "NO", "range") - 0.30) < 1e-9
+    print("Test 8c PASS: ensemble_calibrated cap=0.95 vs default cap=0.70")
+
+    # Test 8d (v13): compute_ensemble_calibration NGR math.
+    # 3 models agreeing closely: 25.0, 25.5, 26.0 C → mean 25.5, std 0.5 (sample, n-1).
+    # NGR: sigma = max(1.5*0.5 + 0.5, 1.0) = max(1.25, 1.0) = 1.25
+    cal = compute_ensemble_calibration(
+        {"icon_max_c": 25.0, "gfs_max_c": 25.5, "ecmwf_max_c": 26.0,
+         "n_models": 3}, "C")
+    assert cal is not None and abs(cal["mu"] - 25.5) < 1e-3, cal
+    assert abs(cal["sigma"] - 1.25) < 1e-3 and cal["n_models"] == 3, cal
+    # 3 models perfectly agreeing: sigma → SIGMA_FLOOR_C=1.0 (NGR would give 0.5)
+    cal2 = compute_ensemble_calibration(
+        {"icon_max_c": 25.0, "gfs_max_c": 25.0, "ecmwf_max_c": 25.0,
+         "n_models": 3}, "C")
+    assert abs(cal2["sigma"] - SIGMA_FLOOR_C) < 1e-9, cal2
+    # Single model present → None (need ≥2).
+    assert compute_ensemble_calibration(
+        {"icon_max_c": 25.0, "gfs_max_c": None, "ecmwf_max_c": None}, "C") is None
+    # F-unit conversion: 25C ≈ 77F, spread of 0.5C ≈ 0.9F
+    cal_f = compute_ensemble_calibration(
+        {"icon_max_c": 25.0, "gfs_max_c": 25.5, "ecmwf_max_c": 26.0,
+         "n_models": 3}, "F")
+    assert abs(cal_f["mu"] - 77.9) < 0.1, cal_f
+    print("Test 8d PASS: compute_ensemble_calibration NGR sigma + unit conversion")
+
+    # Test 8e (v13): mu_override on forecast_probability.
+    # Same spec3 (Jakarta 65-69F range) but with mu_override = 67 (inside bin):
+    # P(65 ≤ T < 69 | T~N(67, sigma)) with sigma=1.25 → cdf((67-65)/1.25) - cdf((67-69)/1.25)
+    # = cdf(1.6) - cdf(-1.6) = 0.945 - 0.055 = 0.890
+    p_inside = forecast_probability(spec3, forecast3,
+                                     mae_override=1.25, mu_override=67.0)
+    assert p_inside is not None and 0.85 <= p_inside <= 0.92, f"got {p_inside}"
+    # Far below the bin: mu=55 (10F below) → P(in bin) tiny
+    p_far = forecast_probability(spec3, forecast3,
+                                  mae_override=1.25, mu_override=55.0)
+    assert p_far is not None and p_far < 0.01, f"got {p_far}"
+    print(f"Test 8e PASS: mu_override → P(inside)={p_inside:.3f} P(far)={p_far:.5f}")
 
     # Test 9: "70°F or above" pattern
     spec4 = parse_market("Highest temperature in Manhattan on May 11, 2026 70°F or above",

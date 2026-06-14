@@ -73,6 +73,8 @@ from weather_edge_helpers import (  # noqa: E402
     auto_extract_station,
     # v11: realized weather for resolutions.observed_value
     fetch_open_meteo_archive,
+    # v13: NGR/EMOS-style ensemble calibration
+    compute_ensemble_calibration,
 )
 import weather_edge_db as db  # noqa: E402
 
@@ -448,22 +450,38 @@ def fetch_forecast(city: str, days: int = 5,
 def _compute_mae_for_market(spec: MarketSpec, ow_forecast: dict,
                               args,
                               station: Optional[dict] = None
-                              ) -> tuple[Optional[float], Optional[float], dict]:
-    """v7+v8: returns (mae_override, bias_override, meta) for a market spec.
+                              ) -> tuple[Optional[float], Optional[float],
+                                         Optional[float], dict]:
+    """v7+v8+v13: returns (mae_override, bias_override, mu_override, meta).
 
     Side effects: writes OpenWeather / Visual Crossing / Open-Meteo
     forecast snapshots to forecast_history. Reads recent history to
-    compute volatility-based MAE. Disagreement penalties:
-      - OW vs VC > 2C/3.6F -> MAE x 1.5
-      - Open-Meteo 3-model spread > 3C -> MAE x 1.5
-    Bias override: comes from station["temp_bias_f"] (v8 cities JSON);
-    applied additively to the forecast reference value before z-score.
+    compute volatility-based MAE.
 
-    Returns (None, None, {}) on any failure path so caller can fall back
-    cleanly. Bias is in spec.threshold_unit (F if market is F, C if C).
+    Two paths, in order of preference:
+      v13 (NEW, preferred when ≥2 Open-Meteo ensemble members present):
+        mae_override = NGR-calibrated σ from ensemble spread
+        mu_override  = ensemble mean (replaces OpenWeather single value)
+        meta["ensemble_calibrated"] = True
+        The legacy multiplier penalties (om_spread_mult, range_penalty_mult)
+        are SKIPPED — the ensemble itself captures regime-specific σ, and
+        stacking multipliers on top double-counts uncertainty.
+
+      v7+v8 legacy (fallback when ensemble unavailable):
+        mae_override = static MAE × (history-volatility, OW/VC disagreement,
+                                      om_spread_mult, range_penalty_mult)
+        mu_override  = None  (caller uses OpenWeather temp_high directly)
+        meta["ensemble_calibrated"] = False
+
+    Bias override (per-city temp_bias_f from cities JSON) is applied in
+    BOTH paths additively on top of the chosen μ. In threshold_unit
+    (F if market is F, C if C).
+
+    Returns (None, None, None, {}) on any failure path so caller can
+    fall back cleanly.
     """
     if not spec.target_date:
-        return None, None, {}
+        return None, None, None, {}
 
     metric = "temp_high_f" if spec.threshold_unit == "F" else "temp_high_c"
     target_iso = spec.target_date.isoformat()
@@ -472,10 +490,10 @@ def _compute_mae_for_market(spec: MarketSpec, ow_forecast: dict,
     days = ow_forecast.get("daily_forecast") or ow_forecast.get("forecasts") or []
     ow_day = next((d for d in days if d.get("date") == target_iso), None)
     if ow_day is None:
-        return None, None, {}
+        return None, None, None, {}
     ow_value = ow_day.get(metric)
     if ow_value is None:
-        return None, None, {}
+        return None, None, None, {}
 
     now_iso = _now_iso()
     try:
@@ -561,53 +579,13 @@ def _compute_mae_for_market(spec: MarketSpec, ow_forecast: dict,
     history_values = [float(r["predicted_value"]) for r in rows]
     mae_dyn = compute_dynamic_mae(history_values, base_mae=base_mae)
 
-    # Disagreement penalty (v7): OW vs VC
+    # OW vs VC disagreement signal (used as a sanity flag in both paths).
     disagreement = 0.0
     if vc_value is not None:
         disagreement = abs(float(ow_value) - vc_value)
-        threshold = 3.6 if spec.threshold_unit == "F" else 2.0  # ~2C
-        if disagreement > threshold:
-            mae_dyn *= 1.5
 
-    # v8 / v9.12 (2026-05-24): graduated penalty by Open-Meteo 3-model
-    # spread. Previously a single 1.5x kicked in only at spread > 3C
-    # — too binary, missing the 2-3C "models disagree mildly" band.
-    # Now scales smoothly:
-    #   spread ≤ 2C  → no penalty (forecast is tight)
-    #   2-3C         → 1.3x  (early uncertainty signal)
-    #   3-5C         → 2.0x  (substantial disagreement, was 1.5x)
-    #   > 5C         → 3.0x  (models really diverge)
-    # om_spread_penalty boolean is kept for back-compat (any non-1.0
-    # multiplier sets it True).
-    om_spread_penalty = False
-    om_spread_mult = 1.0
-    if om_data and (om_spread_c := om_data.get("spread_c")) is not None:
-        spread = float(om_spread_c)
-        if spread > 5.0:
-            om_spread_mult = 3.0
-        elif spread > 3.0:
-            om_spread_mult = 2.0
-        elif spread > 2.0:
-            om_spread_mult = 1.3
-        if om_spread_mult > 1.0:
-            mae_dyn *= om_spread_mult
-            om_spread_penalty = True
-
-    # v9.13 (2026-05-24): range-bracket MAE penalty.
-    # Snapshot showed 61% of entries are range brackets and ALL of those
-    # picked side=NO — selling the probability of the temp landing in a
-    # specific window. The Gaussian model underestimates how often weather
-    # actually lands in tail brackets (fat-tail real distribution vs
-    # Gaussian assumption). Inflating MAE by 1.5x for range brackets
-    # pushes P(NO) closer to market price, fewer "false edge" NO bets
-    # on tail brackets, fewer 100% losses when the cauda hits.
-    # at_least / at_most directional brackets unaffected.
-    range_penalty_mult = 1.0
-    if spec and spec.comparison == "range":
-        range_penalty_mult = 1.5
-        mae_dyn *= range_penalty_mult
-
-    # v8: per-city temperature bias (in spec.threshold_unit)
+    # v8: per-city temperature bias (in spec.threshold_unit). Applies in
+    # both paths additively on top of μ.
     bias = None
     if station and station.get("temp_bias_f") is not None:
         bias_f = float(station["temp_bias_f"])
@@ -615,25 +593,68 @@ def _compute_mae_for_market(spec: MarketSpec, ow_forecast: dict,
             bias = (bias_f if spec.threshold_unit == "F"
                     else bias_f * 5.0 / 9.0)  # F delta -> C delta
 
+    # v13 (preferred): NGR-calibrated ensemble σ + ensemble mean μ.
+    # This replaces the multiplier-on-MAE pattern when ≥2 Open-Meteo
+    # members are present. Rationale: stacking om_spread_mult × range_
+    # penalty_mult × disagreement on a constant base MAE was producing
+    # σ values 2-5x the documented operational σ (1.5K @ 24h) and made
+    # every range market look hopelessly overconfident, which the v12.1
+    # 0.70 cap then ate down to zero edge (the 2026-06-14 zero-entry
+    # run). Ensemble spread is the right uncertainty estimator — NGR
+    # only inflates and floors it (Gneiting 2005 MWR 133).
+    cal = compute_ensemble_calibration(om_data, spec.threshold_unit)
+    if cal is not None:
+        mae_out = float(cal["sigma"])
+        mu_out = float(cal["mu"])
+        ensemble_calibrated = True
+        # Still flag OW vs VC mismatch — if ensemble disagrees with VC by
+        # >2°C, the ensemble might still be biased; let the judge see it.
+        # We DON'T multiply σ here — that double-counts uncertainty
+        # already encoded in the ensemble spread.
+    else:
+        # Legacy path: history-volatility MAE × disagreement × OM band
+        # multiplier × range penalty. Falls through when no ensemble or
+        # only 1 model present (rare cities, archive lag, etc.).
+        if vc_value is not None:
+            threshold = 3.6 if spec.threshold_unit == "F" else 2.0  # ~2C
+            if disagreement > threshold:
+                mae_dyn *= 1.5
+        # om_spread_mult: graduated 1.0/1.3/2.0/3.0
+        if om_data and (om_spread_c := om_data.get("spread_c")) is not None:
+            spread = float(om_spread_c)
+            if spread > 5.0:
+                mae_dyn *= 3.0
+            elif spread > 3.0:
+                mae_dyn *= 2.0
+            elif spread > 2.0:
+                mae_dyn *= 1.3
+        # range-bracket MAE penalty (legacy only — v13 ensemble path
+        # naturally captures range uncertainty via spread).
+        if spec and spec.comparison == "range":
+            mae_dyn *= 1.5
+        mae_out = mae_dyn
+        mu_out = None
+        ensemble_calibrated = False
+
     meta = {
         "ow_value": float(ow_value),
         "vc_value": vc_value,
         "om_spread_c": (om_data or {}).get("spread_c"),
         "om_n_models": (om_data or {}).get("n_models"),
-        "om_spread_penalty": om_spread_penalty,
-        "om_spread_mult": om_spread_mult,   # v9.12: graduated 1.0/1.3/2.0/3.0
-        "range_penalty_mult": range_penalty_mult,  # v9.13: 1.5 for range, 1.0 else
         "comparison": spec.comparison if spec else None,
         "disagreement": round(disagreement, 2),
         "history_n": len(history_values),
         "base_mae": base_mae,
-        "mae_dynamic": round(mae_dyn, 2),
+        "mae_dynamic": round(mae_out, 3),
+        "mu": (round(mu_out, 3) if mu_out is not None else None),
+        "ensemble_calibrated": ensemble_calibrated,  # v13
+        "ensemble_members": (cal or {}).get("members") if cal else None,
         "bias": bias,
         "multi_source": multi_source,
         "open_meteo": om_enabled,
         "station": (station or {}).get("station"),
     }
-    return mae_dyn, bias, meta
+    return mae_out, bias, mu_out, meta
 
 
 def _build_ladder_candidates(candidates: list[dict], args) -> list[dict]:
@@ -952,14 +973,17 @@ def run_discovery(args, cities: dict) -> int:
                                           "station": (station or {}).get("station")})
             continue
 
-        # v7+v8: Persist OW + (optionally) VC + Open-Meteo ensemble for
-        # multi-source consensus + dynamic MAE; also extract per-city bias.
-        mae_dynamic, bias, mae_meta = _compute_mae_for_market(
+        # v7+v8+v13: Persist OW + (optionally) VC + Open-Meteo ensemble for
+        # multi-source consensus + (NGR-calibrated σ + ensemble μ) when
+        # available; extract per-city bias.
+        mae_dynamic, bias, mu_override, mae_meta = _compute_mae_for_market(
             spec, forecast, args, station=station)
+        ensemble_calibrated = bool(mae_meta.get("ensemble_calibrated"))
 
         forecast_prob = forecast_probability(spec, forecast,
                                               mae_override=mae_dynamic,
-                                              bias_override=bias)
+                                              bias_override=bias,
+                                              mu_override=mu_override)
         if forecast_prob is None:
             skipped["no_forecast_for_target_date"] += 1
             log_event("market_skipped", {"slug": slug, "reason": "no_forecast_for_target_date"})
@@ -997,8 +1021,13 @@ def run_discovery(args, cities: dict) -> int:
         # edge). Cap the chosen side's confidence here for storage/sizing, and
         # recompute the edge on the capped value — a range bet that only had
         # edge via inflated confidence is dropped now, before the judge.
+        # v13: when the ensemble_calibrated path is active, the cap relaxes
+        # from 0.70 → 0.95 because the (μ, σ) come from a calibrated NGR
+        # ensemble model rather than a constant MAE — the model's own
+        # uncertainty is the cap; we only bound pathological agreement.
         forecast_prob_sized = prob_yes_for_sizing(
-            forecast_prob, side, spec.comparison)
+            forecast_prob, side, spec.comparison,
+            ensemble_calibrated=ensemble_calibrated)
         p_side = (forecast_prob_sized if side == "YES"
                   else 1.0 - forecast_prob_sized)
         if spec.comparison == "range":
@@ -1009,7 +1038,8 @@ def run_discovery(args, cities: dict) -> int:
                     "slug": slug, "reason": "range_edge_after_cap",
                     "side": side, "p_side_capped": round(p_side, 3),
                     "entry_price": entry_price, "edge_pp": eff_edge_pp,
-                    "edge_floor": edge_floor})
+                    "edge_floor": edge_floor,
+                    "ensemble_calibrated": ensemble_calibrated})
                 try:
                     with db.connect() as _conn:
                         db.insert_discovery_skip(_conn, ts=_now_iso(),
@@ -1870,21 +1900,25 @@ def _do_monitor_check(conn, row, cities: dict, args) -> None:
         log_event("monitor_check", {"entry_id": entry_id, "decision": "HOLD",
                                     "reason": "no_forecast_or_spec"})
         return
-    # v7+v8: dynamic MAE + per-city bias (also writes new forecast snapshot
-    # to history, feeding future MAE calculations across positions in the
-    # same city).
-    mae_dyn, bias, _ = _compute_mae_for_market(spec, forecast, args,
-                                                  station=station)
+    # v7+v8+v13: dynamic MAE + per-city bias + (when available) NGR-
+    # calibrated ensemble σ + ensemble mean μ. Also writes new forecast
+    # snapshots to forecast_history.
+    mae_dyn, bias, mu_over, mae_meta = _compute_mae_for_market(
+        spec, forecast, args, station=station)
+    ens_cal = bool(mae_meta.get("ensemble_calibrated"))
     forecast_prob_yes = forecast_probability(spec, forecast,
                                                mae_override=mae_dyn,
-                                               bias_override=bias)
+                                               bias_override=bias,
+                                               mu_override=mu_over)
     if forecast_prob_yes is None:
         return
-    # v12.1: range markets return raw P(YES); cap the held side's confidence
-    # for the cashout math so convergence/forecast-reversal use the same
-    # bounded P(side) the entry was sized with (not the raw ~0.9-0.99).
+    # v12.1/v13: range markets return raw P(YES); cap the held side's
+    # confidence for the cashout math so convergence/forecast-reversal use
+    # the same bounded P(side) the entry was sized with. Cap is 0.70 in
+    # the legacy MAE path, 0.95 in the ensemble_calibrated path.
     forecast_prob_yes = prob_yes_for_sizing(forecast_prob_yes, side,
-                                            spec.comparison)
+                                            spec.comparison,
+                                            ensemble_calibrated=ens_cal)
 
     token_id = row["token_id_yes"] if side == "YES" else row["token_id_no"]
     book = fetch_orderbook(token_id)  # HTTP
@@ -2432,17 +2466,19 @@ def main():
                         "in weather-cities.json 'stations' dict.")
     p.add_argument("--no-open-meteo", dest="open_meteo", action="store_false",
                    help="Disable Open-Meteo ensemble fetch.")
-    p.add_argument("--min-ttr-hours", type=float, default=24.0,
+    p.add_argument("--min-ttr-hours", type=float, default=12.0,
                    help="Skip markets with TTR < X hours at discovery "
-                        "(single-bin / orphan path). Default 24 (raised "
-                        "from 12 on 2026-05-31 after the -$771 post-mortem: "
-                        "50%% of losing trades had TTR < 18h, where the bot "
-                        "was entering NO range bets with the forecast only "
-                        "~1°C from the bracket — too little time for the "
-                        "forecast to converge. Ladder mode uses the lower "
-                        "--ladder-min-ttr-hours floor since ladder coverage "
-                        "(±5°F) doesn't depend on point precision. "
-                        "Set 0 to disable.")
+                        "(single-bin / orphan path). Default 12 (lowered "
+                        "from 24 on 2026-06-14 after the zero-entry run: "
+                        "24h floor killed 4607/7073 (65%%) of all candidates, "
+                        "the entire single-bin universe. The original 24h "
+                        "rationale — that TTR<18h range NO bets were the "
+                        "post-mortem losers — is now over-protected by "
+                        "v12 range_bin_gap_too_small + v12.1 range_edge_"
+                        "after_cap + judge proximity REJECT, which all "
+                        "specifically target the near-edge NO bets the TTR "
+                        "floor was a blunt proxy for. Ladder mode uses the "
+                        "lower --ladder-min-ttr-hours floor. Set 0 to disable.")
     p.add_argument("--ladder-min-ttr-hours", type=float, default=6.0,
                    help="Minimum TTR (hours) for a leg to enter ladder "
                         "discovery (default 6). Lower than --min-ttr-"
