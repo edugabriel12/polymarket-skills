@@ -81,6 +81,7 @@ list_games_today (scanner)  →  find total-runs Over/Under market  →  NegBin 
 | `--odds-min / --odds-max` | 1.60 / 3.00 | Decimal payout band (→ price 0.625 … 0.333) |
 | `--dispersion F` | 2.0 | `variance = dispersion × mean` |
 | `--league-baseline F` | 8.5 | Neutral game total |
+| `--league-prefix TEXT` | `mlb-` | Only process games whose slug starts with this (filters out soccer/esports; `''` = all) |
 | `--fee-rate F` | 0.0 | Taker fee base (sports are fee-free; 0.063 models crypto-style) |
 | `--use-external / --no-external` | on | Use external data inputs (graceful fallback) |
 | `--projections-csv PATH` | — | ToS-clean season run-rate source (see references/data-sources.md) |

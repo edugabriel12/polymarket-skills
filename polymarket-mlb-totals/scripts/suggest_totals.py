@@ -32,6 +32,7 @@ from category_common import (
     discover_markets,
     fetch_midpoint,
     game_date,
+    log,
     resolve_category,
     sanitize_text,
 )
@@ -257,8 +258,14 @@ def record_prediction_row(db_path, game_slug, game_date, totals, line, chosen, m
 
 def run(args) -> dict:
     api = APIClient(rate_limit_ms=args.rate_limit, debug=args.debug)
+    # Robust terminal logging (stderr -> shows in the uvicorn console). On unless --quiet.
+    vlog = log if getattr(args, "verbose", True) else (lambda *a, **k: None)
     target = args.date or now_utc().date().isoformat()
+    vlog(f"=== MLB totals analysis for {target} ===")
     category_key, candidates = resolve_category("baseball")
+    # Prefer the tighter "mlb" tag; Gamma may ignore an unknown tag_slug and
+    # return ALL sports, so we also hard-filter by slug prefix below.
+    candidates = ["mlb"] + [c for c in candidates if c != "mlb"]
 
     try:
         _tag, markets = discover_markets(api, category_key, candidates,
@@ -267,28 +274,54 @@ def run(args) -> dict:
         return {"date": target, "error": f"discovery failed: {e}",
                 "suggestions": [], "skipped": []}
 
+    vlog(f"Discovery: tag '{_tag}' -> {len(markets)} active market(s)")
     on_day = [m for m in markets if game_date(m) == target]
     games = group_by_event(on_day)
+    vlog(f"  {len(on_day)} market(s) dated {target} across {len(games)} event(s)")
+
+    # Keep only MLB games. Polymarket game slugs are league-prefixed
+    # (mlb-..., fifwc-..., cs2-...); this guarantees we never model a soccer or
+    # esports total as baseball runs even if discovery returned mixed sports.
+    prefix = (args.league_prefix or "").lower()
+    filtered_non_league = 0
+    if prefix:
+        before = len(games)
+        games = {k: v for k, v in games.items() if k.lower().startswith(prefix)}
+        filtered_non_league = before - len(games)
+        vlog(f"  filtered out {filtered_non_league} non-'{prefix}' event(s); "
+             f"{len(games)} MLB game(s) to analyze")
+    if games:
+        vlog("  MLB games: " + ", ".join(sorted(games)))
 
     portfolio_value = float(args.portfolio_value)
     first_trade = data_inputs.is_first_trade(STRATEGY, args.portfolio_db)
 
     suggestions, texts, skipped = [], [], []
 
+    def _skip(slug, reason, **extra):
+        rec = {"game": slug, "reason": reason}
+        rec.update(extra)
+        skipped.append(rec)
+        vlog(f"  [{slug}] SKIP — {reason}")
+
     for event_slug, gmarkets in games.items():
         game = {"markets": gmarkets}
+        vlog(f"[{event_slug}] {len(gmarkets)} market(s): "
+             + " | ".join(sanitize_text(mm.get("question", "")) for mm in gmarkets))
         totals = tm.find_totals_market(game)
         if not totals:
-            skipped.append({"game": event_slug, "reason": "no total-runs market"})
+            _skip(event_slug, "no total-runs market")
             continue
         line = tm.parse_total_line(totals)
         if line is None:
-            skipped.append({"game": event_slug, "reason": "could not parse total line"})
+            _skip(event_slug, "could not parse total line")
             continue
         ou = tm.over_under_tokens(totals)
         if not ou or ou["over_price"] is None or ou["under_price"] is None:
-            skipped.append({"game": event_slug, "reason": "could not map Over/Under tokens"})
+            _skip(event_slug, "could not map Over/Under tokens")
             continue
+        vlog(f"  [{event_slug}] totals line={line} Over={ou['over_price']} "
+             f"Under={ou['under_price']} book_sum={ou['book_sum']} sane={ou['price_sane']}")
 
         # Optional live price refresh (CLOB midpoint), fallback to Gamma price.
         if args.refresh_prices:
@@ -309,32 +342,36 @@ def run(args) -> dict:
         m = model_probabilities(
             line, ou["over_price"], park_factor, inputs,
             league_baseline=args.league_baseline, dispersion=args.dispersion)
+        vlog(f"  [{event_slug}] model: park={park_factor} mu={m['mu']:.2f} "
+             f"P(over)={m['p_over']:.3f} P(under)={m['p_under']:.3f} "
+             f"external_inputs={m['used_external']}"
+             + (f" inputs={inputs}" if inputs else ""))
 
         chosen, side_notes = pick_side(line, ou, m["p_over"], m["p_under"],
                                        args.fee_rate, args.odds_min, args.odds_max)
+        vlog(f"  [{event_slug}] edges: " + "; ".join(
+            f"{n['side']} price={n['price']} p={n['p_model']} edge={n['edge']:+.3f} "
+            f"band={n['in_odds_band']}" for n in side_notes))
         if not chosen:
-            skipped.append({"game": event_slug, "line": line,
-                            "reason": "no positive-edge side within 1.60x-3.0x band",
-                            "sides": side_notes})
+            _skip(event_slug, "no positive-edge side within 1.60x-3.0x band",
+                  line=line, sides=side_notes)
             continue
 
         passed, reason = decision_tree(chosen, totals, ou,
                                        min_volume=args.min_volume, min_edge=args.min_edge)
         if not passed:
-            skipped.append({"game": event_slug, "line": line, "side": chosen["side"],
-                            "reason": reason})
+            _skip(event_slug, reason, line=line, side=chosen["side"])
             continue
 
         size_pct, size_usd, kelly = size_position(
             chosen["p_model"], chosen["price"], portfolio_value, first_trade,
             advisor_kelly_half())
         if kelly <= 0:
-            skipped.append({"game": event_slug, "line": line, "side": chosen["side"],
-                            "reason": "Kelly <= 0"})
+            _skip(event_slug, "Kelly <= 0", line=line, side=chosen["side"])
             continue
         if size_usd < 10:
-            skipped.append({"game": event_slug, "line": line, "side": chosen["side"],
-                            "reason": f"size ${size_usd:.2f} below $10 minimum"})
+            _skip(event_slug, f"size ${size_usd:.2f} below $10 minimum",
+                  line=line, side=chosen["side"])
             continue
 
         confidence = (max(0.5, min(0.5 + chosen["edge"], 0.65))
@@ -353,13 +390,20 @@ def run(args) -> dict:
         suggestions.append({"game": event_slug, "line": line, "mu": round(m["mu"], 3),
                             "prediction_id": prediction_id, "recommendation": rec})
         texts.append(text)
+        vlog(f"  [{event_slug}] >>> SUGGEST {chosen['side']} {line} @ {chosen['price']:.3f} "
+             f"(payout {rd.decimal_odds(chosen['price']):.2f}x) edge={chosen['edge']*100:+.1f}% "
+             f"size={size_pct*100:.2f}% conf={confidence:.2f} pred_id={prediction_id}")
+
+    vlog(f"=== Done: {len(suggestions)} suggestion(s), {len(skipped)} skipped, "
+         f"{filtered_non_league} non-MLB filtered ===")
 
     result = {
         "date": target,
         "portfolio_value": portfolio_value,
         "first_trade_strategy": first_trade,
         "counts": {"games": len(games), "suggestions": len(suggestions),
-                   "skipped": len(skipped)},
+                   "skipped": len(skipped),
+                   "filtered_non_mlb": filtered_non_league},
         "suggestions": suggestions,
         "skipped": skipped,
         "disclaimer": "Paper-trading simulation — not financial advice. Real "
@@ -419,6 +463,8 @@ def main() -> None:
     p.add_argument("--odds-max", type=float, default=rd.ODDS_MAX_DEFAULT, help="Max decimal payout (default 3.00)")
     p.add_argument("--dispersion", type=float, default=2.0, help="variance = dispersion*mean (default 2.0)")
     p.add_argument("--league-baseline", type=float, default=8.5, help="Neutral game total (default 8.5)")
+    p.add_argument("--league-prefix", default="mlb-",
+                   help="Only process games whose slug starts with this (default 'mlb-'; '' = all)")
     p.add_argument("--fee-rate", type=float, default=0.0, help="Taker fee base rate (default 0; sports fee-free)")
     p.add_argument("--use-external", dest="use_external", action="store_true", default=True,
                    help="Use external data inputs (default on; falls back gracefully)")
@@ -438,7 +484,9 @@ def main() -> None:
     p.add_argument("--paper-execute", action="store_true", help="Actually place paper trades (default dry-run)")
     p.add_argument("--output", choices=["json", "text"], default="json")
     p.add_argument("--rate-limit", type=int, default=100, help="Min ms between API calls")
-    p.add_argument("--debug", action="store_true")
+    p.add_argument("--quiet", dest="verbose", action="store_false", default=True,
+                   help="Suppress the per-game analysis logs (stderr)")
+    p.add_argument("--debug", action="store_true", help="Also log every API call")
     args = p.parse_args()
 
     try:
