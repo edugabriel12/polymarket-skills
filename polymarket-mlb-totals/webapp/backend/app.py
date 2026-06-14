@@ -181,15 +181,23 @@ def _run_mlb(date: str) -> dict:
 
 
 def _run_soccer(date: str) -> dict:
-    """Run the soccer Dixon-Coles model in a subprocess (avoids module collision)."""
+    """Run the soccer Dixon-Coles model in a subprocess (avoids module collision).
+
+    Verbose (no --quiet) so the model's per-game logs — discovery, baseline
+    calibration, λ/P(over)/P(btts), edges, skips — are emitted; its stderr is
+    forwarded to the backend output for parity with the in-process MLB logs.
+    """
     cmd = [sys.executable, _SOCCER_SUGGEST, "--date", date, "--output", "json",
-           "--predictions-db", SOCCER_DB, "--all-lines", "--quiet"]
+           "--predictions-db", SOCCER_DB, "--all-lines"]
     if SOCCER_RATINGS_CSV:
         cmd += ["--ratings-csv", SOCCER_RATINGS_CSV]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
     except Exception as e:  # noqa: BLE001
         return {"error": f"soccer model failed: {e}", "counts": {}, "suggestions": [], "skipped": []}
+    if proc.stderr:  # surface the soccer model's logs in the backend terminal
+        print(proc.stderr, end="" if proc.stderr.endswith("\n") else "\n",
+              file=sys.stderr, flush=True)
     if proc.returncode != 0:
         return {"error": (proc.stderr or "")[-500:], "counts": {}, "suggestions": [], "skipped": []}
     try:

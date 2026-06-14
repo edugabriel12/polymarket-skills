@@ -25,13 +25,13 @@ if size_usd < 10: skip          # CLAUDE.md minimum trade size
 to **True** (most conservative). Confidence is kept **below 0.7** (≈0.5 under the zero-edge
 fallback) so sizing stays small until the strategy is paper-validated.
 
-## The 1.60×–3.0× payout filter
+## The 1.50×–3.0× payout filter
 
-Polymarket price = implied probability, so **decimal odds = 1 / price**. The operator's
-1.60×–3.0× payout band maps to an **entry-side price in `[1/3.0, 1/1.6] = [0.3333, 0.625]`**.
+Polymarket price = implied probability, so **decimal odds = 1 / price**. The operator's default
+1.50×–3.0× payout band maps to an **entry-side price in `[1/3.0, 1/1.5] = [0.3333, 0.667]`**.
 A side is only eligible if its own price is inside this band (and its edge is positive). This
-deliberately excludes heavy favorites (price > 0.625, payout < 1.60×) and longshots (price < 0.333,
-payout > 3.0×).
+deliberately excludes heavy favorites (price > 0.667, payout < 1.50×) and longshots (price < 0.333,
+payout > 3.0×). The band is configurable via `--odds-min/--odds-max`.
 
 ## Side selection
 

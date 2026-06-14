@@ -10,7 +10,7 @@ Composable [Agent Skills](https://agentskills.io/specification) for Polymarket p
 | **polymarket-analyzer** | Detect edges: arbitrage, momentum, correlation analysis | None | Zero |
 | **polymarket-monitor** | Price alerts and position monitoring | None | Zero |
 | **polymarket-category-watcher** | List & continuously listen to all live markets of a category (basketball, tennis, soccer) | None | Zero |
-| **polymarket-mlb-totals** | Model MLB total-runs (Over/Under) and suggest entries at 1.60x–3.0x payout | None | Zero (paper) |
+| **polymarket-mlb-totals** | Model MLB total-runs (Over/Under) and suggest entries at 1.50x–3.0x payout | None | Zero (paper) |
 | **polymarket-soccer-goals** | Model soccer total-goals (O/U) + BTTS with Dixon-Coles and suggest entries | None | Zero (paper) |
 | **polymarket-paper-trader** | Simulate trades against live prices, portfolio health checks | None | Zero |
 | **polymarket-strategy-advisor** | Trading methodology, recommendations, backtesting | None | Low |
@@ -140,7 +140,7 @@ Self-contained skill (own `category_common.py`); maps friendly names + PT-BR ali
 
 Reuses the category scanner, the advisor's `kelly_half`, and the paper trader. Negative Binomial
 model (runs are overdispersed), edge vs Polymarket price, half-Kelly with conservative caps, and a
-1.60x–3.0x payout filter. Offline tests: `python polymarket-mlb-totals/scripts/test_run_distribution.py`
+1.50x–3.0x payout filter. Offline tests: `python polymarket-mlb-totals/scripts/test_run_distribution.py`
 and `test_pipeline.py`. See `research/mlb-total-runs-deep-research.md` for the methodology.
 
 ### polymarket-paper-trader/ -- Simulation Engine
