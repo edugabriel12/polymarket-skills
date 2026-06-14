@@ -11,8 +11,10 @@ A modern, colorful UI to interact with the prediction models, with a **sport tog
 Relevant env vars (optional): `PREDICTIONS_DB`, `SOCCER_PREDICTIONS_DB`, `SOCCER_RATINGS_CSV`
 (team-ratings CSV passed to the soccer model), `FOOTBALL_DATA_TOKEN` (football-data.org key — the
 Resultados tab auto-settles soccer from that results feed when set, and the soccer model
-auto-calibrates each league's baseline goals/game from the current season). API endpoints take
-`?sport=mlb|soccer`.
+auto-calibrates each league's baseline goals/game from the current season), `APIFOOTBALL_KEY`
+(api-sports.io key — automatic attack/defense + baseline for leagues Club Elo doesn't cover, e.g.
+Brasileirão Série B). The backend subprocess inherits these, so the dashboard uses them automatically.
+API endpoints take `?sport=mlb|soccer`.
 
 Two tabs:
 

@@ -169,7 +169,7 @@ def run(args) -> dict:
     if getattr(args, "calibrate_baselines", True):
         prefixes = {leagues.league_prefix(k) for k in (set(total_evts) | set(btts_evts))}
         token = getattr(args, "football_data_token", None)
-        calibrated = bsrc.calibrate_baselines(prefixes, token, debug=args.debug)
+        calibrated = bsrc.calibrate_baselines(prefixes, token, date=target, debug=args.debug)
         if calibrated:
             vlog("  baselines calibrated: " + ", ".join(
                 f"{p}={v:.2f}(was {leagues.LEAGUE_BASELINES.get(p, leagues.DEFAULT_BASELINE):.2f})"
@@ -186,7 +186,7 @@ def run(args) -> dict:
         inp = data_inputs.get_match_inputs(api, home, away, leagues.league_prefix(slug),
                                            ratings=ratings, auto=args.auto_ratings,
                                            international=leagues.is_international(slug),
-                                           debug=args.debug)
+                                           date=target, debug=args.debug)
         total, sup, used = derive_total_supremacy(inp, bsrc.baseline_for(slug, calibrated),
                                                   leagues.is_neutral(slug))
         return inp, total, sup, used
