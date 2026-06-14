@@ -79,7 +79,7 @@ def _analysis_args(target_date: str) -> argparse.Namespace:
     """A settings namespace for suggest_totals.run() (paper-off, recording on)."""
     return argparse.Namespace(
         date=target_date, min_volume=1000.0, min_edge=0.05, min_hours=0.0,
-        best_line_only=True,
+        best_line_only=False,  # dashboard shows every qualifying line (carousel)
         odds_min=1.60, odds_max=3.00, dispersion=2.0, league_baseline=8.5,
         league_prefix="mlb-",
         fee_rate=0.0, use_external=True, projections_csv=None,
