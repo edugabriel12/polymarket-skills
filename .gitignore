@@ -6,3 +6,15 @@ __pycache__/
 .env.*
 !.env.example
 *.key
+
+# Web app (polymarket-mlb-totals/webapp)
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+webapp/backend/.venv/
+**/.venv/
+*.db
+.polymarket-mlb-totals/
+webapp/frontend/vite.config.js
+webapp/frontend/vite.config.d.ts

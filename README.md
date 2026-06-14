@@ -10,6 +10,7 @@ Composable [Agent Skills](https://agentskills.io/specification) for Polymarket p
 | **polymarket-analyzer** | Detect edges: arbitrage, momentum, correlation analysis | None | Zero |
 | **polymarket-monitor** | Price alerts and position monitoring | None | Zero |
 | **polymarket-category-watcher** | List & continuously listen to all live markets of a category (basketball, tennis, soccer) | None | Zero |
+| **polymarket-mlb-totals** | Model MLB total-runs (Over/Under) and suggest entries at 1.60x–3.0x payout | None | Zero (paper) |
 | **polymarket-paper-trader** | Simulate trades against live prices, portfolio health checks | None | Zero |
 | **polymarket-strategy-advisor** | Trading methodology, recommendations, backtesting | None | Low |
 | **polymarket-live-executor** | Execute real trades (wallet + explicit human opt-in) | L2 Wallet | Medium |
@@ -128,6 +129,18 @@ Scanner --> Analyzer --> Strategy Advisor --> Paper Trader --> Live Executor
 
 Self-contained skill (own `category_common.py`); maps friendly names + PT-BR aliases
 (basquete, tênis, futebol, ...) to Gamma `tag_slug` candidates. No private key required.
+
+### polymarket-mlb-totals/ -- MLB Total-Runs Model (Read-Only, Paper-First)
+
+| Script | Purpose | Key Args |
+|--------|---------|----------|
+| `suggest_totals.py` | Discover the day's MLB games, model Over/Under total runs, suggest entries | `--date 2026-06-14 [--projections-csv f.csv] [--paper] [--output text]` |
+| `run_distribution.py` | Pure-stdlib Negative Binomial run distribution + Over/Under math (library) | — |
+
+Reuses the category scanner, the advisor's `kelly_half`, and the paper trader. Negative Binomial
+model (runs are overdispersed), edge vs Polymarket price, half-Kelly with conservative caps, and a
+1.60x–3.0x payout filter. Offline tests: `python polymarket-mlb-totals/scripts/test_run_distribution.py`
+and `test_pipeline.py`. See `research/mlb-total-runs-deep-research.md` for the methodology.
 
 ### polymarket-paper-trader/ -- Simulation Engine
 

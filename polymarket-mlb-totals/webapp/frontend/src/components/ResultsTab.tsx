@@ -1,0 +1,146 @@
+import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import {
+  TrendingUp,
+  DollarSign,
+  Target,
+  ArrowUpCircle,
+  ArrowDownCircle,
+  ExternalLink,
+  RefreshCw,
+} from "lucide-react";
+import { api, type Period } from "@/lib/api";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { KpiCard } from "@/components/KpiCard";
+import { StatusBadge } from "@/components/StatusBadge";
+import { WinRateDonut, PnlBar, OverUnderSplit } from "@/components/charts";
+import { cn, pct, signedUsd, usd } from "@/lib/utils";
+
+const PERIODS: { key: Period; label: string }[] = [
+  { key: "daily", label: "Diário" },
+  { key: "weekly", label: "Semanal" },
+  { key: "monthly", label: "Mensal" },
+];
+
+export function ResultsTab() {
+  const [period, setPeriod] = useState<Period>("monthly");
+  // refetchOnMount + always-stale => every visit/interaction triggers backend settlement.
+  const { data, isLoading, isFetching, refetch } = useQuery({
+    queryKey: ["results"],
+    queryFn: () => api.results(),
+    staleTime: 0,
+    refetchOnMount: "always",
+    refetchOnWindowFocus: true,
+  });
+
+  const b = data?.performance[period];
+
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="inline-flex rounded-xl border border-border bg-card p-1">
+          {PERIODS.map((p) => (
+            <button
+              key={p.key}
+              onClick={() => setPeriod(p.key)}
+              className={cn(
+                "rounded-lg px-3 py-1.5 text-sm font-semibold transition-all",
+                period === p.key
+                  ? "bg-gradient-to-r from-emerald-500 to-sky-500 text-white shadow"
+                  : "text-muted-foreground hover:text-foreground"
+              )}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          {data && <span>{data.settlement.checked} pendentes verificadas</span>}
+          <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isFetching}>
+            <RefreshCw className={isFetching ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
+            Atualizar
+          </Button>
+        </div>
+      </div>
+
+      {isLoading || !b ? (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+          {Array.from({ length: 5 }).map((_, i) => (
+            <div key={i} className="skeleton h-28" />
+          ))}
+        </div>
+      ) : (
+        <>
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+            <KpiCard label="ROI" value={pct(b.roi)} sub={`${b.settled} liquidadas`} icon={TrendingUp}
+              gradient="from-emerald-500 to-teal-600" positive={b.roi !== null ? b.roi >= 0 : null} />
+            <KpiCard label="P&L" value={signedUsd(b.pnl)} sub={`investido ${usd(b.invested)}`} icon={DollarSign}
+              gradient="from-sky-500 to-indigo-600" positive={b.pnl >= 0} />
+            <KpiCard label="Win rate" value={pct(b.win_rate)} sub={`${b.counts.acerto}A · ${b.counts.erro}E`} icon={Target}
+              gradient="from-violet-500 to-fuchsia-600" />
+            <KpiCard label="Win Over" value={pct(b.win_rate_over)} sub="entradas no Over" icon={ArrowUpCircle}
+              gradient="from-cyan-500 to-blue-600" />
+            <KpiCard label="Win Under" value={pct(b.win_rate_under)} sub="entradas no Under" icon={ArrowDownCircle}
+              gradient="from-fuchsia-500 to-purple-600" />
+          </div>
+
+          <div className="grid gap-4 lg:grid-cols-3">
+            <Card>
+              <CardHeader><CardTitle>Acerto vs Erro</CardTitle></CardHeader>
+              <CardContent><WinRateDonut block={b} /></CardContent>
+            </Card>
+            <Card>
+              <CardHeader><CardTitle>Win rate Over / Under</CardTitle></CardHeader>
+              <CardContent><OverUnderSplit block={b} /></CardContent>
+            </Card>
+            <Card>
+              <CardHeader><CardTitle>P&L por dia</CardTitle></CardHeader>
+              <CardContent><PnlBar data={data!.pnl_by_day} /></CardContent>
+            </Card>
+          </div>
+
+          <Card>
+            <CardHeader><CardTitle>Previsões recentes</CardTitle></CardHeader>
+            <CardContent className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-border text-left text-xs uppercase tracking-wider text-muted-foreground">
+                    <th className="py-2 pr-3">Jogo</th>
+                    <th className="px-3">Lado</th>
+                    <th className="px-3">Linha</th>
+                    <th className="px-3">Preço</th>
+                    <th className="px-3">Total</th>
+                    <th className="px-3">Status</th>
+                    <th className="px-3">Mercado</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data!.recent.slice(0, 15).map((r) => (
+                    <tr key={r.id} className="border-b border-border/60">
+                      <td className="py-2 pr-3 font-medium">{r.game_slug.replace(/^mlb-/, "").replace(/-\d{4}-\d{2}-\d{2}$/, "")}</td>
+                      <td className="px-3">
+                        <span className={r.side === "OVER" ? "font-bold text-sky-400" : "font-bold text-violet-400"}>{r.side}</span>
+                      </td>
+                      <td className="px-3 tabular-nums">{r.line}</td>
+                      <td className="px-3 tabular-nums">{r.entry_price?.toFixed(2)}</td>
+                      <td className="px-3 tabular-nums">{r.actual_total ?? "—"}</td>
+                      <td className="px-3"><StatusBadge status={r.status} /></td>
+                      <td className="px-3">
+                        {r.market_url && (
+                          <a href={r.market_url} target="_blank" rel="noreferrer" className="text-sky-400 hover:underline">
+                            <ExternalLink className="h-4 w-4" />
+                          </a>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </CardContent>
+          </Card>
+        </>
+      )}
+    </div>
+  );
+}

@@ -122,6 +122,48 @@ def to_float(v: Any, default: float = 0.0) -> float:
         return default
 
 
+# A Polymarket sports game slug embeds the date, e.g. "mlb-hou-kc-2026-06-13".
+_SLUG_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+
+def extract_slug_date(slug: str | None) -> str | None:
+    """Return the YYYY-MM-DD date embedded in a game slug, or None.
+
+    Polymarket lists sports games as `<sport>-<away>-<home>-YYYY-MM-DD`
+    (e.g. `mlb-hou-kc-2026-06-13`). The trailing date is the game date.
+    """
+    if not slug:
+        return None
+    matches = _SLUG_DATE_RE.findall(slug)
+    return matches[-1] if matches else None
+
+
+def iso_date(ts: str | None) -> str | None:
+    """Return the YYYY-MM-DD (UTC) of an ISO timestamp, or None."""
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
+    return dt.date().isoformat()
+
+
+def game_date(market: dict) -> str | None:
+    """Best-effort game date (YYYY-MM-DD) for a parsed market.
+
+    Prefers the date embedded in the slug/event_slug (authoritative for sports
+    games), then `gameStartTime`, then `startDate`.
+    """
+    for slug in (market.get("event_slug"), market.get("slug")):
+        d = extract_slug_date(slug)
+        if d:
+            return d
+    return iso_date(market.get("game_start_time")) or iso_date(market.get("start_date"))
+
+
 class APIClient:
     """`requests` wrapper with rate limiting, retries, and optional debug."""
 
@@ -181,6 +223,7 @@ def parse_market(m: dict, category_key: str) -> dict:
         "category": category_key,
         "question": sanitize_text(m.get("question", "")),
         "slug": m.get("slug", ""),
+        "event_slug": m.get("eventSlug", "") or m.get("event_slug", ""),
         "url": f"https://polymarket.com/event/{m.get('slug', '')}",
         "condition_id": m.get("conditionId", ""),
         "outcomes": [sanitize_text(o) for o in outcomes],
@@ -189,6 +232,8 @@ def parse_market(m: dict, category_key: str) -> dict:
         "volume_24h": to_float(m.get("volume24hr")),
         "volume_total": to_float(m.get("volumeNum")),
         "liquidity": to_float(m.get("liquidityNum")),
+        "game_start_time": m.get("gameStartTime", "") or "",
+        "start_date": m.get("startDate", "") or "",
         "end_date": m.get("endDate", ""),
         "active": bool(m.get("active", False)),
         "accepting_orders": bool(m.get("acceptingOrders", False)),
