@@ -43,6 +43,36 @@ SOCCER_PREFIXES = tuple(sorted(set(LEAGUE_BASELINES) | NEUTRAL_PREFIXES))
 
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
+# League prefix -> Polymarket /sports/<path>/ URL segment (best-effort).
+LEAGUE_URL_PATH = {
+    "fifwc": "world-cup", "world-cup": "world-cup", "wc": "world-cup",
+    "euro": "euro", "eur": "euro",
+    "epl": "epl", "premier-league": "epl",
+    "laliga": "la-liga", "la-liga": "la-liga",
+    "seriea": "serie-a", "serie-a": "serie-a",
+    "bundesliga": "bundesliga", "ligue1": "ligue-1", "ligue-1": "ligue-1",
+    "ucl": "champions-league", "champions-league": "champions-league",
+    "uel": "europa-league", "mls": "mls", "eredivisie": "eredivisie",
+}
+
+# Strip a market suffix ("-total-2pt5", "-btts", "-spread-...") to the base game slug.
+_MARKET_SUFFIX_RE = re.compile(
+    r"-(?:total-\d{1,2}(?:pt5)?|btts|both-teams-to-score|gg|spread-[a-z0-9-]+)$")
+
+
+def base_game_slug(slug: str) -> str:
+    return _MARKET_SUFFIX_RE.sub("", slug or "")
+
+
+def game_url(slug: str) -> str:
+    """Direct Polymarket link: /sports/<path>/<base-game> when the league is known,
+    else the canonical /event/<base-game>."""
+    base = base_game_slug(slug)
+    path = LEAGUE_URL_PATH.get(league_prefix(slug) or "")
+    if path:
+        return f"https://polymarket.com/sports/{path}/{base}"
+    return f"https://polymarket.com/event/{base}"
+
 
 def league_prefix(slug: str) -> str | None:
     """Return the league prefix of a game slug (the part before the first team)."""

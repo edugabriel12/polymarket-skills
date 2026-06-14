@@ -265,8 +265,7 @@ def _emit_or_skip(market_type, slug, m, line, chosen, notes, lam_h, lam_a, used,
     confidence = max(0.5, min(0.5 + chosen["edge"], 0.65)) if used else 0.5
     price = chosen["price"]
     odds = dc.decimal_odds(price)
-    market_slug = m.get("slug") or slug
-    market_url = f"https://polymarket.com/event/{market_slug}"
+    market_url = leagues.game_url(slug)
     desc = (f"{market_type} {chosen['side']}" + (f" {line}" if line is not None else "")
             + f" @ {price:.3f} (payout {odds:.2f}x) edge {chosen['edge']*100:+.1f}% "
             + ("Dixon-Coles" if used else "market-implied (fallback)"))

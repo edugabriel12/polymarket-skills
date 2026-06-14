@@ -39,6 +39,18 @@ class TestLeagues(unittest.TestCase):
         self.assertTrue(leagues.is_soccer_slug("epl-ars-che-2026-06-14-total-2pt5"))
         self.assertFalse(leagues.is_soccer_slug("mlb-hou-kc-2026-06-14-total-8pt5"))
 
+    def test_world_cup_mapping_and_url(self):
+        # The user's example: a neutral-venue World Cup game must map + link to /sports/world-cup/.
+        slug = "fifwc-nld-jpn-2026-06-14-total-2pt5"
+        self.assertTrue(leagues.is_soccer_slug(slug))
+        self.assertEqual(leagues.league_prefix(slug), "fifwc")
+        self.assertTrue(leagues.is_neutral(slug))  # no home advantage at the World Cup
+        self.assertEqual(leagues.parse_teams(slug), ("nld", "jpn"))
+        self.assertEqual(leagues.game_url(slug),
+                         "https://polymarket.com/sports/world-cup/fifwc-nld-jpn-2026-06-14")
+        self.assertEqual(leagues.game_url("fifwc-nld-jpn-2026-06-14-btts"),
+                         "https://polymarket.com/sports/world-cup/fifwc-nld-jpn-2026-06-14")
+
 
 class TestMarketParsing(unittest.TestCase):
     def test_total_and_btts_detection(self):
