@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import _bootstrap  # noqa: F401
 
@@ -38,6 +38,21 @@ CAP_FIRST_TRADE = 0.01
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def date_window_params(target: str) -> dict | None:
+    """Gamma date-filter params bracketing the target day (±a small margin).
+
+    Discovery is ranked by 24h volume and capped at an offset, so low-volume
+    markets (e.g. Série B) are lost in the tail. Filtering by date instead shrinks
+    the candidate set to the day's games, where volume ranking no longer matters.
+    """
+    try:
+        d = datetime.strptime(target, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return {"start_date_min": (d - timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z"),
+            "end_date_max": (d + timedelta(days=2)).strftime("%Y-%m-%dT00:00:00Z")}
 
 
 def fee_for(price: float, fee_rate: float) -> float:
@@ -139,9 +154,20 @@ def run(args) -> dict:
     vlog(f"=== Soccer goals/BTTS analysis for {target} ===")
 
     category_key, candidates = resolve_category("soccer")
+    window = date_window_params(target)
     try:
+        # Date-windowed discovery first (so low-volume leagues like Série B aren't
+        # lost behind the volume-ranked offset cap); fall back to the broad scan.
         _tag, markets = discover_markets(api, category_key, candidates,
-                                         min_volume=0.0, include_closed=False)
+                                         min_volume=0.0, include_closed=False,
+                                         extra_params=window)
+        if window:
+            vlog(f"Discovery: date-windowed [{window['start_date_min']} .. "
+                 f"{window['end_date_max']}] -> {len(markets)} markets")
+        if not markets:
+            vlog("  windowed discovery empty -> retrying unfiltered (volume-ranked)")
+            _tag, markets = discover_markets(api, category_key, candidates,
+                                             min_volume=0.0, include_closed=False)
     except Exception as e:  # noqa: BLE001
         return {"date": target, "error": f"discovery failed: {e}", "suggestions": [], "skipped": []}
 

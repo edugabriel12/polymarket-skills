@@ -39,6 +39,13 @@ class TestLeagues(unittest.TestCase):
         self.assertTrue(leagues.is_soccer_slug("epl-ars-che-2026-06-14-total-2pt5"))
         self.assertFalse(leagues.is_soccer_slug("mlb-hou-kc-2026-06-14-total-8pt5"))
 
+    def test_date_window_params(self):
+        # Brackets the day (±margin) so low-volume games aren't lost behind the cap.
+        w = ss.date_window_params("2026-06-14")
+        self.assertEqual(w["start_date_min"], "2026-06-13T00:00:00Z")
+        self.assertEqual(w["end_date_max"], "2026-06-16T00:00:00Z")
+        self.assertIsNone(ss.date_window_params("garbage"))
+
     def test_world_cup_mapping_and_url(self):
         # The user's example: a neutral-venue World Cup game must map + link to /sports/world-cup/.
         slug = "fifwc-nld-jpn-2026-06-14-total-2pt5"
