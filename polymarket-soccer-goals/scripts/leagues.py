@@ -38,6 +38,14 @@ DEFAULT_BASELINE = 2.70
 # Competitions played at neutral venues (no home advantage).
 NEUTRAL_PREFIXES = {"fifwc", "world-cup", "wc", "euro", "eur", "ucl-final"}
 
+# Competitions between NATIONAL teams (use national-team Elo, not Club Elo).
+INTERNATIONAL_PREFIXES = {"fifwc", "world-cup", "wc", "euro", "eur",
+                          "copa", "copa-america", "nations-league", "wcq"}
+
+
+def is_international(slug: str) -> bool:
+    return (league_prefix(slug) or "") in INTERNATIONAL_PREFIXES
+
 # Prefixes we treat as soccer for discovery (a game slug must start with one).
 SOCCER_PREFIXES = tuple(sorted(set(LEAGUE_BASELINES) | NEUTRAL_PREFIXES))
 

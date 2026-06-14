@@ -171,7 +171,8 @@ def run(args) -> dict:
     def _inputs_for(slug):
         home, away = leagues.parse_teams(slug, home_first=args.home_first)
         inp = data_inputs.get_match_inputs(api, home, away, leagues.league_prefix(slug),
-                                           ratings=ratings, use_clubelo=args.use_clubelo,
+                                           ratings=ratings, auto=args.auto_ratings,
+                                           international=leagues.is_international(slug),
                                            debug=args.debug)
         total, sup, used = derive_total_supremacy(inp, leagues.league_baseline(slug),
                                                   leagues.is_neutral(slug))
@@ -332,8 +333,9 @@ def main() -> None:
     p.add_argument("--odds-min", type=float, default=dc.ODDS_MIN_DEFAULT)
     p.add_argument("--odds-max", type=float, default=dc.ODDS_MAX_DEFAULT)
     p.add_argument("--rho", type=float, default=dc.DEFAULT_RHO, help="Dixon-Coles dependence (default -0.10)")
-    p.add_argument("--ratings-csv", default=None, help="CSV of team elo/att_factor/def_factor (ToS-clean)")
-    p.add_argument("--use-clubelo", action="store_true", help="Best-effort live Club Elo lookup")
+    p.add_argument("--ratings-csv", default=None, help="CSV of team elo/att_factor/def_factor (overrides auto)")
+    p.add_argument("--no-auto-ratings", dest="auto_ratings", action="store_false", default=True,
+                   help="Disable automatic ratings (national Elo / Club Elo / xG) -> market-implied")
     p.add_argument("--home-first", dest="home_first", action="store_true", default=True,
                    help="Slug lists home team first (default)")
     p.add_argument("--away-first", dest="home_first", action="store_false",

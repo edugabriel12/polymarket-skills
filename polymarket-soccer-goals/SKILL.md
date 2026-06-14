@@ -51,11 +51,14 @@ python polymarket-soccer-goals/scripts/test_pipeline.py
   matrix gets the DC `τ` low-score correction (fits draws/0-0/1-1). Soccer goals are ~equidispersed
   (variance/mean ≈ 1), so Poisson — not Negative Binomial — is correct. Then
   `P(Over X.5) = Σ_{i+j>X} P(i,j)` and `P(BTTS) = Σ_{i≥1,j≥1} P(i,j)`. See `references/model.md`.
-- **λ from data:** `total` (league baseline × attack/defense factors) + `supremacy` (from Club Elo or
-  xG) → `λ_home=(total+sup)/2`, `λ_away=(total−sup)/2`. **BTTS is asymmetric** — governed by the
-  smaller λ (weak attack vs strong defense).
-- **Anti-fabrication:** with no inputs the model is **market-implied** (matches the Over and BTTS
-  prices), so edge ≈ 0 and nothing is suggested. Real edge appears only when ratings/Elo/xG move λ.
+- **λ from data (automatic):** `total` (league baseline × attack/defense) + `supremacy` →
+  `λ_home=(total+sup)/2`, `λ_away=(total−sup)/2`. Strength is resolved automatically, in order:
+  **(1)** a ratings CSV if given, **(2)** xG via `soccerdata`, **(3)** Elo — **national-team Elo for
+  international games (World Cup)** and **Club Elo for club leagues**. No manual input needed for
+  covered teams. **BTTS is asymmetric** — governed by the smaller λ (weak attack vs strong defense).
+- **Anti-fabrication:** if no source covers a match, the model is **market-implied** (matches the
+  Over and BTTS prices), so edge ≈ 0 and nothing is suggested. Real edge appears only when a rating
+  source moves λ off the market.
 - **Scope:** only soccer leagues (slug prefixes like `epl-`, `laliga-`, `fifwc-`, ...) and only the
   full-game **total-goals** (`...-total-<line>`) and **BTTS** (`...-btts`) markets — moneyline,
   spreads, etc. are dropped. **Pre-game only** (`--min-hours 0`), $1,000 volume floor (configurable).
@@ -64,8 +67,8 @@ python polymarket-soccer-goals/scripts/test_pipeline.py
 | Flag | Default | Purpose |
 |---|---|---|
 | `--date YYYY-MM-DD` | today (UTC) | Target day |
-| `--ratings-csv PATH` | — | Team ratings CSV (`team,elo,att_factor,def_factor`) — ToS-clean inputs |
-| `--use-clubelo` | off | Best-effort live Club Elo lookup (needs name mapping) |
+| `--ratings-csv PATH` | — | Team ratings CSV (`team,elo,att_factor,def_factor`) — overrides auto sources |
+| `--no-auto-ratings` | off | Disable automatic ratings (national Elo / Club Elo / xG) → market-implied |
 | `--rho F` | -0.10 | Dixon-Coles dependence (negative raises draws) |
 | `--home-first / --away-first` | home-first | Which team the slug lists first |
 | `--min-volume N` | 1000 | Volume gate ($/24h) |
@@ -83,9 +86,11 @@ P(model), edge, sizing) and the Polymarket market link, for later calibration/wi
 ## Honest limitations
 - **Market near-efficient at close; realistic O/U yield ~0.8%** (research). Any model implying >10%
   yield is overfit. Validate with Brier/log-loss + CLV over **~1,000+ entries** before real capital.
-- **xG data needs scraping** (FBref/Understat via `soccerdata`, ToS-flagged) and per-league team-name
-  mapping; the **ratings CSV** is the v1 workhorse (ToS-clean). Club Elo is free but needs a club-name
-  map. Without inputs the engine returns zero edge (no fabrication).
+- **Ratings are automatic** (national-team Elo for the World Cup, Club Elo for club leagues, optional
+  xG via `soccerdata`). The national-team Elo is a **baked-in snapshot** (`ratings_sources.py`) to
+  refresh periodically; Club Elo needs the club in the alias map; xG needs `soccerdata` + a team-name
+  map (ToS-flagged). A `--ratings-csv` overrides everything. Teams not covered by any source fall back
+  to market-implied (zero edge — no fabrication).
 - **Slug team order** (home/away) and league baselines are best-effort/tunable; the sandbox blocks
   live egress so only the deterministic core is tested here. Conservative caps (1% first / 2% model).
 - Not financial advice; real trading involves risk of loss.

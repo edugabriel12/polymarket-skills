@@ -7,7 +7,13 @@ match, an **expected total goals** and a **home supremacy** — everything below
 > Sandbox note: live egress is blocked here, so the network layers return empty and only the
 > **ratings CSV** path (local file IO) and the deterministic engine are exercised offline.
 
-## 1. Ratings CSV (`--ratings-csv`, ToS-clean, the v1 workhorse)
+## 0. Automatic resolution order (`data_inputs.get_match_inputs`)
+Strength is resolved automatically per match: **ratings CSV** (if given) → **xG** (soccerdata) →
+**Elo** (national-team Elo for international games, Club Elo for club leagues). First hit wins; if
+none covers the match → market-implied fallback (zero edge). The static tables live in
+`ratings_sources.py` (`NATIONAL_ELO` snapshot + country aliases; `CLUB_ELO_ALIASES`).
+
+## 1. Ratings CSV (`--ratings-csv`, ToS-clean, overrides the auto sources)
 Supply your own per-team ratings. Columns (case-insensitive; team key = `team`/`abbr`):
 ```
 team,elo,att_factor,def_factor

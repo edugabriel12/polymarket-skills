@@ -113,6 +113,47 @@ class TestPredictions(unittest.TestCase):
             self.assertEqual(len(spdb.get_predictions(db)), 1)
 
 
+class TestAutoRatings(unittest.TestCase):
+    def test_national_and_club_lookups(self):
+        import ratings_sources as rs
+        self.assertIsNotNone(rs.national_elo("nld"))     # Netherlands
+        self.assertEqual(rs.national_elo("ned"), rs.national_elo("nld"))  # alias
+        self.assertIsNone(rs.national_elo("zzz"))
+        self.assertEqual(rs.club_elo_name("ars"), "Arsenal")
+        self.assertEqual(rs.club_elo_name("rma"), "RealMadrid")
+
+    def test_world_cup_auto_national_elo_no_csv(self):
+        import data_inputs as di
+        # International game, no CSV -> national-team Elo (in-memory, no network).
+        inp = di.get_match_inputs(None, "nld", "jpn", "fifwc", international=True, auto=True)
+        self.assertIn("home_elo", inp)
+        self.assertIn("away_elo", inp)
+        self.assertGreater(inp["home_elo"], inp["away_elo"])  # NLD stronger than JPN
+
+    def test_csv_overrides_auto(self):
+        import data_inputs as di
+        ratings = {"nld": {"elo": 1700.0}, "jpn": {"elo": 1700.0}}
+        inp = di.get_match_inputs(None, "nld", "jpn", "fifwc", ratings=ratings,
+                                  international=True, auto=True)
+        self.assertEqual(inp["home_elo"], 1700.0)  # CSV wins over national snapshot
+
+    def test_auto_off_returns_empty(self):
+        import data_inputs as di
+        self.assertEqual(di.get_match_inputs(None, "nld", "jpn", "fifwc",
+                                             international=True, auto=False), {})
+
+    def test_club_path_uses_fetcher(self):
+        import data_inputs as di, ratings_sources as rs
+        orig = rs.fetch_club_elo
+        rs.fetch_club_elo = lambda abbr, **k: {"ars": 1950.0, "che": 1850.0}.get(abbr)
+        try:
+            inp = di.get_match_inputs(None, "ars", "che", "epl", international=False, auto=True)
+            self.assertEqual(inp["home_elo"], 1950.0)
+            self.assertEqual(inp["away_elo"], 1850.0)
+        finally:
+            rs.fetch_club_elo = orig
+
+
 def _rich(slug, question, outcomes, prices, tokens, vol=40000):
     return {"event_slug": slug, "slug": slug, "question": question, "outcomes": outcomes,
             "outcome_prices": prices, "token_ids": tokens, "volume_24h": vol,
@@ -129,7 +170,7 @@ class _Args:
     def __init__(self, **kw):
         d = dict(date="2026-06-14", min_volume=1000.0, min_edge=0.05, min_hours=0.0,
                  odds_min=1.60, odds_max=3.00, rho=dc.DEFAULT_RHO, ratings_csv=None,
-                 use_clubelo=False, home_first=True, best_line_only=True, fee_rate=0.0,
+                 auto_ratings=False, home_first=True, best_line_only=True, fee_rate=0.0,
                  portfolio_value=10000.0, portfolio_db=None, record=False,
                  predictions_db=None, rate_limit=0, verbose=False, debug=False)
         d.update(kw); self.__dict__.update(d)
@@ -176,6 +217,25 @@ class TestEndToEnd(unittest.TestCase):
             self.assertEqual(rec["side"], "YES")
             self.assertLessEqual(rec["size_pct"], 0.01)  # first-trade cap
             self.assertTrue(dc.passes_odds_filter(rec["price"]))
+
+    def test_world_cup_auto_no_csv(self):
+        # World Cup game; no ratings CSV -> national Elo computes lambdas automatically.
+        markets = [
+            _rich("fifwc-nld-jpn-2026-06-14-total-2pt5", "Netherlands vs Japan: O/U 2.5",
+                  ["Over 2.5", "Under 2.5"], [0.50, 0.50], ["o", "u"]),
+            _rich("fifwc-nld-jpn-2026-06-14-btts", "Netherlands vs Japan: Both teams to score?",
+                  ["Yes", "No"], [0.50, 0.50], ["y", "n"]),
+        ]
+        ss.discover_markets = lambda *a, **k: ("soccer", markets)
+        ss.game_date = lambda m: "2026-06-14"
+        ss.APIClient = _NoNetAPI
+        result = ss.run(_Args(ratings_csv=None, auto_ratings=True))  # auto national Elo, no network
+        self.assertEqual(result["counts"]["total_markets"], 1)
+        self.assertEqual(result["counts"]["btts_markets"], 1)
+        # Model ran with real (national-Elo) inputs -> at least one suggestion or a
+        # decision-tree skip, never a market-implied no-op.
+        evaluated = result["counts"]["suggestions"] + result["counts"]["skipped"]
+        self.assertEqual(evaluated, 2)
 
     def test_fallback_no_inputs_no_suggestion(self):
         markets = [_rich("epl-ars-che-2026-06-14-total-2pt5", "O/U 2.5",
