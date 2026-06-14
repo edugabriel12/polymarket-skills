@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 
 # Odds <-> price boundaries for the 1.60x-3.0x payout filter.
-ODDS_MIN_DEFAULT = 1.60
+ODDS_MIN_DEFAULT = 1.50
 ODDS_MAX_DEFAULT = 3.00
 
 # Plausible clamps so a bad input can never blow up the mean.

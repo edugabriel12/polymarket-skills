@@ -5,7 +5,7 @@ description: >-
   RUNS (Over/Under) market. It pulls every MLB game of a date via the category scanner, finds each
   game's total-runs Over/Under market, models P(Over)/P(Under) with a Negative Binomial run
   distribution (park + season run-rate + weather adjusted), computes the edge vs the Polymarket
-  price, and suggests entries — restricted to a 1.60x–3.0x payout. Trigger on: MLB total runs,
+  price, and suggests entries — restricted to a 1.50x–3.0x payout. Trigger on: MLB total runs,
   over/under runs, baseball totals model, suggest MLB bets, run total prediction, MLB totals
   edge, beisebol total de runs, sugerir entradas MLB, modelo de over/under da MLB.
 version: 1.0.0
@@ -17,7 +17,7 @@ author: polymarket-skills
 Operationalizes `research/mlb-total-runs-deep-research.md`: discover the day's MLB games, model
 each game's **total runs** distribution, and suggest **Over/Under** entries with a quantified,
 classified edge — sized by half-Kelly under the constitution's caps, and filtered to a
-**1.60×–3.0× payout** (entry price in `[0.3333, 0.625]`; Polymarket price = implied probability,
+**1.50×–3.0× payout** (entry price in `[0.3333, 0.667]`; Polymarket price = implied probability,
 decimal odds = 1/price).
 
 **Paper trading is the default (CLAUDE.md rule #2).** This is a simulation, not financial advice;
@@ -58,7 +58,7 @@ python polymarket-mlb-totals/scripts/test_pipeline.py
 
 ```
 list_games_today (scanner)  →  find total-runs Over/Under market  →  NegBin model P(Over)/P(Under)
-   →  edge = P_model − price − fee  →  pick side  →  1.60×–3.0× odds filter  →  entry decision tree
+   →  edge = P_model − price − fee  →  pick side  →  1.50×–3.0× odds filter  →  entry decision tree
    →  half-Kelly + 2%/1% caps  →  recommendation (JSON + text)  →  optional --paper
 ```
 
@@ -88,7 +88,7 @@ list_games_today (scanner)  →  find total-runs Over/Under market  →  NegBin 
 | `--min-hours F` | 0 | Min hours until game start (0 = pre-game only, not started) |
 | `--all-lines` | off | Suggest every qualifying line (default: best-edge line per game) |
 | `--min-edge F` | 0.05 | Min edge after fees (decision tree) |
-| `--odds-min / --odds-max` | 1.60 / 3.00 | Decimal payout band (→ price 0.625 … 0.333) |
+| `--odds-min / --odds-max` | 1.50 / 3.00 | Decimal payout band (→ price 0.667 … 0.333) |
 | `--dispersion F` | 2.0 | `variance = dispersion × mean` |
 | `--league-baseline F` | 8.5 | Neutral game total |
 | `--league-prefix TEXT` | `mlb-` | Only process games whose slug starts with this (filters out soccer/esports; `''` = all) |

@@ -11,8 +11,12 @@ export interface Recommendation {
   fee_rate: number;
 }
 
+export type Sport = "mlb" | "soccer";
+
 export interface StatsLog {
   model?: string;
+  market?: string; // soccer: TOTAL | BTTS
+  chosen_side?: string; // OVER/UNDER/YES/NO
   mu?: number;
   variance?: number;
   dispersion?: number;
@@ -20,20 +24,30 @@ export interface StatsLog {
   negbin_p?: number;
   park_factor?: number;
   league_baseline?: number;
+  // soccer (Dixon-Coles)
+  lam_home?: number;
+  lam_away?: number;
+  rho?: number;
   used_external?: boolean;
   inputs?: Record<string, number | null>;
   p_over_eff?: number;
   p_under_eff?: number;
   p_push?: number;
+  model_prob?: number;
   decimal_odds?: number;
   edge_after_fee?: number;
-  chosen_side?: string;
+  line?: number | null;
 }
 
 export interface Suggestion {
   game: string;
-  line: number;
-  mu: number;
+  market?: string; // soccer: TOTAL | BTTS
+  side?: string;
+  line: number | null;
+  mu?: number;
+  lam_home?: number;
+  lam_away?: number;
+  edge?: number;
   prediction_id: number | null;
   recommendation: Recommendation;
   stats?: StatsLog;
@@ -50,13 +64,15 @@ export interface Skipped {
 }
 
 export interface AnalysesResponse {
+  sport: Sport;
   date: string;
   computed_at: string;
   cached: boolean;
-  counts: { games: number; suggestions: number; skipped: number };
+  counts: Record<string, number>;
   suggestions: Suggestion[];
   skipped: Skipped[];
   disclaimer: string;
+  error?: string | null;
 }
 
 export interface PerfBlock {
@@ -77,7 +93,8 @@ export interface PredictionRow {
   id: number;
   game_slug: string;
   game_date: string;
-  line: number;
+  market?: string;
+  line: number | null;
   side: string;
   entry_price: number;
   decimal_odds: number;
@@ -89,6 +106,7 @@ export interface PredictionRow {
 }
 
 export interface ResultsResponse {
+  sport: Sport;
   settlement: { checked: number; settled: unknown[] };
   performance: { daily: PerfBlock; weekly: PerfBlock; monthly: PerfBlock };
   pnl_by_day: { date: string; pnl: number }[];
@@ -103,13 +121,13 @@ async function get<T>(url: string): Promise<T> {
 }
 
 export const api = {
-  analyses: (date?: string, force = false) =>
+  analyses: (sport: Sport, date?: string, force = false) =>
     get<AnalysesResponse>(
-      `/api/analyses?${date ? `date=${date}&` : ""}force=${force}`
+      `/api/analyses?sport=${sport}&${date ? `date=${date}&` : ""}force=${force}`
     ),
-  results: () => get<ResultsResponse>("/api/results"),
-  seedDemo: async (reset = true) => {
-    const r = await fetch(`/api/seed-demo?reset=${reset}`, { method: "POST" });
+  results: (sport: Sport) => get<ResultsResponse>(`/api/results?sport=${sport}`),
+  seedDemo: async (sport: Sport, reset = true) => {
+    const r = await fetch(`/api/seed-demo?sport=${sport}&reset=${reset}`, { method: "POST" });
     if (!r.ok) throw new Error(`seed failed: ${r.status}`);
     return r.json();
   },
