@@ -36,6 +36,7 @@ NWS_API = "https://api.weather.gov"
 
 LEAGUE_RPG = 4.25  # league-average runs per game per team, for rate->factor conversion
 HOME_FIELD_DELTA = 0.10  # small home run-environment nudge when a real game is matched
+NON_NWS_PARKS = {"tor"}  # parks outside the US NWS coverage (skip weather there)
 
 
 # ---------------------------------------------------------------------------
@@ -183,9 +184,10 @@ def get_game_inputs(api, event_slug: str, target_date: str, *,
         if h or a:
             inputs["home_field"] = HOME_FIELD_DELTA  # casa/fora nudge
 
-    # Weather (network; best-effort).
+    # Weather (network; best-effort). NWS only covers US parks, so skip parks
+    # outside its coverage (e.g. Toronto / Rogers Centre) to avoid 404s.
     coords = pf.home_coords_for_slug(event_slug)
-    if coords:
+    if coords and _canon(home or "") not in NON_NWS_PARKS:
         wx = fetch_weather(api, coords[0], coords[1], debug=debug)
         inputs.update(wx)
 
