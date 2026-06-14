@@ -35,6 +35,22 @@ npm run dev                                    # http://localhost:5173  (proxies
 
 Or `./dev.sh` from `webapp/` to start both.
 
+### Windows (PowerShell / IntelliJ)
+`dev.sh` is bash-only (and uses POSIX venv paths). On Windows use the PowerShell launcher
+instead — it creates the venv, installs deps, and opens the backend + frontend in two windows:
+
+```powershell
+# from polymarket-mlb-totals\webapp
+powershell -ExecutionPolicy Bypass -File dev.ps1
+# or just double-click dev.bat
+```
+
+**IntelliJ run configs** ship in `.run/` at the repo root (open the project at the repo root so
+they're detected): **Dashboard Frontend (npm dev)**, **Dashboard Backend (uvicorn)**, and
+**MLB Dashboard (Full)** which runs both. Run `dev.ps1` once first to bootstrap the backend
+`.venv` and `node_modules`; the backend config points at
+`backend\.venv\Scripts\python.exe` (re-select the interpreter in the dropdown if your IDE asks).
+
 ### Demo data (offline)
 Live games/settlement need network (Polymarket + MLB Stats API). To populate sample predictions
 so both tabs are fully usable offline:
