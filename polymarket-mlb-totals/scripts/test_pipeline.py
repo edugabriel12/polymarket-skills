@@ -351,7 +351,8 @@ class _Args:
                         projections_csv=None, refresh_prices=False,
                         portfolio_value=10000.0, portfolio_db=None,
                         record=False, predictions_db=None,
-                        paper=False, paper_execute=False, rate_limit=0, debug=False)
+                        paper=False, paper_execute=False, rate_limit=0,
+                        verbose=False, debug=False)
         defaults.update(kw)
         self.__dict__.update(defaults)
 
