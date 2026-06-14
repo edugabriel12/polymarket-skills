@@ -54,25 +54,49 @@ def national_elo(code: str | None) -> float | None:
 # Club Elo (clubelo.com): Polymarket abbreviation -> Club Elo club name
 # ---------------------------------------------------------------------------
 
+# Polymarket 3-letter club code -> clubelo.com club name. Best-effort and easy to
+# extend/correct: an unknown or wrong code just falls back to market-implied (no
+# harm). Verify a name with `curl http://api.clubelo.com/<Name> | head`.
 CLUB_ELO_ALIASES: dict[str, str] = {
-    # Premier League
+    # --- Premier League ---
     "ars": "Arsenal", "mci": "ManCity", "liv": "Liverpool", "che": "Chelsea",
     "mun": "ManUnited", "tot": "Tottenham", "new": "Newcastle", "avl": "AstonVilla",
     "whu": "WestHam", "bha": "Brighton", "eve": "Everton", "ful": "Fulham",
     "cry": "CrystalPalace", "wol": "Wolves", "bre": "Brentford", "nfo": "Forest",
-    # La Liga
+    "bou": "Bournemouth", "bur": "Burnley", "lee": "Leeds", "lei": "Leicester",
+    "sou": "Southampton", "ips": "Ipswich", "shu": "SheffieldUnited", "lut": "Luton",
+    "nor": "Norwich", "wat": "Watford", "wba": "WestBrom",
+    # --- La Liga ---
     "rma": "RealMadrid", "bar": "Barcelona", "atm": "Atletico", "sev": "Sevilla",
     "rso": "RealSociedad", "vil": "Villarreal", "bet": "Betis", "ath": "Athletic",
-    "val": "Valencia",
-    # Serie A
+    "val": "Valencia", "gir": "Girona", "osa": "Osasuna", "cel": "Celta",
+    "ray": "Rayo", "get": "Getafe", "mll": "Mallorca", "ala": "Alaves",
+    "lpa": "LasPalmas", "gra": "Granada", "cad": "Cadiz", "alm": "Almeria",
+    "vll": "Valladolid", "esp": "Espanyol", "leg": "Leganes", "elc": "Elche",
+    # --- Serie A ---
     "int": "Inter", "juv": "Juventus", "mil": "Milan", "nap": "Napoli",
     "rom": "Roma", "laz": "Lazio", "ata": "Atalanta", "fio": "Fiorentina",
-    # Bundesliga
+    "bol": "Bologna", "tor": "Torino", "mnz": "Monza", "gen": "Genoa",
+    "lec": "Lecce", "udi": "Udinese", "cag": "Cagliari", "ver": "Verona",
+    "emp": "Empoli", "fro": "Frosinone", "sas": "Sassuolo", "sal": "Salernitana",
+    "com": "Como", "par": "Parma", "ven": "Venezia",
+    # --- Bundesliga ---
     "bay": "Bayern", "dor": "Dortmund", "rbl": "RBLeipzig", "b04": "Leverkusen",
-    "wob": "Wolfsburg", "fra": "Frankfurt",
-    # Ligue 1
+    "lev": "Leverkusen", "wob": "Wolfsburg", "fra": "Frankfurt", "sge": "Frankfurt",
+    "scf": "Freiburg", "tsg": "Hoffenheim", "m05": "Mainz", "bmg": "Gladbach",
+    "vfb": "Stuttgart", "fca": "Augsburg", "wbr": "Bremen", "boc": "Bochum",
+    "fch": "Heidenheim", "svd": "Darmstadt", "koe": "Koeln", "unb": "UnionBerlin",
+    "bsc": "Hertha", "s04": "Schalke", "hol": "Kiel", "stp": "StPauli",
+    # --- Ligue 1 ---
     "psg": "Paris", "mar": "Marseille", "lyo": "Lyon", "mon": "Monaco",
-    "lil": "Lille", "ren": "Rennes", "nic": "Nice",
+    "lil": "Lille", "ren": "Rennes", "nic": "Nice", "len": "Lens", "rei": "Reims",
+    "str": "Strasbourg", "nan": "Nantes", "mtp": "Montpellier", "tou": "Toulouse",
+    "brs": "Brest", "hav": "LeHavre", "met": "Metz", "lor": "Lorient",
+    "aux": "Auxerre", "ang": "Angers", "ste": "SaintEtienne",
+    # --- Eredivisie / Primeira Liga ---
+    "aja": "Ajax", "psv": "PSV", "fey": "Feyenoord", "azz": "AZAlkmaar",
+    "twe": "Twente", "utr": "Utrecht", "ben": "Benfica", "por": "Porto",
+    "scp": "Sporting", "bra": "Braga",
 }
 
 

@@ -121,6 +121,18 @@ class TestAutoRatings(unittest.TestCase):
         self.assertIsNone(rs.national_elo("zzz"))
         self.assertEqual(rs.club_elo_name("ars"), "Arsenal")
         self.assertEqual(rs.club_elo_name("rma"), "RealMadrid")
+        # Expanded big-5 + Eredivisie/Primeira coverage (one per league).
+        self.assertEqual(rs.club_elo_name("nap"), "Napoli")
+        self.assertEqual(rs.club_elo_name("bou"), "Bournemouth")
+        self.assertEqual(rs.club_elo_name("gir"), "Girona")
+        self.assertEqual(rs.club_elo_name("scf"), "Freiburg")
+        self.assertEqual(rs.club_elo_name("psv"), "PSV")
+        self.assertIsNone(rs.club_elo_name("zzz"))
+        # Conflicting 3-letter codes resolved deterministically.
+        self.assertEqual(rs.club_elo_name("mon"), "Monaco")    # not Monza (mnz)
+        self.assertEqual(rs.club_elo_name("mnz"), "Monza")
+        self.assertEqual(rs.club_elo_name("bre"), "Brentford")  # not Bremen (wbr)
+        self.assertEqual(rs.club_elo_name("wbr"), "Bremen")
 
     def test_world_cup_auto_national_elo_no_csv(self):
         import data_inputs as di
