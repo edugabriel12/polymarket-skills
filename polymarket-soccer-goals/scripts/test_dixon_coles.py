@@ -122,11 +122,17 @@ class TestMarketImpliedFallback(unittest.TestCase):
 
 class TestOdds(unittest.TestCase):
     def test_filter_boundaries(self):
-        self.assertFalse(dc.passes_odds_filter(0.333))
-        self.assertTrue(dc.passes_odds_filter(0.3334))
-        self.assertTrue(dc.passes_odds_filter(0.625))
-        self.assertFalse(dc.passes_odds_filter(0.6251))
+        # Explicit bounds (independent of the default band).
+        self.assertFalse(dc.passes_odds_filter(0.333, 1.60, 3.0))
+        self.assertTrue(dc.passes_odds_filter(0.3334, 1.60, 3.0))
+        self.assertTrue(dc.passes_odds_filter(0.625, 1.60, 3.0))
+        self.assertFalse(dc.passes_odds_filter(0.6251, 1.60, 3.0))
         self.assertAlmostEqual(dc.decimal_odds(0.5), 2.0, places=9)
+
+    def test_default_band_is_1p50(self):
+        self.assertAlmostEqual(dc.ODDS_MIN_DEFAULT, 1.50, places=9)
+        self.assertTrue(dc.passes_odds_filter(0.66))    # in default band (1.515x)
+        self.assertFalse(dc.passes_odds_filter(0.67))   # below 1.50x floor
 
 
 if __name__ == "__main__":

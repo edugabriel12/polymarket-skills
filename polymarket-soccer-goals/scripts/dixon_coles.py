@@ -25,7 +25,7 @@ KMAX = 12  # max goals per team in the score matrix (covers soccer)
 # probability (the empirically observed correction). Tunable; calibrate per league.
 DEFAULT_RHO = -0.10
 
-ODDS_MIN_DEFAULT = 1.60
+ODDS_MIN_DEFAULT = 1.50
 ODDS_MAX_DEFAULT = 3.00
 
 _LAM_LO, _LAM_HI = 0.10, 6.0

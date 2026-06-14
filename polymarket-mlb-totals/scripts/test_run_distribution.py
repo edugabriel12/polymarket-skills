@@ -146,10 +146,16 @@ class TestMuDerivation(unittest.TestCase):
 
 class TestOddsFilter(unittest.TestCase):
     def test_boundaries(self):
-        self.assertFalse(rd.passes_odds_filter(0.333))     # just below 1/3
-        self.assertTrue(rd.passes_odds_filter(0.3334))
-        self.assertTrue(rd.passes_odds_filter(0.625))      # exactly 1/1.6
-        self.assertFalse(rd.passes_odds_filter(0.6251))
+        # Explicit bounds so the test is independent of the default odds band.
+        self.assertFalse(rd.passes_odds_filter(0.333, 1.60, 3.0))     # just below 1/3
+        self.assertTrue(rd.passes_odds_filter(0.3334, 1.60, 3.0))
+        self.assertTrue(rd.passes_odds_filter(0.625, 1.60, 3.0))      # exactly 1/1.6
+        self.assertFalse(rd.passes_odds_filter(0.6251, 1.60, 3.0))
+
+    def test_default_band_is_1p50(self):
+        self.assertAlmostEqual(rd.ODDS_MIN_DEFAULT, 1.50, places=9)
+        self.assertTrue(rd.passes_odds_filter(0.66))    # 1.515x payout, in default band
+        self.assertFalse(rd.passes_odds_filter(0.67))   # 1.493x payout, below 1.50x floor
 
     def test_decimal_odds_mapping(self):
         self.assertAlmostEqual(rd.decimal_odds(0.625), 1.60, places=6)

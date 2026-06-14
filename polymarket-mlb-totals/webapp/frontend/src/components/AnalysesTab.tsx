@@ -177,7 +177,7 @@ export function AnalysesTab({ sport }: { sport: Sport }) {
             </div>
             <div className="text-lg font-bold">Nenhuma entrada acionável hoje</div>
             <p className="max-w-md text-sm text-muted-foreground">
-              O modelo não encontrou edge dentro do filtro 1.60x–3.0x — ou os jogos do dia já
+              O modelo não encontrou edge dentro do filtro 1.50x–3.0x — ou os jogos do dia já
               começaram / ainda não estão disponíveis. Sessão vazia é normal.
             </p>
           </Card>
