@@ -25,6 +25,7 @@ import run_distribution as rd
 import park_factors as pf
 import totals_market as tm
 import data_inputs
+import predictions_db
 
 from category_common import (
     APIClient,
@@ -65,10 +66,12 @@ def group_by_event(markets: list[dict]) -> dict[str, list[dict]]:
 
 def model_probabilities(line, over_price, park_factor, inputs, *,
                         league_baseline, dispersion):
-    """Return (p_over_eff, p_under_eff, mu, used_external).
+    """Model the total-runs distribution and return the full math as a dict.
 
     With real inputs, mu = park-adjusted baseline + adjustments. Without any
     input, mu = market-implied (edge ~ 0 by construction — never fabricated).
+    Returns: p_over, p_under (effective), mu, var, used_external, p_push, need,
+    and the NegBin params (r, p) — everything needed for the prediction audit log.
     """
     used_external = bool(inputs)
     if used_external:
@@ -76,9 +79,16 @@ def model_probabilities(line, over_price, park_factor, inputs, *,
         mu = rd.adjust_mu(base, **inputs)
     else:
         mu = rd.market_implied_mu(line, over_price, dispersion)
-    pmf = rd.negbin_total_runs_pmf(mu, rd.variance_from_mu(mu, dispersion))
+    var = rd.variance_from_mu(mu, dispersion)
+    pmf = rd.negbin_total_runs_pmf(mu, var)
     probs = rd.prob_over(line, pmf)
-    return probs["p_over_eff"], probs["p_under_eff"], mu, used_external
+    r, p = rd.negbin_params_from_moments(mu, var)
+    return {
+        "p_over": probs["p_over_eff"], "p_under": probs["p_under_eff"],
+        "mu": mu, "var": var, "used_external": used_external,
+        "p_push": probs["p_push"], "need": probs["need"],
+        "negbin_r": r, "negbin_p": p,
+    }
 
 
 def pick_side(line, ou, p_over, p_under, fee_rate, odds_min, odds_max):
@@ -190,6 +200,58 @@ def build_recommendation(game_slug, totals, line, chosen, mu, used_external,
     return rec, text
 
 
+def record_prediction_row(db_path, game_slug, game_date, totals, line, chosen, m,
+                          ou, inputs, park_factor, size_pct, size_usd, kelly,
+                          confidence, side_notes, args) -> int | None:
+    """Persist the prediction + its full statistical/mathematical audit log.
+
+    Returns the prediction row id, or None on failure (recording never blocks a
+    suggestion). status starts as PENDENTE; settle later via track_predictions.py.
+    """
+    price = chosen["price"]
+    odds = rd.decimal_odds(price)
+    stats = {
+        "model": "negative_binomial",
+        "mu": round(m["mu"], 4), "variance": round(m["var"], 4),
+        "dispersion": args.dispersion,
+        "negbin_r": round(m["negbin_r"], 4), "negbin_p": round(m["negbin_p"], 4),
+        "league_baseline": args.league_baseline, "park_factor": park_factor,
+        "used_external": m["used_external"], "inputs": inputs,
+        "line": line, "need": m["need"],
+        "p_over_eff": round(m["p_over"], 4), "p_under_eff": round(m["p_under"], 4),
+        "p_push": round(m["p_push"], 4),
+        "chosen_side": chosen["side"], "entry_price": price,
+        "decimal_odds": round(odds, 4), "model_prob": round(chosen["p_model"], 4),
+        "fee_rate": args.fee_rate, "fee_applied": round(fee_for(price, args.fee_rate), 5),
+        "edge_after_fee": round(chosen["edge"], 4),
+        "book_sum": ou["book_sum"], "price_sane": ou["price_sane"],
+        "kelly_fraction": round(kelly, 5),
+        "cap": CAP_FIRST_TRADE if size_pct <= CAP_FIRST_TRADE else CAP_MODEL,
+        "size_pct": round(size_pct, 5), "size_usd": round(size_usd, 2),
+        "confidence": round(confidence, 3),
+        "side_notes": side_notes,
+    }
+    row = {
+        "game_slug": game_slug, "game_date": game_date,
+        "market_question": sanitize_text(totals.get("question", "")),
+        "condition_id": totals.get("condition_id"),
+        "token_id": chosen["token"], "line": line, "side": chosen["side"],
+        "entry_price": price, "decimal_odds": odds,
+        "model_prob": chosen["p_model"], "edge": chosen["edge"],
+        "mu": m["mu"], "variance": m["var"], "dispersion": args.dispersion,
+        "park_factor": park_factor, "confidence": confidence,
+        "size_pct": size_pct, "size_usd": size_usd, "kelly_fraction": kelly,
+        "used_external": m["used_external"], "fee_rate": args.fee_rate,
+        "strategy": STRATEGY, "stats": stats,
+    }
+    try:
+        return predictions_db.record_prediction(row, db_path)
+    except Exception as e:  # noqa: BLE001 - recording must never block a suggestion
+        if args.debug:
+            print(f"[record] failed: {e}", file=sys.stderr)
+        return None
+
+
 def run(args) -> dict:
     api = APIClient(rate_limit_ms=args.rate_limit, debug=args.debug)
     target = args.date or now_utc().date().isoformat()
@@ -241,12 +303,12 @@ def run(args) -> dict:
                 api, event_slug, target, projections_csv=args.projections_csv,
                 debug=args.debug) or {}
 
-        p_over, p_under, mu, used_external = model_probabilities(
+        m = model_probabilities(
             line, ou["over_price"], park_factor, inputs,
             league_baseline=args.league_baseline, dispersion=args.dispersion)
 
-        chosen, side_notes = pick_side(line, ou, p_over, p_under, args.fee_rate,
-                                       args.odds_min, args.odds_max)
+        chosen, side_notes = pick_side(line, ou, m["p_over"], m["p_under"],
+                                       args.fee_rate, args.odds_min, args.odds_max)
         if not chosen:
             skipped.append({"game": event_slug, "line": line,
                             "reason": "no positive-edge side within 1.60x-3.0x band",
@@ -272,12 +334,21 @@ def run(args) -> dict:
                             "reason": f"size ${size_usd:.2f} below $10 minimum"})
             continue
 
-        confidence = max(0.5, min(0.5 + chosen["edge"], 0.65)) if used_external else 0.5
-        rec, text = build_recommendation(event_slug, totals, line, chosen, mu,
-                                         used_external, size_pct, size_usd,
+        confidence = (max(0.5, min(0.5 + chosen["edge"], 0.65))
+                      if m["used_external"] else 0.5)
+        rec, text = build_recommendation(event_slug, totals, line, chosen, m["mu"],
+                                         m["used_external"], size_pct, size_usd,
                                          confidence, args.fee_rate, ou)
-        suggestions.append({"game": event_slug, "line": line, "mu": round(mu, 3),
-                            "recommendation": rec})
+
+        prediction_id = None
+        if args.record:
+            prediction_id = record_prediction_row(
+                args.predictions_db, event_slug, target, totals, line, chosen, m,
+                ou, inputs, park_factor, size_pct, size_usd, kelly, confidence,
+                side_notes, args)
+
+        suggestions.append({"game": event_slug, "line": line, "mu": round(m["mu"], 3),
+                            "prediction_id": prediction_id, "recommendation": rec})
         texts.append(text)
 
     result = {
@@ -354,6 +425,12 @@ def main() -> None:
     p.add_argument("--refresh-prices", action="store_true", help="Refresh prices via CLOB midpoint")
     p.add_argument("--portfolio-value", type=float, default=10000.0, help="Portfolio USD for sizing")
     p.add_argument("--portfolio-db", default=None, help="Paper portfolio DB (to detect first trade)")
+    p.add_argument("--record", dest="record", action="store_true", default=True,
+                   help="Record predictions (+stats log) to the predictions DB (default on)")
+    p.add_argument("--no-record", dest="record", action="store_false",
+                   help="Do not record predictions")
+    p.add_argument("--predictions-db", default=predictions_db.DEFAULT_DB,
+                   help=f"Predictions DB path (default {predictions_db.DEFAULT_DB})")
     p.add_argument("--paper", action="store_true", help="Pipe suggestions into the paper trader")
     p.add_argument("--paper-execute", action="store_true", help="Actually place paper trades (default dry-run)")
     p.add_argument("--output", choices=["json", "text"], default="json")

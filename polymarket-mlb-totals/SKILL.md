@@ -87,12 +87,41 @@ list_games_today (scanner)  →  find total-runs Over/Under market  →  NegBin 
 | `--refresh-prices` | off | Refresh prices via CLOB midpoint |
 | `--portfolio-value F` | 10000 | Portfolio USD for sizing |
 | `--portfolio-db PATH` | — | Paper DB (detects first trade → 1% cap) |
+| `--record / --no-record` | on | Record each prediction (+ stats log) to the predictions DB |
+| `--predictions-db PATH` | `~/.polymarket-mlb-totals/predictions.db` | Predictions store path |
 | `--paper` / `--paper-execute` | off | Pipe to paper trader (dry-run unless `--paper-execute`) |
 | `--output json\|text` | json | Output format |
 | `--rate-limit MS` / `--debug` | 100 / off | API pacing / logging |
 
-Output: `suggestions[]` (each a paper-trader-ready recommendation + the model μ/line) and
-`skipped[]` (every game not suggested, with the reason — CLAUDE.md rule #8).
+Output: `suggestions[]` (each a paper-trader-ready recommendation + the model μ/line and the
+recorded `prediction_id`) and `skipped[]` (every game not suggested, with the reason — rule #8).
+
+## Predictions store & settlement (`track_predictions.py`)
+
+Every suggested prediction is persisted (by default) to a dedicated SQLite DB
+(`~/.polymarket-mlb-totals/predictions.db`, separate from the paper trader) for later
+analysis — calibration, win rate, CLV. Each row stores the prediction, the **full
+statistical/mathematical audit** behind it (`stats_log`, JSON: μ, variance, NegBin params,
+park factor, inputs used, P(Over)/P(Under)/push, edge, odds, Kelly, sizing, both-sides notes),
+and a **status**:
+
+| Status | Meaning |
+|---|---|
+| `PENDENTE` | default — the game/bet has not settled yet |
+| `ACERTO` | settled and the prediction was correct |
+| `ERRO` | settled and the prediction was wrong |
+| `ANULADO` | push/void (integer line where total == line) |
+
+```bash
+# Review and settle
+python polymarket-mlb-totals/scripts/track_predictions.py --summary
+python polymarket-mlb-totals/scripts/track_predictions.py --list --status PENDENTE --output text
+python polymarket-mlb-totals/scripts/track_predictions.py --settle-game mlb-hou-kc-2026-06-13 --actual-total 9
+python polymarket-mlb-totals/scripts/track_predictions.py --auto-settle --date 2026-06-13   # MLB Stats API finals (best-effort)
+```
+
+Re-recording the same game/line/side while `PENDENTE` updates the snapshot (captures line
+movement); a settled row is never overwritten. Schema in `references/predictions-store.md`.
 
 ## Honest limitations (read `references/edge-and-risk.md`)
 

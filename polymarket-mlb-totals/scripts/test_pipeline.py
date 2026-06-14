@@ -8,6 +8,7 @@ network. Run: python polymarket-mlb-totals/scripts/test_pipeline.py
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -40,13 +41,13 @@ def ou_of(market):
 class TestFallbackNoEdge(unittest.TestCase):
     def test_market_implied_yields_no_actionable_edge(self):
         line, over_price = 8.5, 0.55
-        p_over, p_under, mu, used = st.model_probabilities(
+        m = st.model_probabilities(
             line, over_price, 100.0, {}, league_baseline=8.5, dispersion=2.0)
-        self.assertFalse(used)
+        self.assertFalse(m["used_external"])
         # P(Over) reproduces the market within tolerance -> ~zero edge.
-        self.assertAlmostEqual(p_over, over_price, delta=2e-3)
+        self.assertAlmostEqual(m["p_over"], over_price, delta=2e-3)
         mkt = totals_market(line, over_price, 1 - over_price)
-        chosen, _notes = st.pick_side(line, ou_of(mkt), p_over, p_under,
+        chosen, _notes = st.pick_side(line, ou_of(mkt), m["p_over"], m["p_under"],
                                       0.0, 1.60, 3.00)
         # Even if a microscopic edge sneaks through, the decision tree rejects it.
         if chosen:
@@ -60,13 +61,13 @@ class TestRealInputsCreateEdge(unittest.TestCase):
         line, over_price = 8.5, 0.52
         inputs = {"home_off": 1.2, "away_off": 1.2, "home_sp": 1.1, "away_sp": 1.1,
                   "home_field": 0.1}
-        p_over, p_under, mu, used = st.model_probabilities(
+        m = st.model_probabilities(
             line, over_price, 100.0, inputs, league_baseline=8.5, dispersion=2.0)
-        self.assertTrue(used)
-        self.assertGreater(mu, 9.0)              # offense raised the mean
-        self.assertGreater(p_over, over_price)   # -> positive Over edge
+        self.assertTrue(m["used_external"])
+        self.assertGreater(m["mu"], 9.0)              # offense raised the mean
+        self.assertGreater(m["p_over"], over_price)   # -> positive Over edge
         mkt = totals_market(line, over_price, 1 - over_price)
-        chosen, _ = st.pick_side(line, ou_of(mkt), p_over, p_under, 0.0, 1.60, 3.00)
+        chosen, _ = st.pick_side(line, ou_of(mkt), m["p_over"], m["p_under"], 0.0, 1.60, 3.00)
         self.assertIsNotNone(chosen)
         self.assertEqual(chosen["side"], "OVER")
         self.assertEqual(chosen["token"], "o1")
@@ -179,6 +180,72 @@ class TestFirstTrade(unittest.TestCase):
         self.assertTrue(data_inputs.is_first_trade("mlb-totals-negbin", "/no/such/file.db"))
 
 
+class TestPredictionsDB(unittest.TestCase):
+    """The predictions store: record (PENDENTE) -> settle (ACERTO/ERRO/ANULADO)."""
+
+    def _pred(self, **kw):
+        base = dict(game_slug="mlb-hou-kc-2026-06-13", game_date="2026-06-13",
+                    market_question="total runs over/under 8.5?",
+                    condition_id="0xabc", token_id="o1", line=8.5, side="OVER",
+                    entry_price=0.50, decimal_odds=2.0, model_prob=0.60, edge=0.10,
+                    mu=9.3, variance=18.6, dispersion=2.0, park_factor=104.0,
+                    confidence=0.6, size_pct=0.01, size_usd=100.0,
+                    kelly_fraction=0.2, used_external=True, fee_rate=0.0,
+                    strategy="mlb-totals-negbin",
+                    stats={"model": "negative_binomial", "mu": 9.3, "inputs": {}})
+        base.update(kw)
+        return base
+
+    def test_record_is_pendente_with_stats_log(self):
+        import predictions_db as pdb
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "p.db")
+            pid = pdb.record_prediction(self._pred(), db)
+            rows = pdb.get_predictions(db)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["status"], "PENDENTE")
+            self.assertEqual(rows[0]["id"], pid)
+            self.assertEqual(json.loads(rows[0]["stats_log"])["model"], "negative_binomial")
+
+    def test_upsert_keeps_one_row_while_pending(self):
+        import predictions_db as pdb
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "p.db")
+            pdb.record_prediction(self._pred(entry_price=0.50), db)
+            pdb.record_prediction(self._pred(entry_price=0.48), db)  # line moved
+            rows = pdb.get_predictions(db)
+            self.assertEqual(len(rows), 1)
+            self.assertAlmostEqual(rows[0]["entry_price"], 0.48)  # refreshed snapshot
+
+    def test_settle_hit_and_miss(self):
+        import predictions_db as pdb
+        self.assertEqual(pdb.compute_status("OVER", 8.5, 9), "ACERTO")
+        self.assertEqual(pdb.compute_status("OVER", 8.5, 8), "ERRO")
+        self.assertEqual(pdb.compute_status("UNDER", 8.5, 8), "ACERTO")
+        self.assertEqual(pdb.compute_status("UNDER", 8.5, 9), "ERRO")
+        self.assertEqual(pdb.compute_status("OVER", 9.0, 9), "ANULADO")  # push
+
+    def test_settle_game_updates_status_and_summary(self):
+        import predictions_db as pdb
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "p.db")
+            pdb.record_prediction(self._pred(side="OVER", line=8.5), db)
+            pdb.record_prediction(self._pred(side="OVER", line=9.5,
+                                             game_slug="mlb-nyy-bos-2026-06-13"), db)
+            # First game totals 10 -> OVER 8.5 is ACERTO.
+            res = pdb.settle_game("mlb-hou-kc-2026-06-13", 10, db)
+            self.assertEqual(res[0]["status"], "ACERTO")
+            s = pdb.summary(db)
+            self.assertEqual(s["acerto"], 1)
+            self.assertEqual(s["pendente"], 1)   # the other game still pending
+            self.assertEqual(s["win_rate"], 1.0)
+            # A settled row is immutable on re-record.
+            pdb.record_prediction(self._pred(side="OVER", line=8.5, entry_price=0.9), db)
+            row = [r for r in pdb.get_predictions(db) if r["line"] == 8.5][0]
+            self.assertEqual(row["status"], "ACERTO")
+            self.assertAlmostEqual(row["actual_total"], 10.0)
+
+
 class _NoNetAPI:
     """Stub APIClient whose .get always fails (simulates blocked network)."""
     def __init__(self, *a, **k):
@@ -230,24 +297,39 @@ class TestEndToEndRun(unittest.TestCase):
                 # Strong offenses + weak pitching -> mu well above 8.5 -> Over edge.
                 fh.write("team,off_factor,pitch_factor\nkc,1.25,1.10\nhou,1.25,1.10\n")
 
+            preds_db = os.path.join(d, "preds.db")
             args = _Args(date="2026-06-14", projections_csv=csv_path,
-                         use_external=True, paper=True, paper_execute=False)
+                         use_external=True, paper=True, paper_execute=False,
+                         record=True, predictions_db=preds_db)
             result = st.run(args)
 
-        self.assertEqual(result["counts"]["games"], 2)
-        self.assertGreaterEqual(result["counts"]["suggestions"], 1)
-        sug = result["suggestions"][0]
-        rec = sug["recommendation"]
-        self.assertEqual(rec["token_id"], "A_over")     # bet Over on its token
-        self.assertEqual(rec["side"], "YES")
-        self.assertEqual(rec["strategy"], "mlb-totals-negbin")
-        self.assertLessEqual(rec["size_pct"], 0.01)     # first-trade cap
-        self.assertTrue(rd.passes_odds_filter(rec["price"]))
-        # Game B (moneyline only) was skipped with a reason.
-        self.assertTrue(any(s["reason"] == "no total-runs market" for s in result["skipped"]))
-        # --paper dry-run produced a result per suggestion.
-        self.assertIn("paper_results", result)
-        self.assertEqual(len(result["paper_results"]), result["counts"]["suggestions"])
+            self.assertEqual(result["counts"]["games"], 2)
+            self.assertGreaterEqual(result["counts"]["suggestions"], 1)
+            sug = result["suggestions"][0]
+            rec = sug["recommendation"]
+            self.assertEqual(rec["token_id"], "A_over")     # bet Over on its token
+            self.assertEqual(rec["side"], "YES")
+            self.assertEqual(rec["strategy"], "mlb-totals-negbin")
+            self.assertLessEqual(rec["size_pct"], 0.01)     # first-trade cap
+            self.assertTrue(rd.passes_odds_filter(rec["price"]))
+            # Game B (moneyline only) was skipped with a reason.
+            self.assertTrue(any(s["reason"] == "no total-runs market" for s in result["skipped"]))
+            # --paper dry-run produced a result per suggestion.
+            self.assertIn("paper_results", result)
+            self.assertEqual(len(result["paper_results"]), result["counts"]["suggestions"])
+
+            # Prediction was recorded with PENDENTE status + a stats audit log.
+            import predictions_db as pdb
+            self.assertIsNotNone(sug["prediction_id"])
+            rows = pdb.get_predictions(preds_db, status="PENDENTE")
+            self.assertGreaterEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual(row["side"], "OVER")
+            self.assertEqual(row["game_slug"], "mlb-hou-kc-2026-06-14")
+            stats = json.loads(row["stats_log"])
+            self.assertEqual(stats["model"], "negative_binomial")
+            self.assertIn("mu", stats)
+            self.assertIn("inputs", stats)         # math/stats audit present
 
 
 class _Args:
@@ -258,6 +340,7 @@ class _Args:
                         league_baseline=8.5, fee_rate=0.0, use_external=True,
                         projections_csv=None, refresh_prices=False,
                         portfolio_value=10000.0, portfolio_db=None,
+                        record=False, predictions_db=None,
                         paper=False, paper_execute=False, rate_limit=0, debug=False)
         defaults.update(kw)
         self.__dict__.update(defaults)
