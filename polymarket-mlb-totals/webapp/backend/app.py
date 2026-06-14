@@ -188,6 +188,22 @@ def predictions(status: str | None = Query(None), date: str | None = Query(None)
     return {"predictions": pdb.get_predictions(DB_PATH, status=status, game_date=date)}
 
 
+@app.post("/api/cache/clear")
+def clear_cache(date: str | None = Query(None)) -> dict:
+    """Delete the analyses cache (all, or one date) so the next call recomputes."""
+    _ensure_cache_table()
+    con = pdb.connect(DB_PATH)
+    try:
+        with con:
+            if date:
+                n = con.execute("DELETE FROM analysis_cache WHERE date=?", (date,)).rowcount
+            else:
+                n = con.execute("DELETE FROM analysis_cache").rowcount
+        return {"cleared_rows": n, "date": date or "all"}
+    finally:
+        con.close()
+
+
 @app.post("/api/seed-demo")
 def seed_demo_route(reset: bool = Query(False)) -> dict:
     """Populate sample predictions so the UI is usable offline (demo only)."""

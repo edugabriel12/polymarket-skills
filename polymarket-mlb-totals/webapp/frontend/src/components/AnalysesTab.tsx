@@ -1,4 +1,5 @@
-import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { motion } from "framer-motion";
 import { RefreshCw, Database, CalendarDays, Inbox, BadgeInfo } from "lucide-react";
 import { api } from "@/lib/api";
@@ -14,12 +15,26 @@ function msUntilEndOfDay() {
 }
 
 export function AnalysesTab() {
-  const { data, isLoading, isFetching, refetch } = useQuery({
+  const qc = useQueryClient();
+  const [recalculating, setRecalculating] = useState(false);
+  const { data, isLoading, isFetching } = useQuery({
     queryKey: ["analyses"],
     queryFn: () => api.analyses(),
     staleTime: msUntilEndOfDay(),
     refetchOnWindowFocus: false,
   });
+
+  // "Recalcular" forces the backend to drop the day's cache and recompute.
+  const recalc = async () => {
+    setRecalculating(true);
+    try {
+      await api.analyses(undefined, true); // force=true overwrites the cached payload
+      await qc.invalidateQueries({ queryKey: ["analyses"] });
+    } finally {
+      setRecalculating(false);
+    }
+  };
+  const busy = isFetching || recalculating;
 
   return (
     <div className="space-y-5">
@@ -34,8 +49,8 @@ export function AnalysesTab() {
             </span>
           )}
         </div>
-        <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isFetching}>
-          <RefreshCw className={isFetching ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
+        <Button variant="outline" size="sm" onClick={recalc} disabled={busy}>
+          <RefreshCw className={busy ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
           Recalcular
         </Button>
       </div>
