@@ -54,12 +54,15 @@ python polymarket-soccer-goals/scripts/test_pipeline.py
 - **λ from data (automatic):** `total` (league baseline × attack/defense) + `supremacy` →
   `λ_home=(total+sup)/2`, `λ_away=(total−sup)/2`. The **league baseline** (avg goals/game — the
   total anchor) is **auto-calibrated** from the current season's finished matches via
-  **football-data.org** (`baselines_source.py`; set `FOOTBALL_DATA_TOKEN`), falling back to the static
-  `LEAGUE_BASELINES` per league when offline or below a min-matches floor. Strength is resolved
+  **football-data.org** (`baselines_source.py`; set `FOOTBALL_DATA_TOKEN`) — or the **API-Football**
+  league table (`APIFOOTBALL_KEY`) for leagues it doesn't cover (e.g. Série B) — falling back to the
+  static `LEAGUE_BASELINES` per league when offline or below a min-matches floor. Strength is resolved
   automatically, in order:
-  **(1)** a ratings CSV if given, **(2)** xG via `soccerdata`, **(3)** Elo — **national-team Elo for
-  international games (World Cup)** and **Club Elo for club leagues**. No manual input needed for
-  covered teams. **BTTS is asymmetric** — governed by the smaller λ (weak attack vs strong defense).
+  **(1)** a ratings CSV if given, **(2)** xG via `soccerdata`, **(3)** **API-Football season
+  attack/defense** (`apifootball_source.py`; set `APIFOOTBALL_KEY` — covers leagues Club Elo lacks,
+  e.g. **Brasileirão Série B**), **(4)** Elo — **national-team Elo for international games (World Cup)**
+  and **Club Elo for club leagues**. No manual input needed for covered teams. **BTTS is asymmetric**
+  — governed by the smaller λ (weak attack vs strong defense).
 - **Anti-fabrication:** if no source covers a match, the model is **market-implied** (matches the
   Over and BTTS prices), so edge ≈ 0 and nothing is suggested. Real edge appears only when a rating
   source moves λ off the market.
@@ -104,8 +107,11 @@ python polymarket-soccer-goals/scripts/track_soccer.py --settle-game fifwc-nld-j
 ## Honest limitations
 - **Market near-efficient at close; realistic O/U yield ~0.8%** (research). Any model implying >10%
   yield is overfit. Validate with Brier/log-loss + CLV over **~1,000+ entries** before real capital.
-- **Ratings are automatic** (national-team Elo for the World Cup, Club Elo for club leagues, optional
-  xG via `soccerdata`). The national-team Elo is a **baked-in snapshot** (`ratings_sources.py`) to
+- **Ratings are automatic** (national-team Elo for the World Cup, Club Elo for European club leagues,
+  **API-Football season attack/defense** for leagues Club Elo lacks — e.g. **Brasileirão Série B**,
+  set `APIFOOTBALL_KEY`, free 100 req/day — and optional xG via `soccerdata`). API-Football resolves
+  each team by fuzzy-matching the Polymarket abbreviation to the league table (ambiguous → skipped, no
+  wrong data). The national-team Elo is a **baked-in snapshot** (`ratings_sources.py`) to
   refresh periodically; Club Elo needs the club in the alias map; xG needs `soccerdata` + a team-name
   map (ToS-flagged). A `--ratings-csv` overrides everything. Teams not covered by any source fall back
   to market-implied (zero edge — no fabrication).

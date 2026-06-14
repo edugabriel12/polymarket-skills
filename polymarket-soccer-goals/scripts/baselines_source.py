@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 
 import leagues
+import apifootball_source as apif
 
 FOOTBALL_DATA_API = "https://api.football-data.org/v4"
 
@@ -107,29 +108,36 @@ def fetch_league_baseline(prefix: str | None, token: str | None, *,
 
 
 def calibrate_baselines(prefixes, token: str | None = None, *, season: int | None = None,
-                        timeout: int = 8, debug: bool = False) -> dict[str, float]:
+                        date: str | None = None, timeout: int = 8,
+                        debug: bool = False) -> dict[str, float]:
     """Map {league_prefix -> calibrated baseline} for the prefixes that succeed.
 
-    Prefixes with no FD code, no key, or too few finished matches are omitted (the
-    caller then falls back to leagues.league_baseline). One request per league.
+    Per league: try football-data.org (current-season finished matches); for leagues
+    it doesn't cover (e.g. Série B) fall back to API-Football's league table. Prefixes
+    that neither source resolves are omitted (caller uses leagues.league_baseline).
     """
     token = token or os.environ.get("FOOTBALL_DATA_TOKEN")
     out: dict[str, float] = {}
-    if not token:
-        return out
     seen_codes: dict[str, float] = {}
     for p in {(x or "").strip().lower() for x in prefixes if x}:
-        code = fd_code(p)
-        if not code:
-            continue
-        if code in seen_codes:  # alias of an already-fetched competition
-            out[p] = seen_codes[code]
-            continue
-        val = fetch_league_baseline(p, token, season=season, timeout=timeout)
+        code, val, src = fd_code(p), None, None
+        if code and token:
+            if code in seen_codes:  # alias of an already-fetched competition
+                out[p] = seen_codes[code]
+                continue
+            val = fetch_league_baseline(p, token, season=season, timeout=timeout)
+            if val is not None:
+                src = "football-data"
+        if val is None:  # football-data.org gap -> API-Football league table
+            val = apif.league_baseline(p, date)
+            if val is not None:
+                src = "api-football"
         if val is not None:
-            out[p] = seen_codes[code] = val
+            out[p] = val
+            if code:
+                seen_codes[code] = val
             if debug:
-                print(f"  [baseline] {p}: calibrated {val:.2f} "
+                print(f"  [baseline] {p}: calibrated {val:.2f} via {src} "
                       f"(static {leagues.LEAGUE_BASELINES.get(p, leagues.DEFAULT_BASELINE):.2f})")
     return out
 

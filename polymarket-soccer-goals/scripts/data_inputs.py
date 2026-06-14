@@ -20,6 +20,7 @@ import os
 import sqlite3
 
 import ratings_sources as rs
+import apifootball_source as apif
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +82,7 @@ def load_ratings(csv_path: str) -> dict[str, dict]:
 def get_match_inputs(api, home_abbr: str | None, away_abbr: str | None,
                      league_prefix: str | None, *, ratings: dict | None = None,
                      international: bool = False, auto: bool = True,
-                     debug: bool = False) -> dict:
+                     date: str | None = None, debug: bool = False) -> dict:
     """Return model inputs for a match, or {} to trigger the zero-edge fallback.
 
     Keys: home_elo, away_elo, att_home, def_home, att_away, def_away,
@@ -113,6 +114,15 @@ def get_match_inputs(api, home_abbr: str | None, away_abbr: str | None,
         xg = rs.fetch_team_xg(home_abbr, away_abbr, league_prefix or "", debug=debug)
         if xg:
             return xg
+
+    # 2.5 API-Football season attack/defense (club leagues; covers e.g. Série B,
+    # which Club Elo lacks). Returns total_xg + supremacy_xg directly.
+    if not international and home_abbr and away_abbr:
+        af = apif.team_inputs(home_abbr, away_abbr, league_prefix, date)
+        if af:
+            if not debug:
+                af.pop("_resolved", None)
+            return af
 
     # 3. Elo — national teams for international games, Club Elo for club leagues.
     if international:
