@@ -70,13 +70,23 @@ list_games_today (scanner)  →  find total-runs Over/Under market  →  NegBin 
   and nothing is suggested. Real edge appears only when real inputs move μ off the market.
 - **Edge type & sizing:** classified as **news-driven** (model/forecast) → **2% cap**, **1% on the
   first trades** of this new strategy; half-Kelly via the advisor. See `references/edge-and-risk.md`.
+- **Scope filters:** only **MLB** games (slug prefix `mlb-`) and only **full-game run-total** markets
+  (`...-total-<line>`) — moneyline, spreads, first-5-innings (`-f5-`), strikeout props (`-k-`), and
+  NRFI are excluded, so a non-run total is never modeled.
+- **Daily-sports gates (relax the generic constitution rules):** this operation targets the day's
+  games, so it bets **pre-game only** (game not started, `--min-hours 0`) instead of the generic
+  ">24h to resolution" rule, and uses a **$1,000** volume floor (MLB total sub-markets are thinner
+  than the generic $10k). By default it suggests the **best-edge line per game** (`--all-lines` to
+  show every line).
 
 ## Script: suggest_totals.py
 
 | Flag | Default | Purpose |
 |---|---|---|
 | `--date YYYY-MM-DD` | today (UTC) | Target day |
-| `--min-volume N` | 10000 | Decision-tree volume gate ($/24h) |
+| `--min-volume N` | 1000 | Decision-tree volume gate ($/24h) |
+| `--min-hours F` | 0 | Min hours until game start (0 = pre-game only, not started) |
+| `--all-lines` | off | Suggest every qualifying line (default: best-edge line per game) |
 | `--min-edge F` | 0.05 | Min edge after fees (decision tree) |
 | `--odds-min / --odds-max` | 1.60 / 3.00 | Decimal payout band (→ price 0.625 … 0.333) |
 | `--dispersion F` | 2.0 | `variance = dispersion × mean` |

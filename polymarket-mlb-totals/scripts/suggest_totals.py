@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -38,6 +39,16 @@ from category_common import (
 )
 
 STRATEGY = "mlb-totals-negbin"
+
+# Full-GAME total-runs market slug: "...-YYYY-MM-DD-total-<line>[pt5]".
+# This excludes moneyline, spreads, first-5-innings (-f5-), strikeout props (-k-),
+# NRFI, etc., so the run model never evaluates a non-run-total market.
+_GAME_TOTAL_RE = re.compile(r"-\d{4}-\d{2}-\d{2}-total-\d{1,2}(?:pt5)?$")
+
+
+def matchup_key(slug: str) -> str:
+    """Strip the -total-<line> suffix to get the base matchup (for best-line dedupe)."""
+    return _GAME_TOTAL_RE.sub("", slug)
 
 # CLAUDE.md per-trade caps for this model/news-driven edge.
 CAP_MODEL = 0.02
@@ -121,8 +132,12 @@ def pick_side(line, ou, p_over, p_under, fee_rate, odds_min, odds_max):
 
 
 def decision_tree(chosen, totals_market, ou, *, min_volume, min_edge,
-                  max_spread=0.10, min_hours=24.0):
-    """Run the entry decision tree. Returns (passed: bool, reason: str|None)."""
+                  max_spread=0.10, min_hours=0.0):
+    """Run the entry decision tree. Returns (passed: bool, reason: str|None).
+
+    For daily MLB totals, min_hours defaults to 0: the game must not have started
+    yet (end_date in the future), rather than the generic >24h horizon rule.
+    """
     vol = float(totals_market.get("volume_24h") or 0)
     if vol < min_volume:
         return False, f"volume ${vol:,.0f}/24h < ${min_volume:,.0f}"
@@ -140,7 +155,9 @@ def decision_tree(chosen, totals_market, ou, *, min_volume, min_edge,
             dt = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
             hours = (dt - now_utc()).total_seconds() / 3600.0
             if hours < min_hours:
-                return False, f"end_date {hours:.1f}h away < {min_hours:.0f}h"
+                if hours < 0:
+                    return False, f"game already started ({-hours:.1f}h ago)"
+                return False, f"game starts in {hours:.1f}h < {min_hours:.0f}h lead"
         except ValueError:
             pass
 
@@ -289,9 +306,16 @@ def run(args) -> dict:
         games = {k: v for k, v in games.items() if k.lower().startswith(prefix)}
         filtered_non_league = before - len(games)
         vlog(f"  filtered out {filtered_non_league} non-'{prefix}' event(s); "
-             f"{len(games)} MLB game(s) to analyze")
+             f"{len(games)} MLB event(s)")
+
+    # Keep only full-GAME total-runs markets (drop moneyline/spread/F5/K-prop/NRFI).
+    before_total = len(games)
+    games = {k: v for k, v in games.items() if _GAME_TOTAL_RE.search(k.lower())}
+    filtered_non_total = before_total - len(games)
+    vlog(f"  dropped {filtered_non_total} non-run-total event(s) "
+         f"(moneyline/spread/F5/K-prop/NRFI); {len(games)} run-total market(s) to analyze")
     if games:
-        vlog("  MLB games: " + ", ".join(sorted(games)))
+        vlog("  run-total markets: " + ", ".join(sorted(games)))
 
     portfolio_value = float(args.portfolio_value)
     first_trade = data_inputs.is_first_trade(STRATEGY, args.portfolio_db)
@@ -358,7 +382,8 @@ def run(args) -> dict:
             continue
 
         passed, reason = decision_tree(chosen, totals, ou,
-                                       min_volume=args.min_volume, min_edge=args.min_edge)
+                                       min_volume=args.min_volume, min_edge=args.min_edge,
+                                       min_hours=args.min_hours)
         if not passed:
             _skip(event_slug, reason, line=line, side=chosen["side"])
             continue
@@ -388,14 +413,27 @@ def run(args) -> dict:
                 side_notes, args)
 
         suggestions.append({"game": event_slug, "line": line, "mu": round(m["mu"], 3),
-                            "prediction_id": prediction_id, "recommendation": rec})
-        texts.append(text)
+                            "edge": round(chosen["edge"], 4), "prediction_id": prediction_id,
+                            "recommendation": rec, "_text": text})
         vlog(f"  [{event_slug}] >>> SUGGEST {chosen['side']} {line} @ {chosen['price']:.3f} "
              f"(payout {rd.decimal_odds(chosen['price']):.2f}x) edge={chosen['edge']*100:+.1f}% "
              f"size={size_pct*100:.2f}% conf={confidence:.2f} pred_id={prediction_id}")
 
+    # Best-line-per-game: keep only the highest-edge line for each matchup.
+    if args.best_line_only and suggestions:
+        best: dict[str, dict] = {}
+        for s in suggestions:
+            key = matchup_key(s["game"])
+            if key not in best or s["edge"] > best[key]["edge"]:
+                best[key] = s
+        before_dedupe = len(suggestions)
+        suggestions = sorted(best.values(), key=lambda s: s["edge"], reverse=True)
+        if before_dedupe != len(suggestions):
+            vlog(f"  best-line-per-game: {before_dedupe} -> {len(suggestions)} suggestion(s)")
+
+    texts = [s.pop("_text") for s in suggestions]
     vlog(f"=== Done: {len(suggestions)} suggestion(s), {len(skipped)} skipped, "
-         f"{filtered_non_league} non-MLB filtered ===")
+         f"{filtered_non_league} non-MLB + {filtered_non_total} non-run-total filtered ===")
 
     result = {
         "date": target,
@@ -403,7 +441,8 @@ def run(args) -> dict:
         "first_trade_strategy": first_trade,
         "counts": {"games": len(games), "suggestions": len(suggestions),
                    "skipped": len(skipped),
-                   "filtered_non_mlb": filtered_non_league},
+                   "filtered_non_mlb": filtered_non_league,
+                   "filtered_non_total": filtered_non_total},
         "suggestions": suggestions,
         "skipped": skipped,
         "disclaimer": "Paper-trading simulation — not financial advice. Real "
@@ -457,7 +496,12 @@ def render_text(result: dict) -> str:
 def main() -> None:
     p = argparse.ArgumentParser(description="Suggest MLB total-runs entries on Polymarket.")
     p.add_argument("--date", default=None, help="Target day YYYY-MM-DD (default today UTC)")
-    p.add_argument("--min-volume", type=float, default=10000.0, help="Min 24h volume (decision tree)")
+    p.add_argument("--min-volume", type=float, default=1000.0,
+                   help="Min 24h volume (default 1000; lower than the generic 10k for MLB totals)")
+    p.add_argument("--min-hours", type=float, default=0.0,
+                   help="Min hours until game start (default 0 = pre-game only, not started)")
+    p.add_argument("--all-lines", dest="best_line_only", action="store_false", default=True,
+                   help="Suggest every qualifying line (default: best-edge line per game only)")
     p.add_argument("--min-edge", type=float, default=0.05, help="Min edge after fees (default 0.05)")
     p.add_argument("--odds-min", type=float, default=rd.ODDS_MIN_DEFAULT, help="Min decimal payout (default 1.60)")
     p.add_argument("--odds-max", type=float, default=rd.ODDS_MAX_DEFAULT, help="Max decimal payout (default 3.00)")
