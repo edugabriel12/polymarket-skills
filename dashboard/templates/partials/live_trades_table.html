@@ -1,0 +1,53 @@
+{# Live trades table from ~/.polymarket-live/trades.log #}
+
+{% if not trades %}
+<div class="empty-state">
+  <div class="empty-icon">○</div>
+  <div class="empty-title">No live trades yet</div>
+  <div class="empty-msg">When the bot executes a real trade, it logs to
+    <code>~/.polymarket-live/trades.log</code> and shows here.</div>
+</div>
+{% else %}
+<div class="table-filter">
+  <input type="text" data-filter-target="live-trades-table"
+         placeholder="Filter by token, side, status…">
+  <span class="filter-count" id="live-trades-table-filter-count"></span>
+</div>
+<table class="data-table data-table-compact" id="live-trades-table">
+  <thead>
+    <tr>
+      <th>When (UTC)</th>
+      <th>Status</th>
+      <th>Side</th>
+      <th>Size</th>
+      <th>Price</th>
+      <th>Cost USD</th>
+      <th>Token</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for t in trades %}
+    <tr>
+      <td class="mono small">{{ (t.timestamp or t.ts or '')[:16] }}</td>
+      <td class="mono small">
+        {% set st = t.status or 'UNKNOWN' %}
+        <span class="reason-tag reason-{{ st|lower }}">{{ st }}</span>
+      </td>
+      <td class="mono small">{{ t.side or '—' }}</td>
+      <td class="mono small">
+        {% if t.size %}{{ "%.2f"|format(t.size|float) }}{% else %}—{% endif %}
+      </td>
+      <td class="mono small">
+        {% if t.price %}${{ "%.3f"|format(t.price|float) }}{% else %}—{% endif %}
+      </td>
+      <td class="mono small">
+        {% if t.cost_usd %}${{ "%.2f"|format(t.cost_usd|float) }}{% else %}—{% endif %}
+      </td>
+      <td class="mono small">
+        {% if t.token_id %}{{ t.token_id|string|truncate(14) }}{% else %}—{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}

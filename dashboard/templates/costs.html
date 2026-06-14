@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="period-selector">
+  <span>Period:</span>
+  <button class="period-btn {% if days == 7 %}active{% endif %}"
+          hx-get="/api/costs?days=7" hx-target="#costs-body" hx-swap="innerHTML"
+          onclick="setActive(this)">7d</button>
+  <button class="period-btn {% if days == 14 %}active{% endif %}"
+          hx-get="/api/costs?days=14" hx-target="#costs-body" hx-swap="innerHTML"
+          onclick="setActive(this)">14d</button>
+  <button class="period-btn {% if days == 30 %}active{% endif %}"
+          hx-get="/api/costs?days=30" hx-target="#costs-body" hx-swap="innerHTML"
+          onclick="setActive(this)">30d</button>
+  <button class="period-btn {% if days == 90 %}active{% endif %}"
+          hx-get="/api/costs?days=90" hx-target="#costs-body" hx-swap="innerHTML"
+          onclick="setActive(this)">90d</button>
+  <button class="period-btn {% if days == 3650 %}active{% endif %}"
+          hx-get="/api/costs?days=3650" hx-target="#costs-body" hx-swap="innerHTML"
+          onclick="setActive(this)">all</button>
+</section>
+
+<div id="costs-body"
+     hx-get="/api/costs?days={{ days }}"
+     hx-trigger="load"
+     hx-swap="innerHTML">
+  <div class="muted">Loading costs…</div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+  function setActive(btn) {
+    document.querySelectorAll('.period-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+  }
+</script>
+{% endblock %}

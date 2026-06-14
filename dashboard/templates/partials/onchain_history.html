@@ -1,0 +1,95 @@
+{# On-chain transaction history (last N from Polygonscan).
+   Shows USDC.e transfers, Polymarket contract calls, MATIC movements,
+   and approvals — categorized + linked to Polygonscan. #}
+
+{% if not h.configured %}
+<div class="empty-state">
+  <div class="empty-icon">⛓</div>
+  <div class="empty-title">No wallet configured</div>
+  <div class="empty-msg">Set <code>POLYMARKET_PRIVATE_KEY</code> in
+    Settings to see on-chain history.</div>
+</div>
+{% elif h.n_total == 0 and h.rpc_errors %}
+<div class="empty-state">
+  <div class="empty-icon">⚠</div>
+  <div class="empty-title">No transactions found</div>
+  <div class="empty-msg">
+    Polygonscan returned no data — could be rate-limited (free tier:
+    5 req/sec, 100k/day shared).<br>
+    Set <code>POLYGONSCAN_API_KEY</code> in <code>agent/.env</code> for
+    higher caps. Or visit
+    <a href="{{ h.polygonscan_address_url }}" target="_blank" rel="noopener"
+       class="market-link">Polygonscan ↗</a>
+    directly.
+  </div>
+</div>
+{% elif h.n_total == 0 %}
+<div class="empty-state">
+  <div class="empty-icon">○</div>
+  <div class="empty-title">No on-chain activity yet</div>
+  <div class="empty-msg">
+    This wallet hasn't transacted on Polygon. Fund it with USDC.e + a
+    bit of MATIC for gas to start trading.<br>
+    <a href="{{ h.polygonscan_address_url }}" target="_blank" rel="noopener"
+       class="market-link">View on Polygonscan ↗</a>
+  </div>
+</div>
+{% else %}
+
+<div class="onchain-summary muted small">
+  Showing {{ h.n_total }} most-recent transactions ·
+  cached at {{ (h.cached_at_iso or '')[:19] }} UTC ·
+  <a href="{{ h.polygonscan_address_url }}" target="_blank" rel="noopener"
+     class="market-link">Polygonscan ↗</a>
+</div>
+
+<div class="table-filter">
+  <input type="text" data-filter-target="onchain-table"
+         placeholder="Filter by hash, counterparty, category…">
+  <span class="filter-count" id="onchain-table-filter-count"></span>
+</div>
+<table class="data-table data-table-compact" id="onchain-table">
+  <thead>
+    <tr>
+      <th>When (UTC)</th>
+      <th>Type</th>
+      <th>Amount</th>
+      <th>Counterparty</th>
+      <th>Tx</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for t in h.transactions %}
+    <tr {% if t.is_error %}class="row-warn"{% endif %}>
+      <td class="mono small">{{ (t.ts_iso or '')[:16] }}</td>
+      <td class="mono small">
+        <span class="reason-tag onchain-tag-{{ t.category }}">{{ t.category }}</span>
+        {% if t.is_error %}<span class="reason-tag reason-failed">FAILED</span>{% endif %}
+      </td>
+      <td class="mono small">{{ t.amount or '—' }}</td>
+      <td class="mono small">
+        {% if t.counterparty_label %}
+          <strong>{{ t.counterparty_label }}</strong>
+          <span class="muted">({{ t.counterparty_short }})</span>
+        {% else %}
+          {{ t.counterparty_short }}
+        {% endif %}
+      </td>
+      <td class="mono small">
+        <a href="{{ t.polygonscan_url }}" target="_blank" rel="noopener"
+           class="market-link" title="Open on Polygonscan">
+          {{ t.hash_short }} ↗
+        </a>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<button class="btn btn-disabled" style="margin-top: 8px;"
+        hx-get="/api/wallet/onchain?refresh=1"
+        hx-target="#onchain-zone"
+        hx-swap="innerHTML">
+  Refresh
+</button>
+{% endif %}

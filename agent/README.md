@@ -245,6 +245,136 @@ Lendo `CLAUDE.md` §4.1 e ativando este modo, você está conscientemente aceita
 
 ---
 
+## Weather Edge Bot (paper-only daemon)
+
+Sistema separado do agente Claude principal — é um par de daemons Python que:
+1. Detecta edges entre forecasts OpenWeather e preços de mercados weather no Polymarket.
+2. Submete propostas a um AI judge (Claude API) que cruza com NWS + Visual Crossing + web search.
+3. Executa só propostas aprovadas. Monitora pra cash-out oportunista.
+4. Persiste tudo em SQLite pra análise contrafactual e tuning de thresholds.
+
+### Pré-requisitos
+
+```bash
+# 1. API keys no .env
+OPENWEATHER_API_KEY=...        # free 1000/day
+VISUAL_CROSSING_API_KEY=...    # free 1000/day
+NWS_USER_AGENT="polymarket-weather-edge youremail@example.com"
+ANTHROPIC_API_KEY=...           # já configurada se usa o agent principal
+
+# 2. Paper portfolio inicializado
+python ~/polymarket-skills/polymarket-paper-trader/scripts/paper_engine.py --action init --balance 1000
+```
+
+### Smoke test (sem custo Anthropic)
+
+```bash
+cd ~/polymarket-skills
+python polymarket-analyzer/scripts/weather_edge_bot.py --once --dry-run --judge-mode=off --debug
+```
+
+Esperado: imprime mercados weather encontrados, edges calculadas, decisão (skip/propose) sem chamar API nem executar nada.
+
+### Deploy 24/7 (systemd)
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp agent/weather-edge-bot.service ~/.config/systemd/user/
+cp agent/weather-edge-judge.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now weather-edge-bot weather-edge-judge
+
+# Acompanhar:
+journalctl --user -u weather-edge-bot -u weather-edge-judge -f
+```
+
+### Análise periódica (depois de N trades)
+
+```bash
+python polymarket-analyzer/scripts/weather_edge_analyzer.py --since 2026-05-01
+```
+
+Output em markdown com:
+- Win rate por bucket de edge (10-15pp / 15-20pp / 20pp+)
+- Calibração de probabilidades (forecasts de 60% resolvem 60% das vezes?)
+- Counterfactual de cash-outs (quantos teriam sido melhor mantidos)
+- Performance do judge (cost, taxa de aprovação, valor perdido em rejeições)
+- Sugestões automáticas de tuning de thresholds (operador aprova manualmente)
+
+### Replay de uma decisão específica
+
+```bash
+python polymarket-analyzer/scripts/weather_edge_analyzer.py --replay-entry 42
+```
+
+Mostra o snapshot OpenWeather que o bot viu, o verdict do judge, o cashout (se houver), a resolução final, e o counterfactual.
+
+### Custos estimados
+
+- Anthropic API: $15-50/mês (Sonnet 4.6 + prompt caching, 5-15 reviews/dia)
+- OpenWeather: free tier suficiente (~96 calls/dia × discovery cycles)
+- Visual Crossing: free tier suficiente (~30 calls/dia se 5-15 propostas)
+
+### Killswitch
+
+```bash
+systemctl --user stop weather-edge-bot weather-edge-judge
+```
+
+Ou drena o spend cap pra $0:
+```bash
+echo "JUDGE_DAILY_BUDGET_USD=0" >> ~/polymarket-skills/agent/.env
+systemctl --user restart weather-edge-judge
+```
+
+### Strategy Advisor (meta-agente semanal)
+
+Lê semanalmente os relatórios agregados do bot (buckets de edge/TTR, calibração, judge stats, cashout triggers, performance por cidade, MAE observado) e propõe mudanças de tuning. **Só sugestões — nunca aplica nada sozinho.** Operador revisa e aplica manualmente.
+
+```bash
+# Run on-demand
+python polymarket-analyzer/scripts/weather_strategy_advisor.py --once --since-days 14
+
+# Preview do payload sem chamar API (gratuito)
+python polymarket-analyzer/scripts/weather_strategy_advisor.py --dry-run --since-days 14
+
+# Mock LLM (gratuito, gera artefatos com sugestão dummy)
+python polymarket-analyzer/scripts/weather_strategy_advisor.py --once --mock-llm --since-days 14
+
+# Deploy semanal automático (domingo 06:00 UTC)
+cp agent/weather-strategy-advisor.service ~/.config/systemd/user/
+cp agent/weather-strategy-advisor.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now weather-strategy-advisor.timer
+systemctl --user list-timers | grep advisor
+```
+
+Relatórios ficam em `~/.polymarket-paper/advisor_reports/YYYY-MM-DD_strategy_report.{md,json}`. Histórico de runs em SQLite: `SELECT * FROM advisor_runs;` em `~/.polymarket-paper/weather_edge.db`.
+
+Custo estimado: ~$1-2 por run com Opus 4.7 (cache hit nas chamadas subsequentes); ~$5/mês na cadência semanal. Configure `ADVISOR_WEEKLY_BUDGET_USD` em `.env` para o cap por run.
+
+### Dashboard
+
+Monitor visual local (FastAPI + HTMX) com 4 abas: Overview, Positions, Performance, Live Events. Substitui os comandos ad-hoc (`portfolio_report.py`, `Get-Content`, SQL inline) por dashboards real-time.
+
+```bash
+pip install -r dashboard/requirements.txt
+uvicorn dashboard.main:app --host 127.0.0.1 --port 8765
+# Abre http://127.0.0.1:8765 no browser
+```
+
+Read-only — lê `portfolio.db`, `weather_edge.db` e `weather_edge.jsonl` sem nunca mutar. Roda em paralelo com bot/judge sem conflito. Detalhes em `dashboard/README.md`.
+
+### Documentação
+
+- `polymarket-analyzer/references/weather-edge-strategy.md` — estratégia, fórmulas, racional
+- `polymarket-analyzer/references/weather-judge-prompt.md` — system prompt do judge
+- `polymarket-analyzer/references/strategy-advisor-prompt.md` — system prompt do advisor
+- `polymarket-analyzer/scripts/weather_edge_*.py`, `weather_strategy_advisor.py` — código
+- `dashboard/README.md` — dashboard de monitoramento
+
+---
+
 ## Limitações
 
 - Sem replay/resume — se um ciclo crash no meio de uma execução paper, pode ficar half-done. O `paper_engine.py` é transacional, então o DB fica consistente, mas a recomendação foi perdida.

@@ -1,0 +1,60 @@
+{# Wallet balance widget — shown on /settings + /live. #}
+
+{% if not w.configured %}
+  <div class="empty-state">
+    <div class="empty-icon">○</div>
+    <div class="empty-title">No wallet configured</div>
+    <div class="empty-msg">
+      {{ w.reason }}.<br>
+      Use the form below to set <code>POLYMARKET_PRIVATE_KEY</code>
+      (use a fresh burner wallet — never your main).
+    </div>
+  </div>
+{% else %}
+<div class="wallet-card">
+  <div class="wallet-row">
+    <span class="muted small">Address</span>
+    <span class="mono">{{ w.address }}</span>
+    <a href="{{ w.polymarket_url }}" target="_blank" rel="noopener"
+       class="market-link" title="View on Polymarket">Polymarket ↗</a>
+    <a href="{{ w.polygonscan_url }}" target="_blank" rel="noopener"
+       class="market-link" title="View on Polygonscan">Polygonscan ↗</a>
+  </div>
+
+  <div class="wallet-balances">
+    <div class="kpi">
+      <span class="kpi-label">USDC.e</span>
+      <span class="kpi-value {% if w.usdc_status == 'low' %}warn{% endif %}">
+        {% if w.usdc_balance is not none %}
+          ${{ "%.2f"|format(w.usdc_balance) }}
+        {% else %}—{% endif %}
+      </span>
+      <span class="kpi-delta muted">
+        tier: {{ w.tier or '—' }}
+      </span>
+    </div>
+    <div class="kpi">
+      <span class="kpi-label">MATIC (gas)</span>
+      <span class="kpi-value {% if w.matic_status == 'low' %}warn{% endif %}">
+        {% if w.matic_balance is not none %}
+          {{ "%.4f"|format(w.matic_balance) }}
+        {% else %}—{% endif %}
+      </span>
+      <span class="kpi-delta muted">need ≥ 0.01</span>
+    </div>
+  </div>
+
+  {% if w.rpc_errors %}
+  <div class="muted small">
+    ⚠ RPC issues: {{ w.rpc_errors|join(', ') }}
+  </div>
+  {% endif %}
+
+  <button class="btn btn-disabled" style="margin-top: 8px;"
+          hx-get="/api/wallet/balance?refresh=1"
+          hx-target="#wallet-card"
+          hx-swap="innerHTML">
+    Refresh
+  </button>
+</div>
+{% endif %}

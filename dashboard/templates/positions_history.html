@@ -1,0 +1,133 @@
+{% extends "base.html" %}
+{% block title %}Positions History{% endblock %}
+{% block content %}
+<h1>Positions history</h1>
+<p class="muted small">
+  All positions that have been closed — either by an early cashout
+  (profit_lock / trailing_stop) or by market resolution. Most recent
+  first. Live positions are on <a href="/positions">Positions</a>.
+</p>
+
+{# --- Summary KPI strip --- #}
+{% if summary and summary.available and summary.n_total > 0 %}
+<div class="kpi-grid" style="margin-bottom:20px;">
+  <div class="kpi">
+    <span class="kpi-label">Closed positions</span>
+    <span class="kpi-value">{{ summary.n_total }}</span>
+    <span class="kpi-delta muted">{{ summary.n_wins }} wins · {{ summary.n_losses }} losses</span>
+  </div>
+  <div class="kpi">
+    <span class="kpi-label">Win rate</span>
+    <span class="kpi-value {% if summary.win_rate and summary.win_rate >= 0.55 %}up{% elif summary.win_rate and summary.win_rate <= 0.40 %}down{% endif %}">
+      {% if summary.win_rate is not none %}{{ "%.0f"|format(summary.win_rate * 100) }}%{% else %}—{% endif %}
+    </span>
+    <span class="kpi-delta muted">all-time</span>
+  </div>
+  <div class="kpi">
+    <span class="kpi-label">Realized P&L</span>
+    <span class="kpi-value {% if summary.total_pnl_usd > 0 %}up{% elif summary.total_pnl_usd < 0 %}down{% endif %}">
+      {{ "+" if summary.total_pnl_usd >= 0 else "" }}${{ "%.2f"|format(summary.total_pnl_usd) }}
+    </span>
+    <span class="kpi-delta muted">
+      {% if summary.pnl_per_dollar is not none %}
+        {{ "%.1f"|format(summary.pnl_per_dollar * 100) }}% / $ deployed
+      {% endif %}
+    </span>
+  </div>
+  <div class="kpi">
+    <span class="kpi-label">Total stake</span>
+    <span class="kpi-value">${{ "%.0f"|format(summary.total_stake_usd) }}</span>
+    <span class="kpi-delta muted">across all closed</span>
+  </div>
+</div>
+{% endif %}
+
+{# --- Filter chips --- #}
+<div class="table-filter" style="margin-bottom:12px;">
+  <a href="/positions/history?outcome=all"
+     class="filter-chip {% if filter_outcome == 'all' %}active{% endif %}">All ({{ history|length if filter_outcome == 'all' else '...' }})</a>
+  <a href="/positions/history?outcome=winner"
+     class="filter-chip {% if filter_outcome == 'winner' %}active{% endif %}">Wins</a>
+  <a href="/positions/history?outcome=loser"
+     class="filter-chip {% if filter_outcome == 'loser' %}active{% endif %}">Losses</a>
+</div>
+
+{# --- History table --- #}
+{% if not history %}
+  <div class="empty-state">
+    <div class="empty-icon">∅</div>
+    <div class="empty-title">No closed positions yet</div>
+    <div class="empty-msg">
+      Positions appear here once they cash out (profit_lock /
+      trailing_stop trigger) or settle at market resolution
+      (run_resolution_sweep). If positions past their end_date are
+      stuck open, run
+      <code>python force_resolution_sweep.py</code> to backfill.
+    </div>
+  </div>
+{% else %}
+<table class="data-table history-table">
+  <thead>
+    <tr>
+      <th>Closed</th>
+      <th>Market</th>
+      <th>Side</th>
+      <th>Entry → Exit</th>
+      <th>Stake</th>
+      <th>P&L</th>
+      <th>%</th>
+      <th>Held</th>
+      <th>Exit reason</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for h in history %}
+    <tr class="{% if h.is_win %}row-win{% else %}row-loss{% endif %}">
+      <td class="mono small muted">{{ h.exit_ts[:16] if h.exit_ts else '—' }}</td>
+      <td>
+        <div class="city">
+          {{ h.city or '?' }}
+          {% if h.ladder_group_id %}
+            <span class="ladder-badge ladder-pos-{{ h.ladder_position }}"
+                  title="Ladder group {{ h.ladder_group_id[:8] }}">⛓ {{ h.ladder_position }}</span>
+          {% endif %}
+          {% if h.threshold_value %}
+            <span class="muted small">{{ h.threshold_value }}{{ h.threshold_unit or '' }}</span>
+          {% endif %}
+        </div>
+        <div class="slug muted small">
+          <a href="https://polymarket.com/event/{{ h.parent_event_slug or h.market_slug }}"
+             target="_blank" rel="noopener"
+             class="market-link"
+             title="Open parent event on Polymarket">
+            {{ (h.parent_event_slug or h.market_slug)|truncate(40) }} ↗
+          </a>
+        </div>
+      </td>
+      <td><span class="side side-{{ h.side|lower }}">{{ h.side }}</span></td>
+      <td class="mono small">
+        ${{ "%.3f"|format(h.entry_price) }} → <b>${{ "%.3f"|format(h.exit_price) }}</b>
+      </td>
+      <td class="mono">${{ "%.2f"|format(h.size_usd) }}</td>
+      <td class="mono {% if h.is_win %}up{% else %}down{% endif %}">
+        {{ "+" if h.realized_pnl_usd >= 0 else "" }}${{ "%.2f"|format(h.realized_pnl_usd) }}
+      </td>
+      <td class="mono small {% if h.is_win %}up{% else %}down{% endif %}">
+        {{ "+" if h.pnl_pct >= 0 else "" }}{{ "%.1f"|format(h.pnl_pct) }}%
+      </td>
+      <td class="mono small muted">{{ h.held_human }}</td>
+      <td class="mono small">
+        <span class="exit-kind exit-kind-{{ h.exit_kind }}">{{ h.exit_kind }}</span>
+        <span class="muted">{{ h.reason|truncate(40) if h.reason else '' }}</span>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<p class="muted small" style="margin-top:12px;">
+  Showing latest {{ history|length }} closed positions
+  {% if limit == 200 %}(default cap). Pass <code>?limit=500</code> to see more.{% endif %}
+</p>
+{% endif %}
+
+{% endblock %}

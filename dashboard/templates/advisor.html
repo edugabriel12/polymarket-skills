@@ -1,0 +1,159 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="kpi-grid">
+  <div class="kpi">
+    <span class="kpi-label">Total runs</span>
+    <span class="kpi-value">{{ kpis.n_runs }}</span>
+    <span class="kpi-delta muted">advisor sessions to date</span>
+  </div>
+  <div class="kpi">
+    <span class="kpi-label">Lifetime cost</span>
+    <span class="kpi-value">${{ "%.2f"|format(kpis.total_cost_usd) }}</span>
+    <span class="kpi-delta muted">Claude API spend</span>
+  </div>
+  <div class="kpi">
+    <span class="kpi-label">Last run</span>
+    <span class="kpi-value">{{ (kpis.last_run_ts or '—')[:16] }}</span>
+    <span class="kpi-delta muted">UTC</span>
+  </div>
+  <div class="kpi" title="Total suggestions applied across all runs vs total emitted by the LLM. Higher = more recommendations adopted.">
+    <span class="kpi-label">Acceptance rate</span>
+    {% if acceptance and acceptance.available and acceptance.total_suggestions > 0 %}
+      <span class="kpi-value">{{ "%.0f"|format(acceptance.acceptance_rate * 100) }}%</span>
+      <span class="kpi-delta muted">{{ acceptance.applied }} of {{ acceptance.total_suggestions }}</span>
+    {% else %}
+      <span class="kpi-value muted">—</span>
+      <span class="kpi-delta muted">{{ kpis.n_applies }} applied</span>
+    {% endif %}
+  </div>
+</section>
+
+{% if acceptance and acceptance.available and acceptance.by_category %}
+<section class="card">
+  <h2>Acceptance by category</h2>
+  <table class="data-table">
+    <thead>
+      <tr><th>Category</th><th>Applied ✓</th><th>Failed ✗</th><th>Unsupported</th></tr>
+    </thead>
+    <tbody>
+      {% for cat, counts in acceptance.by_category.items() %}
+      <tr>
+        <td class="mono">{{ cat }}</td>
+        <td class="mono up">{{ counts.applied }}</td>
+        <td class="mono {% if counts.failed > 0 %}down{% endif %}">{{ counts.failed }}</td>
+        <td class="mono muted">{{ counts.unsupported }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>Run advisor on-demand</h2>
+  <div id="advisor-run-zone">
+    {% include "partials/run_advisor_form.html" %}
+  </div>
+</section>
+
+<section class="card">
+  <h2>Global options</h2>
+  <label class="auto-restart-label">
+    <input type="checkbox" id="global-auto-restart" checked
+           onchange="window.AUTO_RESTART = this.checked;">
+    Auto-restart affected processes after Apply
+  </label>
+  <p class="muted small">
+    When ON, applying a suggestion of category
+    <code>threshold</code>/<code>mae_constant</code>/<code>city</code>/<code>risk_limit</code>/<code>judge_prompt</code>
+    triggers a kill+respawn of the affected daemon (bot and/or judge).
+    Operator can toggle per-session.
+  </p>
+
+  <hr style="border-color: var(--border); margin: 14px 0;">
+
+  <h3 style="font-size: 13px; color: var(--text-muted); margin: 0 0 8px 0;">
+    Notifications (Tier 4A)
+  </h3>
+  <div id="notify-status"
+       hx-get="/api/notify/status"
+       hx-trigger="load"
+       hx-swap="innerHTML">
+    <div class="muted small">Loading…</div>
+  </div>
+  <button class="btn btn-apply" style="margin-top: 8px;"
+          hx-post="/api/notify/test"
+          hx-target="#notify-test-result"
+          hx-swap="innerHTML">
+    Send test notification
+  </button>
+  <div id="notify-test-result"></div>
+</section>
+
+<section class="card">
+  <h2>Advisor runs</h2>
+  {% if not runs %}
+    <div class="muted">No advisor runs yet. Run on-demand:<br>
+      <code>python polymarket-analyzer/scripts/weather_strategy_advisor.py --once --since-days 30</code>
+    </div>
+  {% else %}
+  <table class="data-table">
+    <thead>
+      <tr><th>Run</th><th>When (UTC)</th><th>Trigger</th><th>Model</th>
+          <th>Suggestions</th><th>Cost $</th><th>Status</th><th>Action</th></tr>
+    </thead>
+    <tbody>
+      {% for r in runs %}
+      <tr>
+        <td class="mono">#{{ r.run_id }}</td>
+        <td class="mono small">{{ (r.ts or '')[:16] }}</td>
+        <td class="mono small">{{ r.trigger }}</td>
+        <td class="mono small">{{ r.llm_model }}</td>
+        <td class="mono">{{ r.n_suggestions }}</td>
+        <td class="mono">${{ "%.4f"|format(r.cost_usd or 0) }}</td>
+        <td class="mono {% if r.status != 'ok' %}down{% endif %}">{{ r.status }}</td>
+        <td>
+          <button class="period-btn"
+                  hx-get="/api/advisor/runs/{{ r.run_id }}"
+                  hx-target="#advisor-detail"
+                  hx-swap="innerHTML"
+                  hx-trigger="click">
+            View
+          </button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+
+<div id="advisor-detail"></div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // Global auto-restart preference (default ON). Per-page session state.
+  window.AUTO_RESTART = true;
+
+  // Add ?auto_restart=true to all advisor Apply POSTs based on global toggle.
+  document.body.addEventListener('htmx:configRequest', (e) => {
+    if (e.detail.path && e.detail.path.startsWith('/api/advisor/apply/')) {
+      if (window.AUTO_RESTART && e.detail.verb === 'post') {
+        e.detail.parameters.auto_restart = 'true';
+      }
+    }
+  });
+
+  // After a successful apply, show the restart banner.
+  document.body.addEventListener('htmx:afterRequest', (e) => {
+    if (e.detail.requestConfig.verb === 'post' &&
+        e.detail.requestConfig.path.startsWith('/api/advisor/apply/')) {
+      const banner = document.getElementById('restart-banner');
+      if (banner) banner.classList.remove('hidden');
+    }
+  });
+</script>
+{% endblock %}

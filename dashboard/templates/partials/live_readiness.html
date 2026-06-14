@@ -1,0 +1,51 @@
+{# Live readiness — 4 cards from backtest.py --live-check --json. #}
+
+{% if r.error %}
+  <div class="muted small">
+    Could not run readiness check: {{ r.error }}
+    {% if r.stderr %}<br><code>{{ r.stderr }}</code>{% endif %}
+  </div>
+{% elif not r.criteria %}
+  <div class="empty-state">
+    <div class="empty-icon">⏳</div>
+    <div class="empty-title">No data yet</div>
+    <div class="empty-msg">Run paper trades for ~24h to populate readiness criteria.</div>
+  </div>
+{% else %}
+
+<div class="readiness-summary">
+  {% if r.verdict == 'READY' %}
+    <span class="up"><strong>✓ READY</strong></span>
+  {% else %}
+    <span class="down"><strong>✗ NOT READY</strong></span>
+  {% endif %}
+  · {{ r.criteria_passed }}/{{ r.criteria_total }} criteria passed
+</div>
+
+<div class="readiness-grid">
+  {% for c in r.criteria %}
+  <div class="readiness-card readiness-{% if c.passed %}pass{% else %}fail{% endif %}">
+    <div class="readiness-name">{{ c.name }}</div>
+    <div class="readiness-vals mono">
+      <span class="muted small">current:</span> {{ c.actual }}<br>
+      <span class="muted small">required:</span> {{ c.required }}
+    </div>
+    <div class="readiness-icon">{% if c.passed %}✓{% else %}✗{% endif %}</div>
+  </div>
+  {% endfor %}
+</div>
+
+{% if r.gaps %}
+<div class="muted small" style="margin-top: 10px;">
+  <strong>Gaps:</strong>
+  <ul>{% for g in r.gaps %}<li>{{ g }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+
+<button class="btn btn-disabled" style="margin-top: 8px;"
+        hx-get="/api/live/readiness?refresh=1"
+        hx-target="#readiness-zone"
+        hx-swap="innerHTML">
+  Re-run check
+</button>
+{% endif %}

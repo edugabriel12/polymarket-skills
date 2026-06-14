@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section id="kpis"
+         hx-get="/api/kpis"
+         hx-trigger="load, every {{ refresh_kpi_sec }}s"
+         hx-swap="innerHTML">
+  <div class="kpi-skeleton">Loading KPIs…</div>
+</section>
+
+<section class="two-col">
+  <div class="card">
+    <h2>Cumulative P&L (30d)</h2>
+    <div hx-get="/api/cumulative-pnl-chart?days=30"
+         hx-trigger="load"
+         hx-swap="innerHTML">
+      <div class="empty-chart">Loading chart…</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Recent events</h2>
+    <div id="recent-events"
+         hx-get="/api/recent-events?limit=10"
+         hx-trigger="load, every {{ refresh_events_sec }}s"
+         hx-swap="innerHTML">
+      <div class="muted">Loading events…</div>
+    </div>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Open positions (top 5 by size) <span class="muted small">⚡ live</span></h2>
+  <div id="mini-positions"
+       hx-get="/api/positions?top=5&sort=size&refresh=1"
+       hx-trigger="load, every {{ refresh_positions_sec }}s"
+       hx-swap="innerHTML">
+    <div class="muted">Loading live positions…</div>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Recently SKIPPED <span class="muted small">(stale edge, judge issues, capacity)</span></h2>
+  <div id="skipped-entries"
+       hx-get="/api/skipped-entries?limit=20"
+       hx-trigger="load, every 60s"
+       hx-swap="innerHTML">
+    <div class="muted">Loading skipped entries…</div>
+  </div>
+</section>
+
+{% endblock %}

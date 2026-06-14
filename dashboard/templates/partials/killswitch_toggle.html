@@ -1,0 +1,33 @@
+{# Killswitch toggle — big red/green button. #}
+
+<div class="killswitch-block">
+  {% if armed %}
+    <div class="killswitch-status killswitch-status-armed">
+      <span class="killswitch-icon">⛔</span>
+      <strong>TRADING HALTED</strong>
+      <p class="small">Killswitch file present at <code>{{ path }}</code>.
+        The agent loop will skip live trades until disarmed.</p>
+    </div>
+    <button class="btn killswitch-btn-armed"
+            hx-post="/api/live/killswitch?action=disarm"
+            hx-target="#killswitch-zone"
+            hx-swap="innerHTML"
+            hx-confirm="Disarm killswitch and resume live trading?">
+      Disarm — resume trading
+    </button>
+  {% else %}
+    <div class="killswitch-status killswitch-status-disarmed">
+      <span class="killswitch-icon">🟢</span>
+      <strong>TRADING ACTIVE</strong>
+      <p class="small">No killswitch file. Live trades may execute
+        per the configured caps.</p>
+    </div>
+    <button class="btn killswitch-btn-disarmed"
+            hx-post="/api/live/killswitch?action=arm"
+            hx-target="#killswitch-zone"
+            hx-swap="innerHTML"
+            hx-confirm="ARM killswitch and HALT all live trading immediately?">
+      ⛔ ARM killswitch
+    </button>
+  {% endif %}
+</div>

@@ -32,7 +32,7 @@ DEFAULT_BALANCE = 1000.0
 DEFAULT_RISK = {
     "max_position_pct": 0.10,       # 10% of bankroll per trade
     "max_drawdown_pct": 0.30,       # 30% total drawdown halts trading
-    "max_concurrent_positions": 5,
+    "max_concurrent_positions": 50,
     "daily_loss_limit_pct": 0.05,   # 5% of starting bankroll
     "max_single_market_pct": 0.20,  # 20% portfolio in one market
     "human_approval_pct": 0.15,     # trades > 15% need human approval
@@ -109,8 +109,9 @@ def lookup_market(token_id: str) -> dict | None:
 def _get_db() -> sqlite3.Connection:
     """Open (and possibly initialize) the SQLite database."""
     DB_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=5.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     _init_schema(conn)
@@ -676,9 +677,18 @@ def close_position(
     portfolio_name: str = "default",
     fee_rate: float = DEFAULT_FEE_RATE,
     reasoning: str = "",
+    force_exit_price: float | None = None,
 ) -> dict:
     """
-    Close an open position at current market price.
+    Close an open position.
+
+    Normal path (force_exit_price=None): walks orderbook bids to simulate
+    a market-sell fill at current prices.
+
+    Resolution path (force_exit_price set): credits all shares at the
+    given price with no orderbook fetch. Used by the bot when a market
+    resolves on Polymarket — the orderbook may be stale/empty and the
+    actual payout is the resolution value, not the bid.
 
     Args:
         token_id: The CLOB token to close
@@ -686,20 +696,27 @@ def close_position(
         portfolio_name: Which portfolio
         fee_rate: Override fee rate
         reasoning: Why closing
+        force_exit_price: When set (0.0 ≤ price ≤ 1.0), bypass orderbook
+            and fill all shares at this exact price.
 
     Returns: Close execution result.
     """
-    # Fetch order book BEFORE acquiring write lock (network I/O)
-    orderbook = fetch_orderbook(token_id)
-
-    # Walk bids to simulate sell fill
-    bids = sorted(
-        orderbook.get("bids", []),
-        key=lambda x: float(x["price"]),
-        reverse=True,
-    )
-    if not bids:
-        raise RuntimeError("No bids in order book — cannot close position")
+    if force_exit_price is None:
+        # Normal path: orderbook walk
+        orderbook = fetch_orderbook(token_id)
+        bids = sorted(
+            orderbook.get("bids", []),
+            key=lambda x: float(x["price"]),
+            reverse=True,
+        )
+        if not bids:
+            raise RuntimeError("No bids in order book — cannot close position")
+    else:
+        if not (0.0 <= force_exit_price <= 1.0):
+            raise ValueError(
+                f"force_exit_price {force_exit_price} out of range [0, 1]"
+            )
+        bids = None  # signal "skip orderbook walk"
 
     conn = _get_db()
     try:
@@ -734,21 +751,27 @@ def close_position(
         for pos in positions:
             pos = dict(pos)
 
-            remaining_shares = pos["shares"]
-            total_proceeds = 0.0
-            for level in bids:
-                lvl_price = float(level["price"])
-                lvl_size = float(level["size"])
-                sell_shares = min(remaining_shares, lvl_size)
-                total_proceeds += sell_shares * lvl_price
-                remaining_shares -= sell_shares
-                if remaining_shares < 0.0001:
-                    break
+            if force_exit_price is not None:
+                # Resolution path: all shares fill at the forced price.
+                shares_sold = pos["shares"]
+                total_proceeds = shares_sold * force_exit_price
+                remaining_shares = 0
+            else:
+                remaining_shares = pos["shares"]
+                total_proceeds = 0.0
+                for level in bids:
+                    lvl_price = float(level["price"])
+                    lvl_size = float(level["size"])
+                    sell_shares = min(remaining_shares, lvl_size)
+                    total_proceeds += sell_shares * lvl_price
+                    remaining_shares -= sell_shares
+                    if remaining_shares < 0.0001:
+                        break
 
-            shares_sold = pos["shares"] - remaining_shares
-            if shares_sold <= 0:
-                conn.rollback()
-                raise RuntimeError("Could not sell any shares at current bids")
+                shares_sold = pos["shares"] - remaining_shares
+                if shares_sold <= 0:
+                    conn.rollback()
+                    raise RuntimeError("Could not sell any shares at current bids")
 
             avg_sell_price = total_proceeds / shares_sold if shares_sold > 0 else 0
             fee = total_proceeds * fee_rate
@@ -923,6 +946,55 @@ def _format_trades(trades: list[dict]) -> str:
         if t.get("reasoning"):
             lines.append(f"    Reason: {t['reasoning'][:70]}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# PaperEngine — OO wrapper around the module functions
+# ---------------------------------------------------------------------------
+
+
+class PaperEngine:
+    """Thin OO wrapper providing a stable instance-based API for callers
+    that prefer method calls over module functions (e.g., weather_edge_bot).
+
+    The wrapper only re-shapes call signatures and result keys; all real
+    work happens in the module-level `place_order`, `close_position`, and
+    `get_portfolio` functions.
+    """
+
+    def __init__(self, portfolio: str = "default"):
+        self.portfolio = portfolio
+
+    def get_portfolio(self, refresh_prices: bool = True) -> dict:
+        return get_portfolio(self.portfolio, refresh_prices=refresh_prices)
+
+    def open_position(self, *, token_id: str, side: str, size_usd: float,
+                       market_question: str = "",   # ignored — engine looks it up
+                       fee_rate: float = DEFAULT_FEE_RATE,
+                       confidence: float = 0.5,     # informational, ignored
+                       reasoning: str = "") -> dict:
+        result = place_order(
+            token_id=token_id, side=side, size=size_usd,
+            portfolio_name=self.portfolio,
+            fee_rate=fee_rate, reasoning=reasoning,
+        )
+        # Normalize result keys to what weather_edge_bot.run_execute expects.
+        if result.get("status") == "filled":
+            return {
+                **result,
+                "status": "executed",
+                "cost_usd": result.get("total_cost"),
+                "shares_filled": result.get("shares"),
+                "avg_price": result.get("avg_price"),
+            }
+        return result
+
+    def close_position(self, *, token_id: str, side: str | None = None,
+                        reasoning: str = "") -> dict:
+        return close_position(
+            token_id=token_id, side=side,
+            portfolio_name=self.portfolio, reasoning=reasoning,
+        )
 
 
 # ---------------------------------------------------------------------------

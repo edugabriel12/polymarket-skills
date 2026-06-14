@@ -1,0 +1,27 @@
+{# Daily spend gauge — sum of today's EXECUTED trade costs vs daily limit. #}
+
+<div class="daily-spend-block">
+  <div class="kpi">
+    <span class="kpi-label">Spent today (UTC)</span>
+    <span class="kpi-value">${{ "%.2f"|format(s.spent_usd) }}</span>
+    <span class="kpi-delta muted">{{ s.n_trades }} trades</span>
+  </div>
+  <div class="kpi">
+    <span class="kpi-label">Daily limit</span>
+    {% if s.limit_usd %}
+      <span class="kpi-value">${{ "%.2f"|format(s.limit_usd) }}</span>
+      <span class="kpi-delta {% if s.pct_of_limit and s.pct_of_limit > 80 %}down{% elif s.pct_of_limit and s.pct_of_limit > 50 %}warn{% else %}muted{% endif %}">
+        {{ s.pct_of_limit }}% of cap
+      </span>
+    {% else %}
+      <span class="kpi-value muted">unset</span>
+      <span class="kpi-delta muted">set POLYMARKET_DAILY_LOSS_LIMIT</span>
+    {% endif %}
+  </div>
+</div>
+
+{% if s.pct_of_limit and s.pct_of_limit > 80 %}
+<div class="muted small warn" style="margin-top: 8px;">
+  ⚠ Approaching daily cap. New trades will be rejected at 100%.
+</div>
+{% endif %}

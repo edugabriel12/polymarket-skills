@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="card private-key-warning">
+  <h2>⚠ Sensitive area</h2>
+  <p class="small">
+    This page reads and writes <code>agent/.env</code>. Private keys
+    <strong>never leave this machine</strong>. The dashboard MUST run on
+    <code>127.0.0.1</code> only — if you bound to <code>0.0.0.0</code>,
+    stop and rebind. CLAUDE.md §6 prohibits exposing this UI publicly.
+  </p>
+</section>
+
+<section class="card">
+  <h2>Wallet</h2>
+  <div id="wallet-card"
+       hx-get="/api/wallet/balance"
+       hx-trigger="load"
+       hx-swap="innerHTML">
+    <div class="muted">Loading wallet info…</div>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Live trading env vars</h2>
+  <p class="muted small">
+    The 5 critical vars from CLAUDE.md §4. Other vars (ANTHROPIC_API_KEY,
+    NOTIFIER_*, etc.) are edited directly in <code>agent/.env</code>.
+  </p>
+
+  <div id="settings-form-zone">
+    {% include "partials/settings_form.html" with context %}
+  </div>
+</section>
+
+<section class="card">
+  <h2>How to apply changes</h2>
+  <ol class="muted small">
+    <li>Save a var → it's written to <code>agent/.env</code> with
+      <code>chmod 600</code> immediately.</li>
+    <li>The bot/judge daemons pick up env changes only on restart.
+      For per-trade caps (<code>MAX_SIZE</code>, <code>DAILY_LOSS_LIMIT</code>),
+      <code>execute_live.py</code> reads env on each call so they take effect
+      for the next live trade.</li>
+    <li>To pick up changes in the dashboard itself (this page),
+      <code>Ctrl+C</code> and re-launch <code>uvicorn</code>.</li>
+  </ol>
+</section>
+
+{% endblock %}

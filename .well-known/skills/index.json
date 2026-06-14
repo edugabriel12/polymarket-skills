@@ -19,10 +19,20 @@
         "SKILL.md",
         "references/fee-model.md",
         "references/viable-strategies.md",
+        "references/data-api.md",
+        "references/weather-cities.json",
+        "references/weather-edge-strategy.md",
+        "references/weather-judge-prompt.md",
         "scripts/analyze_orderbook.py",
         "scripts/correlation_tracker.py",
         "scripts/find_edges.py",
-        "scripts/momentum_scanner.py"
+        "scripts/momentum_scanner.py",
+        "scripts/lol_top_holders.py",
+        "scripts/weather_edge_db.py",
+        "scripts/weather_edge_helpers.py",
+        "scripts/weather_edge_bot.py",
+        "scripts/weather_edge_judge.py",
+        "scripts/weather_edge_analyzer.py"
       ]
     },
     {
@@ -71,6 +81,17 @@
         "scripts/check_positions.py",
         "scripts/execute_live.py",
         "scripts/setup_wallet.py"
+      ]
+    },
+    {
+      "name": "polymarket-forecast-skill",
+      "description": "Use this skill when the user asks about current or future weather conditions, temperature, precipitation, or weather-dependent planning for any location. Provides real-time weather data and 5-day forecasts via OpenWeather, plus multi-location comparisons and activity suitability scoring (skiing, hiking, picnic, etc). Useful as a signal source for Polymarket weather markets. Imported from kevinl95/ForecastSkill (MIT).",
+      "files": [
+        "SKILL.md",
+        "config.json",
+        "references/prompt_templates.md",
+        "references/setup.md",
+        "scripts/get_weather.py"
       ]
     }
   ]

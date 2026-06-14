@@ -81,7 +81,7 @@ def get_daily_spending() -> float:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     total = 0.0
 
-    for line in LOG_FILE.read_text().splitlines():
+    for line in LOG_FILE.read_text(encoding="utf-8").splitlines():
         try:
             entry = json.loads(line)
             if entry.get("timestamp", "").startswith(today) and entry.get("status") == "EXECUTED":

@@ -1,0 +1,19 @@
+{# Compact 2-trigger progress display per position. Expects `t` (triggers dict) in scope.
+   v9.5: convergence trigger was removed from default operation (--convergence-pp 0)
+   because under 3-bin laddering it captures only ~30% of full payout. The bar was
+   removed from the UI in v9.7.4. The convergence field is still computed by
+   trigger_distances() for counterfactual replay analysis. #}
+<div class="trigger-bar" title="profit_lock: bid ≥ ${{ '%.3f'|format(t.profit_lock.target_bid) }}">
+  <span class="trig-label">P</span>
+  <span class="trig-fill" style="width:{{ (t.profit_lock.progress * 100)|round(0) }}%"></span>
+  <span class="trig-pct">{{ (t.profit_lock.progress * 100)|round(0) }}%</span>
+</div>
+<div class="trigger-bar {% if not t.trailing_stop.armed %}disarmed{% endif %}"
+     title="trailing_stop: {{ 'armed, peak $' + ('%.3f'|format(t.trailing_stop.peak_bid)) if t.trailing_stop.armed else 'not armed (peak < entry+20pp)' }}">
+  <span class="trig-label">T</span>
+  <span class="trig-fill" style="width:{{ (t.trailing_stop.progress * 100)|round(0) }}%"></span>
+  <span class="trig-pct">{{ (t.trailing_stop.progress * 100)|round(0) }}%</span>
+</div>
+{% if t.would_fire_now and t.winning_trigger != 'convergence' %}
+<div class="trigger-fire">🔥 {{ t.winning_trigger }}</div>
+{% endif %}

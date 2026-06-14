@@ -105,7 +105,7 @@ def show_local_log():
         print("  No local trade log found.")
         return
 
-    lines = LOG_FILE.read_text().splitlines()
+    lines = LOG_FILE.read_text(encoding="utf-8").splitlines()
     if not lines:
         print("  Trade log is empty.")
         return

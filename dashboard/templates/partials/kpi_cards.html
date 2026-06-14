@@ -1,0 +1,145 @@
+{% if k.error %}
+  <div class="card err">⚠ {{ k.error }}</div>
+{% else %}
+<div class="kpi-grid">
+  <div class="kpi" title="Total portfolio value = cash balance + market value of open positions (using last known bid).">
+    <span class="kpi-label">
+      Portfolio{% if k.price_source == 'live' %} <span class="muted small">⚡</span>{% endif %}
+    </span>
+    <span class="kpi-value">${{ "%.2f"|format(k.portfolio_total_usd) }}</span>
+    {% if k.portfolio_delta_today_usd is not none %}
+      {% set d = k.portfolio_delta_today_usd %}
+      <span class="kpi-delta {% if d >= 0 %}up{% else %}down{% endif %}">
+        {{ "+" if d >= 0 else "" }}${{ "%.2f"|format(d) }} today
+      </span>
+    {% else %}
+      <span class="kpi-delta muted">no snapshot yet</span>
+    {% endif %}
+  </div>
+
+  <div class="kpi" title="Number of currently open positions vs the configured max_concurrent_positions cap (CLAUDE.md §2). When at cap, new approved entries wait in the queue.">
+    <span class="kpi-label">Open Positions</span>
+    <span class="kpi-value">{{ k.open_positions }} / {{ k.max_positions }}</span>
+    <span class="kpi-delta muted">cash ${{ "%.2f"|format(k.cash_usd) }}</span>
+  </div>
+
+  <div class="kpi" title="Sum of realized P&L from cashouts that closed today (UTC). Includes both monitor-triggered cashouts and resolution payouts.">
+    <span class="kpi-label">Realized P&L today</span>
+    {% set r = k.realized_pnl_today_usd %}
+    <span class="kpi-value {% if r > 0 %}up{% elif r < 0 %}down{% endif %}">
+      {{ "+" if r >= 0 else "" }}${{ "%.2f"|format(r) }}
+    </span>
+    <span class="kpi-delta muted">from cashouts</span>
+  </div>
+
+  <div class="kpi" title="Current portfolio value vs all-time peak. CLAUDE.md §2: -10% triggers position size cut, -15% halts new momentum/news trades, -20% closes ALL positions.">
+    <span class="kpi-label">Drawdown from peak</span>
+    {% set dd = k.drawdown_pct_from_peak %}
+    <span class="kpi-value {% if dd <= -10 %}down{% endif %}">{{ "%.2f"|format(dd) }}%</span>
+    <span class="kpi-delta muted">peak ${{ "%.2f"|format(k.drawdown_peak_usd) }}</span>
+  </div>
+</div>
+
+{# v6: Judge accuracy KPIs (only render when there's enough data) #}
+{% if judge and judge.available %}
+<div class="kpi-grid kpi-grid-judge">
+  <div class="kpi" title="Brier score: mean squared error of judge_prob vs actual outcome. Lower is better. < 0.20 good · 0.20-0.30 mediocre · > 0.30 broken.">
+    <span class="kpi-label">Judge Brier ({{ judge.days }}d)</span>
+    <span class="kpi-value {{ judge.brier_color }}">
+      {% if judge.brier is not none %}{{ "%.3f"|format(judge.brier) }}{% else %}—{% endif %}
+    </span>
+    <span class="kpi-delta muted">{{ judge.n_resolved }} resolved</span>
+  </div>
+  <div class="kpi" title="Fraction of trades the judge approved (APPROVE+ADJUST). Above 70% = rubber-stamping risk; below 20% = over-conservative.">
+    <span class="kpi-label">Approval rate</span>
+    <span class="kpi-value {{ judge.approval_color }}">{{ "%.0f"|format(judge.approval_rate * 100) }}%</span>
+    <span class="kpi-delta muted">{{ judge.n_reviews }} reviewed</span>
+  </div>
+  <div class="kpi" title="Of trades the judge approved that resolved, fraction that lost. > 50% = HALLUCINATION SIGNAL.">
+    <span class="kpi-label">False positive rate</span>
+    <span class="kpi-value {{ judge.fpr_color }}">
+      {% if judge.false_positive_rate is not none %}{{ "%.0f"|format(judge.false_positive_rate * 100) }}%{% else %}—{% endif %}
+    </span>
+    <span class="kpi-delta muted">approved → lost</span>
+  </div>
+  <div class="kpi" title="Hypothetical P&L from REJECTED entries that would have won. High value = judge over-conservative.">
+    <span class="kpi-label">Missed P&L (rejects)</span>
+    <span class="kpi-value">${{ "%.0f"|format(judge.missed_pnl_usd) }}</span>
+    <span class="kpi-delta muted">{{ judge.n_flags }} flags</span>
+  </div>
+</div>
+{% endif %}
+
+{# v9: Ladder strategy KPIs — formation funnel + ladder-vs-single perf #}
+{% if ladder and ladder.available %}
+<div class="kpi-grid kpi-grid-ladder">
+  <div class="kpi" title="Ladder groups formed in last {{ ladder.days }} days. 3-bin = full central+below+above, 2-bin = central + one neighbor (extreme bracket).">
+    <span class="kpi-label">Ladders formed ({{ ladder.days }}d)</span>
+    <span class="kpi-value">{{ ladder.n_total_groups }}</span>
+    <span class="kpi-delta muted">{{ ladder.n_3bin }} × 3-bin · {{ ladder.n_2bin }} × 2-bin</span>
+  </div>
+  <div class="kpi" title="Orphan single-bin entries (events with <2 brackets surviving discovery filters). Each must pass --min-entry-price 0.30 + --min-edge-pp 20 + --min-ttr-hours 12.">
+    <span class="kpi-label">Single-bin orphans</span>
+    <span class="kpi-value">{{ ladder.n_orphans }}</span>
+    <span class="kpi-delta muted">no sibling brackets</span>
+  </div>
+  <div class="kpi" title="Realized P&L from RESOLVED ladder groups in the window (sums P&L across all legs of each group).">
+    <span class="kpi-label">Ladder P&L</span>
+    <span class="kpi-value {{ ladder.ladder_pnl_color }}">
+      {% if ladder.ladder_pnl_usd is not none %}
+        {{ "+" if ladder.ladder_pnl_usd >= 0 else "" }}${{ "%.2f"|format(ladder.ladder_pnl_usd) }}
+      {% else %}—{% endif %}
+    </span>
+    <span class="kpi-delta muted">
+      {% if ladder.ladder_pnl_per_dollar is not none %}
+        {{ "%.1f"|format(ladder.ladder_pnl_per_dollar * 100) }}% / $
+      {% else %}no resolved ladders{% endif %}
+    </span>
+  </div>
+  <div class="kpi" title="Win rate of trades with TTR 6-12h — the new admittance band unlocked by lowering --ladder-min-ttr-hours to 6. Should match or beat the 24h+ baseline if the change paid off.">
+    <span class="kpi-label">6-12h TTR cohort</span>
+    <span class="kpi-value {{ ladder.short_ttr_color }}">
+      {% if ladder.short_ttr_win_rate is not none %}
+        {{ "%.0f"|format(ladder.short_ttr_win_rate * 100) }}%
+      {% else %}—{% endif %}
+    </span>
+    <span class="kpi-delta muted">{{ ladder.short_ttr_n }} resolved</span>
+  </div>
+</div>
+{% if ladder.interpretation %}
+  {% for line in ladder.interpretation %}
+    <div class="muted small" style="margin-top:6px;font-size:11px;">⚠ {{ line }}</div>
+  {% endfor %}
+{% endif %}
+{% endif %}
+
+{# v6: Queue health #}
+{% if queue and queue.available %}
+<div class="kpi-grid kpi-grid-queue">
+  <div class="kpi" title="Entries the bot has proposed but the judge hasn't reviewed yet.">
+    <span class="kpi-label">Pending judge review</span>
+    <span class="kpi-value {% if queue.n_proposed > 5 %}warn{% endif %}">{{ queue.n_proposed }}</span>
+    <span class="kpi-delta muted">PROPOSED</span>
+  </div>
+  <div class="kpi" title="Judge-approved entries waiting to be executed (queue behind position-limit cap).">
+    <span class="kpi-label">Awaiting execution</span>
+    <span class="kpi-value {% if queue.n_approved_waiting > 3 %}warn{% endif %}">{{ queue.n_approved_waiting }}</span>
+    <span class="kpi-delta muted">APPROVED/ADJUSTED</span>
+  </div>
+  <div class="kpi" title="Age in minutes of the oldest entry still pending. > 30 min = warning, > 2h = danger.">
+    <span class="kpi-label">Oldest pending</span>
+    <span class="kpi-value {{ queue.age_color }}">
+      {% if queue.oldest_age_min is not none %}{{ queue.oldest_age_min }}m{% else %}—{% endif %}
+    </span>
+    <span class="kpi-delta muted">queue age</span>
+  </div>
+  <div class="kpi" title="Entries skipped today (UTC) — see breakdown by reason below.">
+    <span class="kpi-label">Skipped today</span>
+    <span class="kpi-value {% if queue.n_skipped_today > 10 %}warn{% endif %}">{{ queue.n_skipped_today }}</span>
+    <span class="kpi-delta muted">
+      {% for r in queue.skipped_by_reason[:2] %}{{ r.n }} {{ r.reason }}{% if not loop.last %}, {% endif %}{% endfor %}
+    </span>
+  </div>
+</div>
+{% endif %}
+{% endif %}

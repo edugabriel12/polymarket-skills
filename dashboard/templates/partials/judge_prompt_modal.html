@@ -1,0 +1,66 @@
+{# Judge prompt editor modal — opens when operator clicks Apply on a
+   judge_prompt suggestion. Operator pastes the new full file content
+   and clicks Save. #}
+
+<div class="modal-backdrop" id="judge-prompt-modal"
+     onclick="if(event.target.id==='judge-prompt-modal') closeJudgePromptModal()">
+  <div class="modal-content modal-wide">
+    <button class="modal-close" onclick="closeJudgePromptModal()">×</button>
+    <h2>Edit weather-judge-prompt.md</h2>
+
+    <div class="judge-modal-guidance">
+      <h3>{{ s.title }}</h3>
+      <p class="muted small">
+        Suggestion <code>{{ s.id }}</code> · Confidence:
+        <strong>{{ s.confidence }}</strong> · Priority:
+        <strong>{{ s.priority }}</strong>
+      </p>
+      <p><strong>Rationale:</strong> {{ s.rationale }}</p>
+      {% if s.counterfactual %}
+      <p class="muted small"><strong>Counterfactual:</strong> {{ s.counterfactual }}</p>
+      {% endif %}
+      {% if s.proposed_value %}
+      <details>
+        <summary>Advisor's proposed_value (raw)</summary>
+        <pre class="mono small">{{ s.proposed_value }}</pre>
+      </details>
+      {% endif %}
+    </div>
+
+    <form hx-post="/api/advisor/apply/{{ run.run_id }}/{{ s.id }}/judge-prompt"
+          hx-target="#sug-card-{{ s.id }}"
+          hx-swap="outerHTML"
+          hx-on::after-request="if(event.detail.successful) closeJudgePromptModal()">
+      <p class="muted small">
+        Edit the textarea below. Your full text becomes the new
+        <code>weather-judge-prompt.md</code> content
+        (200 ≤ length ≤ 50000 chars). A git commit is made automatically.
+      </p>
+      <textarea name="operator_text" rows="28" class="judge-editor"
+                required minlength="200" maxlength="50000"
+      >{{ current_text }}</textarea>
+
+      <label class="auto-restart-label">
+        <input type="checkbox" name="auto_restart" value="true"
+               {% if auto_restart_default %}checked{% endif %}>
+        Auto-restart judge after save
+      </label>
+
+      <div class="modal-actions">
+        <button type="button" class="btn btn-disabled"
+                onclick="closeJudgePromptModal()">Cancel</button>
+        <button type="submit" class="btn btn-apply">Save + Commit</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+  function closeJudgePromptModal() {
+    const m = document.getElementById('judge-prompt-modal');
+    if (m) m.remove();
+  }
+  document.addEventListener('keydown', function escClose(e) {
+    if (e.key === 'Escape') closeJudgePromptModal();
+  }, { once: true });
+</script>

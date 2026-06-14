@@ -1,0 +1,164 @@
+{% extends "base.html" %}
+{% block title %}Ladders{% endblock %}
+{% block content %}
+<h1>3-bin laddering</h1>
+<p class="muted small">
+  Each ladder group is a coordinated 2- or 3-leg bet on the same Polymarket
+  event (central forecast bracket + below + above neighbors). All legs share
+  a <code>ladder_group_id</code> and cashout atomically. Single-bin orphans
+  appear on <a href="/positions">Positions</a> instead.
+</p>
+
+{# --- Strategy KPI summary --- #}
+{% if ladder_kpis and ladder_kpis.available %}
+<div class="kpi-grid kpi-grid-ladder" style="margin-bottom:20px;">
+  <div class="kpi">
+    <span class="kpi-label">Ladders formed ({{ ladder_kpis.days }}d)</span>
+    <span class="kpi-value">{{ ladder_kpis.n_total_groups }}</span>
+    <span class="kpi-delta muted">{{ ladder_kpis.n_3bin }} × 3-bin · {{ ladder_kpis.n_2bin }} × 2-bin</span>
+  </div>
+  <div class="kpi">
+    <span class="kpi-label">Open groups now</span>
+    <span class="kpi-value">{{ open_groups|length }}</span>
+    <span class="kpi-delta muted">
+      ${{ "%.0f"|format(open_groups|sum(attribute='total_stake_usd')) }} stake
+    </span>
+  </div>
+  <div class="kpi">
+    <span class="kpi-label">Ladder P&L ({{ ladder_kpis.days }}d)</span>
+    <span class="kpi-value {{ ladder_kpis.ladder_pnl_color }}">
+      {% if ladder_kpis.ladder_pnl_usd is not none %}
+        {{ "+" if ladder_kpis.ladder_pnl_usd >= 0 else "" }}${{ "%.2f"|format(ladder_kpis.ladder_pnl_usd) }}
+      {% else %}—{% endif %}
+    </span>
+    <span class="kpi-delta muted">
+      {% if ladder_kpis.ladder_win_rate is not none %}
+        {{ "%.0f"|format(ladder_kpis.ladder_win_rate * 100) }}% win
+      {% else %}no resolved{% endif %}
+    </span>
+  </div>
+  <div class="kpi">
+    <span class="kpi-label">Atomic gate failures</span>
+    <span class="kpi-value {% if ladder_kpis.atomic_failures > 0 %}warn{% endif %}">
+      {{ ladder_kpis.atomic_failures }}
+    </span>
+    <span class="kpi-delta muted">aborts + sibling fails</span>
+  </div>
+</div>
+{% if ladder_kpis.interpretation %}
+  {% for line in ladder_kpis.interpretation %}
+    <div class="muted small" style="margin-bottom:6px;">⚠ {{ line }}</div>
+  {% endfor %}
+{% endif %}
+{% else %}
+<div class="card warn">
+  <strong>Ladder analytics unavailable.</strong>
+  {{ ladder_kpis.reason if ladder_kpis else "Bot has not run yet." }}
+</div>
+{% endif %}
+
+{# --- Open groups table --- #}
+<h2 style="margin-top:30px;">Open ladder groups</h2>
+{% if not open_groups %}
+  <div class="empty-state">
+    <div class="empty-icon">⛓</div>
+    <div class="empty-title">No open ladder groups</div>
+    <div class="empty-msg">
+      When the bot opens a 2- or 3-leg ladder, it appears here grouped by
+      <code>ladder_group_id</code>. Check the
+      <a href="/settings">settings page</a> if you don't see ladders forming —
+      especially <code>LADDER_MODE</code>, <code>LADDER_MIN_LEG_EDGE_PP</code>
+      and <code>LADDER_MIN_TTR_HOURS</code>.
+    </div>
+  </div>
+{% else %}
+<table class="data-table ladders-table">
+  <thead>
+    <tr>
+      <th>Group</th>
+      <th>City</th>
+      <th>Resolution</th>
+      <th>Legs</th>
+      <th>Stake</th>
+      <th>Brackets &amp; stakes</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for g in open_groups %}
+    <tr>
+      <td class="mono small">
+        <span class="ladder-badge ladder-pos-central">{{ g.leg_label }}</span>
+        <br><span class="muted">{{ g.ladder_group_id[:8] }}…</span>
+      </td>
+      <td>{{ g.city or '?' }}</td>
+      <td class="mono small muted">{{ g.end_date[:16] if g.end_date else '—' }}</td>
+      <td class="mono">{{ g.n_legs }}</td>
+      <td class="mono">${{ "%.2f"|format(g.total_stake_usd) }}</td>
+      <td>
+        {% for leg in g.legs %}
+          <div class="leg-row">
+            <span class="ladder-badge ladder-pos-{{ leg.position }}">⛓ {{ leg.position }}</span>
+            {% if leg.threshold_value is not none %}
+              <span class="mono small">{{ leg.threshold_value }}{{ g.threshold_unit }}</span>
+            {% endif %}
+            <span class="side side-{{ leg.side|lower }}">{{ leg.side }}</span>
+            <span class="mono small">@ ${{ "%.3f"|format(leg.entry_price) }}</span>
+            <span class="mono small muted">size ${{ "%.2f"|format(leg.size_usd) }}</span>
+            {% if leg.ladder_stake_usd %}
+              <span class="muted small">(target ${{ "%.2f"|format(leg.ladder_stake_usd) }})</span>
+            {% endif %}
+            <a href="#" onclick="openReplay({{ leg.entry_id }});return false;"
+               class="small">#{{ leg.entry_id }}</a>
+          </div>
+        {% endfor %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{# --- History --- #}
+<h2 style="margin-top:30px;">Resolved ladders ({{ history|length }})</h2>
+{% if not history %}
+  <p class="muted small">No resolved ladder groups yet.</p>
+{% else %}
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>Closed</th><th>City</th><th>Group</th>
+      <th>Legs</th><th>Stake</th><th>P&amp;L</th><th>%</th>
+      <th>Trigger</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for h in history %}
+    <tr>
+      <td class="mono small muted">{{ h.last_cashout_ts[:16] if h.last_cashout_ts else '—' }}</td>
+      <td>{{ h.city or '?' }}</td>
+      <td class="mono small">{{ h.ladder_group_id[:8] }}…</td>
+      <td class="mono">{{ h.n_legs }}</td>
+      <td class="mono">${{ "%.2f"|format(h.total_stake_usd) }}</td>
+      <td class="mono {% if h.won %}up{% else %}down{% endif %}">
+        {{ "+" if h.total_pnl_usd >= 0 else "" }}${{ "%.2f"|format(h.total_pnl_usd) }}
+      </td>
+      <td class="mono small {% if h.won %}up{% else %}down{% endif %}">
+        {% if h.pnl_pct is not none %}{{ "%.1f"|format(h.pnl_pct) }}%{% else %}—{% endif %}
+      </td>
+      <td class="mono small muted">{{ h.reason or '—' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<script>
+  // Defer to existing replay modal infra in dashboard.js
+  function openReplay(entryId) {
+    if (typeof window.openReplay === 'function' && window.openReplay !== openReplay) {
+      return window.openReplay(entryId);
+    }
+    window.location.href = `/positions?focus=${entryId}`;
+  }
+</script>
+{% endblock %}

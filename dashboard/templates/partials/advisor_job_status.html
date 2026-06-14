@@ -1,0 +1,69 @@
+{# Status card for a Run Advisor Now job. Auto-polls every 5s while
+   the job is pending/running; stops on terminal states (done/failed). #}
+
+{% if not job %}
+  <div class="job-status job-status-error">Job not found.</div>
+{% else %}
+
+{% set running = job.status in ('pending', 'running') %}
+
+<div id="advisor-job-card"
+     class="job-status job-status-{{ job.status }}"
+     {% if running %}
+     hx-get="/api/advisor/jobs/{{ job.job_id }}"
+     hx-trigger="every 5s"
+     hx-swap="outerHTML"
+     {% endif %}>
+
+  <div class="job-status-header">
+    {% if running %}
+      <span class="spinner"></span>
+      <strong>Advisor job #{{ job.job_id }} — {{ job.status }}</strong>
+    {% elif job.status == 'done' %}
+      <span class="ok-icon">✓</span>
+      <strong>Advisor job #{{ job.job_id }} — done</strong>
+    {% elif job.status == 'failed' %}
+      <span class="err-icon">✗</span>
+      <strong>Advisor job #{{ job.job_id }} — failed</strong>
+    {% else %}
+      <strong>Advisor job #{{ job.job_id }} — {{ job.status }}</strong>
+    {% endif %}
+  </div>
+
+  <div class="job-status-body">
+    <p class="muted small">
+      Started: <code>{{ (job.ts_started or '')[:19] }}</code>
+      {% if job.ts_finished %}
+        · Finished: <code>{{ job.ts_finished[:19] }}</code>
+      {% endif %}
+      {% if job.pid %}· PID: <code>{{ job.pid }}</code>{% endif %}
+    </p>
+
+    {% if job.status == 'done' and job.resulting_run_id %}
+      <p>
+        <a class="btn btn-apply"
+           hx-get="/api/advisor/runs/{{ job.resulting_run_id }}"
+           hx-target="#advisor-detail"
+           hx-swap="innerHTML">
+          View run #{{ job.resulting_run_id }} →
+        </a>
+      </p>
+    {% endif %}
+
+    {% if job.status == 'failed' and job.error_msg %}
+      <p class="err">Error: {{ job.error_msg }}</p>
+      {% if job.log_path %}
+      <p class="muted small">Logs: <code>{{ job.log_path }}</code></p>
+      {% endif %}
+    {% endif %}
+
+    {% if running and job.log_path %}
+      <p class="muted small">
+        Streaming to: <code>{{ job.log_path }}</code>
+        (polling every 5s)
+      </p>
+    {% endif %}
+  </div>
+</div>
+
+{% endif %}
