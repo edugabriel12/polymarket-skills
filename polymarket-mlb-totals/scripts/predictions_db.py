@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS predictions (
     used_external   INTEGER,
     fee_rate        REAL,
     strategy        TEXT,
+    market_url      TEXT,                       -- direct Polymarket market link
     stats_log       TEXT,                       -- JSON: full math/stats audit
     status          TEXT NOT NULL DEFAULT 'PENDENTE'
                     CHECK(status IN ('PENDENTE','ACERTO','ERRO','ANULADO')),
@@ -69,8 +70,11 @@ _FIELDS = (
     "line", "side", "entry_price", "decimal_odds", "model_prob", "edge", "mu",
     "variance", "dispersion", "park_factor", "confidence", "size_pct",
     "size_usd", "kelly_fraction", "used_external", "fee_rate", "strategy",
-    "stats_log",
+    "market_url", "stats_log",
 )
+
+# Columns added after the initial release; created on older DBs via ensure_columns.
+_ADDED_COLUMNS = {"market_url": "TEXT"}
 
 
 def _now() -> str:
@@ -83,7 +87,17 @@ def connect(db_path: str = DEFAULT_DB) -> sqlite3.Connection:
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     con.executescript(_SCHEMA)
+    _ensure_columns(con)
     return con
+
+
+def _ensure_columns(con: sqlite3.Connection) -> None:
+    """Idempotent migration: add columns introduced after the first release."""
+    existing = {r["name"] for r in con.execute("PRAGMA table_info(predictions)")}
+    for col, decl in _ADDED_COLUMNS.items():
+        if col not in existing:
+            con.execute(f"ALTER TABLE predictions ADD COLUMN {col} {decl}")
+    con.commit()
 
 
 def record_prediction(pred: dict, db_path: str = DEFAULT_DB) -> int:

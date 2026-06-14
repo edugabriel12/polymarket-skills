@@ -210,6 +210,9 @@ def record_prediction_row(db_path, game_slug, game_date, totals, line, chosen, m
     """
     price = chosen["price"]
     odds = rd.decimal_odds(price)
+    market_slug = totals.get("slug") or ""
+    market_url = (f"https://polymarket.com/event/{market_slug}" if market_slug
+                  else f"https://polymarket.com/sports/mlb/{game_slug}")
     stats = {
         "model": "negative_binomial",
         "mu": round(m["mu"], 4), "variance": round(m["var"], 4),
@@ -242,7 +245,7 @@ def record_prediction_row(db_path, game_slug, game_date, totals, line, chosen, m
         "park_factor": park_factor, "confidence": confidence,
         "size_pct": size_pct, "size_usd": size_usd, "kelly_fraction": kelly,
         "used_external": m["used_external"], "fee_rate": args.fee_rate,
-        "strategy": STRATEGY, "stats": stats,
+        "strategy": STRATEGY, "market_url": market_url, "stats": stats,
     }
     try:
         return predictions_db.record_prediction(row, db_path)

@@ -123,6 +123,19 @@ python polymarket-mlb-totals/scripts/track_predictions.py --auto-settle --date 2
 Re-recording the same game/line/side while `PENDENTE` updates the snapshot (captures line
 movement); a settled row is never overwritten. Schema in `references/predictions-store.md`.
 
+## Web dashboard (`webapp/`)
+
+A modern React + FastAPI dashboard to interact with the model visually — two tabs:
+- **Análises** — the day's Over/Under suggestions as colorful cards with the full NegBin math; the
+  heavy calc runs **once per day** and is cached until day end.
+- **Resultados** — ROI, P&L, total/Over/Under win rate (daily/weekly/monthly) with charts; **each
+  visit triggers cross-source settlement** (MLB final + Polymarket closed) to update PENDENTE →
+  ACERTO/ERRO, with a direct Polymarket market link per row.
+
+Dark/light toggle, read-only (never trades). Run with `webapp/dev.sh` (backend :8000, frontend
+:5173) or see `webapp/README.md`. Seed offline demo data: `POST /api/seed-demo` or
+`python scripts/seed_demo.py --reset`.
+
 ## Honest limitations (read `references/edge-and-risk.md`)
 
 1. **No live data in this sandbox.** Polymarket and MLB data egress is blocked; only the
