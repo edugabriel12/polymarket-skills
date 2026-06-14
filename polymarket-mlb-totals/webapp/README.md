@@ -66,8 +66,24 @@ curl -X POST "http://localhost:8000/api/seed-demo?reset=true"
 | `GET /api/analyses?date=&force=` | Day's suggestions (cached once/day; `force=true` recomputes) |
 | `GET /api/results` | Runs settlement, then returns daily/weekly/monthly performance + recent |
 | `GET /api/predictions?status=&date=` | Raw prediction rows |
+| `POST /api/cache/clear?date=` | Delete the analyses cache (all, or one date) |
 | `POST /api/seed-demo?reset=` | Seed sample predictions (demo) |
 | `GET /api/health` | Liveness |
+
+### Clear the cache / recompute
+```bash
+# Recompute today and overwrite the cache (one shot):
+curl "http://localhost:8000/api/analyses?force=true"
+
+# Delete the whole analyses cache (next call recomputes):
+curl -X POST "http://localhost:8000/api/cache/clear"
+
+# Delete just one day:
+curl -X POST "http://localhost:8000/api/cache/clear?date=2026-06-14"
+```
+In the UI, the **Recalcular** button on the Análises tab does the force-recompute. (On Windows
+PowerShell use `curl.exe`.) Without the server, clear it directly:
+`python -c "import sqlite3,os;c=sqlite3.connect(os.path.expanduser('~/.polymarket-mlb-totals/predictions.db'));c.execute('DELETE FROM analysis_cache');c.commit()"`
 
 ## Tests
 - Backend: `cd backend && . .venv/bin/activate && python test_api.py`
