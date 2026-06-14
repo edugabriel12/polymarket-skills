@@ -275,21 +275,21 @@ class TestEndToEndRun(unittest.TestCase):
 
     def test_run_produces_suggestion_and_paper_dryrun(self):
         markets = [
-            # Game A: has an Over/Under totals market priced at 0.50 (payout 2.0x, in band).
-            _rich_market("mlb-hou-kc-2026-06-14",
-                         "Will the total runs be over or under 8.5?",
+            # Game A run-total event (own -total- slug), priced 0.50 (payout 2.0x, in band).
+            _rich_market("mlb-hou-kc-2026-06-14-total-8pt5",
+                         "Houston Astros vs. Kansas City Royals: O/U 8.5",
                          ["Over 8.5", "Under 8.5"], [0.50, 0.50], ["A_over", "A_under"]),
+            # Moneyline event -> dropped as non-run-total (not skipped).
             _rich_market("mlb-hou-kc-2026-06-14",
                          "Will the Astros beat the Royals?",
                          ["Astros", "Royals"], [0.55, 0.45], ["A_ml1", "A_ml2"]),
-            # Game B: moneyline only -> should be skipped ("no total-runs market").
-            _rich_market("mlb-nyy-bos-2026-06-14",
-                         "Will the Yankees beat the Red Sox?",
-                         ["Yankees", "Red Sox"], [0.60, 0.40], ["B_ml1", "B_ml2"]),
-            # Soccer (World Cup) total-GOALS market — must be filtered out, never
-            # modeled as baseball runs (different league prefix).
-            _rich_market("fifwc-ger-kor-2026-06-14",
-                         "Will the total goals be over or under 2.5?",
+            # Strikeout prop with Over/Under -> must NOT be modeled as a run total.
+            _rich_market("mlb-hou-kc-2026-06-14-k-someone-5pt5",
+                         "Someone: Strikeouts O/U 5.5",
+                         ["Over 5.5", "Under 5.5"], [0.50, 0.50], ["K_over", "K_under"]),
+            # Soccer (World Cup) total-GOALS -> filtered by the mlb- prefix.
+            _rich_market("fifwc-ger-kor-2026-06-14-total-2pt5",
+                         "Germany vs. Korea: O/U 2.5",
                          ["Over 2.5", "Under 2.5"], [0.50, 0.50], ["S_over", "S_under"]),
         ]
         st.discover_markets = lambda *a, **k: ("mlb", markets)
@@ -308,11 +308,13 @@ class TestEndToEndRun(unittest.TestCase):
                          record=True, predictions_db=preds_db)
             result = st.run(args)
 
-            # Soccer game filtered out by the mlb- prefix (not modeled, not skipped).
-            self.assertEqual(result["counts"]["games"], 2)             # only the 2 mlb games
+            # Only the run-total event survives the filters.
+            self.assertEqual(result["counts"]["games"], 1)             # the -total-8pt5 event
             self.assertEqual(result["counts"]["filtered_non_mlb"], 1)  # fifwc dropped
-            self.assertFalse(any("fifwc" in s["game"] for s in result["skipped"]))
-            self.assertFalse(any("fifwc" in s["game"] for s in result["suggestions"]))
+            self.assertEqual(result["counts"]["filtered_non_total"], 2)  # moneyline + K-prop
+            # Soccer + strikeout prop never modeled or listed.
+            self.assertFalse(any("fifwc" in s["game"] for s in result["suggestions"] + result["skipped"]))
+            self.assertFalse(any("-k-" in s["game"] for s in result["suggestions"] + result["skipped"]))
             self.assertGreaterEqual(result["counts"]["suggestions"], 1)
             sug = result["suggestions"][0]
             rec = sug["recommendation"]
@@ -321,8 +323,6 @@ class TestEndToEndRun(unittest.TestCase):
             self.assertEqual(rec["strategy"], "mlb-totals-negbin")
             self.assertLessEqual(rec["size_pct"], 0.01)     # first-trade cap
             self.assertTrue(rd.passes_odds_filter(rec["price"]))
-            # Game B (moneyline only) was skipped with a reason.
-            self.assertTrue(any(s["reason"] == "no total-runs market" for s in result["skipped"]))
             # --paper dry-run produced a result per suggestion.
             self.assertIn("paper_results", result)
             self.assertEqual(len(result["paper_results"]), result["counts"]["suggestions"])
@@ -334,7 +334,7 @@ class TestEndToEndRun(unittest.TestCase):
             self.assertGreaterEqual(len(rows), 1)
             row = rows[0]
             self.assertEqual(row["side"], "OVER")
-            self.assertEqual(row["game_slug"], "mlb-hou-kc-2026-06-14")
+            self.assertEqual(row["game_slug"], "mlb-hou-kc-2026-06-14-total-8pt5")
             stats = json.loads(row["stats_log"])
             self.assertEqual(stats["model"], "negative_binomial")
             self.assertIn("mu", stats)
@@ -344,7 +344,8 @@ class TestEndToEndRun(unittest.TestCase):
 class _Args:
     """Minimal args namespace with pipeline defaults overridable by kwargs."""
     def __init__(self, **kw):
-        defaults = dict(date=None, min_volume=10000.0, min_edge=0.05,
+        defaults = dict(date=None, min_volume=1000.0, min_edge=0.05, min_hours=0.0,
+                        best_line_only=True,
                         odds_min=1.60, odds_max=3.00, dispersion=2.0,
                         league_baseline=8.5, league_prefix="mlb-",
                         fee_rate=0.0, use_external=True,
