@@ -265,15 +265,18 @@ Scanner ──→ Analyzer ──→ Strategy Advisor ──→ Paper Trader ─
 | Browse/search markets | polymarket-scanner | `scan_markets.py`, `get_prices.py`, `get_orderbook.py` |
 | Find edges/arbitrage | polymarket-analyzer | `find_edges.py`, `momentum_scanner.py`, `analyze_orderbook.py` |
 | Monitor prices/alerts | polymarket-monitor | `monitor_prices.py`, `watch_market.py` |
+| List/listen to all markets in a category | polymarket-category-watcher | `list_category_markets.py`, `watch_category.py` |
 | Get trade recommendations | polymarket-strategy-advisor | `advisor.py`, `daily_review.py` |
 | Simulate trades | polymarket-paper-trader | `paper_engine.py`, `execute_paper.py`, `portfolio_report.py` |
 | Execute real trades | polymarket-live-executor | `execute_live.py`, `check_positions.py` |
+| Analyze any public wallet | polymarket-wallet-analyzer | `analyze_wallet.py` |
 
 All scripts are in `<skill>/scripts/` and require the Python venv: `source ~/.venv/bin/activate`
 
 All API calls use:
 - **Gamma API** (`gamma-api.polymarket.com`) — market metadata, zero auth
 - **CLOB API** (`clob.polymarket.com`) — prices/orderbooks read-only, trading needs L2 auth
+- **Data API** (`data-api.polymarket.com`) — wallet positions/trades/holders, read-only, zero auth
 
 ---
 
