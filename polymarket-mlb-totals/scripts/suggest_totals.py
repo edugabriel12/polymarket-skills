@@ -259,6 +259,9 @@ def run(args) -> dict:
     api = APIClient(rate_limit_ms=args.rate_limit, debug=args.debug)
     target = args.date or now_utc().date().isoformat()
     category_key, candidates = resolve_category("baseball")
+    # Prefer the tighter "mlb" tag; Gamma may ignore an unknown tag_slug and
+    # return ALL sports, so we also hard-filter by slug prefix below.
+    candidates = ["mlb"] + [c for c in candidates if c != "mlb"]
 
     try:
         _tag, markets = discover_markets(api, category_key, candidates,
@@ -269,6 +272,16 @@ def run(args) -> dict:
 
     on_day = [m for m in markets if game_date(m) == target]
     games = group_by_event(on_day)
+
+    # Keep only MLB games. Polymarket game slugs are league-prefixed
+    # (mlb-..., fifwc-..., cs2-...); this guarantees we never model a soccer or
+    # esports total as baseball runs even if discovery returned mixed sports.
+    prefix = (args.league_prefix or "").lower()
+    filtered_non_league = 0
+    if prefix:
+        before = len(games)
+        games = {k: v for k, v in games.items() if k.lower().startswith(prefix)}
+        filtered_non_league = before - len(games)
 
     portfolio_value = float(args.portfolio_value)
     first_trade = data_inputs.is_first_trade(STRATEGY, args.portfolio_db)
@@ -359,7 +372,8 @@ def run(args) -> dict:
         "portfolio_value": portfolio_value,
         "first_trade_strategy": first_trade,
         "counts": {"games": len(games), "suggestions": len(suggestions),
-                   "skipped": len(skipped)},
+                   "skipped": len(skipped),
+                   "filtered_non_mlb": filtered_non_league},
         "suggestions": suggestions,
         "skipped": skipped,
         "disclaimer": "Paper-trading simulation — not financial advice. Real "
@@ -419,6 +433,8 @@ def main() -> None:
     p.add_argument("--odds-max", type=float, default=rd.ODDS_MAX_DEFAULT, help="Max decimal payout (default 3.00)")
     p.add_argument("--dispersion", type=float, default=2.0, help="variance = dispersion*mean (default 2.0)")
     p.add_argument("--league-baseline", type=float, default=8.5, help="Neutral game total (default 8.5)")
+    p.add_argument("--league-prefix", default="mlb-",
+                   help="Only process games whose slug starts with this (default 'mlb-'; '' = all)")
     p.add_argument("--fee-rate", type=float, default=0.0, help="Taker fee base rate (default 0; sports fee-free)")
     p.add_argument("--use-external", dest="use_external", action="store_true", default=True,
                    help="Use external data inputs (default on; falls back gracefully)")

@@ -80,6 +80,7 @@ def _analysis_args(target_date: str) -> argparse.Namespace:
     return argparse.Namespace(
         date=target_date, min_volume=10000.0, min_edge=0.05,
         odds_min=1.60, odds_max=3.00, dispersion=2.0, league_baseline=8.5,
+        league_prefix="mlb-",
         fee_rate=0.0, use_external=True, projections_csv=None,
         refresh_prices=False, portfolio_value=10000.0, portfolio_db=None,
         record=True, predictions_db=DB_PATH, paper=False, paper_execute=False,

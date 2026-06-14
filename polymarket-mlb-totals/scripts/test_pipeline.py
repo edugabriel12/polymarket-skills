@@ -286,6 +286,11 @@ class TestEndToEndRun(unittest.TestCase):
             _rich_market("mlb-nyy-bos-2026-06-14",
                          "Will the Yankees beat the Red Sox?",
                          ["Yankees", "Red Sox"], [0.60, 0.40], ["B_ml1", "B_ml2"]),
+            # Soccer (World Cup) total-GOALS market — must be filtered out, never
+            # modeled as baseball runs (different league prefix).
+            _rich_market("fifwc-ger-kor-2026-06-14",
+                         "Will the total goals be over or under 2.5?",
+                         ["Over 2.5", "Under 2.5"], [0.50, 0.50], ["S_over", "S_under"]),
         ]
         st.discover_markets = lambda *a, **k: ("mlb", markets)
         st.game_date = lambda m: "2026-06-14"
@@ -303,7 +308,11 @@ class TestEndToEndRun(unittest.TestCase):
                          record=True, predictions_db=preds_db)
             result = st.run(args)
 
-            self.assertEqual(result["counts"]["games"], 2)
+            # Soccer game filtered out by the mlb- prefix (not modeled, not skipped).
+            self.assertEqual(result["counts"]["games"], 2)             # only the 2 mlb games
+            self.assertEqual(result["counts"]["filtered_non_mlb"], 1)  # fifwc dropped
+            self.assertFalse(any("fifwc" in s["game"] for s in result["skipped"]))
+            self.assertFalse(any("fifwc" in s["game"] for s in result["suggestions"]))
             self.assertGreaterEqual(result["counts"]["suggestions"], 1)
             sug = result["suggestions"][0]
             rec = sug["recommendation"]
@@ -337,7 +346,8 @@ class _Args:
     def __init__(self, **kw):
         defaults = dict(date=None, min_volume=10000.0, min_edge=0.05,
                         odds_min=1.60, odds_max=3.00, dispersion=2.0,
-                        league_baseline=8.5, fee_rate=0.0, use_external=True,
+                        league_baseline=8.5, league_prefix="mlb-",
+                        fee_rate=0.0, use_external=True,
                         projections_csv=None, refresh_prices=False,
                         portfolio_value=10000.0, portfolio_db=None,
                         record=False, predictions_db=None,
