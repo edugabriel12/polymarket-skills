@@ -76,6 +76,22 @@ curl -s "https://clob.polymarket.com/midpoint?token_id=<TOKEN_ID>" | jq
 If a slug differs, update `CATEGORY_TAG_CANDIDATES` in `category_common.py`
 (and this table), or just pass the working slug with `--tag`.
 
+## Sports game slugs (used by `list_games_today.py`)
+
+Polymarket lists a sports game with a date-stamped slug under `/sports/<league>/`:
+
+```
+https://polymarket.com/sports/mlb/mlb-hou-kc-2026-06-13
+                                   └─┬─┘ └┬┘ └┬┘ └────┬────┘
+                                  league away home  game date
+```
+
+`extract_slug_date()` reads the trailing `YYYY-MM-DD` from the slug (or
+`event_slug`), which is the **authoritative** game date. `game_date()` falls back
+to `gameStartTime` then `startDate` (UTC) when a slug carries no date. Each game
+is one event; its moneyline, totals, and run-line markets share the same
+`event_slug` and are grouped into a single game row.
+
 ## Pagination
 
 `discover_markets` requests pages of 100 (`limit=100`) and advances `offset` by

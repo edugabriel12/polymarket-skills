@@ -43,6 +43,18 @@ source ~/.venv/bin/activate && python polymarket-category-watcher/scripts/list_c
   --category futebol --min-volume 10000
 ```
 
+### List all baseball/MLB games happening today
+
+```bash
+source ~/.venv/bin/activate && python polymarket-category-watcher/scripts/list_games_today.py --output text
+```
+
+```bash
+# A specific day, only games not yet started
+source ~/.venv/bin/activate && python polymarket-category-watcher/scripts/list_games_today.py \
+  --date 2026-06-13 --upcoming-only --output text
+```
+
 ### Continuously listen to a whole category (live price stream)
 
 ```bash
@@ -74,6 +86,36 @@ result is not limited to one 100-row page.
 
 Provide either `--category` or `--tag`. JSON output includes per-market `token_ids`, which feed
 straight into `watch_category.py`.
+
+### list_games_today.py — a day's games for a sport
+
+Lists all **games** of a sport happening on a given day, one row per game. Built
+for date-stamped sports slugs like `mlb-hou-kc-2026-06-13` (HOU @ KC on
+2026-06-13, page `https://polymarket.com/sports/mlb/<slug>`): the game date is
+read from the slug, so it is exact. Markets for the same game (moneyline, totals,
+run line) are grouped, with the moneyline used as the game's headline.
+
+**Arguments:**
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--date YYYY-MM-DD` | today (UTC) | Target day |
+| `--category TEXT` | baseball | Category/alias to discover (candidates incl. `mlb`) |
+| `--tag SLUG` | — | Explicit Gamma `tag_slug`, overrides `--category` |
+| `--sport-path TEXT` | mlb | URL segment under `/sports/` for game links |
+| `--min-volume N` | 0 | Minimum 24h volume per market |
+| `--include-closed` | off | Also include closed/resolved markets |
+| `--upcoming-only` | off | Drop games whose start time is already past |
+| `--output json\|text` | json | Output format |
+| `--rate-limit MS` / `--debug` | 100 / off | API pacing / logging |
+
+**Per-game output:** `game_slug`, `game_date`, `game_start_time`, `url`,
+`matchup`, `teams`, `moneyline_prices`, aggregated `volume_24h`, and the full
+`markets` list (each with `token_ids` for monitoring/trading).
+
+> Date note: the game date comes from the slug when present (authoritative),
+> else from `gameStartTime`/`startDate` in **UTC**. For late US games that cross
+> midnight UTC, pass `--date` explicitly to target the intended day.
 
 ### watch_category.py — continuous listener
 
@@ -122,6 +164,9 @@ The exact slug candidates and how to verify/extend them live in
 ```
 list_category_markets.py  ──(token_ids)──▶  watch_category.py
    discover all markets                       poll prices + alert + re-scan
+
+list_games_today.py        ──(per-game token_ids)──▶  watch_category.py / trading
+   one row per game on a day
 ```
 
 ## Notes
