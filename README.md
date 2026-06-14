@@ -9,6 +9,7 @@ Composable [Agent Skills](https://agentskills.io/specification) for Polymarket p
 | **polymarket-scanner** | Browse, search, and explore live markets | None | Zero |
 | **polymarket-analyzer** | Detect edges: arbitrage, momentum, correlation analysis | None | Zero |
 | **polymarket-monitor** | Price alerts and position monitoring | None | Zero |
+| **polymarket-category-watcher** | List & continuously listen to all live markets of a category (basketball, tennis, soccer) | None | Zero |
 | **polymarket-paper-trader** | Simulate trades against live prices, portfolio health checks | None | Zero |
 | **polymarket-strategy-advisor** | Trading methodology, recommendations, backtesting | None | Low |
 | **polymarket-live-executor** | Execute real trades (wallet + explicit human opt-in) | L2 Wallet | Medium |
@@ -117,6 +118,16 @@ Scanner --> Analyzer --> Strategy Advisor --> Paper Trader --> Live Executor
 |--------|---------|----------|
 | `monitor_prices.py` | Multi-token polling with threshold alerts (JSON) | `--token-id ID --interval 30 --threshold 5.0` |
 | `watch_market.py` | Continuous single-market snapshots | `--token-id ID --interval 15` |
+
+### polymarket-category-watcher/ -- Category Discovery & Live Listener (Read-Only)
+
+| Script | Purpose | Key Args |
+|--------|---------|----------|
+| `list_category_markets.py` | List ALL live markets of a category (paginated) | `--category basketball [--output text] [--min-volume N]` |
+| `watch_category.py` | Continuously listen to every market in a category; emits JSON events and re-scans for new markets | `--category tennis --interval 20 --threshold 3` |
+
+Self-contained skill (own `category_common.py`); maps friendly names + PT-BR aliases
+(basquete, tênis, futebol, ...) to Gamma `tag_slug` candidates. No private key required.
 
 ### polymarket-paper-trader/ -- Simulation Engine
 
