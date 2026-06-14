@@ -209,6 +209,12 @@ def run(args) -> dict:
         chosen, notes = pick_side([("OVER", ou["over_token"], ou["over_price"], probs["p_over_eff"]),
                                    ("UNDER", ou["under_token"], ou["under_price"], probs["p_under_eff"])],
                                   args.fee_rate, args.odds_min, args.odds_max)
+        vlog(f"  [{slug}] model(TOTAL {line}): λh={lam_h:.2f} λa={lam_a:.2f} ρ={args.rho} "
+             f"P(over)={probs['p_over_eff']:.3f} P(under)={probs['p_under_eff']:.3f} external={used}"
+             + (f" inputs={_inp}" if _inp else ""))
+        vlog(f"  [{slug}] edges(TOTAL): " + "; ".join(
+            f"{n['side']} price={n['price']} p={n['p_model']} edge={n['edge']:+.3f} "
+            f"band={n['in_odds_band']}" for n in notes))
         _emit_or_skip("TOTAL", slug, m, line, chosen, notes, lam_h, lam_a, used,
                       ou["book_sum"], ou["price_sane"], args, portfolio_value, first_trade, kh,
                       suggestions, _skip, target)
@@ -230,6 +236,12 @@ def run(args) -> dict:
         chosen, notes = pick_side([("YES", bt["yes_token"], bt["yes_price"], probs["p_yes"]),
                                    ("NO", bt["no_token"], bt["no_price"], probs["p_no"])],
                                   args.fee_rate, args.odds_min, args.odds_max)
+        vlog(f"  [{slug}] model(BTTS): λh={lam_h:.2f} λa={lam_a:.2f} ρ={args.rho} "
+             f"P(yes)={probs['p_yes']:.3f} P(no)={probs['p_no']:.3f} external={used}"
+             + (f" inputs={_inp}" if _inp else ""))
+        vlog(f"  [{slug}] edges(BTTS): " + "; ".join(
+            f"{n['side']} price={n['price']} p={n['p_model']} edge={n['edge']:+.3f} "
+            f"band={n['in_odds_band']}" for n in notes))
         _emit_or_skip("BTTS", slug, m, None, chosen, notes, lam_h, lam_a, used,
                       bt["book_sum"], bt["price_sane"], args, portfolio_value, first_trade, kh,
                       suggestions, _skip, target)
