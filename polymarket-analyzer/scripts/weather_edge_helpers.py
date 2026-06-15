@@ -65,9 +65,16 @@ SIGMA_FLOOR_C = 1.0         # °C
 SIGMA_FLOOR_F = SIGMA_FLOOR_C * 9.0 / 5.0  # = 1.8°F
 # When the calibrated ensemble path is in use, the v12.1 P(side) cap of 0.70
 # is replaced by a looser sanity cap — the ensemble itself is now the
-# uncertainty model, not a constant. Caps at 0.95 just to bound the
-# pathological case (all 3 models perfectly agree at the threshold midpoint).
-ENSEMBLE_PROB_CAP = 0.95
+# uncertainty model, not a constant.
+# v13.1 (2026-06-15): lowered 0.95 → 0.80. The 0.95 cap let the ensemble
+# emit bot_prob ~0.95 on range NO bets, while the judge's range calibration
+# discipline caps judge_prob at 0.65-0.70 — a permanent ~30pp gap that
+# tripped Rule 6 on 84% of reviews and rejected the whole pipeline
+# (2026-06-15 run: 226 REJECT / 296). 0.80 keeps the ensemble's sharpness
+# but stays within ~15pp of the judge so Rule 6 (20pp) no longer fires on
+# the judge's own ADJUST verdicts. Also honors the research caveat that
+# ≤1°C bins need proven calibration before trusting prob > 0.90.
+ENSEMBLE_PROB_CAP = 0.80
 
 
 # ---------------------------------------------------------------------------
@@ -1602,16 +1609,17 @@ if __name__ == "__main__":
     assert prob_yes_for_sizing(0.42, "NO", "exceed") == 0.42
     print("Test 8b PASS: prob_yes_for_sizing caps chosen side for range only")
 
-    # Test 8c (v13): ensemble_calibrated=True relaxes the cap to 0.95.
-    # P(YES)=0.02 (very small) NO side → cap at 0.95 means floor at 0.05.
+    # Test 8c (v13.1): ensemble_calibrated=True relaxes the cap to 0.80
+    # (lowered from 0.95 to stay within Rule-6's 20pp of the judge's range cap).
+    # P(YES)=0.02 (very small) NO side → cap P(NO) at 0.80 means floor P(YES) at 0.20.
     s_no_cal = prob_yes_for_sizing(0.02, "NO", "range", ensemble_calibrated=True)
-    assert abs(s_no_cal - 0.05) < 1e-9, f"calibrated NO cap should give 0.05, got {s_no_cal}"
-    # P(YES)=0.98 YES side → cap at 0.95.
+    assert abs(s_no_cal - 0.20) < 1e-9, f"calibrated NO cap should give 0.20, got {s_no_cal}"
+    # P(YES)=0.98 YES side → cap at 0.80.
     s_yes_cal = prob_yes_for_sizing(0.98, "YES", "range", ensemble_calibrated=True)
-    assert abs(s_yes_cal - 0.95) < 1e-9, f"calibrated YES cap should give 0.95, got {s_yes_cal}"
+    assert abs(s_yes_cal - 0.80) < 1e-9, f"calibrated YES cap should give 0.80, got {s_yes_cal}"
     # Default (False) still caps at 0.70.
     assert abs(prob_yes_for_sizing(0.02, "NO", "range") - 0.30) < 1e-9
-    print("Test 8c PASS: ensemble_calibrated cap=0.95 vs default cap=0.70")
+    print("Test 8c PASS: ensemble_calibrated cap=0.80 vs default cap=0.70")
 
     # Test 8d (v13): compute_ensemble_calibration NGR math.
     # 3 models agreeing closely: 25.0, 25.5, 26.0 C → mean 25.5, std 0.5 (sample, n-1).
