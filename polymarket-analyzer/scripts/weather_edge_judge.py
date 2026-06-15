@@ -102,6 +102,16 @@ RANGE_PROB_CAP_NEAR = float(os.environ.get("JUDGE_RANGE_PROB_CAP_NEAR", "0.65"))
 RANGE_NEAR_MAE_MULT = float(os.environ.get("JUDGE_RANGE_NEAR_MAE_MULT", "2.0"))
 RANGE_ADJUST_SIZE_USD = float(os.environ.get("JUDGE_RANGE_ADJUST_SIZE_USD", "20.0"))
 
+# v13.1 (2026-06-15): Rule-6 divergence on an ADJUST verdict no longer hard-
+# REJECTs. The judge emitting ADJUST means "same side, less conviction —
+# size down", not "kill". When such an ADJUST diverges from the bot by
+# >20pp, we keep ADJUST but cap the stake to this tiny size (the judge's
+# conviction, not the bot's, governs exposure). APPROVE that diverges still
+# hard-REJECTs (the bot wanted full size and the judge fundamentally
+# disagrees). A trade the judge itself sees as -EV (judge_prob <= the side's
+# price) is still REJECTed — never trade without a quantifiable edge.
+RULE6_DOWNSIZE_USD = float(os.environ.get("JUDGE_RULE6_DOWNSIZE_USD", "10.0"))
+
 # Pricing per 1M tokens (Sonnet 4.6 / Opus 4.7 — adjust if model changed)
 PRICING = {
     "claude-sonnet-4-6": {"input": 3.00, "output": 15.00, "cache_read": 0.30},
@@ -218,6 +228,30 @@ def call_claude(entry_row: dict, evidence: dict, system_prompt: str) -> Optional
 
     client = anthropic.Anthropic()  # uses ANTHROPIC_API_KEY
 
+    # v13.1 (C): surface the calibrated Open-Meteo ensemble (ICON+GFS+ECMWF)
+    # the bot sized with, so the judge calibrates against the SAME evidence
+    # rather than applying a blanket range cap. When the ensemble members
+    # agree tightly, the bot's high P(side) is well-founded and the judge
+    # should not penalize it down to 0.65 out of generic range skepticism.
+    ensemble_block = None
+    try:
+        dm = json.loads(entry_row["discovery_meta_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        dm = {}
+    if dm.get("ensemble_calibrated"):
+        ensemble_block = {
+            "source": "Open-Meteo ICON+GFS+ECMWF (NGR-calibrated)",
+            "ensemble_mean_mu": dm.get("mu"),
+            "ensemble_sigma": dm.get("mae_dynamic"),
+            "members": dm.get("ensemble_members"),
+            "unit": entry_row["threshold_unit"],
+            "note": ("This (mu, sigma) is what the bot sized with. If the "
+                     "members agree tightly (small sigma), a high P(side) is "
+                     "well-founded — do NOT cap your judge_prob down out of "
+                     "generic range-market skepticism. Disagree only with "
+                     "independent evidence (NWS/VC/news/climatology)."),
+        }
+
     # Build user content: market context + evidence
     user_content = json.dumps({
         "market_question": entry_row["market_question"],
@@ -236,6 +270,7 @@ def call_claude(entry_row: dict, evidence: dict, system_prompt: str) -> Optional
             "edge_pp": entry_row["edge_pp_at_entry"],
             "openweather_forecast": json.loads(entry_row["forecast_snapshot_json"] or "{}"),
         },
+        "ensemble_forecast": ensemble_block,
         "additional_evidence": evidence,
     }, indent=2, ensure_ascii=False)
 
@@ -509,7 +544,8 @@ def _range_calibration(entry_row) -> Optional[dict]:
     """
     try:
         from weather_edge_helpers import (parse_market, forecast_ref_value,
-                                          load_cities, MAE_TEMP_C, MAE_TEMP_F)
+                                          load_cities, MAE_TEMP_C, MAE_TEMP_F,
+                                          ENSEMBLE_PROB_CAP)
     except Exception:
         return None
     try:
@@ -528,7 +564,27 @@ def _range_calibration(entry_row) -> Optional[dict]:
     if ref is None:
         return None
     lo, hi = float(spec.threshold_value), float(spec.threshold_value_high)
-    mae = MAE_TEMP_C if (spec.threshold_unit or "").upper() == "C" else MAE_TEMP_F
+
+    # v13.1 (C): when the bot sized with a CALIBRATED ENSEMBLE, use the
+    # ensemble sigma (not the static MAE) for the near-edge band, and relax
+    # the far cap to ENSEMBLE_PROB_CAP. A tight 3-model ensemble far from the
+    # bin is genuinely confident — clamping it to 0.70 out of generic range
+    # skepticism is what froze the pipeline (2026-06-15). Legacy MAE-path
+    # range markets keep the conservative 0.70/0.65 caps.
+    ensemble_sigma = None
+    try:
+        dm = json.loads(entry_row["discovery_meta_json"] or "{}")
+        if dm.get("ensemble_calibrated") and dm.get("mae_dynamic"):
+            ensemble_sigma = float(dm["mae_dynamic"])
+    except (TypeError, json.JSONDecodeError):
+        pass
+    if ensemble_sigma is not None and ensemble_sigma > 0:
+        mae = ensemble_sigma
+        cap_far = ENSEMBLE_PROB_CAP            # 0.80, matches bot's sizing cap
+    else:
+        mae = MAE_TEMP_C if (spec.threshold_unit or "").upper() == "C" else MAE_TEMP_F
+        cap_far = RANGE_PROB_CAP               # 0.70 (legacy)
+
     # Distance from the forecast to the nearest edge of [lo, hi] (0 if inside).
     if ref < lo:
         dist = lo - ref
@@ -537,9 +593,10 @@ def _range_calibration(entry_row) -> Optional[dict]:
     else:
         dist = 0.0
     near = dist < RANGE_NEAR_MAE_MULT * mae
-    return {"cap": RANGE_PROB_CAP_NEAR if near else RANGE_PROB_CAP,
+    return {"cap": RANGE_PROB_CAP_NEAR if near else cap_far,
             "near": near, "dist": dist, "mae": mae,
-            "lo": lo, "hi": hi, "ref": ref}
+            "lo": lo, "hi": hi, "ref": ref,
+            "ensemble": ensemble_sigma is not None}
 
 
 def apply_verdict(conn, entry_row, verdict: dict) -> None:
@@ -565,9 +622,38 @@ def apply_verdict(conn, entry_row, verdict: dict) -> None:
                 f"confidence=0.0 indicates broken/unparseable LLM output; "
                 f"cannot trust APPROVE/ADJUST with no confidence")
         elif divergence > 0.20:
-            override_reason = (
-                f"Rule 6 violation: |judge_prob {judge_prob:.2f} - "
-                f"bot_prob {bot_prob:.2f}| = {divergence*100:.0f}pp > 20pp")
+            # v13.1: Rule-6 divergence is handled DIFFERENTLY by verdict.
+            #  - APPROVE: hard-REJECT (bot wanted full size, judge
+            #    fundamentally disagrees — unchanged behavior).
+            #  - ADJUST: the judge already wants to size down, not kill.
+            #    Keep ADJUST but cap the stake to RULE6_DOWNSIZE_USD so the
+            #    judge's (lower) conviction governs exposure — UNLESS the
+            #    judge itself sees no edge (judge_prob <= the side's price),
+            #    in which case REJECT (never trade without an edge, §1.1).
+            if original_verdict == "APPROVE":
+                override_reason = (
+                    f"Rule 6 violation on APPROVE: |judge_prob {judge_prob:.2f} "
+                    f"- bot_prob {bot_prob:.2f}| = {divergence*100:.0f}pp > 20pp")
+            else:  # ADJUST
+                entry_price = float(entry_row["entry_price"] or 0.0)
+                if judge_prob <= entry_price:
+                    override_reason = (
+                        f"Rule 6 on ADJUST + no edge at judge_prob: "
+                        f"judge_prob {judge_prob:.2f} <= side price "
+                        f"{entry_price:.2f} (bot {bot_prob:.2f})")
+                    override_kind = "rule6_adjust_no_edge"
+                else:
+                    cur_cap = verdict.get("adjusted_size_usd")
+                    new_cap = (RULE6_DOWNSIZE_USD if not cur_cap
+                               else min(float(cur_cap), RULE6_DOWNSIZE_USD))
+                    verdict["adjusted_size_usd"] = new_cap
+                    log_event("rule6_adjust_downsize", {
+                        "entry_id": entry_row["entry_id"],
+                        "judge_prob": judge_prob, "bot_prob": bot_prob,
+                        "divergence_pp": round(divergence * 100, 1),
+                        "entry_price": entry_price,
+                        "size_cap_usd": new_cap,
+                    }, level="WARN")
         else:
             # v11: threshold-proximity hard-enforce (forecast ~1°C from the
             # threshold / range edge → coin flip → REJECT). Checked only when
@@ -849,8 +935,8 @@ def _test_rule6_enforce():
     We don't actually call apply_verdict (it writes to DB); we re-implement
     the decision tree here so the test is hermetic and fast."""
 
-    def _decide(verdict_dict: dict, bot_prob: float):
-        """Mirror of the override block in apply_verdict()."""
+    def _decide(verdict_dict: dict, bot_prob: float, entry_price: float = 0.0):
+        """Mirror of the override block in apply_verdict() (v13.1)."""
         v = dict(verdict_dict)  # copy
         original_verdict = v["verdict"]
         confidence = float(v.get("confidence") or 0.0)
@@ -861,7 +947,16 @@ def _test_rule6_enforce():
             if confidence == 0.0:
                 override_reason = "confidence=0.0"
             elif divergence > 0.20:
-                override_reason = f"Rule 6 violation ({divergence*100:.0f}pp)"
+                if original_verdict == "APPROVE":
+                    override_reason = f"Rule 6 violation on APPROVE ({divergence*100:.0f}pp)"
+                else:  # ADJUST: downsize unless the judge sees no edge
+                    if judge_prob <= entry_price:
+                        override_reason = "Rule 6 on ADJUST + no edge at judge_prob"
+                    else:
+                        cur = v.get("adjusted_size_usd")
+                        v["adjusted_size_usd"] = (RULE6_DOWNSIZE_USD if not cur
+                                                  else min(float(cur), RULE6_DOWNSIZE_USD))
+                        return v  # stays ADJUST, downsized
         if override_reason:
             v["verdict"] = "REJECT"
             v["rationale"] = (f"[SYSTEM OVERRIDE: {override_reason}]\n\n"
@@ -884,7 +979,7 @@ def _test_rule6_enforce():
                   "judge_prob": 0.10, "rationale": "I think it's still fine"},
                  bot_prob=0.90)
     assert r["verdict"] == "REJECT", r
-    assert "Rule 6 violation (80pp)" in r["rationale"]
+    assert "Rule 6 violation on APPROVE (80pp)" in r["rationale"]
     assert "I think it's still fine" in r["rationale"]  # original preserved
     print(f"Test 2 PASS: APPROVE Δ=80pp → REJECT (rationale preserved)")
 
@@ -914,14 +1009,33 @@ def _test_rule6_enforce():
     assert r["verdict"] == "APPROVE", f"exactly 20pp should pass: {r}"
     print(f"Test 5 PASS: Δ=20pp exactly is not a violation (> 0.20 threshold)")
 
-    # Test 6: ADJUST with Δ=21pp → override
+    # Test 6 (v13.1): ADJUST Δ=21pp with edge at judge_prob → DOWNSIZE, keep
+    # ADJUST (was REJECT pre-v13.1). judge_prob 0.69 > side price 0.55.
     r = _decide({"verdict": "ADJUST", "confidence": 0.65,
                   "judge_prob": 0.69, "rationale": "moderately confident",
                   "adjusted_size_usd": 8.0},
-                 bot_prob=0.90)
+                 bot_prob=0.90, entry_price=0.55)
+    assert r["verdict"] == "ADJUST", r
+    assert "OVERRIDE" not in r["rationale"]
+    assert r["adjusted_size_usd"] == min(8.0, RULE6_DOWNSIZE_USD), r
+    print(f"Test 6 PASS: ADJUST Δ=21pp + edge → DOWNSIZE (stays ADJUST, cap ${r['adjusted_size_usd']})")
+
+    # Test 7 (v13.1): ADJUST Δ>20pp but judge sees NO edge (judge_prob <=
+    # side price) → REJECT (never trade a -EV bet, §1.1).
+    r = _decide({"verdict": "ADJUST", "confidence": 0.6,
+                  "judge_prob": 0.65, "rationale": "thin",
+                  "adjusted_size_usd": 8.0},
+                 bot_prob=0.94, entry_price=0.66)
     assert r["verdict"] == "REJECT", r
-    assert "Rule 6 violation (21pp)" in r["rationale"]
-    print(f"Test 6 PASS: ADJUST Δ=21pp → REJECT")
+    assert "no edge at judge_prob" in r["rationale"]
+    print(f"Test 7 PASS: ADJUST Δ>20pp + judge_prob<=price → REJECT (no edge)")
+
+    # Test 8 (v13.1): ADJUST with bare downsize when no prior adjusted_size.
+    r = _decide({"verdict": "ADJUST", "confidence": 0.55,
+                  "judge_prob": 0.65, "rationale": "size down"},
+                 bot_prob=0.95, entry_price=0.50)
+    assert r["verdict"] == "ADJUST" and r["adjusted_size_usd"] == RULE6_DOWNSIZE_USD, r
+    print(f"Test 8 PASS: ADJUST downsize with no prior cap → ${RULE6_DOWNSIZE_USD}")
 
     print("\nAll Rule 6 enforce tests PASS (6/6)")
 
