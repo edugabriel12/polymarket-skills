@@ -148,6 +148,14 @@ python polymarket-mlb-totals/scripts/audit_log.py --sport soccer  # the soccer s
 python polymarket-mlb-totals/scripts/audit_log.py --json > audit.json   # machine-readable
 ```
 
+### Reset the store (`reset_db.py`)
+Clear all recorded predictions (and the analysis cache) to start fresh after a model change. Pure
+stdlib; `--sport mlb|soccer|all`. Destructive — asks to confirm unless `--yes`.
+```bash
+python polymarket-mlb-totals/scripts/reset_db.py --sport all --yes   # clear both stores
+python polymarket-mlb-totals/scripts/reset_db.py --sport mlb --delete-file --yes  # remove the .db file
+```
+
 Re-recording the same game/line/side while `PENDENTE` updates the snapshot (captures line
 movement); a settled row is never overwritten. Schema in `references/predictions-store.md`.
 
