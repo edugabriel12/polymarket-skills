@@ -275,6 +275,12 @@ def results(sport: str = Query("mlb")) -> dict:
         except Exception as e:  # noqa: BLE001
             settled = {"checked": 0, "settled": [], "error": str(e)}
         perf, series, recent = analytics.performance(db), analytics.pnl_by_day(db), pdb.get_predictions(db)[:50]
+    print(f"[results] {sport} settlement: checked={settled.get('checked', 0)} "
+          f"finals_found={settled.get('finals_found', '-')} "
+          f"settled={len(settled.get('settled', []))} "
+          f"backfilled_urls={settled.get('backfilled_urls', 0)}"
+          + (f" error={settled['error']}" if settled.get('error') else ""),
+          file=sys.stderr, flush=True)
     return {"sport": sport, "settlement": settled, "performance": perf,
             "pnl_by_day": series, "recent": recent, "generated_at": _now()}
 

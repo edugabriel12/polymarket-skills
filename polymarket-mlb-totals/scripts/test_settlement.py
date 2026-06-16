@@ -32,18 +32,23 @@ class TestDecideSettlements(unittest.TestCase):
         ]
         self.finals = {("hou", "kc"): 9.0, ("nyy", "bos"): 7.0}  # lad-sf not final
 
-    def test_requires_both_sources(self):
-        closed = {"0xA": True, "0xB": False}  # B final but market not closed
+    def test_default_settles_on_mlb_final(self):
+        # New default: the MLB final is authoritative; Polymarket-closed is ignored.
+        closed = {"0xA": True, "0xB": False}  # B final but market not (yet) closed
         out = settlement.decide_settlements(self.pending, self.finals, closed)
+        self.assertEqual(sorted(out), [(1, 9.0), (2, 7.0)])  # both finals settle
+
+    def test_require_closed_opt_in_needs_both(self):
+        closed = {"0xA": True, "0xB": False}
+        out = settlement.decide_settlements(self.pending, self.finals, closed, require_closed=True)
         self.assertEqual(out, [(1, 9.0)])  # only A: final + closed
 
-    def test_no_market_status_blocks_when_required(self):
-        out = settlement.decide_settlements(self.pending, self.finals, {}, require_closed=True)
-        self.assertEqual(out, [])
-
-    def test_allow_without_close_when_not_required(self):
-        out = settlement.decide_settlements(self.pending, self.finals, {}, require_closed=False)
-        self.assertEqual(sorted(out), [(1, 9.0), (2, 7.0)])  # both finals, no close gate
+    def test_no_market_status_blocks_only_when_required(self):
+        self.assertEqual(
+            settlement.decide_settlements(self.pending, self.finals, {}, require_closed=True), [])
+        self.assertEqual(
+            sorted(settlement.decide_settlements(self.pending, self.finals, {})),
+            [(1, 9.0), (2, 7.0)])  # default: no close gate -> both finals settle
 
 
 class TestSettlePendingOffline(unittest.TestCase):
