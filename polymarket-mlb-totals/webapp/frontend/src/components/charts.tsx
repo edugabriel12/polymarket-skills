@@ -26,25 +26,31 @@ export function WinRateDonut({ block }: { block: PerfBlock }) {
     { name: "Erro", value: block.counts.erro, color: C.loss },
   ];
   const total = block.counts.acerto + block.counts.erro;
+  const hasData = total > 0;
+  const slices = hasData ? data : [{ name: "—", value: 1, color: "#334155" }];
   return (
     <div className="relative h-48">
       <ResponsiveContainer width="100%" height="100%">
         <PieChart>
           <Pie
-            data={total ? data : [{ name: "—", value: 1, color: "#334155" }]}
+            data={slices}
             innerRadius={58}
             outerRadius={80}
-            paddingAngle={3}
+            paddingAngle={hasData ? 3 : 0}
             dataKey="value"
             stroke="none"
+            isAnimationActive={hasData}
           >
-            {(total ? data : [{ color: "#334155" }]).map((d, i) => (
+            {slices.map((d, i) => (
               <Cell key={i} fill={d.color} />
             ))}
           </Pie>
-          <Tooltip
-            contentStyle={{ background: "#0f172a", border: "1px solid #334155", borderRadius: 12, color: "#fff" }}
-          />
+          {hasData && (
+            <Tooltip
+              contentStyle={{ background: "#0f172a", border: "1px solid #334155", borderRadius: 12, color: "#fff" }}
+              formatter={(value: number, name: string) => [`${value} (${total ? ((value / total) * 100).toFixed(0) : 0}%)`, name]}
+            />
+          )}
         </PieChart>
       </ResponsiveContainer>
       <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">

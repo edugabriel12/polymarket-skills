@@ -140,8 +140,9 @@ A modern React + FastAPI dashboard to interact with the model visually — two t
 - **Análises** — the day's Over/Under suggestions as colorful cards with the full NegBin math; the
   heavy calc runs **once per day** and is cached until day end.
 - **Resultados** — ROI, P&L, total/Over/Under win rate (daily/weekly/monthly) with charts; **each
-  visit triggers cross-source settlement** (MLB final + Polymarket closed) to update PENDENTE →
-  ACERTO/ERRO, with a direct Polymarket market link per row.
+  visit triggers settlement** from the authoritative MLB final total (reported only once a game is
+  Final) to update PENDENTE → ACERTO/ERRO, with a direct Polymarket market link per row. The
+  Polymarket closed status is an optional extra guard (`require_closed`), off by default.
 
 Dark/light toggle, read-only (never trades). Run with `webapp/dev.sh` (backend :8000, frontend
 :5173) or see `webapp/README.md`. Seed offline demo data: `POST /api/seed-demo` or

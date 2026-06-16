@@ -23,8 +23,9 @@ Two tabs:
   **once per day** and is cached (backend `analysis_cache` table) until the next UTC day.
 - **Resultados** — ROI, P&L, total/Over/Under win rate for **diário / semanal / mensal**, with
   charts and a recent-predictions table linking to each Polymarket market. **Every visit triggers
-  cross-source settlement** (MLB Stats API final total + Polymarket market closed) to move PENDENTE
-  rows to ACERTO/ERRO.
+  settlement** from the authoritative MLB Stats API final total (a total is only reported once a game
+  is Final), moving PENDENTE rows to ACERTO/ERRO. The Polymarket market's closed status is fetched to
+  backfill links and is available as an optional extra guard (`require_closed`), off by default.
 
 Dark/light theme toggle. Read/analysis only — it never places live trades (paper-first).
 

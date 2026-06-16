@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Cross-source settlement of PENDENTE predictions.
 
-A prediction is settled to ACERTO/ERRO only when BOTH sources confirm:
-  1. MLB Stats API reports the game Final with a total runs count (the truth for
-     Over/Under), reused from track_predictions.fetch_final_totals.
-  2. The Polymarket market is closed/resolved (Gamma API), so the bet actually
-     resolved (guards against postponed/suspended games).
+The authoritative Over/Under resolution is the MLB Stats API final total: it only
+reports a total once a game reaches the **Final** state (postponed/suspended games
+never do), so a final total already means the game resolved. Settlement keys off
+that.
+
+The Polymarket market's closed/resolved status (Gamma API) is fetched too — used to
+backfill the stored market_url and available as an *optional* extra guard via
+`require_closed=True`. It is **not** required by default, because Polymarket often
+closes a market well after the game ends (and the lookup itself is flaky), which
+would otherwise leave clearly-finished games stuck on PENDENTE.
 
 Best-effort and network-isolated: with egress blocked, sources return empty and
-nothing settles (rows stay PENDENTE). Also backfills the stored market_url.
+nothing settles (rows stay PENDENTE).
 """
 
 from __future__ import annotations
@@ -57,11 +62,11 @@ def fetch_market_status(api, condition_ids: list[str]) -> tuple[dict, dict]:
 
 
 def decide_settlements(pending: list[dict], finals: dict, closed_map: dict,
-                       require_closed: bool = True) -> list[tuple[int, float]]:
+                       require_closed: bool = False) -> list[tuple[int, float]]:
     """Pure: choose (prediction_id, actual_total) pairs ready to settle.
 
-    Requires an MLB final total for the matchup and (when require_closed) the
-    Polymarket market to be closed/resolved.
+    Requires an MLB final total for the matchup (authoritative). When
+    require_closed is set, also requires the Polymarket market to be closed.
     """
     out = []
     for row in pending:
@@ -76,16 +81,17 @@ def decide_settlements(pending: list[dict], finals: dict, closed_map: dict,
 
 
 def settle_pending(api, db_path: str = pdb.DEFAULT_DB,
-                   require_closed: bool = True) -> dict:
-    """Settle eligible PENDENTE predictions across MLB + Polymarket sources.
+                   require_closed: bool = False) -> dict:
+    """Settle eligible PENDENTE predictions from the authoritative MLB final total.
 
-    Returns {checked, settled:[{id,status,actual_total}], backfilled_urls}.
+    Returns {checked, finals_found, markets_closed, settled:[...], backfilled_urls}.
     """
     from track_predictions import fetch_final_totals  # lazy (pulls requests)
 
     pending = pdb.get_predictions(db_path, status="PENDENTE")
     if not pending:
-        return {"checked": 0, "settled": [], "backfilled_urls": 0}
+        return {"checked": 0, "finals_found": 0, "markets_closed": 0,
+                "settled": [], "backfilled_urls": 0}
 
     dates = sorted({r["game_date"] for r in pending if r.get("game_date")})
     finals: dict = {}
@@ -101,7 +107,9 @@ def settle_pending(api, db_path: str = pdb.DEFAULT_DB,
     for pid, total in decide_settlements(pending, finals, closed_map, require_closed):
         status = pdb.settle_prediction(pid, total, db_path)
         settled.append({"id": pid, "status": status, "actual_total": total})
-    return {"checked": len(pending), "settled": settled, "backfilled_urls": backfilled}
+    return {"checked": len(pending), "finals_found": len(finals),
+            "markets_closed": sum(1 for v in closed_map.values() if v),
+            "settled": settled, "backfilled_urls": backfilled}
 
 
 def _backfill_market_urls(db_path, pending, slug_map) -> int:
