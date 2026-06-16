@@ -287,6 +287,31 @@ def record_prediction_row(db_path, game_slug, game_date, totals, line, chosen, m
         return None
 
 
+def _shadow_log_mlb(args, target, slug, line, side_notes, chosen, m, bet, skip_reason, totals):
+    """Shadow-log one modeled run-total (bet or not) for later calibration."""
+    if not args.record:
+        return
+    ref = next((n for n in side_notes if n["side"] == "OVER"), None)
+    url = (f"https://polymarket.com/event/{totals.get('slug')}" if totals.get("slug")
+           else f"https://polymarket.com/sports/mlb/{slug}")
+    try:
+        predictions_db.record_model_log({
+            "game_slug": slug, "game_date": target, "league": None, "market": "TOTAL",
+            "line": line, "ref_side": "OVER",
+            "ref_prob": ref["p_model"] if ref else None,
+            "ref_price": ref["price"] if ref else None,
+            "pick_side": chosen["side"] if chosen else None,
+            "pick_edge": round(chosen["edge"], 4) if chosen else None,
+            "used_external": m["used_external"],
+            "model_params": {"mu": round(m["mu"], 4), "market_mu": round(m["market_mu"], 4),
+                             "variance": round(m["var"], 4)},
+            "bet": bet, "skip_reason": skip_reason, "market_url": url,
+        }, args.predictions_db)
+    except Exception as e:  # noqa: BLE001
+        if args.debug:
+            print(f"[model_log] failed: {e}", file=sys.stderr)
+
+
 def run(args) -> dict:
     api = APIClient(rate_limit_ms=args.rate_limit, debug=args.debug)
     # Robust terminal logging (stderr -> shows in the uvicorn console). On unless --quiet.
@@ -335,6 +360,7 @@ def run(args) -> dict:
     first_trade = data_inputs.is_first_trade(STRATEGY, args.portfolio_db)
 
     suggestions, texts, skipped = [], [], []
+    candidates = []  # passing lines; recorded after best-line selection (fix: one bet/game)
 
     def _skip(slug, reason, **extra):
         rec = {"game": slug, "reason": reason}
@@ -391,31 +417,6 @@ def run(args) -> dict:
             f"{n['side']} price={n['price']} p={n['p_model']} edge={n['edge']:+.3f} "
             f"band={n['in_odds_band']}" for n in side_notes))
 
-        def _shadow(bet, skip_reason, *, _slug=event_slug, _line=line, _notes=side_notes,
-                    _chosen=chosen, _m=m, _totals=totals):
-            """Shadow-log this modeled game (bet or not) for later calibration."""
-            if not args.record:
-                return
-            ref = next((n for n in _notes if n["side"] == "OVER"), None)
-            url = (f"https://polymarket.com/event/{_totals.get('slug')}" if _totals.get("slug")
-                   else f"https://polymarket.com/sports/mlb/{_slug}")
-            try:
-                predictions_db.record_model_log({
-                    "game_slug": _slug, "game_date": target, "league": None, "market": "TOTAL",
-                    "line": _line, "ref_side": "OVER",
-                    "ref_prob": ref["p_model"] if ref else None,
-                    "ref_price": ref["price"] if ref else None,
-                    "pick_side": _chosen["side"] if _chosen else None,
-                    "pick_edge": round(_chosen["edge"], 4) if _chosen else None,
-                    "used_external": _m["used_external"],
-                    "model_params": {"mu": round(_m["mu"], 4), "market_mu": round(_m["market_mu"], 4),
-                                     "variance": round(_m["var"], 4)},
-                    "bet": bet, "skip_reason": skip_reason, "market_url": url,
-                }, args.predictions_db)
-            except Exception as e:  # noqa: BLE001
-                if args.debug:
-                    print(f"[model_log] failed: {e}", file=sys.stderr)
-
         if not chosen:
             implausible = next((n for n in side_notes
                                 if n.get("implausible") and n["edge"] > 0 and n["in_odds_band"]), None)
@@ -424,7 +425,7 @@ def run(args) -> dict:
                       if implausible else
                       f"no positive-edge side within "
                       f"{args.odds_min:.2f}x-{args.odds_max:.1f}x band")
-            _shadow(0, reason)
+            _shadow_log_mlb(args, target, event_slug, line, side_notes, chosen, m, 0, reason, totals)
             _skip(event_slug, reason, line=line, sides=side_notes)
             continue
 
@@ -432,7 +433,7 @@ def run(args) -> dict:
                                        min_volume=args.min_volume, min_edge=args.min_edge,
                                        min_hours=args.min_hours)
         if not passed:
-            _shadow(0, reason)
+            _shadow_log_mlb(args, target, event_slug, line, side_notes, chosen, m, 0, reason, totals)
             _skip(event_slug, reason, line=line, side=chosen["side"])
             continue
 
@@ -440,13 +441,13 @@ def run(args) -> dict:
             chosen["p_model"], chosen["price"], portfolio_value, first_trade,
             advisor_kelly_half())
         if kelly <= 0:
-            _shadow(0, "Kelly <= 0")
+            _shadow_log_mlb(args, target, event_slug, line, side_notes, chosen, m, 0, "Kelly <= 0", totals)
             _skip(event_slug, "Kelly <= 0", line=line, side=chosen["side"])
             continue
         if size_usd < 10:
-            _shadow(0, f"size ${size_usd:.2f} below $10 minimum")
-            _skip(event_slug, f"size ${size_usd:.2f} below $10 minimum",
-                  line=line, side=chosen["side"])
+            r = f"size ${size_usd:.2f} below $10 minimum"
+            _shadow_log_mlb(args, target, event_slug, line, side_notes, chosen, m, 0, r, totals)
+            _skip(event_slug, r, line=line, side=chosen["side"])
             continue
 
         confidence = (max(0.5, min(0.5 + chosen["edge"], 0.65))
@@ -454,33 +455,47 @@ def run(args) -> dict:
         rec, text = build_recommendation(event_slug, totals, line, chosen, m["mu"],
                                          m["used_external"], size_pct, size_usd,
                                          confidence, args.fee_rate, ou)
+        # Defer recording until best-line selection (avoids correlated multi-line bets).
+        candidates.append({
+            "event_slug": event_slug, "line": line, "totals": totals, "ou": ou,
+            "inputs": inputs, "park_factor": park_factor, "m": m, "chosen": chosen,
+            "side_notes": side_notes, "size_pct": size_pct, "size_usd": size_usd,
+            "kelly": kelly, "confidence": confidence, "rec": rec, "text": text,
+        })
 
+    # Best-line-per-game: record/score only the highest-edge line per matchup; the other
+    # passing lines are reported as skipped (not bet) so we never place correlated bets.
+    by_match: dict[str, list] = {}
+    for c in candidates:
+        by_match.setdefault(matchup_key(c["event_slug"]), []).append(c)
+    final = []
+    for cs in by_match.values():
+        cs.sort(key=lambda c: c["chosen"]["edge"], reverse=True)
+        winners = cs[:1] if args.best_line_only else cs
+        for c in (cs[1:] if args.best_line_only else []):
+            _shadow_log_mlb(args, target, c["event_slug"], c["line"], c["side_notes"],
+                            c["chosen"], c["m"], 0, "not best line for this game", c["totals"])
+            _skip(c["event_slug"], "not best line for this game (best_line_only)",
+                  line=c["line"], side=c["chosen"]["side"])
+        final.extend(winners)
+
+    for c in final:
         prediction_id = None
         if args.record:
             prediction_id = record_prediction_row(
-                args.predictions_db, event_slug, target, totals, line, chosen, m,
-                ou, inputs, park_factor, size_pct, size_usd, kelly, confidence,
-                side_notes, args)
-        _shadow(1, None)
-
-        suggestions.append({"game": event_slug, "line": line, "mu": round(m["mu"], 3),
-                            "edge": round(chosen["edge"], 4), "prediction_id": prediction_id,
-                            "recommendation": rec, "_text": text})
-        vlog(f"  [{event_slug}] >>> SUGGEST {chosen['side']} {line} @ {chosen['price']:.3f} "
-             f"(payout {rd.decimal_odds(chosen['price']):.2f}x) edge={chosen['edge']*100:+.1f}% "
-             f"size={size_pct*100:.2f}% conf={confidence:.2f} pred_id={prediction_id}")
-
-    # Best-line-per-game: keep only the highest-edge line for each matchup.
-    if args.best_line_only and suggestions:
-        best: dict[str, dict] = {}
-        for s in suggestions:
-            key = matchup_key(s["game"])
-            if key not in best or s["edge"] > best[key]["edge"]:
-                best[key] = s
-        before_dedupe = len(suggestions)
-        suggestions = sorted(best.values(), key=lambda s: s["edge"], reverse=True)
-        if before_dedupe != len(suggestions):
-            vlog(f"  best-line-per-game: {before_dedupe} -> {len(suggestions)} suggestion(s)")
+                args.predictions_db, c["event_slug"], target, c["totals"], c["line"],
+                c["chosen"], c["m"], c["ou"], c["inputs"], c["park_factor"],
+                c["size_pct"], c["size_usd"], c["kelly"], c["confidence"], c["side_notes"], args)
+        _shadow_log_mlb(args, target, c["event_slug"], c["line"], c["side_notes"],
+                        c["chosen"], c["m"], 1, None, c["totals"])
+        suggestions.append({"game": c["event_slug"], "line": c["line"],
+                            "mu": round(c["m"]["mu"], 3), "edge": round(c["chosen"]["edge"], 4),
+                            "prediction_id": prediction_id, "recommendation": c["rec"],
+                            "_text": c["text"]})
+        vlog(f"  [{c['event_slug']}] >>> SUGGEST {c['chosen']['side']} {c['line']} "
+             f"@ {c['chosen']['price']:.3f} edge={c['chosen']['edge']*100:+.1f}% "
+             f"size={c['size_pct']*100:.2f}% conf={c['confidence']:.2f} pred_id={prediction_id}")
+    suggestions.sort(key=lambda s: s["edge"], reverse=True)
 
     texts = [s.pop("_text") for s in suggestions]
     vlog(f"=== Done: {len(suggestions)} suggestion(s), {len(skipped)} skipped, "

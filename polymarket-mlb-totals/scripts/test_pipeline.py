@@ -270,6 +270,39 @@ class TestPredictionsDB(unittest.TestCase):
             self.assertAlmostEqual(row["actual_total"], 10.0)
 
 
+class TestBestLineOneBetPerGame(unittest.TestCase):
+    def test_only_best_line_recorded_others_shadowed(self):
+        import suggest_totals as st
+        import predictions_db as pdb
+        # Two lines of the SAME matchup, both passing the edge gate (8.5 has more edge).
+        markets = [
+            _rich_market("mlb-hou-kc-2026-06-14-total-8pt5", "HOU vs KC O/U 8.5",
+                         ["Over 8.5", "Under 8.5"], [0.52, 0.48], ["o1", "u1"]),
+            _rich_market("mlb-hou-kc-2026-06-14-total-9pt5", "HOU vs KC O/U 9.5",
+                         ["Over 9.5", "Under 9.5"], [0.44, 0.56], ["o2", "u2"]),
+        ]
+        st.discover_markets = lambda *a, **k: ("mlb", markets)
+        st.game_date = lambda m: "2026-06-14"
+        st.APIClient = _NoNetAPI
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "p.db")
+            csv = os.path.join(d, "proj.csv")
+            with open(csv, "w", encoding="utf-8") as fh:
+                fh.write("team,off_factor,pitch_factor\nkc,1.10,1.06\nhou,1.10,1.06\n")
+            result = st.run(_Args(date="2026-06-14", projections_csv=csv, use_external=True,
+                                  record=True, predictions_db=db, best_line_only=True))
+            # Exactly one bet recorded for the matchup (the higher-edge 8.5 line).
+            self.assertEqual(result["counts"]["suggestions"], 1)
+            preds = pdb.get_predictions(db)
+            self.assertEqual(len(preds), 1)
+            self.assertEqual(preds[0]["line"], 8.5)
+            # Both lines are shadow-logged; the non-best one is bet=0 "not best line".
+            mlog = {m["line"]: m for m in pdb.get_model_log(db)}
+            self.assertEqual(mlog[8.5]["bet"], 1)
+            self.assertEqual(mlog[9.5]["bet"], 0)
+            self.assertIn("not best line", mlog[9.5]["skip_reason"])
+
+
 class _NoNetAPI:
     """Stub APIClient whose .get always fails (simulates blocked network)."""
     def __init__(self, *a, **k):

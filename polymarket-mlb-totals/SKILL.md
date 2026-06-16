@@ -163,9 +163,19 @@ movement); a settled row is never overwritten. Schema in `references/predictions
 **Every** modeled game is logged to a separate `model_log` table — including the ones the model did
 **not** bet (`bet=0`, with the `skip_reason`). It stores the reference-side probability (`ref_prob`
 for OVER), the market price, the model params, and the pick. This avoids selection bias so you can
-later compute **Brier / log-loss / CLV over all games**, not just the bet ones. Read it with
-`predictions_db.get_model_log()` / `soccer_predictions.get_model_log()`. Filling the outcome
-(`ref_outcome`) for the Brier report is the next step.
+compute **Brier / log-loss / reliability over all games**, not just the bet ones. Read it with
+`predictions_db.get_model_log()` / `soccer_predictions.get_model_log()`.
+
+### Calibration report (`calibration.py`)
+Settles the shadow log (a game's actual outcome is propagated to **all** its lines, bet or not) and
+scores the model. Pure stdlib; `--sport mlb|soccer`.
+```bash
+python polymarket-mlb-totals/scripts/calibration.py --sport mlb --settle      # settle + report
+python polymarket-mlb-totals/scripts/calibration.py --sport soccer --settle --json
+```
+Reports Brier, log-loss, and a reliability table (predicted vs empirical) for all modeled markets and
+for bet-only. **CLV** (needs a closing-price snapshot) and settling games with no bet line (needs the
+results feed) are the documented follow-ups.
 
 ## Web dashboard (`webapp/`)
 

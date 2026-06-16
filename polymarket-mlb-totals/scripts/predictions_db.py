@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS model_log (
     skip_reason     TEXT,
     market_url      TEXT,
     actual_total    REAL,
+    actual_btts     INTEGER,     -- unused for MLB; kept for a shared settle path
     ref_outcome     INTEGER,     -- 1 if ref_side won, 0 if lost (filled at settlement)
     status          TEXT NOT NULL DEFAULT 'PENDENTE',
     UNIQUE(game_slug, market, line)
