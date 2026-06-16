@@ -22,6 +22,11 @@ import math
 ODDS_MIN_DEFAULT = 1.50
 ODDS_MAX_DEFAULT = 3.00
 
+# Max believable post-fee edge on a (near-efficient) MLB total. The deep research
+# puts realistic edge at 2-5%; anything past this is almost certainly the model
+# disagreeing with superior market information, not a real opportunity -> reject.
+MAX_PLAUSIBLE_EDGE = 0.15
+
 # Plausible clamps so a bad input can never blow up the mean.
 _FACTOR_LO, _FACTOR_HI = 0.70, 1.30
 _MU_LO, _MU_HI = 3.0, 18.0
