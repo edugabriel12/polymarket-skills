@@ -92,6 +92,13 @@ python polymarket-soccer-goals/scripts/test_pipeline.py
 Records each suggestion (status PENDENTE) with the full Dixon-Coles audit (λ_home, λ_away, ρ,
 P(model), edge, sizing) and the Polymarket market link, for later calibration/win-rate analysis.
 
+**Full math audit:** dump the complete `stats_log` (λ_home/λ_away, ρ, P(model), edge, sizing) for
+every soccer prediction with the shared `audit_log.py`:
+```bash
+python polymarket-mlb-totals/scripts/audit_log.py --sport soccer            # all, full audit
+python polymarket-mlb-totals/scripts/audit_log.py --sport soccer --json > audit.json
+```
+
 ## Auto-settlement (`track_soccer.py`)
 PENDENTE predictions are settled from a results feed (**football-data.org**, free; set
 `FOOTBALL_DATA_TOKEN` or pass `--token`). Settlement is order-independent — total = sum of goals,
