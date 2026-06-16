@@ -34,22 +34,28 @@ def _count(con: sqlite3.Connection, table: str) -> int:
 
 
 def reset(db_path: str, *, delete_file: bool = False) -> dict:
-    """Reset one DB. Returns {existed, deleted_file, predictions, cache}."""
+    """Reset one DB. Returns {existed, deleted_file, predictions, model_log, cache}."""
     if not os.path.exists(db_path):
-        return {"existed": False, "deleted_file": False, "predictions": 0, "cache": 0}
+        return {"existed": False, "deleted_file": False, "predictions": 0,
+                "model_log": 0, "cache": 0}
     if delete_file:
         os.remove(db_path)
-        return {"existed": True, "deleted_file": True, "predictions": 0, "cache": 0}
+        return {"existed": True, "deleted_file": True, "predictions": 0,
+                "model_log": 0, "cache": 0}
     con = sqlite3.connect(db_path)
     try:
         preds = _count(con, "predictions")
+        mlog = _count(con, "model_log")        # shadow calibration log
         cache = _count(con, "analysis_cache")  # only present in the MLB store
         with con:
             con.execute("DELETE FROM predictions")
+            if mlog:
+                con.execute("DELETE FROM model_log")
             if cache:
                 con.execute("DELETE FROM analysis_cache")
         con.execute("VACUUM")
-        return {"existed": True, "deleted_file": False, "predictions": preds, "cache": cache}
+        return {"existed": True, "deleted_file": False, "predictions": preds,
+                "model_log": mlog, "cache": cache}
     finally:
         con.close()
 
@@ -85,7 +91,7 @@ def main() -> None:
             print(f"  [{name}] file deleted: {path}")
         else:
             print(f"  [{name}] cleared {r['predictions']} prediction(s)"
-                  f" + {r['cache']} cache row(s): {path}")
+                  f" + {r['model_log']} model-log + {r['cache']} cache row(s): {path}")
     print("Done.")
 
 

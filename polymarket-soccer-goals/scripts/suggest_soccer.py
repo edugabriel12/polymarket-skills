@@ -296,23 +296,56 @@ def run(args) -> dict:
     return result
 
 
+def _shadow_log(market_type, slug, line, notes, chosen, lam_h, lam_a, used, args, target,
+                bet, skip_reason):
+    """Shadow-log this modeled market (bet or not) for later calibration."""
+    if not args.record:
+        return
+    ref_side = "OVER" if market_type == "TOTAL" else "YES"
+    ref = next((n for n in notes if n["side"] == ref_side), None)
+    try:
+        spdb.record_model_log({
+            "game_slug": slug, "game_date": target, "league": leagues.league_prefix(slug),
+            "market": market_type, "line": line, "ref_side": ref_side,
+            "ref_prob": ref["p_model"] if ref else None,
+            "ref_price": ref["price"] if ref else None,
+            "pick_side": chosen["side"] if chosen else None,
+            "pick_edge": round(chosen["edge"], 4) if chosen else None,
+            "used_external": used,
+            "model_params": {"lam_home": round(lam_h, 4), "lam_away": round(lam_a, 4),
+                             "rho": args.rho},
+            "bet": bet, "skip_reason": skip_reason, "market_url": leagues.game_url(slug),
+        }, args.predictions_db)
+    except Exception as e:  # noqa: BLE001
+        if args.debug:
+            print(f"[model_log] failed: {e}", file=sys.stderr)
+
+
 def _emit_or_skip(market_type, slug, m, line, chosen, notes, lam_h, lam_a, used,
                   book_sum, price_sane, args, portfolio_value, first_trade, kh,
                   suggestions, _skip, target):
+    def _shadow(bet, skip_reason):
+        _shadow_log(market_type, slug, line, notes, chosen, lam_h, lam_a, used, args,
+                    target, bet, skip_reason)
+
     if not chosen:
-        _skip(slug, f"no positive-edge side within {args.odds_min:.2f}x-{args.odds_max:.1f}x band",
-              market=market_type, sides=notes)
+        reason = f"no positive-edge side within {args.odds_min:.2f}x-{args.odds_max:.1f}x band"
+        _shadow(0, reason)
+        _skip(slug, reason, market=market_type, sides=notes)
         return
     passed, reason = decision_tree(chosen, m, book_sum, price_sane,
                                    min_volume=args.min_volume, min_edge=args.min_edge,
                                    min_hours=args.min_hours)
     if not passed:
+        _shadow(0, reason)
         _skip(slug, reason, market=market_type, side=chosen["side"]); return
     size_pct, size_usd, kelly = size_position(chosen["p_model"], chosen["price"],
                                               portfolio_value, first_trade, kh)
     if kelly <= 0:
+        _shadow(0, "Kelly <= 0")
         _skip(slug, "Kelly <= 0", market=market_type); return
     if size_usd < 10:
+        _shadow(0, f"size ${size_usd:.2f} below $10 minimum")
         _skip(slug, f"size ${size_usd:.2f} below $10 minimum", market=market_type); return
 
     confidence = max(0.5, min(0.5 + chosen["edge"], 0.65)) if used else 0.5
@@ -349,6 +382,7 @@ def _emit_or_skip(market_type, slug, m, line, chosen, notes, lam_h, lam_a, used,
         except Exception as e:  # noqa: BLE001
             if args.debug:
                 print(f"[record] failed: {e}", file=sys.stderr)
+    _shadow(1, None)
 
     rec = {"token_id": chosen["token"], "side": "YES", "action": "BUY",
            "size_pct": round(size_pct, 4), "price": round(price, 4),
