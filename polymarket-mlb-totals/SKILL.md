@@ -67,9 +67,11 @@ list_games_today (scanner)  →  find total-runs Over/Under market  →  NegBin 
 - **μ is anchored to the market** unless a **STRONG input** (team offense/pitching factors) is present.
   The mean starts at the **market-implied** μ; only `*_off`/`*_sp` factors move it off the market.
   **Weather and the park factor alone do NOT override the market** (they're second-order and already
-  in the line) — this is what stops the model fabricating huge fake edges on high-total games. Team
-  factors are resolved automatically from the **MLB Stats API season standings** (`team_factors.py`),
-  or supplied via `--projections-csv` (override). Starter-level SIERA/xFIP is the documented next step.
+  in the line) — this is what stops the model fabricating huge fake edges on high-total games. Strong
+  inputs are resolved automatically from the **MLB Stats API** (free, no key): team offense/pitching
+  from season standings (`team_factors.py`), refined by **today's probable starter's FIP**
+  (`starter_factors.py`, the #1 input, blended ~60/40 starter/bullpen). A `--projections-csv` overrides
+  both. SIERA/xFIP (FanGraphs, ToS-flagged) would be a further upgrade over FIP.
 - **Anti-fabrication + sanity cap:** with no strong inputs μ = market-implied, so edge ≈ 0 and nothing
   is suggested. And any post-fee edge above **`MAX_PLAUSIBLE_EDGE` (15%)** is **rejected** — on a
   near-efficient market that signals model error, not value (the col-oak post-mortem).

@@ -31,6 +31,10 @@ import sqlite3
 import park_factors as pf
 import ballparks
 import team_factors
+import starter_factors
+
+# Innings share of the starting pitcher when blending starter vs team (bullpen).
+STARTER_WEIGHT = 0.6
 
 STATSAPI = "https://statsapi.mlb.com/api/v1"
 OPEN_METEO = "https://api.open-meteo.com/v1/forecast"  # free, no key, global
@@ -202,6 +206,16 @@ def get_game_inputs(api, event_slug: str, target_date: str, *,
                 inputs["away_off"], inputs["away_sp"] = a["off_factor"], a["pitch_factor"]
             if h or a:
                 inputs.setdefault("home_field", HOME_FIELD_DELTA)
+
+            # Starter-level refinement (#1 input): blend today's probable starter's
+            # FIP factor with the team's season pitching (bullpen) factor.
+            for side, abbr in (("home", home), ("away", away)):
+                sf = starter_factors.starter_factor(api, _canon(abbr), target_date, int(season))
+                if sf is not None:
+                    team_sp = inputs.get(f"{side}_sp", 1.0)
+                    inputs[f"{side}_sp"] = round(
+                        STARTER_WEIGHT * sf + (1.0 - STARTER_WEIGHT) * team_sp, 4)
+                    inputs.setdefault("home_field", HOME_FIELD_DELTA)
 
     # Weather (network; best-effort). Open-Meteo is global, so every park works.
     coords = pf.home_coords_for_slug(event_slug)
