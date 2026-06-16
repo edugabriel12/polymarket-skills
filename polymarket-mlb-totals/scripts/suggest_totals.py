@@ -287,7 +287,7 @@ def record_prediction_row(db_path, game_slug, game_date, totals, line, chosen, m
         return None
 
 
-def _shadow_log_mlb(args, target, slug, line, side_notes, chosen, m, bet, skip_reason, totals):
+def _shadow_log_mlb(args, target, slug, line, side_notes, chosen, m, bet, skip_reason, totals, ou):
     """Shadow-log one modeled run-total (bet or not) for later calibration."""
     if not args.record:
         return
@@ -300,6 +300,7 @@ def _shadow_log_mlb(args, target, slug, line, side_notes, chosen, m, bet, skip_r
             "line": line, "ref_side": "OVER",
             "ref_prob": ref["p_model"] if ref else None,
             "ref_price": ref["price"] if ref else None,
+            "ref_token": (ou or {}).get("over_token"),
             "pick_side": chosen["side"] if chosen else None,
             "pick_edge": round(chosen["edge"], 4) if chosen else None,
             "used_external": m["used_external"],
@@ -425,7 +426,7 @@ def run(args) -> dict:
                       if implausible else
                       f"no positive-edge side within "
                       f"{args.odds_min:.2f}x-{args.odds_max:.1f}x band")
-            _shadow_log_mlb(args, target, event_slug, line, side_notes, chosen, m, 0, reason, totals)
+            _shadow_log_mlb(args, target, event_slug, line, side_notes, chosen, m, 0, reason, totals, ou)
             _skip(event_slug, reason, line=line, sides=side_notes)
             continue
 
@@ -433,7 +434,7 @@ def run(args) -> dict:
                                        min_volume=args.min_volume, min_edge=args.min_edge,
                                        min_hours=args.min_hours)
         if not passed:
-            _shadow_log_mlb(args, target, event_slug, line, side_notes, chosen, m, 0, reason, totals)
+            _shadow_log_mlb(args, target, event_slug, line, side_notes, chosen, m, 0, reason, totals, ou)
             _skip(event_slug, reason, line=line, side=chosen["side"])
             continue
 
@@ -441,12 +442,12 @@ def run(args) -> dict:
             chosen["p_model"], chosen["price"], portfolio_value, first_trade,
             advisor_kelly_half())
         if kelly <= 0:
-            _shadow_log_mlb(args, target, event_slug, line, side_notes, chosen, m, 0, "Kelly <= 0", totals)
+            _shadow_log_mlb(args, target, event_slug, line, side_notes, chosen, m, 0, "Kelly <= 0", totals, ou)
             _skip(event_slug, "Kelly <= 0", line=line, side=chosen["side"])
             continue
         if size_usd < 10:
             r = f"size ${size_usd:.2f} below $10 minimum"
-            _shadow_log_mlb(args, target, event_slug, line, side_notes, chosen, m, 0, r, totals)
+            _shadow_log_mlb(args, target, event_slug, line, side_notes, chosen, m, 0, r, totals, ou)
             _skip(event_slug, r, line=line, side=chosen["side"])
             continue
 
@@ -474,7 +475,7 @@ def run(args) -> dict:
         winners = cs[:1] if args.best_line_only else cs
         for c in (cs[1:] if args.best_line_only else []):
             _shadow_log_mlb(args, target, c["event_slug"], c["line"], c["side_notes"],
-                            c["chosen"], c["m"], 0, "not best line for this game", c["totals"])
+                            c["chosen"], c["m"], 0, "not best line for this game", c["totals"], c["ou"])
             _skip(c["event_slug"], "not best line for this game (best_line_only)",
                   line=c["line"], side=c["chosen"]["side"])
         final.extend(winners)
@@ -487,7 +488,7 @@ def run(args) -> dict:
                 c["chosen"], c["m"], c["ou"], c["inputs"], c["park_factor"],
                 c["size_pct"], c["size_usd"], c["kelly"], c["confidence"], c["side_notes"], args)
         _shadow_log_mlb(args, target, c["event_slug"], c["line"], c["side_notes"],
-                        c["chosen"], c["m"], 1, None, c["totals"])
+                        c["chosen"], c["m"], 1, None, c["totals"], c["ou"])
         suggestions.append({"game": c["event_slug"], "line": c["line"],
                             "mu": round(c["m"]["mu"], 3), "edge": round(c["chosen"]["edge"], 4),
                             "prediction_id": prediction_id, "recommendation": c["rec"],
