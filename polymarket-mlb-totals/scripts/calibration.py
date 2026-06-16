@@ -143,6 +143,28 @@ def _settled_rows(db_path: str, bet: int | None = None) -> list[dict]:
         con.close()
 
 
+def clv_stats(db_path: str) -> dict:
+    """Closing-line value over rows that have a captured close price."""
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = [dict(r) for r in con.execute(
+            "SELECT ref_price, close_price FROM model_log "
+            "WHERE close_price IS NOT NULL AND ref_price IS NOT NULL")]
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        con.close()
+    if not rows:
+        return {"n": 0}
+    clvs = [float(r["close_price"]) - float(r["ref_price"]) for r in rows]
+    return {"n": len(rows),
+            "avg_ref_price": sum(float(r["ref_price"]) for r in rows) / len(rows),
+            "avg_close_price": sum(float(r["close_price"]) for r in rows) / len(rows),
+            "avg_clv": sum(clvs) / len(clvs),
+            "beat_close_pct": sum(1 for c in clvs if c > 0) / len(clvs)}
+
+
 def report(db_path: str) -> dict:
     """Calibration metrics over the settled shadow log (all games + bet-only)."""
     con = sqlite3.connect(db_path)
@@ -157,8 +179,9 @@ def report(db_path: str) -> dict:
         "all": {"n": len(allr), "brier": brier(allr), "log_loss": log_loss(allr),
                 "reliability": reliability(allr)},
         "bet": {"n": len(betr), "brier": brier(betr), "log_loss": log_loss(betr)},
-        "note": "CLV needs a closing-price snapshot (not captured yet); games with no "
-                "bet line are settled only via the results feed (follow-up).",
+        "clv": clv_stats(db_path),
+        "note": "CLV uses captured closing prices (run --capture-close near game time). "
+                "Reference side = OVER (totals) / YES (BTTS).",
     }
 
 
@@ -180,6 +203,17 @@ def format_report(rep: dict) -> str:
     for b in a["reliability"]:
         lines.append(f"  {b['bucket']:<10} {b['n']:>5} {b['avg_pred']:>9.3f} "
                      f"{b['empirical']:>10.3f}")
+    clv = rep.get("clv", {})
+    if clv.get("n", 0) > 0:
+        lines += [
+            "", "Closing-line value (CLV):",
+            f"  n={clv['n']}   avg_ref_price={clv['avg_ref_price']:.4f}"
+            f"   avg_close={clv['avg_close_price']:.4f}",
+            f"  avg_CLV={clv['avg_clv']:+.4f}   beat_close={clv['beat_close_pct']:.1%}",
+        ]
+    else:
+        lines += ["", "CLV: no closing prices captured yet "
+                  "(run --capture-close near game time)."]
     lines += ["", "Lower Brier/LogLoss = better. A well-calibrated model tracks the",
               "diagonal (avg_pred ≈ empirical). " + rep["note"]]
     return "\n".join(lines)
@@ -190,7 +224,11 @@ def main() -> None:
     p.add_argument("--sport", choices=("mlb", "soccer"), default="mlb")
     p.add_argument("--db", default=None, help="Override DB path (default per --sport)")
     p.add_argument("--settle", action="store_true",
-                   help="First settle model_log from settled predictions")
+                   help="Settle model_log from settled predictions (offline cross-propagation)")
+    p.add_argument("--settle-feed", action="store_true",
+                   help="Settle model_log via results feed (covers non-bet games)")
+    p.add_argument("--capture-close", action="store_true",
+                   help="Snapshot closing CLOB prices for CLV (run near game time)")
     p.add_argument("--json", action="store_true")
     a = p.parse_args()
     db = a.db or DEFAULT_DBS[a.sport]
@@ -200,12 +238,58 @@ def main() -> None:
     if a.settle:
         n = settle_from_predictions(db)
         print(f"Settled {n} shadow row(s) from settled predictions.\n", file=sys.stderr)
+    if a.settle_feed:
+        n = _settle_feed(a.sport, db)
+        print(f"Feed-settled {n} shadow row(s).\n", file=sys.stderr)
+    if a.capture_close:
+        n = _capture_close(a.sport, db)
+        print(f"Captured {n} closing price(s).\n", file=sys.stderr)
     rep = report(db)
     if a.json:
         import json
         print(json.dumps(rep, indent=2, default=str))
     else:
         print(format_report(rep))
+
+
+def _settle_feed(sport: str, db: str) -> int:
+    """Dispatch to sport-specific feed settlement."""
+    if sport == "mlb":
+        try:
+            from category_common import APIClient
+            import settlement as sett
+            api = APIClient()
+            return sett.settle_model_log_from_feed(api, db)
+        except Exception as e:
+            print(f"MLB feed settlement error: {e}", file=sys.stderr)
+            return 0
+    else:
+        try:
+            import soccer_results
+            return soccer_results.settle_model_log_from_feed(db)
+        except Exception as e:
+            print(f"Soccer feed settlement error: {e}", file=sys.stderr)
+            return 0
+
+
+def _capture_close(sport: str, db: str) -> int:
+    """Dispatch to sport-specific close-price capture."""
+    if sport == "mlb":
+        try:
+            from category_common import APIClient
+            import settlement as sett
+            api = APIClient()
+            return sett.capture_close_prices(api, db)
+        except Exception as e:
+            print(f"MLB close capture error: {e}", file=sys.stderr)
+            return 0
+    else:
+        try:
+            import soccer_results
+            return soccer_results.capture_close_prices(db)
+        except Exception as e:
+            print(f"Soccer close capture error: {e}", file=sys.stderr)
+            return 0
 
 
 if __name__ == "__main__":

@@ -112,6 +112,57 @@ def settle_pending(api, db_path: str = pdb.DEFAULT_DB,
             "settled": settled, "backfilled_urls": backfilled}
 
 
+def settle_model_log_from_feed(api, db_path: str = pdb.DEFAULT_DB) -> int:
+    """Settle ALL shadow rows (bet or not) from MLB finals, for unbiased calibration.
+
+    Unlike settle_pending, this covers games the model did NOT bet — needed so the
+    calibration report isn't biased toward games where edge was found. Best-effort.
+    """
+    rows = pdb.get_model_log(db_path)
+    dates = sorted({r["game_date"] for r in rows
+                    if r.get("game_date") and r.get("ref_outcome") is None})
+    if not dates:
+        return 0
+    from track_predictions import fetch_final_totals  # lazy
+    finals_pair: dict = {}
+    for d in dates:
+        finals_pair.update(fetch_final_totals(api, d))
+    # Map base game slug -> total via its (away, home) teams.
+    finals_total: dict = {}
+    for r in rows:
+        base = pdb.model_log_base(r.get("game_slug", ""))
+        if base in finals_total:
+            continue
+        away, home = pf.parse_slug_teams(r.get("game_slug", ""))
+        t = finals_pair.get((away, home))
+        if t is not None:
+            finals_total[base] = t
+    return pdb.settle_model_log(db_path, finals_total)
+
+
+def capture_close_prices(api, db_path: str = pdb.DEFAULT_DB) -> int:
+    """Snapshot the reference-side closing price for shadow rows missing it (CLV).
+
+    Run near game time. Fetches the current CLOB midpoint for each row's ref_token.
+    Best-effort: rows without a token or price are left for a later run.
+    """
+    from category_common import fetch_midpoint  # lazy
+    con = pdb.connect(db_path)
+    try:
+        rows = [dict(r) for r in con.execute(
+            "SELECT id, ref_token FROM model_log WHERE close_price IS NULL "
+            "AND ref_token IS NOT NULL")]
+    finally:
+        con.close()
+    n = 0
+    for r in rows:
+        mid = fetch_midpoint(api, r["ref_token"])
+        if mid is not None:
+            pdb.set_close_price(db_path, r["id"], mid)
+            n += 1
+    return n
+
+
 def _backfill_market_urls(db_path, pending, slug_map) -> int:
     """Fill market_url for rows missing it, using a Gamma slug when available."""
     con = pdb.connect(db_path)

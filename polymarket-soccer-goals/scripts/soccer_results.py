@@ -102,6 +102,54 @@ def decide_settlements(pending_games: list[dict], lookup: dict[tuple, tuple]) ->
     return out
 
 
+def settle_model_log_from_feed(db_path: str = spdb.DEFAULT_DB, token: str | None = None,
+                               days_back: int = 4) -> int:
+    """Settle ALL shadow rows (bet or not) from the results feed, for unbiased calibration."""
+    token = token or os.environ.get("FOOTBALL_DATA_TOKEN")
+    rows = spdb.get_model_log(db_path)
+    unsettled = [r for r in rows if r.get("ref_outcome") is None and r.get("game_date")]
+    if not unsettled or not token:
+        return 0
+    dates = sorted({r["game_date"] for r in unsettled})
+    today = datetime.now(timezone.utc).date().isoformat()
+    date_from = min(dates[0], (datetime.now(timezone.utc).date()
+                               - timedelta(days=days_back)).isoformat())
+    lookup = fetch_finished(date_from, max(dates[-1], today), token)
+    finals_total, finals_btts = {}, {}
+    for r in unsettled:
+        base = spdb.model_log_base(r["game_slug"])
+        if base in finals_total:
+            continue
+        home, away = leagues.parse_teams(r["game_slug"])
+        if not (home and away):
+            continue
+        res = lookup.get(_pair_key(r["game_date"], home, away))
+        if res is not None:
+            finals_total[base] = res[0]
+            finals_btts[base] = 1 if res[1] else 0
+    return spdb.settle_model_log(db_path, finals_total, finals_btts)
+
+
+def capture_close_prices(db_path: str = spdb.DEFAULT_DB) -> int:
+    """Snapshot the reference-side closing price for shadow rows missing it (CLV)."""
+    from category_common import APIClient, fetch_midpoint  # lazy
+    con = spdb.connect(db_path)
+    try:
+        rows = [dict(r) for r in con.execute(
+            "SELECT id, ref_token FROM model_log WHERE close_price IS NULL "
+            "AND ref_token IS NOT NULL")]
+    finally:
+        con.close()
+    api = APIClient()
+    n = 0
+    for r in rows:
+        mid = fetch_midpoint(api, r["ref_token"])
+        if mid is not None:
+            spdb.set_close_price(db_path, r["id"], mid)
+            n += 1
+    return n
+
+
 def settle_pending(db_path: str = spdb.DEFAULT_DB, token: str | None = None,
                    days_back: int = 4) -> dict:
     """Settle eligible PENDENTE soccer predictions from the results feed."""

@@ -243,7 +243,7 @@ def run(args) -> dict:
             f"band={n['in_odds_band']}" for n in notes))
         c = _evaluate("TOTAL", slug, m, line, chosen, notes, lam_h, lam_a, used,
                       ou["book_sum"], ou["price_sane"], args, portfolio_value, first_trade, kh,
-                      _skip, target)
+                      _skip, target, ref_token=ou.get("over_token"))
         if c:
             cand_rows.append(c)
 
@@ -272,7 +272,7 @@ def run(args) -> dict:
             f"band={n['in_odds_band']}" for n in notes))
         c = _evaluate("BTTS", slug, m, None, chosen, notes, lam_h, lam_a, used,
                       bt["book_sum"], bt["price_sane"], args, portfolio_value, first_trade, kh,
-                      _skip, target)
+                      _skip, target, ref_token=bt.get("yes_token"))
         if c:
             cand_rows.append(c)
 
@@ -288,7 +288,7 @@ def run(args) -> dict:
         for c in (cs[1:] if args.best_line_only else []):
             _shadow_log(c["market_type"], c["slug"], c["line"], c["notes"], c["chosen"],
                         c["lam_h"], c["lam_a"], c["used"], args, target, 0,
-                        "not best line for this game")
+                        "not best line for this game", c["ref_token"])
             _skip(c["slug"], "not best line for this game (best_line_only)",
                   market=c["market_type"], side=c["chosen"]["side"])
         final.extend(winners)
@@ -296,7 +296,7 @@ def run(args) -> dict:
     for c in final:
         pred_id = _record_soccer(c, args, target)
         _shadow_log(c["market_type"], c["slug"], c["line"], c["notes"], c["chosen"],
-                    c["lam_h"], c["lam_a"], c["used"], args, target, 1, None)
+                    c["lam_h"], c["lam_a"], c["used"], args, target, 1, None, c["ref_token"])
         suggestions.append({"game": c["slug"], "market": c["market_type"],
                             "side": c["chosen"]["side"], "line": c["line"],
                             "edge": round(c["chosen"]["edge"], 4),
@@ -320,7 +320,7 @@ def run(args) -> dict:
 
 
 def _shadow_log(market_type, slug, line, notes, chosen, lam_h, lam_a, used, args, target,
-                bet, skip_reason):
+                bet, skip_reason, ref_token=None):
     """Shadow-log this modeled market (bet or not) for later calibration."""
     if not args.record:
         return
@@ -332,6 +332,7 @@ def _shadow_log(market_type, slug, line, notes, chosen, lam_h, lam_a, used, args
             "market": market_type, "line": line, "ref_side": ref_side,
             "ref_prob": ref["p_model"] if ref else None,
             "ref_price": ref["price"] if ref else None,
+            "ref_token": ref_token,
             "pick_side": chosen["side"] if chosen else None,
             "pick_edge": round(chosen["edge"], 4) if chosen else None,
             "used_external": used,
@@ -345,7 +346,8 @@ def _shadow_log(market_type, slug, line, notes, chosen, lam_h, lam_a, used, args
 
 
 def _evaluate(market_type, slug, m, line, chosen, notes, lam_h, lam_a, used,
-              book_sum, price_sane, args, portfolio_value, first_trade, kh, _skip, target):
+              book_sum, price_sane, args, portfolio_value, first_trade, kh, _skip, target,
+              ref_token=None):
     """Return a candidate dict for a passing market, or None (skip handled inline).
 
     Recording is deferred to the caller's best-line selection so we never place
@@ -353,7 +355,7 @@ def _evaluate(market_type, slug, m, line, chosen, notes, lam_h, lam_a, used,
     """
     def _shadow(bet, skip_reason):
         _shadow_log(market_type, slug, line, notes, chosen, lam_h, lam_a, used, args,
-                    target, bet, skip_reason)
+                    target, bet, skip_reason, ref_token)
 
     if not chosen:
         reason = f"no positive-edge side within {args.odds_min:.2f}x-{args.odds_max:.1f}x band"
@@ -402,7 +404,8 @@ def _evaluate(market_type, slug, m, line, chosen, notes, lam_h, lam_a, used,
     return {"market_type": market_type, "slug": slug, "m": m, "line": line, "chosen": chosen,
             "notes": notes, "lam_h": lam_h, "lam_a": lam_a, "used": used, "confidence": confidence,
             "price": price, "odds": odds, "market_url": market_url, "size_pct": size_pct,
-            "size_usd": size_usd, "kelly": kelly, "stats": stats, "rec": rec, "text": text}
+            "size_usd": size_usd, "kelly": kelly, "stats": stats, "rec": rec, "text": text,
+            "ref_token": ref_token}
 
 
 def _record_soccer(c, args, target):

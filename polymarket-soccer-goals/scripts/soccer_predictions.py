@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -82,6 +83,8 @@ CREATE TABLE IF NOT EXISTS model_log (
     bet INTEGER NOT NULL DEFAULT 0,   -- 1 = became a recorded suggestion, 0 = not bet
     skip_reason TEXT,
     market_url TEXT,
+    ref_token TEXT,       -- token of the reference side (to snapshot the close)
+    close_price REAL,     -- reference-side price near close (for CLV)
     actual_total REAL,
     actual_btts INTEGER,
     ref_outcome INTEGER,  -- 1 if ref_side won, 0 if lost (filled at settlement)
@@ -93,9 +96,11 @@ CREATE INDEX IF NOT EXISTS idx_soccer_mlog_date ON model_log(game_date);
 
 _MODEL_LOG_FIELDS = (
     "game_slug", "game_date", "league", "market", "line", "ref_side", "ref_prob",
-    "ref_price", "pick_side", "pick_edge", "used_external", "model_params", "bet",
-    "skip_reason", "market_url",
+    "ref_price", "ref_token", "pick_side", "pick_edge", "used_external", "model_params",
+    "bet", "skip_reason", "market_url",
 )
+_MODEL_LOG_ADDED = {"ref_token": "TEXT", "close_price": "REAL"}
+_MLOG_SUFFIX_RE = re.compile(r"-(?:total-\d{1,2}(?:pt5)?|btts|both-teams-to-score|gg)$")
 
 _FIELDS = (
     "game_slug", "game_date", "league", "market", "market_question", "condition_id",
@@ -114,7 +119,61 @@ def connect(db_path: str = DEFAULT_DB) -> sqlite3.Connection:
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     con.executescript(_SCHEMA)
+    mlog = {r["name"] for r in con.execute("PRAGMA table_info(model_log)")}
+    for col, decl in _MODEL_LOG_ADDED.items():
+        if mlog and col not in mlog:
+            con.execute(f"ALTER TABLE model_log ADD COLUMN {col} {decl}")
+    con.commit()
     return con
+
+
+def model_log_base(slug: str) -> str:
+    return _MLOG_SUFFIX_RE.sub("", slug or "")
+
+
+def _ref_outcome(market, line, actual_total, actual_btts):
+    if (market or "").upper() == "BTTS":
+        return None if actual_btts is None else (1 if actual_btts else 0)
+    if actual_total is None or line is None:
+        return None
+    if abs(float(actual_total) - float(line)) < 1e-9:
+        return None  # push
+    return 1 if float(actual_total) > float(line) else 0
+
+
+def settle_model_log(db_path, finals_total: dict, finals_btts: dict | None = None) -> int:
+    """Fill ref_outcome for shadow rows from {base_game_slug: outcome}. Returns updated."""
+    finals_btts = finals_btts or {}
+    con = connect(db_path)
+    updated = 0
+    try:
+        with con:
+            for r in con.execute("SELECT * FROM model_log WHERE ref_outcome IS NULL"):
+                d = dict(r)
+                key = model_log_base(d.get("game_slug", ""))
+                at, ab = finals_total.get(key), finals_btts.get(key)
+                if at is None and ab is None:
+                    continue
+                out = _ref_outcome(d.get("market"), d.get("line"), at, ab)
+                if out is None:
+                    continue
+                con.execute(
+                    "UPDATE model_log SET ref_outcome=?, actual_total=?, actual_btts=?, "
+                    "status='SETTLED' WHERE id=?",
+                    (out, at, (1 if ab else 0) if ab is not None else None, d["id"]))
+                updated += 1
+    finally:
+        con.close()
+    return updated
+
+
+def set_close_price(db_path, row_id: int, close_price: float) -> None:
+    con = connect(db_path)
+    try:
+        with con:
+            con.execute("UPDATE model_log SET close_price=? WHERE id=?", (close_price, row_id))
+    finally:
+        con.close()
 
 
 def record_prediction(pred: dict, db_path: str = DEFAULT_DB) -> int:
