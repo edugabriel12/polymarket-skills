@@ -131,6 +131,16 @@ python polymarket-mlb-totals/scripts/track_predictions.py --settle-game mlb-hou-
 python polymarket-mlb-totals/scripts/track_predictions.py --auto-settle --date 2026-06-13   # MLB Stats API finals (best-effort)
 ```
 
+### Full math audit (`audit_log.py`)
+Dump the complete `stats_log` (model, μ/variance, inputs, probabilities, edge, sizing) for every
+prediction. Pure stdlib; works for both the MLB and soccer stores (`--sport`).
+```bash
+python polymarket-mlb-totals/scripts/audit_log.py                 # all MLB predictions, full audit
+python polymarket-mlb-totals/scripts/audit_log.py --status PENDENTE --date 2026-06-16
+python polymarket-mlb-totals/scripts/audit_log.py --sport soccer  # the soccer store
+python polymarket-mlb-totals/scripts/audit_log.py --json > audit.json   # machine-readable
+```
+
 Re-recording the same game/line/side while `PENDENTE` updates the snapshot (captures line
 movement); a settled row is never overwritten. Schema in `references/predictions-store.md`.
 
