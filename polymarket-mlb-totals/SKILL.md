@@ -43,7 +43,7 @@ source ~/.venv/bin/activate && python polymarket-mlb-totals/scripts/suggest_tota
 source ~/.venv/bin/activate && python polymarket-mlb-totals/scripts/suggest_totals.py \
   --projections-csv myteams.csv --paper
 
-# Honest "no edge" mode (no external inputs -> market-implied -> zero edge)
+# Honest "no edge" mode (no STRONG inputs -> market-implied -> zero edge)
 source ~/.venv/bin/activate && python polymarket-mlb-totals/scripts/suggest_totals.py --no-external --output text
 ```
 
@@ -63,11 +63,16 @@ list_games_today (scanner)  →  find total-runs Over/Under market  →  NegBin 
 ```
 
 - **Model:** the game total is **Negative Binomial** (MLB runs are overdispersed, `variance ≈ 2×mean`
-  — plain Poisson is wrong). The mean μ is a **park-adjusted league baseline** modified by **season
-  run-rates** (offense + starter/bullpen) and **weather**; `P(Over)` is the PMF tail. Details +
-  the included/excluded feature list in `references/run-model.md`.
-- **Anti-fabrication:** with no external inputs the model uses the **market-implied** μ, so edge ≈ 0
-  and nothing is suggested. Real edge appears only when real inputs move μ off the market.
+  — plain Poisson is wrong). `P(Over)` is the PMF tail.
+- **μ is anchored to the market** unless a **STRONG input** (team offense/pitching factors) is present.
+  The mean starts at the **market-implied** μ; only `*_off`/`*_sp` factors move it off the market.
+  **Weather and the park factor alone do NOT override the market** (they're second-order and already
+  in the line) — this is what stops the model fabricating huge fake edges on high-total games. Team
+  factors are resolved automatically from the **MLB Stats API season standings** (`team_factors.py`),
+  or supplied via `--projections-csv` (override). Starter-level SIERA/xFIP is the documented next step.
+- **Anti-fabrication + sanity cap:** with no strong inputs μ = market-implied, so edge ≈ 0 and nothing
+  is suggested. And any post-fee edge above **`MAX_PLAUSIBLE_EDGE` (15%)** is **rejected** — on a
+  near-efficient market that signals model error, not value (the col-oak post-mortem).
 - **Edge type & sizing:** classified as **news-driven** (model/forecast) → **2% cap**, **1% on the
   first trades** of this new strategy; half-Kelly via the advisor. See `references/edge-and-risk.md`.
 - **Scope filters:** only **MLB** games (slug prefix `mlb-`) and only **full-game run-total** markets

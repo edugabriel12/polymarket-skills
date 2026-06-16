@@ -76,36 +76,48 @@ def group_by_event(markets: list[dict]) -> dict[str, list[dict]]:
     return out
 
 
+# Inputs strong enough to justify overriding the market's expected total. Weather
+# (temp/wind) and the park factor are second-order and largely already in the line,
+# so they do NOT on their own move mu off the market — otherwise the model
+# manufactures fake edges (see the col-oak post-mortem).
+STRONG_INPUT_KEYS = ("home_off", "away_off", "home_sp", "away_sp")
+
+
 def model_probabilities(line, over_price, park_factor, inputs, *,
                         league_baseline, dispersion):
     """Model the total-runs distribution and return the full math as a dict.
 
-    With real inputs, mu = park-adjusted baseline + adjustments. Without any
-    input, mu = market-implied (edge ~ 0 by construction — never fabricated).
-    Returns: p_over, p_under (effective), mu, var, used_external, p_push, need,
-    and the NegBin params (r, p) — everything needed for the prediction audit log.
+    mu is anchored to the **market-implied total** unless we have a STRONG input
+    (team offense / pitching factors); weather/park alone keep mu at the market
+    (edge ~ 0 — never fabricated). The market-implied mu is always reported for
+    transparency. Returns p_over/p_under (effective), mu, market_mu, var,
+    used_external, p_push, need, and the NegBin params (r, p).
     """
-    used_external = bool(inputs)
+    market_mu = rd.market_implied_mu(line, over_price, dispersion)
+    used_external = any(k in inputs for k in STRONG_INPUT_KEYS)
     if used_external:
         base = rd.baseline_mu(park_factor, league_baseline)
         mu = rd.adjust_mu(base, **inputs)
     else:
-        mu = rd.market_implied_mu(line, over_price, dispersion)
+        mu = market_mu
     var = rd.variance_from_mu(mu, dispersion)
     pmf = rd.negbin_total_runs_pmf(mu, var)
     probs = rd.prob_over(line, pmf)
     r, p = rd.negbin_params_from_moments(mu, var)
     return {
         "p_over": probs["p_over_eff"], "p_under": probs["p_under_eff"],
-        "mu": mu, "var": var, "used_external": used_external,
+        "mu": mu, "market_mu": market_mu, "var": var, "used_external": used_external,
         "p_push": probs["p_push"], "need": probs["need"],
         "negbin_r": r, "negbin_p": p,
     }
 
 
-def pick_side(line, ou, p_over, p_under, fee_rate, odds_min, odds_max):
+def pick_side(line, ou, p_over, p_under, fee_rate, odds_min, odds_max,
+              max_edge=rd.MAX_PLAUSIBLE_EDGE):
     """Choose Over/Under by post-fee edge among odds-filter-eligible sides.
 
+    A side whose post-fee edge exceeds `max_edge` is flagged `implausible` and
+    excluded — on a near-efficient market that signals model error, not value.
     Returns a dict for the chosen side or None, plus a list of per-side notes.
     """
     sides = [
@@ -119,10 +131,11 @@ def pick_side(line, ou, p_over, p_under, fee_rate, odds_min, odds_max):
             continue
         edge = p_model - price - fee_for(price, fee_rate)
         in_odds = rd.passes_odds_filter(price, odds_min, odds_max)
+        implausible = edge > max_edge
         notes.append({"side": name, "price": round(price, 4),
                       "p_model": round(p_model, 4), "edge": round(edge, 4),
-                      "in_odds_band": in_odds})
-        if edge > 0 and in_odds:
+                      "in_odds_band": in_odds, "implausible": implausible})
+        if edge > 0 and in_odds and not implausible:
             candidates.append({"side": name, "token": token, "price": price,
                                "p_model": p_model, "edge": edge})
     if not candidates:
@@ -233,7 +246,8 @@ def record_prediction_row(db_path, game_slug, game_date, totals, line, chosen, m
                   else f"https://polymarket.com/sports/mlb/{game_slug}")
     stats = {
         "model": "negative_binomial",
-        "mu": round(m["mu"], 4), "variance": round(m["var"], 4),
+        "mu": round(m["mu"], 4), "market_mu": round(m["market_mu"], 4),
+        "variance": round(m["var"], 4),
         "dispersion": args.dispersion,
         "negbin_r": round(m["negbin_r"], 4), "negbin_p": round(m["negbin_p"], 4),
         "league_baseline": args.league_baseline, "park_factor": park_factor,
@@ -377,9 +391,14 @@ def run(args) -> dict:
             f"{n['side']} price={n['price']} p={n['p_model']} edge={n['edge']:+.3f} "
             f"band={n['in_odds_band']}" for n in side_notes))
         if not chosen:
-            _skip(event_slug, f"no positive-edge side within "
-                  f"{args.odds_min:.2f}x-{args.odds_max:.1f}x band",
-                  line=line, sides=side_notes)
+            implausible = next((n for n in side_notes
+                                if n.get("implausible") and n["edge"] > 0 and n["in_odds_band"]), None)
+            reason = (f"edge {implausible['edge']:.1%} implausibly large "
+                      f"(> {rd.MAX_PLAUSIBLE_EDGE:.0%} cap) — likely model error, skipped"
+                      if implausible else
+                      f"no positive-edge side within "
+                      f"{args.odds_min:.2f}x-{args.odds_max:.1f}x band")
+            _skip(event_slug, reason, line=line, sides=side_notes)
             continue
 
         passed, reason = decision_tree(chosen, totals, ou,

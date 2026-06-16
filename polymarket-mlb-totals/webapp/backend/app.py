@@ -167,7 +167,7 @@ def _cache_put(sport: str, date: str, payload: dict) -> None:
 
 def _mlb_args(date: str) -> argparse.Namespace:
     return argparse.Namespace(
-        date=date, min_volume=1000.0, min_edge=0.05, min_hours=0.0, best_line_only=False,
+        date=date, min_volume=1000.0, min_edge=0.05, min_hours=0.0, best_line_only=True,
         odds_min=1.50, odds_max=3.00, dispersion=2.0, league_baseline=8.5, league_prefix="mlb-",
         fee_rate=0.0, use_external=True, projections_csv=None, refresh_prices=False,
         portfolio_value=10000.0, portfolio_db=None, record=True, predictions_db=MLB_DB,
@@ -188,7 +188,7 @@ def _run_soccer(date: str) -> dict:
     forwarded to the backend output for parity with the in-process MLB logs.
     """
     cmd = [sys.executable, _SOCCER_SUGGEST, "--date", date, "--output", "json",
-           "--predictions-db", SOCCER_DB, "--all-lines"]
+           "--predictions-db", SOCCER_DB]  # best-line-only: one bet per game (avoids correlated lines)
     if SOCCER_RATINGS_CSV:
         cmd += ["--ratings-csv", SOCCER_RATINGS_CSV]
     try:

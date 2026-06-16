@@ -59,7 +59,8 @@ class TestFallbackNoEdge(unittest.TestCase):
 class TestRealInputsCreateEdge(unittest.TestCase):
     def test_strong_offense_pushes_over_edge(self):
         line, over_price = 8.5, 0.52
-        inputs = {"home_off": 1.2, "away_off": 1.2, "home_sp": 1.1, "away_sp": 1.1,
+        # Moderate strong inputs -> mu modestly above 8.5 -> a *plausible* Over edge.
+        inputs = {"home_off": 1.08, "away_off": 1.08, "home_sp": 1.04, "away_sp": 1.04,
                   "home_field": 0.1}
         m = st.model_probabilities(
             line, over_price, 100.0, inputs, league_baseline=8.5, dispersion=2.0)
@@ -71,6 +72,29 @@ class TestRealInputsCreateEdge(unittest.TestCase):
         self.assertIsNotNone(chosen)
         self.assertEqual(chosen["side"], "OVER")
         self.assertEqual(chosen["token"], "o1")
+
+    def test_weather_only_anchors_to_market(self):
+        # The col-oak bug: weather alone must NOT override the market's expected total.
+        line, over_price = 13.5, 0.475
+        m = st.model_probabilities(line, over_price, 97.0,
+                                   {"temp_f": 68.4, "wind_out_mph": 4.5},
+                                   league_baseline=8.5, dispersion=2.0)
+        self.assertFalse(m["used_external"])           # weather is not a strong input
+        self.assertAlmostEqual(m["mu"], m["market_mu"], places=6)
+        self.assertAlmostEqual(m["p_over"], over_price, delta=2e-3)  # ~zero edge
+
+    def test_implausible_edge_rejected(self):
+        # Extreme inputs -> a >15% edge -> flagged implausible and excluded.
+        line, over_price = 12.5, 0.385
+        inputs = {"home_off": 0.7, "away_off": 0.7, "home_sp": 0.8, "away_sp": 0.8}
+        m = st.model_probabilities(line, over_price, 97.0, inputs,
+                                   league_baseline=8.5, dispersion=2.0)
+        mkt = totals_market(line, over_price, 1 - over_price)
+        chosen, notes = st.pick_side(line, ou_of(mkt), m["p_over"], m["p_under"],
+                                     0.0, 1.60, 3.00)
+        self.assertIsNone(chosen)                       # implausible edge -> no bet
+        under = next(n for n in notes if n["side"] == "UNDER")
+        self.assertTrue(under["implausible"])
 
 
 class TestOddsFilter(unittest.TestCase):
@@ -299,8 +323,8 @@ class TestEndToEndRun(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             csv_path = os.path.join(d, "proj.csv")
             with open(csv_path, "w", encoding="utf-8") as fh:
-                # Strong offenses + weak pitching -> mu well above 8.5 -> Over edge.
-                fh.write("team,off_factor,pitch_factor\nkc,1.25,1.10\nhou,1.25,1.10\n")
+                # Moderate offenses/pitching -> mu modestly above 8.5 -> plausible Over edge.
+                fh.write("team,off_factor,pitch_factor\nkc,1.08,1.05\nhou,1.08,1.05\n")
 
             preds_db = os.path.join(d, "preds.db")
             args = _Args(date="2026-06-14", projections_csv=csv_path,
