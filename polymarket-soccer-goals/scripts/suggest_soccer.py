@@ -201,7 +201,7 @@ def run(args) -> dict:
                 f"{p}={v:.2f}(was {leagues.LEAGUE_BASELINES.get(p, leagues.DEFAULT_BASELINE):.2f})"
                 for p, v in sorted(calibrated.items())))
 
-    suggestions, skipped = [], []
+    suggestions, skipped, cand_rows = [], [], []
 
     def _skip(slug, reason, **extra):
         rec = {"game": slug, "reason": reason}; rec.update(extra)
@@ -241,9 +241,11 @@ def run(args) -> dict:
         vlog(f"  [{slug}] edges(TOTAL): " + "; ".join(
             f"{n['side']} price={n['price']} p={n['p_model']} edge={n['edge']:+.3f} "
             f"band={n['in_odds_band']}" for n in notes))
-        _emit_or_skip("TOTAL", slug, m, line, chosen, notes, lam_h, lam_a, used,
+        c = _evaluate("TOTAL", slug, m, line, chosen, notes, lam_h, lam_a, used,
                       ou["book_sum"], ou["price_sane"], args, portfolio_value, first_trade, kh,
-                      suggestions, _skip, target)
+                      _skip, target)
+        if c:
+            cand_rows.append(c)
 
     # --- BTTS markets ---
     for slug, gmarkets in btts_evts.items():
@@ -268,18 +270,39 @@ def run(args) -> dict:
         vlog(f"  [{slug}] edges(BTTS): " + "; ".join(
             f"{n['side']} price={n['price']} p={n['p_model']} edge={n['edge']:+.3f} "
             f"band={n['in_odds_band']}" for n in notes))
-        _emit_or_skip("BTTS", slug, m, None, chosen, notes, lam_h, lam_a, used,
+        c = _evaluate("BTTS", slug, m, None, chosen, notes, lam_h, lam_a, used,
                       bt["book_sum"], bt["price_sane"], args, portfolio_value, first_trade, kh,
-                      suggestions, _skip, target)
+                      _skip, target)
+        if c:
+            cand_rows.append(c)
 
-    # Best-line-per-game for TOTAL markets (BTTS is already one per matchup).
-    if args.best_line_only:
-        best = {}
-        for s in suggestions:
-            key = (sm.GAME_TOTAL_RE.sub("", s["game"]), s["market"])
-            if key not in best or s["edge"] > best[key]["edge"]:
-                best[key] = s
-        suggestions = sorted(best.values(), key=lambda s: s["edge"], reverse=True)
+    # Best-line-per-game: record/score only the highest-edge line per (game, market); the
+    # other passing lines are reported as skipped (not bet) so we never place correlated bets.
+    groups: dict = {}
+    for c in cand_rows:
+        groups.setdefault((sm.GAME_TOTAL_RE.sub("", c["slug"]), c["market_type"]), []).append(c)
+    final = []
+    for cs in groups.values():
+        cs.sort(key=lambda c: c["chosen"]["edge"], reverse=True)
+        winners = cs[:1] if args.best_line_only else cs
+        for c in (cs[1:] if args.best_line_only else []):
+            _shadow_log(c["market_type"], c["slug"], c["line"], c["notes"], c["chosen"],
+                        c["lam_h"], c["lam_a"], c["used"], args, target, 0,
+                        "not best line for this game")
+            _skip(c["slug"], "not best line for this game (best_line_only)",
+                  market=c["market_type"], side=c["chosen"]["side"])
+        final.extend(winners)
+
+    for c in final:
+        pred_id = _record_soccer(c, args, target)
+        _shadow_log(c["market_type"], c["slug"], c["line"], c["notes"], c["chosen"],
+                    c["lam_h"], c["lam_a"], c["used"], args, target, 1, None)
+        suggestions.append({"game": c["slug"], "market": c["market_type"],
+                            "side": c["chosen"]["side"], "line": c["line"],
+                            "edge": round(c["chosen"]["edge"], 4),
+                            "lam_home": round(c["lam_h"], 3), "lam_away": round(c["lam_a"], 3),
+                            "prediction_id": pred_id, "recommendation": c["rec"], "_text": c["text"]})
+    suggestions.sort(key=lambda s: s["edge"], reverse=True)
 
     texts = [s.pop("_text") for s in suggestions]
     vlog(f"=== Done: {len(suggestions)} suggestion(s), {len(skipped)} skipped ===")
@@ -321,9 +344,13 @@ def _shadow_log(market_type, slug, line, notes, chosen, lam_h, lam_a, used, args
             print(f"[model_log] failed: {e}", file=sys.stderr)
 
 
-def _emit_or_skip(market_type, slug, m, line, chosen, notes, lam_h, lam_a, used,
-                  book_sum, price_sane, args, portfolio_value, first_trade, kh,
-                  suggestions, _skip, target):
+def _evaluate(market_type, slug, m, line, chosen, notes, lam_h, lam_a, used,
+              book_sum, price_sane, args, portfolio_value, first_trade, kh, _skip, target):
+    """Return a candidate dict for a passing market, or None (skip handled inline).
+
+    Recording is deferred to the caller's best-line selection so we never place
+    correlated multi-line bets on one game.
+    """
     def _shadow(bet, skip_reason):
         _shadow_log(market_type, slug, line, notes, chosen, lam_h, lam_a, used, args,
                     target, bet, skip_reason)
@@ -332,21 +359,21 @@ def _emit_or_skip(market_type, slug, m, line, chosen, notes, lam_h, lam_a, used,
         reason = f"no positive-edge side within {args.odds_min:.2f}x-{args.odds_max:.1f}x band"
         _shadow(0, reason)
         _skip(slug, reason, market=market_type, sides=notes)
-        return
+        return None
     passed, reason = decision_tree(chosen, m, book_sum, price_sane,
                                    min_volume=args.min_volume, min_edge=args.min_edge,
                                    min_hours=args.min_hours)
     if not passed:
         _shadow(0, reason)
-        _skip(slug, reason, market=market_type, side=chosen["side"]); return
+        _skip(slug, reason, market=market_type, side=chosen["side"]); return None
     size_pct, size_usd, kelly = size_position(chosen["p_model"], chosen["price"],
                                               portfolio_value, first_trade, kh)
     if kelly <= 0:
         _shadow(0, "Kelly <= 0")
-        _skip(slug, "Kelly <= 0", market=market_type); return
+        _skip(slug, "Kelly <= 0", market=market_type); return None
     if size_usd < 10:
         _shadow(0, f"size ${size_usd:.2f} below $10 minimum")
-        _skip(slug, f"size ${size_usd:.2f} below $10 minimum", market=market_type); return
+        _skip(slug, f"size ${size_usd:.2f} below $10 minimum", market=market_type); return None
 
     confidence = max(0.5, min(0.5 + chosen["edge"], 0.65)) if used else 0.5
     price = chosen["price"]
@@ -365,25 +392,6 @@ def _emit_or_skip(market_type, slug, m, line, chosen, notes, lam_h, lam_a, used,
         "kelly_fraction": round(kelly, 5), "size_pct": round(size_pct, 5),
         "size_usd": round(size_usd, 2), "confidence": round(confidence, 3), "sides": notes,
     }
-    pred_id = None
-    if args.record:
-        try:
-            pred_id = spdb.record_prediction({
-                "game_slug": slug, "game_date": target, "league": leagues.league_prefix(slug),
-                "market": market_type, "market_question": sanitize_text(m.get("question", "")),
-                "condition_id": m.get("condition_id"), "token_id": chosen["token"], "line": line,
-                "side": chosen["side"], "entry_price": price, "decimal_odds": odds,
-                "model_prob": chosen["p_model"], "edge": chosen["edge"], "lam_home": lam_h,
-                "lam_away": lam_a, "rho": args.rho, "confidence": confidence, "size_pct": size_pct,
-                "size_usd": size_usd, "kelly_fraction": kelly, "used_external": used,
-                "fee_rate": args.fee_rate, "strategy": STRATEGY, "market_url": market_url,
-                "stats": stats,
-            }, args.predictions_db)
-        except Exception as e:  # noqa: BLE001
-            if args.debug:
-                print(f"[record] failed: {e}", file=sys.stderr)
-    _shadow(1, None)
-
     rec = {"token_id": chosen["token"], "side": "YES", "action": "BUY",
            "size_pct": round(size_pct, 4), "price": round(price, 4),
            "confidence": round(confidence, 3), "reasoning": sanitize_text(desc),
@@ -391,10 +399,32 @@ def _emit_or_skip(market_type, slug, m, line, chosen, notes, lam_h, lam_a, used,
     text = (f"Market: {sanitize_text(m.get('question',''))}  [{slug}]\n"
             f"Edge type: news-driven (Dixon-Coles model)\n{desc}\n"
             f"Size: ${size_usd:,.2f} ({size_pct*100:.2f}%)  Confidence: {confidence:.2f}")
-    suggestions.append({"game": slug, "market": market_type, "side": chosen["side"],
-                        "line": line, "edge": round(chosen["edge"], 4),
-                        "lam_home": round(lam_h, 3), "lam_away": round(lam_a, 3),
-                        "prediction_id": pred_id, "recommendation": rec, "_text": text})
+    return {"market_type": market_type, "slug": slug, "m": m, "line": line, "chosen": chosen,
+            "notes": notes, "lam_h": lam_h, "lam_a": lam_a, "used": used, "confidence": confidence,
+            "price": price, "odds": odds, "market_url": market_url, "size_pct": size_pct,
+            "size_usd": size_usd, "kelly": kelly, "stats": stats, "rec": rec, "text": text}
+
+
+def _record_soccer(c, args, target):
+    """Persist a winning candidate to the predictions DB; returns the row id."""
+    if not args.record:
+        return None
+    try:
+        return spdb.record_prediction({
+            "game_slug": c["slug"], "game_date": target, "league": leagues.league_prefix(c["slug"]),
+            "market": c["market_type"], "market_question": sanitize_text(c["m"].get("question", "")),
+            "condition_id": c["m"].get("condition_id"), "token_id": c["chosen"]["token"],
+            "line": c["line"], "side": c["chosen"]["side"], "entry_price": c["price"],
+            "decimal_odds": c["odds"], "model_prob": c["chosen"]["p_model"], "edge": c["chosen"]["edge"],
+            "lam_home": c["lam_h"], "lam_away": c["lam_a"], "rho": args.rho,
+            "confidence": c["confidence"], "size_pct": c["size_pct"], "size_usd": c["size_usd"],
+            "kelly_fraction": c["kelly"], "used_external": c["used"], "fee_rate": args.fee_rate,
+            "strategy": STRATEGY, "market_url": c["market_url"], "stats": c["stats"],
+        }, args.predictions_db)
+    except Exception as e:  # noqa: BLE001
+        if args.debug:
+            print(f"[record] failed: {e}", file=sys.stderr)
+        return None
 
 
 def render_text(result: dict) -> str:
