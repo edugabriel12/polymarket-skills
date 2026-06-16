@@ -159,6 +159,14 @@ python polymarket-mlb-totals/scripts/reset_db.py --sport mlb --delete-file --yes
 Re-recording the same game/line/side while `PENDENTE` updates the snapshot (captures line
 movement); a settled row is never overwritten. Schema in `references/predictions-store.md`.
 
+### Shadow calibration log (`model_log` table)
+**Every** modeled game is logged to a separate `model_log` table — including the ones the model did
+**not** bet (`bet=0`, with the `skip_reason`). It stores the reference-side probability (`ref_prob`
+for OVER), the market price, the model params, and the pick. This avoids selection bias so you can
+later compute **Brier / log-loss / CLV over all games**, not just the bet ones. Read it with
+`predictions_db.get_model_log()` / `soccer_predictions.get_model_log()`. Filling the outcome
+(`ref_outcome`) for the Brier report is the next step.
+
 ## Web dashboard (`webapp/`)
 
 A modern React + FastAPI dashboard to interact with the model visually — two tabs:

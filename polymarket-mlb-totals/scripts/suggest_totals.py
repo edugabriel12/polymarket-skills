@@ -390,6 +390,32 @@ def run(args) -> dict:
         vlog(f"  [{event_slug}] edges: " + "; ".join(
             f"{n['side']} price={n['price']} p={n['p_model']} edge={n['edge']:+.3f} "
             f"band={n['in_odds_band']}" for n in side_notes))
+
+        def _shadow(bet, skip_reason, *, _slug=event_slug, _line=line, _notes=side_notes,
+                    _chosen=chosen, _m=m, _totals=totals):
+            """Shadow-log this modeled game (bet or not) for later calibration."""
+            if not args.record:
+                return
+            ref = next((n for n in _notes if n["side"] == "OVER"), None)
+            url = (f"https://polymarket.com/event/{_totals.get('slug')}" if _totals.get("slug")
+                   else f"https://polymarket.com/sports/mlb/{_slug}")
+            try:
+                predictions_db.record_model_log({
+                    "game_slug": _slug, "game_date": target, "league": None, "market": "TOTAL",
+                    "line": _line, "ref_side": "OVER",
+                    "ref_prob": ref["p_model"] if ref else None,
+                    "ref_price": ref["price"] if ref else None,
+                    "pick_side": _chosen["side"] if _chosen else None,
+                    "pick_edge": round(_chosen["edge"], 4) if _chosen else None,
+                    "used_external": _m["used_external"],
+                    "model_params": {"mu": round(_m["mu"], 4), "market_mu": round(_m["market_mu"], 4),
+                                     "variance": round(_m["var"], 4)},
+                    "bet": bet, "skip_reason": skip_reason, "market_url": url,
+                }, args.predictions_db)
+            except Exception as e:  # noqa: BLE001
+                if args.debug:
+                    print(f"[model_log] failed: {e}", file=sys.stderr)
+
         if not chosen:
             implausible = next((n for n in side_notes
                                 if n.get("implausible") and n["edge"] > 0 and n["in_odds_band"]), None)
@@ -398,6 +424,7 @@ def run(args) -> dict:
                       if implausible else
                       f"no positive-edge side within "
                       f"{args.odds_min:.2f}x-{args.odds_max:.1f}x band")
+            _shadow(0, reason)
             _skip(event_slug, reason, line=line, sides=side_notes)
             continue
 
@@ -405,6 +432,7 @@ def run(args) -> dict:
                                        min_volume=args.min_volume, min_edge=args.min_edge,
                                        min_hours=args.min_hours)
         if not passed:
+            _shadow(0, reason)
             _skip(event_slug, reason, line=line, side=chosen["side"])
             continue
 
@@ -412,9 +440,11 @@ def run(args) -> dict:
             chosen["p_model"], chosen["price"], portfolio_value, first_trade,
             advisor_kelly_half())
         if kelly <= 0:
+            _shadow(0, "Kelly <= 0")
             _skip(event_slug, "Kelly <= 0", line=line, side=chosen["side"])
             continue
         if size_usd < 10:
+            _shadow(0, f"size ${size_usd:.2f} below $10 minimum")
             _skip(event_slug, f"size ${size_usd:.2f} below $10 minimum",
                   line=line, side=chosen["side"])
             continue
@@ -431,6 +461,7 @@ def run(args) -> dict:
                 args.predictions_db, event_slug, target, totals, line, chosen, m,
                 ou, inputs, park_factor, size_pct, size_usd, kelly, confidence,
                 side_notes, args)
+        _shadow(1, None)
 
         suggestions.append({"game": event_slug, "line": line, "mu": round(m["mu"], 3),
                             "edge": round(chosen["edge"], 4), "prediction_id": prediction_id,

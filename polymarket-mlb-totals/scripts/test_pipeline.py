@@ -364,6 +364,15 @@ class TestEndToEndRun(unittest.TestCase):
             self.assertIn("mu", stats)
             self.assertIn("inputs", stats)         # math/stats audit present
 
+            # Shadow model_log: every modeled game logged, the bet one flagged bet=1.
+            mlog = pdb.get_model_log(preds_db)
+            self.assertGreaterEqual(len(mlog), 1)
+            bet_rows = [r for r in mlog if r["bet"] == 1]
+            self.assertGreaterEqual(len(bet_rows), 1)
+            self.assertEqual(bet_rows[0]["ref_side"], "OVER")
+            self.assertIsNotNone(bet_rows[0]["ref_prob"])
+            self.assertIn("mu", json.loads(bet_rows[0]["model_params"]))
+
 
 class _Args:
     """Minimal args namespace with pipeline defaults overridable by kwargs."""

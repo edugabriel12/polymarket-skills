@@ -236,6 +236,13 @@ class TestEndToEnd(unittest.TestCase):
                          predictions_db=os.path.join(d, "p.db"))
             result = ss.run(args)
 
+            # Shadow model_log: both modeled markets (TOTAL + BTTS) logged with bet=1.
+            import soccer_predictions as spdb_
+            mlog = spdb_.get_model_log(args.predictions_db)
+            self.assertEqual({r["market"] for r in mlog}, {"TOTAL", "BTTS"})
+            self.assertTrue(all(r["bet"] == 1 for r in mlog))
+            self.assertEqual({r["ref_side"] for r in mlog}, {"OVER", "YES"})
+
         self.assertEqual(result["counts"]["total_markets"], 1)
         self.assertEqual(result["counts"]["btts_markets"], 1)
         self.assertGreaterEqual(result["counts"]["suggestions"], 1)

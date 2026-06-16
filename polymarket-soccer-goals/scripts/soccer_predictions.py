@@ -62,7 +62,40 @@ CREATE TABLE IF NOT EXISTS predictions (
 );
 CREATE INDEX IF NOT EXISTS idx_soccer_status ON predictions(status);
 CREATE INDEX IF NOT EXISTS idx_soccer_date ON predictions(game_date);
+
+CREATE TABLE IF NOT EXISTS model_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    game_slug TEXT NOT NULL,
+    game_date TEXT,
+    league TEXT,
+    market TEXT,
+    line REAL,
+    ref_side TEXT,        -- calibration reference side (OVER / YES)
+    ref_prob REAL,        -- model P(ref_side)
+    ref_price REAL,       -- market price of ref_side
+    pick_side TEXT,       -- model's preferred side (may differ)
+    pick_edge REAL,
+    used_external INTEGER,
+    model_params TEXT,    -- JSON (lam_home/lam_away/rho)
+    bet INTEGER NOT NULL DEFAULT 0,   -- 1 = became a recorded suggestion, 0 = not bet
+    skip_reason TEXT,
+    market_url TEXT,
+    actual_total REAL,
+    actual_btts INTEGER,
+    ref_outcome INTEGER,  -- 1 if ref_side won, 0 if lost (filled at settlement)
+    status TEXT NOT NULL DEFAULT 'PENDENTE',
+    UNIQUE(game_slug, market, line)
+);
+CREATE INDEX IF NOT EXISTS idx_soccer_mlog_date ON model_log(game_date);
 """
+
+_MODEL_LOG_FIELDS = (
+    "game_slug", "game_date", "league", "market", "line", "ref_side", "ref_prob",
+    "ref_price", "pick_side", "pick_edge", "used_external", "model_params", "bet",
+    "skip_reason", "market_url",
+)
 
 _FIELDS = (
     "game_slug", "game_date", "league", "market", "market_question", "condition_id",
@@ -114,6 +147,56 @@ def record_prediction(pred: dict, db_path: str = DEFAULT_DB) -> int:
                 "AND line=:l AND side=:s",
                 {"g": row["game_slug"], "m": row["market"], "l": row["line"], "s": row["side"]})
             return cur.fetchone()["id"]
+    finally:
+        con.close()
+
+
+def record_model_log(entry: dict, db_path: str = DEFAULT_DB) -> None:
+    """Shadow-log EVERY modeled market (bet or not) for calibration analysis.
+
+    Upserts one row per (game_slug, market, line) while PENDENTE so re-runs refresh
+    the snapshot. `bet=0` marks a game the model did NOT bet (skip_reason explains).
+    """
+    row = {k: entry.get(k) for k in _MODEL_LOG_FIELDS}
+    if isinstance(row.get("model_params"), (dict, list)):
+        row["model_params"] = json.dumps(row["model_params"], ensure_ascii=False, default=str)
+    if row.get("used_external") is not None:
+        row["used_external"] = int(bool(row["used_external"]))
+    row["bet"] = int(bool(row.get("bet")))
+    if row.get("line") is None:
+        row["line"] = -1.0  # BTTS sentinel, keeps the UNIQUE key stable
+    now = _now()
+    cols = ", ".join(_MODEL_LOG_FIELDS)
+    ph = ", ".join(f":{f}" for f in _MODEL_LOG_FIELDS)
+    upd = ", ".join(f"{f}=excluded.{f}" for f in _MODEL_LOG_FIELDS)
+    sql = (
+        f"INSERT INTO model_log (created_at, updated_at, status, {cols}) "
+        f"VALUES (:created_at, :updated_at, 'PENDENTE', {ph}) "
+        f"ON CONFLICT(game_slug, market, line) DO UPDATE SET "
+        f"updated_at=excluded.updated_at, {upd} WHERE model_log.status='PENDENTE'"
+    )
+    con = connect(db_path)
+    try:
+        with con:
+            con.execute(sql, dict(row, created_at=now, updated_at=now))
+    finally:
+        con.close()
+
+
+def get_model_log(db_path: str = DEFAULT_DB, *, bet: int | None = None,
+                  game_date: str | None = None) -> list[dict]:
+    con = connect(db_path)
+    try:
+        q, args = "SELECT * FROM model_log", []
+        conds = []
+        if bet is not None:
+            conds.append("bet=?"); args.append(int(bet))
+        if game_date:
+            conds.append("game_date=?"); args.append(game_date)
+        if conds:
+            q += " WHERE " + " AND ".join(conds)
+        q += " ORDER BY id"
+        return [dict(r) for r in con.execute(q, args).fetchall()]
     finally:
         con.close()
 
