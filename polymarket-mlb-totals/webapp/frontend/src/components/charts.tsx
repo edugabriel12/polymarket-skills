@@ -29,7 +29,7 @@ export function WinRateDonut({ block }: { block: PerfBlock }) {
   const hasData = total > 0;
   const slices = hasData ? data : [{ name: "—", value: 1, color: "#334155" }];
   return (
-    <div className="relative h-48">
+    <div className="relative h-48 [&_*]:outline-none">
       <ResponsiveContainer width="100%" height="100%">
         <PieChart>
           <Pie
@@ -45,12 +45,6 @@ export function WinRateDonut({ block }: { block: PerfBlock }) {
               <Cell key={i} fill={d.color} />
             ))}
           </Pie>
-          {hasData && (
-            <Tooltip
-              contentStyle={{ background: "#0f172a", border: "1px solid #334155", borderRadius: 12, color: "#fff" }}
-              formatter={(value: number, name: string) => [`${value} (${total ? ((value / total) * 100).toFixed(0) : 0}%)`, name]}
-            />
-          )}
         </PieChart>
       </ResponsiveContainer>
       <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
