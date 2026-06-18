@@ -5,7 +5,7 @@ import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { StatusBadge } from "@/components/StatusBadge";
 import type { Suggestion } from "@/lib/api";
-import { cn, pct } from "@/lib/utils";
+import { cn, gameEventUrl, pct } from "@/lib/utils";
 
 function prettyMatchup(slug: string) {
   const m = slug.match(/^[a-z0-9]+-([a-z0-9]+)-([a-z0-9]+)-/i);
@@ -71,7 +71,7 @@ export function PredictionCard({ s }: { s: Suggestion }) {
               <ChevronDown className={cn("h-3.5 w-3.5 transition-transform", open && "rotate-180")} />
             </button>
             {s.market_url && (
-              <a href={s.market_url} target="_blank" rel="noreferrer"
+              <a href={gameEventUrl(s.market_url)} target="_blank" rel="noreferrer"
                 className="inline-flex items-center gap-1 text-xs font-semibold text-sky-400 hover:underline">
                 Ver mercado <ExternalLink className="h-3.5 w-3.5" />
               </a>
