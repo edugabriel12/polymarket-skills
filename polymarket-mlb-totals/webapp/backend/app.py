@@ -268,13 +268,13 @@ def results(sport: str = Query("mlb")) -> dict:
             settled = soccer_results.settle_pending(db, token=FOOTBALL_DATA_TOKEN)
         except Exception as e:  # noqa: BLE001
             settled = {"checked": 0, "settled": [], "error": str(e)}
-        perf, series, recent = spdb.performance(db), spdb.pnl_by_day(db), spdb.get_predictions(db)[:50]
+        perf, series, recent = spdb.performance(db), spdb.pnl_by_day(db), spdb.get_predictions(db)
     else:
         try:
             settled = settlement.settle_pending(_QuickAPI(), db)
         except Exception as e:  # noqa: BLE001
             settled = {"checked": 0, "settled": [], "error": str(e)}
-        perf, series, recent = analytics.performance(db), analytics.pnl_by_day(db), pdb.get_predictions(db)[:50]
+        perf, series, recent = analytics.performance(db), analytics.pnl_by_day(db), pdb.get_predictions(db)
     print(f"[results] {sport} settlement: checked={settled.get('checked', 0)} "
           f"finals_found={settled.get('finals_found', '-')} "
           f"settled={len(settled.get('settled', []))} "
