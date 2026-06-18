@@ -26,11 +26,12 @@ class _NoNetAPI:
 class TestDecideSettlements(unittest.TestCase):
     def setUp(self):
         self.pending = [
-            {"id": 1, "game_slug": "mlb-hou-kc-2026-06-13", "condition_id": "0xA"},
-            {"id": 2, "game_slug": "mlb-nyy-bos-2026-06-13", "condition_id": "0xB"},
-            {"id": 3, "game_slug": "mlb-lad-sf-2026-06-13", "condition_id": "0xC"},
+            {"id": 1, "game_slug": "mlb-hou-kc-2026-06-13", "game_date": "2026-06-13", "condition_id": "0xA"},
+            {"id": 2, "game_slug": "mlb-nyy-bos-2026-06-13", "game_date": "2026-06-13", "condition_id": "0xB"},
+            {"id": 3, "game_slug": "mlb-lad-sf-2026-06-13", "game_date": "2026-06-13", "condition_id": "0xC"},
         ]
-        self.finals = {("hou", "kc"): 9.0, ("nyy", "bos"): 7.0}  # lad-sf not final
+        # Finals are keyed by (game_date, away, home); lad-sf not final.
+        self.finals = {("2026-06-13", "hou", "kc"): 9.0, ("2026-06-13", "nyy", "bos"): 7.0}
 
     def test_default_settles_on_mlb_final(self):
         # New default: the MLB final is authoritative; Polymarket-closed is ignored.
@@ -49,6 +50,17 @@ class TestDecideSettlements(unittest.TestCase):
         self.assertEqual(
             sorted(settlement.decide_settlements(self.pending, self.finals, {})),
             [(1, 9.0), (2, 7.0)])  # default: no close gate -> both finals settle
+
+    def test_consecutive_day_rematch_does_not_cross_settle(self):
+        # Same two teams play on the 16th (final) and again on the 17th (not started).
+        # The 17th's prediction must NOT inherit the 16th's final.
+        pending = [
+            {"id": 10, "game_slug": "mlb-cws-nyy-2026-06-16", "game_date": "2026-06-16", "condition_id": "0xD"},
+            {"id": 11, "game_slug": "mlb-cws-nyy-2026-06-17", "game_date": "2026-06-17", "condition_id": "0xE"},
+        ]
+        finals = {("2026-06-16", "cws", "nyy"): 8.0}  # only the 16th is final
+        out = settlement.decide_settlements(pending, finals, {})
+        self.assertEqual(out, [(10, 8.0)])  # the 17th stays pending
 
 
 class TestSettlePendingOffline(unittest.TestCase):

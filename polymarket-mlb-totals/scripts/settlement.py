@@ -65,13 +65,15 @@ def decide_settlements(pending: list[dict], finals: dict, closed_map: dict,
                        require_closed: bool = False) -> list[tuple[int, float]]:
     """Pure: choose (prediction_id, actual_total) pairs ready to settle.
 
-    Requires an MLB final total for the matchup (authoritative). When
-    require_closed is set, also requires the Polymarket market to be closed.
+    Requires an MLB final total for the matchup **on that game's date**
+    (authoritative); finals is keyed by (game_date, away, home) so the same two
+    teams playing on consecutive days never cross-settle. When require_closed is
+    set, also requires the Polymarket market to be closed.
     """
     out = []
     for row in pending:
         away, home = pf.parse_slug_teams(row.get("game_slug", ""))
-        total = finals.get((away, home))
+        total = finals.get((row.get("game_date"), away, home))
         if total is None:
             continue
         if require_closed and not closed_map.get(row.get("condition_id")):
@@ -96,7 +98,8 @@ def settle_pending(api, db_path: str = pdb.DEFAULT_DB,
     dates = sorted({r["game_date"] for r in pending if r.get("game_date")})
     finals: dict = {}
     for d in dates:
-        finals.update(fetch_final_totals(api, d))
+        for (away, home), total in fetch_final_totals(api, d).items():
+            finals[(d, away, home)] = total
 
     cond_ids = [r.get("condition_id") for r in pending]
     closed_map, slug_map = fetch_market_status(api, cond_ids)
@@ -124,17 +127,19 @@ def settle_model_log_from_feed(api, db_path: str = pdb.DEFAULT_DB) -> int:
     if not dates:
         return 0
     from track_predictions import fetch_final_totals  # lazy
+    # Key finals by (date, away, home) so consecutive-day rematches never cross-settle.
     finals_pair: dict = {}
     for d in dates:
-        finals_pair.update(fetch_final_totals(api, d))
-    # Map base game slug -> total via its (away, home) teams.
+        for (away, home), total in fetch_final_totals(api, d).items():
+            finals_pair[(d, away, home)] = total
+    # Map base game slug -> total via its date + (away, home) teams.
     finals_total: dict = {}
     for r in rows:
         base = pdb.model_log_base(r.get("game_slug", ""))
         if base in finals_total:
             continue
         away, home = pf.parse_slug_teams(r.get("game_slug", ""))
-        t = finals_pair.get((away, home))
+        t = finals_pair.get((r.get("game_date"), away, home))
         if t is not None:
             finals_total[base] = t
     return pdb.settle_model_log(db_path, finals_total)
