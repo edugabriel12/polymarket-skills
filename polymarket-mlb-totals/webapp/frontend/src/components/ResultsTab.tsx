@@ -17,7 +17,7 @@ import { Button } from "@/components/ui/button";
 import { KpiCard } from "@/components/KpiCard";
 import { StatusBadge } from "@/components/StatusBadge";
 import { WinRateDonut, PnlBar, OverUnderSplit } from "@/components/charts";
-import { cn, pct, signedUsd, usd } from "@/lib/utils";
+import { cn, gameEventUrl, pct, signedUsd, usd } from "@/lib/utils";
 
 const PERIODS: { key: Period; label: string }[] = [
   { key: "daily", label: "Diário" },
@@ -148,7 +148,7 @@ export function ResultsTab({ sport }: { sport: Sport }) {
                       <td className="px-3"><StatusBadge status={r.status} /></td>
                       <td className="px-3">
                         {r.market_url && (
-                          <a href={r.market_url} target="_blank" rel="noreferrer" className="text-sky-400 hover:underline">
+                          <a href={gameEventUrl(r.market_url)} target="_blank" rel="noreferrer" className="text-sky-400 hover:underline">
                             <ExternalLink className="h-4 w-4" />
                           </a>
                         )}
