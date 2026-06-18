@@ -172,8 +172,9 @@ def _backfill_market_urls(db_path, pending, slug_map) -> int:
             for r in pending:
                 if r.get("market_url"):
                     continue
-                slug = slug_map.get(r.get("condition_id"))
-                url = (f"https://polymarket.com/event/{slug}" if slug
+                # Link to the game event, not the specific total line (strip "-total-9pt5").
+                event = pdb.model_log_base(slug_map.get(r.get("condition_id")) or "")
+                url = (f"https://polymarket.com/event/{event}" if event
                        else f"https://polymarket.com/sports/mlb/{r.get('game_slug','')}")
                 con.execute("UPDATE predictions SET market_url=? WHERE id=?", (url, r["id"]))
                 n += 1

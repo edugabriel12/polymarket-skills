@@ -241,8 +241,9 @@ def record_prediction_row(db_path, game_slug, game_date, totals, line, chosen, m
     """
     price = chosen["price"]
     odds = rd.decimal_odds(price)
-    market_slug = totals.get("slug") or ""
-    market_url = (f"https://polymarket.com/event/{market_slug}" if market_slug
+    # Link to the game event, not the specific total line (strip "-total-9pt5").
+    event = predictions_db.model_log_base(game_slug or totals.get("slug") or "")
+    market_url = (f"https://polymarket.com/event/{event}" if event
                   else f"https://polymarket.com/sports/mlb/{game_slug}")
     stats = {
         "model": "negative_binomial",
@@ -292,7 +293,9 @@ def _shadow_log_mlb(args, target, slug, line, side_notes, chosen, m, bet, skip_r
     if not args.record:
         return
     ref = next((n for n in side_notes if n["side"] == "OVER"), None)
-    url = (f"https://polymarket.com/event/{totals.get('slug')}" if totals.get("slug")
+    # Link to the game event, not the specific total line (strip "-total-9pt5").
+    event = predictions_db.model_log_base(slug or totals.get("slug") or "")
+    url = (f"https://polymarket.com/event/{event}" if event
            else f"https://polymarket.com/sports/mlb/{slug}")
     try:
         predictions_db.record_model_log({

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   TrendingUp,
@@ -8,6 +8,8 @@ import {
   ArrowDownCircle,
   ExternalLink,
   RefreshCw,
+  ChevronLeft,
+  ChevronRight,
 } from "lucide-react";
 import { api, type Period, type Sport } from "@/lib/api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -23,8 +25,11 @@ const PERIODS: { key: Period; label: string }[] = [
   { key: "monthly", label: "Mensal" },
 ];
 
+const PAGE_SIZE = 15;
+
 export function ResultsTab({ sport }: { sport: Sport }) {
   const [period, setPeriod] = useState<Period>("monthly");
+  const [page, setPage] = useState(0);
   // refetchOnMount + always-stale => every visit/interaction triggers backend settlement.
   const { data, isLoading, isFetching, refetch } = useQuery({
     queryKey: ["results", sport],
@@ -35,6 +40,12 @@ export function ResultsTab({ sport }: { sport: Sport }) {
   });
 
   const b = data?.performance[period];
+  const recent = data?.recent ?? [];
+  const pageCount = Math.max(1, Math.ceil(recent.length / PAGE_SIZE));
+  // Reset to the first page whenever the dataset or sport changes.
+  useEffect(() => setPage(0), [sport, recent.length]);
+  const safePage = Math.min(page, pageCount - 1);
+  const pageRows = recent.slice(safePage * PAGE_SIZE, safePage * PAGE_SIZE + PAGE_SIZE);
 
   return (
     <div className="space-y-5">
@@ -101,7 +112,14 @@ export function ResultsTab({ sport }: { sport: Sport }) {
           </div>
 
           <Card>
-            <CardHeader><CardTitle>Previsões recentes</CardTitle></CardHeader>
+            <CardHeader className="flex flex-row items-center justify-between gap-2 space-y-0">
+              <CardTitle>Previsões recentes</CardTitle>
+              {recent.length > 0 && (
+                <span className="text-xs font-normal text-muted-foreground">
+                  {recent.length} no total
+                </span>
+              )}
+            </CardHeader>
             <CardContent className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
@@ -116,7 +134,7 @@ export function ResultsTab({ sport }: { sport: Sport }) {
                   </tr>
                 </thead>
                 <tbody>
-                  {data!.recent.slice(0, 15).map((r) => (
+                  {pageRows.map((r) => (
                     <tr key={r.id} className="border-b border-border/60">
                       <td className="py-2 pr-3 font-medium">
                         {r.game_slug.replace(/^[a-z0-9]+-/, "").replace(/-\d{4}-\d{2}-\d{2}.*$/, "")}
@@ -137,8 +155,42 @@ export function ResultsTab({ sport }: { sport: Sport }) {
                       </td>
                     </tr>
                   ))}
+                  {pageRows.length === 0 && (
+                    <tr>
+                      <td colSpan={7} className="py-6 text-center text-sm text-muted-foreground">
+                        Nenhuma previsão registrada ainda.
+                      </td>
+                    </tr>
+                  )}
                 </tbody>
               </table>
+              {pageCount > 1 && (
+                <div className="mt-4 flex items-center justify-between gap-3">
+                  <span className="text-xs text-muted-foreground">
+                    Página {safePage + 1} de {pageCount}
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setPage((p) => Math.max(0, p - 1))}
+                      disabled={safePage === 0}
+                    >
+                      <ChevronLeft className="h-4 w-4" />
+                      Anterior
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
+                      disabled={safePage >= pageCount - 1}
+                    >
+                      Próxima
+                      <ChevronRight className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </div>
+              )}
             </CardContent>
           </Card>
         </>
