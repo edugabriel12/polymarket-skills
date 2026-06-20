@@ -81,6 +81,7 @@ LEAGUE_API_ID: dict[str, int] = {
     "denmark": 119, "den": 119,
     "greece": 197, "gre": 197,
     "rpl": 235, "russia": 235,
+    "mar1": 200, "morocco": 200, "botola": 200,     # Morocco Botola Pro
     # Asia
     "csl": 169, "china": 169,
     "jleague": 98, "j1": 98, "jpn": 98,
@@ -104,6 +105,7 @@ EURO_CROSS_YEAR = {
     "eredivisie", "ned", "primeira", "liga-portugal", "por",
     "superlig", "tur", "belgium", "bel", "jpl", "spfl", "scotland", "sco",
     "swiss", "sui", "austria", "aut", "denmark", "den", "greece", "gre", "rpl", "russia",
+    "mar1", "morocco", "botola",
     "ucl", "champions-league", "bkcl", "uel", "europa-league", "uecl", "conference",
 }
 

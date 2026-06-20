@@ -67,6 +67,7 @@ LEAGUE_BASELINES: dict[str, float] = {
     "denmark": 2.85, "den": 2.85,
     "greece": 2.30, "gre": 2.30,
     "rpl": 2.50, "russia": 2.50,
+    "mar1": 2.30, "morocco": 2.30, "botola": 2.30,           # Morocco Botola Pro
     # --- Asia ---
     "csl": 2.80, "china": 2.80,                               # Chinese Super League
     "jleague": 2.75, "j1": 2.75, "jpn": 2.75,                 # Japan J1
@@ -161,6 +162,8 @@ LEAGUE_URL_PATH = {
     "denmark": "denmark", "den": "denmark",
     "greece": "greece", "gre": "greece",
     "rpl": "russia", "russia": "russia",
+    "mar1": "mar1", "morocco": "mar1", "botola": "mar1",
+
     # Asia
     "csl": "csl", "china": "csl",
     "jleague": "j-league", "j1": "j-league", "jpn": "j-league",
