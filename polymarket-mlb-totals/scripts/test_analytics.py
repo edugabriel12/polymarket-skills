@@ -134,5 +134,43 @@ class TestMarketUrlMigration(unittest.TestCase):
             self.assertEqual(got["market_url"], "https://polymarket.com/event/xyz")
 
 
+class TestSupersedePending(unittest.TestCase):
+    def test_rerun_voids_stale_line_keeps_settled(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "p.db")
+            g = "mlb-cws-nyy-2026-06-18"
+            # First run records the total-8.5 OVER.
+            r1 = _pred("OVER", None, line=8.5, game_date="2026-06-18")
+            r1["game_slug"] = g
+            id1 = pdb.record_prediction(r1, db)
+            # Re-run: best line moved to total-9.5 OVER (a new row).
+            r2 = _pred("OVER", None, line=9.5, game_date="2026-06-18")
+            r2["game_slug"] = g
+            id2 = pdb.record_prediction(r2, db)
+
+            voided = pdb.supersede_pending(db, g, {id2})
+            self.assertEqual(voided, 1)
+            by_id = {r["id"]: r["status"] for r in pdb.get_predictions(db)}
+            self.assertEqual(by_id[id1], "ANULADO")   # stale line neutralized
+            self.assertEqual(by_id[id2], "PENDENTE")  # current best line kept
+
+    def test_settled_row_never_superseded(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "p.db")
+            g = "mlb-cws-nyy-2026-06-18"
+            r1 = _pred("UNDER", None, line=7.5, game_date="2026-06-18")
+            r1["game_slug"] = g
+            id1 = pdb.record_prediction(r1, db)
+            pdb.settle_prediction(id1, 10.0, db)  # UNDER 7.5 vs 10 -> ERRO
+            r2 = _pred("OVER", None, line=9.5, game_date="2026-06-18")
+            r2["game_slug"] = g
+            id2 = pdb.record_prediction(r2, db)
+
+            voided = pdb.supersede_pending(db, g, {id2})
+            self.assertEqual(voided, 0)  # nothing to void; settled is protected
+            self.assertEqual(
+                {r["id"]: r["status"] for r in pdb.get_predictions(db)}[id1], "ERRO")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

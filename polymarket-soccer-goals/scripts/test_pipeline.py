@@ -131,6 +131,25 @@ class TestPredictions(unittest.TestCase):
             spdb.record_prediction(self._row("BTTS", "NO", line=None), db)  # CHECK allows NO
             self.assertEqual(len(spdb.get_predictions(db)), 1)
 
+    def test_supersede_voids_stale_total_keeps_btts(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "p.db")
+            g = "epl-ars-che-2026-06-14"
+            # First run: total-2.5 OVER + a BTTS YES bet.
+            old_total = spdb.record_prediction(self._row("TOTAL", "OVER", 2.5), db)
+            btts_id = spdb.record_prediction(self._row("BTTS", "YES", line=None), db)
+            # Re-run: best total line moved to 3.5; BTTS unchanged (re-recorded -> same id).
+            new_total = spdb.record_prediction(self._row("TOTAL", "OVER", 3.5), db)
+            btts_id2 = spdb.record_prediction(self._row("BTTS", "YES", line=None), db)
+            self.assertEqual(btts_id, btts_id2)  # BTTS upserted in place
+
+            voided = spdb.supersede_pending(db, g, {new_total, btts_id2})
+            self.assertEqual(voided, 1)
+            by_id = {r["id"]: r["status"] for r in spdb.get_predictions(db)}
+            self.assertEqual(by_id[old_total], "ANULADO")   # stale total line voided
+            self.assertEqual(by_id[new_total], "PENDENTE")  # current total kept
+            self.assertEqual(by_id[btts_id], "PENDENTE")    # BTTS bet untouched
+
 
 class TestAutoRatings(unittest.TestCase):
     def test_national_and_club_lookups(self):

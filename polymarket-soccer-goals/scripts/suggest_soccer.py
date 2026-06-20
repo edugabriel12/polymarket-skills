@@ -193,6 +193,18 @@ def run(args) -> dict:
     vlog(f"  {len(total_evts)} total-goals + {len(btts_evts)} BTTS soccer markets "
          f"({filtered_non_soccer} other events dropped)")
 
+    # Diagnostic: when nothing classifies, dump a sample of the real market shapes so
+    # the slug/outcome format can be inspected from the logs (Gamma changes formats).
+    if not classified and games:
+        n_soccer = sum(1 for k in games if leagues.is_soccer_slug(k))
+        vlog(f"  [diag] 0 classified; {n_soccer}/{len(games)} events pass is_soccer_slug. Samples:")
+        for k, v in list(games.items())[:6]:
+            mk = v[0] if v else {}
+            vlog(f"  [diag] event={k!r} soccer={leagues.is_soccer_slug(k)} markets={len(v)}")
+            for x in v[:3]:
+                vlog(f"  [diag]    slug={x.get('slug')!r} event_slug={x.get('event_slug')!r} "
+                     f"outcomes={x.get('outcomes')} q={(x.get('question') or '')[:60]!r}")
+
     portfolio_value = float(args.portfolio_value)
     first_trade = data_inputs.is_first_trade(STRATEGY, args.portfolio_db)
     ratings = data_inputs.load_ratings(args.ratings_csv) if args.ratings_csv else {}
@@ -307,8 +319,11 @@ def run(args) -> dict:
                   market=c["market_type"], side=c["chosen"]["side"])
         final.extend(winners)
 
+    recorded_ids: dict = {}
     for c in final:
         pred_id = _record_soccer(c, args, target)
+        if pred_id is not None:
+            recorded_ids.setdefault(c["slug"], set()).add(pred_id)
         _shadow_log(c["market_type"], c["slug"], c["line"], c["notes"], c["chosen"],
                     c["lam_h"], c["lam_a"], c["used"], args, target, 1, None, c["ref_token"])
         suggestions.append({"game": c["slug"], "market": c["market_type"],
@@ -316,6 +331,17 @@ def run(args) -> dict:
                             "edge": round(c["chosen"]["edge"], 4),
                             "lam_home": round(c["lam_h"], 3), "lam_away": round(c["lam_a"], 3),
                             "prediction_id": pred_id, "recommendation": c["rec"], "_text": c["text"]})
+
+    # A re-run may pick a different best line per (game, market); void this game's
+    # now-stale PENDENTE entries so it never carries two open positions per market.
+    # keep_ids spans TOTAL+BTTS, so a stale total line won't void the BTTS bet.
+    superseded = 0
+    if args.record:
+        for game_slug, keep in recorded_ids.items():
+            n = spdb.supersede_pending(args.predictions_db, game_slug, keep)
+            if n:
+                superseded += n
+                vlog(f"  [{game_slug}] superseded {n} stale PENDENTE entry(ies) from an earlier run")
     suggestions.sort(key=lambda s: s["edge"], reverse=True)
 
     texts = [s.pop("_text") for s in suggestions]
@@ -324,7 +350,8 @@ def run(args) -> dict:
     result = {
         "date": target,
         "counts": {"total_markets": len(total_evts), "btts_markets": len(btts_evts),
-                   "suggestions": len(suggestions), "skipped": len(skipped)},
+                   "suggestions": len(suggestions), "skipped": len(skipped),
+                   "superseded": superseded},
         "suggestions": suggestions, "skipped": skipped,
         "disclaimer": "Paper-trading simulation — not financial advice. Without live "
                       "inputs the Dixon-Coles engine returns zero edge (market-implied).",

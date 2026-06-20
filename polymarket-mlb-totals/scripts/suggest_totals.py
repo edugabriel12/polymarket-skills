@@ -483,6 +483,7 @@ def run(args) -> dict:
                   line=c["line"], side=c["chosen"]["side"])
         final.extend(winners)
 
+    recorded_ids: dict[str, set] = {}
     for c in final:
         prediction_id = None
         if args.record:
@@ -490,6 +491,8 @@ def run(args) -> dict:
                 args.predictions_db, c["event_slug"], target, c["totals"], c["line"],
                 c["chosen"], c["m"], c["ou"], c["inputs"], c["park_factor"],
                 c["size_pct"], c["size_usd"], c["kelly"], c["confidence"], c["side_notes"], args)
+            if prediction_id is not None:
+                recorded_ids.setdefault(c["event_slug"], set()).add(prediction_id)
         _shadow_log_mlb(args, target, c["event_slug"], c["line"], c["side_notes"],
                         c["chosen"], c["m"], 1, None, c["totals"], c["ou"])
         suggestions.append({"game": c["event_slug"], "line": c["line"],
@@ -499,6 +502,16 @@ def run(args) -> dict:
         vlog(f"  [{c['event_slug']}] >>> SUGGEST {c['chosen']['side']} {c['line']} "
              f"@ {c['chosen']['price']:.3f} edge={c['chosen']['edge']*100:+.1f}% "
              f"size={c['size_pct']*100:.2f}% conf={c['confidence']:.2f} pred_id={prediction_id}")
+
+    # A re-run may pick a different best line per game; void this game's now-stale
+    # PENDENTE entries from an earlier run so it carries one open position, not two.
+    superseded = 0
+    if args.record:
+        for game_slug, keep in recorded_ids.items():
+            n = predictions_db.supersede_pending(args.predictions_db, game_slug, keep)
+            if n:
+                superseded += n
+                vlog(f"  [{game_slug}] superseded {n} stale PENDENTE entry(ies) from an earlier run")
     suggestions.sort(key=lambda s: s["edge"], reverse=True)
 
     texts = [s.pop("_text") for s in suggestions]
@@ -512,7 +525,8 @@ def run(args) -> dict:
         "counts": {"games": len(games), "suggestions": len(suggestions),
                    "skipped": len(skipped),
                    "filtered_non_mlb": filtered_non_league,
-                   "filtered_non_total": filtered_non_total},
+                   "filtered_non_total": filtered_non_total,
+                   "superseded": superseded},
         "suggestions": suggestions,
         "skipped": skipped,
         "disclaimer": "Paper-trading simulation — not financial advice. Real "

@@ -284,6 +284,29 @@ def record_prediction(pred: dict, db_path: str = DEFAULT_DB) -> int:
         con.close()
 
 
+def supersede_pending(db_path: str, game_slug: str, keep_ids) -> int:
+    """Void (ANULADO) still-PENDENTE predictions for a game except `keep_ids`.
+
+    When a re-run records a different best line for a game (e.g. the line moved
+    from total-8.5 to total-9.5), the stale PENDENTE entry from the earlier run
+    is neutralized — stake returned, excluded from win rates — so one game never
+    carries two open paper positions. Settled rows (ACERTO/ERRO/ANULADO) are
+    never touched. Returns the number voided.
+    """
+    keep = [int(i) for i in keep_ids if i is not None]
+    placeholders = ",".join("?" for _ in keep) or "NULL"
+    con = connect(db_path)
+    try:
+        with con:
+            cur = con.execute(
+                f"UPDATE predictions SET status='ANULADO', settled_at=? "
+                f"WHERE game_slug=? AND status='PENDENTE' AND id NOT IN ({placeholders})",
+                [_now(), game_slug, *keep])
+            return cur.rowcount
+    finally:
+        con.close()
+
+
 def compute_status(side: str, line: float, actual_total: float) -> str:
     """ACERTO / ERRO / ANULADO for a settled Over/Under prediction."""
     side = (side or "").upper()
