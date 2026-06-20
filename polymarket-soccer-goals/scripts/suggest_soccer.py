@@ -175,12 +175,21 @@ def run(args) -> dict:
     games = group_by_event(on_day)
     vlog(f"Discovery: tag '{_tag}' -> {len(markets)} markets; {len(on_day)} dated {target}, {len(games)} events")
 
-    # Keep only soccer total-goals and BTTS markets.
+    # Keep only soccer total-goals and BTTS markets. Gamma groups every market of a
+    # game under one event_slug (no -total-/-btts suffix), so classify by the per-MARKET
+    # slugs inside each event, not the event key — and stay goals-specific (the suffix
+    # regex excludes corners/cards totals).
+    def _has_market(gmarkets, slug_re) -> bool:
+        return any(slug_re.search((x.get("slug") or "").lower()) for x in gmarkets)
+
     total_evts = {k: v for k, v in games.items()
-                  if leagues.is_soccer_slug(k) and sm.GAME_TOTAL_RE.search(k.lower())}
+                  if leagues.is_soccer_slug(k) and _has_market(v, sm.GAME_TOTAL_RE)}
     btts_evts = {k: v for k, v in games.items()
-                 if leagues.is_soccer_slug(k) and sm.GAME_BTTS_RE.search(k.lower())}
-    filtered_non_soccer = len(games) - len(total_evts) - len(btts_evts)
+                 if leagues.is_soccer_slug(k) and _has_market(v, sm.GAME_BTTS_RE)}
+    # An event can carry BOTH a total and a BTTS market, so count distinct events
+    # to avoid double-subtracting (which made "dropped" go negative).
+    classified = set(total_evts) | set(btts_evts)
+    filtered_non_soccer = len(games) - len(classified)
     vlog(f"  {len(total_evts)} total-goals + {len(btts_evts)} BTTS soccer markets "
          f"({filtered_non_soccer} other events dropped)")
 
@@ -219,37 +228,42 @@ def run(args) -> dict:
 
     # --- TOTAL-GOALS markets ---
     for slug, gmarkets in total_evts.items():
-        m = next((x for x in gmarkets if sm.is_total_market(x)), None)
-        if not m:
+        # All goals-total lines for this game (the event groups them); each is modeled,
+        # then best-line-per-game keeps only the highest-edge one below.
+        tmarkets = [x for x in gmarkets
+                    if sm.GAME_TOTAL_RE.search((x.get("slug") or "").lower()) and sm.is_total_market(x)]
+        if not tmarkets:
             _skip(slug, "no total-goals market"); continue
-        line = sm.parse_total_line(m)
-        ou = sm.over_under_tokens(m)
-        if line is None or not ou or ou["over_price"] is None or ou["under_price"] is None:
-            _skip(slug, "could not parse total line/tokens"); continue
-        _inp, total, sup, used = _inputs_for(slug)
-        if used:
-            lam_h, lam_a = dc.lambdas_from_total_supremacy(total, sup)
-        else:
-            lam_h, lam_a = dc.market_implied_lambdas(line, ou["over_price"])
-        probs = dc.prob_over(line, dc.score_matrix(lam_h, lam_a, args.rho))
-        chosen, notes = pick_side([("OVER", ou["over_token"], ou["over_price"], probs["p_over_eff"]),
-                                   ("UNDER", ou["under_token"], ou["under_price"], probs["p_under_eff"])],
-                                  args.fee_rate, args.odds_min, args.odds_max)
-        vlog(f"  [{slug}] model(TOTAL {line}): λh={lam_h:.2f} λa={lam_a:.2f} ρ={args.rho} "
-             f"P(over)={probs['p_over_eff']:.3f} P(under)={probs['p_under_eff']:.3f} external={used}"
-             + (f" inputs={_inp}" if _inp else ""))
-        vlog(f"  [{slug}] edges(TOTAL): " + "; ".join(
-            f"{n['side']} price={n['price']} p={n['p_model']} edge={n['edge']:+.3f} "
-            f"band={n['in_odds_band']}" for n in notes))
-        c = _evaluate("TOTAL", slug, m, line, chosen, notes, lam_h, lam_a, used,
-                      ou["book_sum"], ou["price_sane"], args, portfolio_value, first_trade, kh,
-                      _skip, target, ref_token=ou.get("over_token"))
-        if c:
-            cand_rows.append(c)
+        _inp, total, sup, used = _inputs_for(slug)  # game-level inputs: compute once
+        for m in tmarkets:
+            line = sm.parse_total_line(m)
+            ou = sm.over_under_tokens(m)
+            if line is None or not ou or ou["over_price"] is None or ou["under_price"] is None:
+                _skip(slug, "could not parse total line/tokens"); continue
+            if used:
+                lam_h, lam_a = dc.lambdas_from_total_supremacy(total, sup)
+            else:
+                lam_h, lam_a = dc.market_implied_lambdas(line, ou["over_price"])
+            probs = dc.prob_over(line, dc.score_matrix(lam_h, lam_a, args.rho))
+            chosen, notes = pick_side([("OVER", ou["over_token"], ou["over_price"], probs["p_over_eff"]),
+                                       ("UNDER", ou["under_token"], ou["under_price"], probs["p_under_eff"])],
+                                      args.fee_rate, args.odds_min, args.odds_max)
+            vlog(f"  [{slug}] model(TOTAL {line}): λh={lam_h:.2f} λa={lam_a:.2f} ρ={args.rho} "
+                 f"P(over)={probs['p_over_eff']:.3f} P(under)={probs['p_under_eff']:.3f} external={used}"
+                 + (f" inputs={_inp}" if _inp else ""))
+            vlog(f"  [{slug}] edges(TOTAL): " + "; ".join(
+                f"{n['side']} price={n['price']} p={n['p_model']} edge={n['edge']:+.3f} "
+                f"band={n['in_odds_band']}" for n in notes))
+            c = _evaluate("TOTAL", slug, m, line, chosen, notes, lam_h, lam_a, used,
+                          ou["book_sum"], ou["price_sane"], args, portfolio_value, first_trade, kh,
+                          _skip, target, ref_token=ou.get("over_token"))
+            if c:
+                cand_rows.append(c)
 
     # --- BTTS markets ---
     for slug, gmarkets in btts_evts.items():
-        m = next((x for x in gmarkets if sm.is_btts_market(x)), None)
+        m = next((x for x in gmarkets
+                  if sm.GAME_BTTS_RE.search((x.get("slug") or "").lower()) and sm.is_btts_market(x)), None)
         if not m:
             _skip(slug, "no BTTS market"); continue
         bt = sm.btts_tokens(m)
