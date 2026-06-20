@@ -193,6 +193,18 @@ def run(args) -> dict:
     vlog(f"  {len(total_evts)} total-goals + {len(btts_evts)} BTTS soccer markets "
          f"({filtered_non_soccer} other events dropped)")
 
+    # Diagnostic: when nothing classifies, dump a sample of the real market shapes so
+    # the slug/outcome format can be inspected from the logs (Gamma changes formats).
+    if not classified and games:
+        n_soccer = sum(1 for k in games if leagues.is_soccer_slug(k))
+        vlog(f"  [diag] 0 classified; {n_soccer}/{len(games)} events pass is_soccer_slug. Samples:")
+        for k, v in list(games.items())[:6]:
+            mk = v[0] if v else {}
+            vlog(f"  [diag] event={k!r} soccer={leagues.is_soccer_slug(k)} markets={len(v)}")
+            for x in v[:3]:
+                vlog(f"  [diag]    slug={x.get('slug')!r} event_slug={x.get('event_slug')!r} "
+                     f"outcomes={x.get('outcomes')} q={(x.get('question') or '')[:60]!r}")
+
     portfolio_value = float(args.portfolio_value)
     first_trade = data_inputs.is_first_trade(STRATEGY, args.portfolio_db)
     ratings = data_inputs.load_ratings(args.ratings_csv) if args.ratings_csv else {}
