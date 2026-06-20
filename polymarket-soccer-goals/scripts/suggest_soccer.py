@@ -73,22 +73,29 @@ def group_by_event(markets: list[dict]) -> dict[str, list[dict]]:
 # cap. Querying each real league tag keeps every page on-topic.
 SOCCER_TAGS = sorted(set(leagues.LEAGUE_URL_PATH.values()))
 
+# Per-tag fetch cap. A real league tag returns a small on-topic set (well under this);
+# an unknown tag makes Gamma return the global volume-ranked mix, so the cap stops it
+# after a few pages instead of paginating thousands of off-topic markets.
+PER_TAG_MAX = 400
+
 
 def discover_soccer(api, vlog) -> list[dict]:
     """Union live markets across every real soccer league tag (deduped).
 
     No date window: each league tag is a small, on-topic set well under the offset
     cap, so the day's games are never crowded out; the caller filters to the date.
+    Unknown tags (Gamma returns the global mix) are bounded by PER_TAG_MAX and pruned
+    downstream by is_soccer_slug.
     """
     markets, seen = [], set()
     for tag in SOCCER_TAGS:
         try:
             _t, ms = discover_markets(api, "soccer", [tag], min_volume=0.0,
-                                      include_closed=False)
+                                      max_markets=PER_TAG_MAX, include_closed=False)
         except Exception as e:  # noqa: BLE001
             vlog(f"  tag {tag!r} failed: {e}")
             continue
-        added = 0
+        added = soccer = 0
         for m in ms:
             key = m.get("condition_id") or m.get("slug")
             if key and key in seen:
@@ -97,8 +104,10 @@ def discover_soccer(api, vlog) -> list[dict]:
                 seen.add(key)
             markets.append(m)
             added += 1
+            if leagues.is_soccer_slug(m.get("event_slug") or m.get("slug") or ""):
+                soccer += 1
         if added:
-            vlog(f"  tag {tag!r}: +{added} markets")
+            vlog(f"  tag {tag!r}: +{added} markets ({soccer} soccer)")
     return markets
 
 

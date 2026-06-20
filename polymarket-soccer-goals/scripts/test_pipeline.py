@@ -39,6 +39,26 @@ class TestLeagues(unittest.TestCase):
         self.assertTrue(leagues.is_soccer_slug("epl-ars-che-2026-06-14-total-2pt5"))
         self.assertFalse(leagues.is_soccer_slug("mlb-hou-kc-2026-06-14-total-8pt5"))
 
+    def test_broad_league_coverage(self):
+        # The expanded mapping should recognize many leagues across confederations and
+        # expose them for discovery (SOCCER_TAGS) + auto-ratings (API-Football ids).
+        import apifootball_source as apif
+        for tag in ("world-cup", "bra2", "bra", "epl", "laliga", "sea", "ligue-1",
+                    "mls", "allsvenskan", "csl", "saudi", "ucl"):
+            self.assertIn(tag, ss.SOCCER_TAGS, tag)
+        # A spread of leagues must each map to a non-default baseline + an API id.
+        for pfx in ("epl", "laliga", "seriea", "bundesliga", "ligue1", "eredivisie",
+                    "mls", "bra", "bra2", "argentina", "allsvenskan", "csl", "saudi",
+                    "belgium", "scotland", "ucl", "uel"):
+            self.assertNotEqual(leagues.league_baseline(f"{pfx}-aaa-bbb-2026-06-14"),
+                                leagues.DEFAULT_BASELINE, pfx)
+            self.assertIn(pfx, apif.LEAGUE_API_ID, pfx)
+        # is_soccer_slug recognizes games from newly-added leagues.
+        for slug in ("allsvenskan-aik-ham-2026-06-14-total-2pt5",
+                     "saudi-hil-nas-2026-06-14-btts",
+                     "argentina-boc-riv-2026-06-14-total-2pt5"):
+            self.assertTrue(leagues.is_soccer_slug(slug), slug)
+
     def test_date_window_params(self):
         # Brackets the day (±margin) so low-volume games aren't lost behind the cap.
         w = ss.date_window_params("2026-06-14")
