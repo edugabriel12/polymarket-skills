@@ -73,41 +73,80 @@ def group_by_event(markets: list[dict]) -> dict[str, list[dict]]:
 # cap. Querying each real league tag keeps every page on-topic.
 SOCCER_TAGS = sorted(set(leagues.LEAGUE_URL_PATH.values()))
 
-# Per-tag fetch cap. A real league tag returns a small on-topic set (well under this);
-# an unknown tag makes Gamma return the global volume-ranked mix, so the cap stops it
-# after a few pages instead of paginating thousands of off-topic markets.
-PER_TAG_MAX = 400
+# Discovery tuning. A REAL (honored) league tag returns a small, ~100%-soccer set; an
+# UNKNOWN tag makes Gamma return the global volume-ranked mix (mostly non-soccer). We
+# probe one page to tell them apart, fully paginate honored tags, and never deep-paginate
+# the global mix (which only re-fetches the same markets 50x and starves the offset cap).
+PROBE_MAX = 100             # one page, to classify a tag honored vs global-mix
+PER_TAG_MAX = 600           # full pull for an honored league tag
+DEEP_MAX = 2500             # fallback broad pass when no tag is honored
+HONORED_FRAC = 0.60         # >= this soccer fraction in the probe => honored tag
+
+
+def _is_soccer(m) -> bool:
+    return leagues.is_soccer_slug(m.get("event_slug") or m.get("slug") or "")
 
 
 def discover_soccer(api, vlog) -> list[dict]:
-    """Union live markets across every real soccer league tag (deduped).
+    """Union the day's soccer markets across the league tags (deduped, soccer-only).
 
-    No date window: each league tag is a small, on-topic set well under the offset
-    cap, so the day's games are never crowded out; the caller filters to the date.
-    Unknown tags (Gamma returns the global mix) are bounded by PER_TAG_MAX and pruned
-    downstream by is_soccer_slug.
+    Per tag: probe one page and measure its soccer fraction. Honored tags (~all soccer)
+    are paginated in full; tags that return the global mix are NOT deep-paginated (their
+    soccer subset from the probe is still kept, deduped). If Gamma honors none, fall back
+    to one DEEP broad pass so low-volume leagues aren't lost behind a 1-page probe.
     """
     markets, seen = [], set()
-    for tag in SOCCER_TAGS:
-        try:
-            _t, ms = discover_markets(api, "soccer", [tag], min_volume=0.0,
-                                      max_markets=PER_TAG_MAX, include_closed=False)
-        except Exception as e:  # noqa: BLE001
-            vlog(f"  tag {tag!r} failed: {e}")
-            continue
-        added = soccer = 0
+    honored, mixed = [], []
+
+    def _add(ms) -> int:
+        n = 0
         for m in ms:
+            if not _is_soccer(m):
+                continue
             key = m.get("condition_id") or m.get("slug")
             if key and key in seen:
                 continue
             if key:
                 seen.add(key)
             markets.append(m)
-            added += 1
-            if leagues.is_soccer_slug(m.get("event_slug") or m.get("slug") or ""):
-                soccer += 1
-        if added:
-            vlog(f"  tag {tag!r}: +{added} markets ({soccer} soccer)")
+            n += 1
+        return n
+
+    for tag in SOCCER_TAGS:
+        try:
+            _t, probe = discover_markets(api, "soccer", [tag], min_volume=0.0,
+                                         max_markets=PROBE_MAX, include_closed=False)
+        except Exception as e:  # noqa: BLE001
+            vlog(f"  tag {tag!r} failed: {e}")
+            continue
+        if not probe:
+            continue
+        frac = sum(1 for m in probe if _is_soccer(m)) / len(probe)
+        if frac >= HONORED_FRAC:
+            try:
+                _t, full = discover_markets(api, "soccer", [tag], min_volume=0.0,
+                                            max_markets=PER_TAG_MAX, include_closed=False)
+            except Exception:  # noqa: BLE001
+                full = probe
+            added = _add(full)
+            honored.append(tag)
+            vlog(f"  tag {tag!r}: HONORED +{added} soccer (probe {frac:.0%})")
+        else:
+            _add(probe)            # global mix: keep its soccer subset, don't paginate deeper
+            mixed.append(tag)
+
+    if mixed:
+        vlog(f"  {len(honored)} honored tag(s); {len(mixed)} returned the global mix")
+    if not honored:
+        # Gamma honored no tag -> one deep broad pass so low-volume leagues aren't lost.
+        try:
+            _t, deep = discover_markets(api, "soccer", ["soccer"], min_volume=0.0,
+                                        max_markets=DEEP_MAX, include_closed=False)
+            added = _add(deep)
+            vlog(f"  no honored tags -> deep broad pass: +{added} soccer "
+                 f"(of {len(deep)} scanned)")
+        except Exception as e:  # noqa: BLE001
+            vlog(f"  deep broad pass failed: {e}")
     return markets
 
 
