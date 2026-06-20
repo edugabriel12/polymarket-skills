@@ -114,8 +114,10 @@ is the strongest signal — and therefore the most dangerous leakage vector.
 - **Staking:** **quarter-Kelly** until calibration is proven, then **half-Kelly** (constitution §2).
   Full-Kelly with estimation error → >50% drawdowns.
 - **Pitfalls:**
-  - **Retirements/walkovers:** settlement rules vary by book (walkover voids; retirement sometimes
-    pays). Encode the book's exact rule; filter `Comment`/score `RET`/`W/O`.
+  - **Retirements/walkovers:** rules vary by book. **On Polymarket a retirement is NOT voided — it
+    pays the player who advanced** (the match winner), so settle retirements to the advancer
+    (ACERTO/ERRO), not ANULADO; only a true no-play walkover voids. Filter `Comment`/score
+    `RET`/`W/O` accordingly.
   - **Timing leakage:** odds collapse when a retirement looms — never mix in-play price into a
     "pre-match" backtest. Fix the odds timestamp (use the close).
   - **Look-ahead in Elo:** update ratings only with pre-match info (walk-forward).

@@ -82,7 +82,11 @@ P(model), edge, sizing) and the Polymarket match link. Every modeled match is sh
 
 ## Settlement & calibration
 - Settle a match by the winner's label: `tennis_predictions.settle_match(slug, winner)`. Status:
-  PENDENTE → ACERTO (chosen side won) / ERRO (opponent won) / ANULADO (walkover/void/unknown).
+  PENDENTE → ACERTO (chosen side won) / ERRO (opponent won) / ANULADO (only a genuine no-result).
+- **Retirements:** on Polymarket a retirement (desistência) is **not voided** — it **pays the player
+  who advanced**. So a retirement settles ACERTO/ERRO like any result, since the advancer is the
+  winner (Sackmann records that player as `winner_name` even on a `RET` score). Only a true walkover
+  with no winner falls to ANULADO.
 - The `model_log` shadow table (ref_side = player A, ref_token/close_price) feeds the same
   calibration/CLV read-out used by the other skills (Brier / log-loss / reliability + CLV vs the
   closing line). Validate with **~1,000+ settled matches** before any real capital.
@@ -98,7 +102,8 @@ P(model), edge, sizing) and the Polymarket match link. Every modeled match is sh
   market-implied (zero edge — no fabrication).
 - **Polymarket tennis slug/tag formats are best-effort** (`TENNIS_TAGS`, `parse_players`,
   `SURFACE_KEYWORDS`); confirm against the per-tag discovery logs on a live run and adjust.
-- **Backtesting pitfalls (research):** encode the book's retirement/walkover rule, fix the odds
-  timestamp (use the close), walk-forward Elo (no look-ahead), and resist surface×season overfitting.
+- **Backtesting pitfalls (research):** **Polymarket pays the winner on a retirement** (does not
+  void), so settle retirements to the advancer, not ANULADO. Fix the odds timestamp (use the close),
+  walk-forward Elo (no look-ahead), and resist surface×season overfitting.
 - Not financial advice; real trading involves risk of loss.
 </content>

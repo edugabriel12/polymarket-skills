@@ -160,8 +160,15 @@ def get_predictions(db_path: str = DEFAULT_DB, status: str | None = None,
 
 
 def compute_status(side: str, opponent: str, actual_winner: str) -> str:
-    """ACERTO if the chosen side won, ERRO if the opponent won, ANULADO otherwise
-    (walkover / void / unrecognized winner)."""
+    """Resolve a moneyline bet against the match winner's label.
+
+    ACERTO if the chosen side won, ERRO if the opponent won. A RETIREMENT counts as a
+    win for the player who advanced — Polymarket pays that winner, it does NOT void —
+    so as long as a winner label is supplied (Sackmann records the advancer as the
+    winner even on a 'RET' score), retirements settle ACERTO/ERRO like any result.
+    ANULADO is only for a genuine no-result (true walkover with no winner, or an
+    unrecognized winner label).
+    """
     w = (actual_winner or "").strip().lower()
     if not w:
         return "ANULADO"

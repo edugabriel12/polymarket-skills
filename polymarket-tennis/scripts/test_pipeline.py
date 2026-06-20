@@ -97,8 +97,19 @@ class TestStore(unittest.TestCase):
     def test_settle_loss_and_void(self):
         self.assertEqual(tdb.compute_status("A", "B", "B"), "ERRO")
         self.assertEqual(tdb.compute_status("A", "B", "A"), "ACERTO")
-        self.assertEqual(tdb.compute_status("A", "B", ""), "ANULADO")     # walkover/void
+        self.assertEqual(tdb.compute_status("A", "B", ""), "ANULADO")     # no winner -> void
         self.assertEqual(tdb.compute_status("A", "B", "C"), "ANULADO")    # unknown winner
+
+    def test_retirement_pays_the_winner_not_voided(self):
+        # Polymarket pays the player who advanced on a retirement; if we backed the
+        # retiree's opponent (the advancer), it's ACERTO — never ANULADO.
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "p.db")
+            tdb.record_prediction(self._row(side="Frances Tiafoe", opp="Daniel Altmaier"), db)
+            # Altmaier retires -> Tiafoe advances -> Tiafoe is the winner label.
+            res = tdb.settle_match("atp-alcaraz-sinner-2026-06-20", "Frances Tiafoe", db)
+            self.assertEqual(res[0]["status"], "ACERTO")
+            self.assertEqual(tdb.summary(db)["anulado"], 0)
 
     def test_model_log_settles_ref_outcome(self):
         with tempfile.TemporaryDirectory() as d:
