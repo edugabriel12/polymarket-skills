@@ -81,7 +81,11 @@ def load_ratings(csv_path: str) -> dict:
 
 
 def resolve(name: str, ratings: dict) -> dict | None:
-    """Resolve a player name/abbreviation to a rating dict, or None if not covered."""
+    """Resolve a player name/abbreviation to a rating dict, or None if not covered.
+
+    Handles full names, surnames, 'C. Surname', and Polymarket's TRUNCATED slug tokens
+    (e.g. 'altmaie' for 'altmaier') via an unambiguous prefix match.
+    """
     if not ratings:
         return None
     key = normalize(name)
@@ -96,4 +100,10 @@ def resolve(name: str, ratings: dict) -> dict | None:
         rest = " ".join(toks[1:])
         if rest in ratings:
             return ratings[rest]
+    # Truncated slug token (Polymarket cuts surnames): match if it's a unique prefix of,
+    # or is uniquely prefixed by, a known surname. Min length 4 to avoid false hits.
+    if len(last) >= 4:
+        hits = {k for k in ratings if " " not in k and (k.startswith(last) or last.startswith(k))}
+        if len(hits) == 1:
+            return ratings[next(iter(hits))]
     return None

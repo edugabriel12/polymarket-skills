@@ -22,6 +22,7 @@ import _bootstrap  # noqa: F401  (adds category-watcher scripts to sys.path)
 
 import elo
 import ratings as ratings_mod
+import ratings_source
 import tennis_market as tm
 import tennis_predictions as tdb
 
@@ -133,7 +134,15 @@ def run(args) -> dict:
     vlog(f"  {len(match_evts)} tennis moneyline matches "
          f"({len(matches) - len(match_evts)} other events dropped)")
 
-    rt = ratings_mod.load_ratings(args.ratings_csv) if args.ratings_csv else {}
+    # Ratings: explicit CSV wins; else auto-compute surface Elo from Sackmann data
+    # (network, cached; empty offline -> market-implied). --no-auto-ratings forces CSV-only.
+    if args.ratings_csv:
+        rt = ratings_mod.load_ratings(args.ratings_csv)
+    elif args.auto_ratings:
+        rt = ratings_source.auto_ratings(tour=args.tour, debug=args.debug)
+        vlog(f"  auto ratings ({args.tour}): {len(rt)} players")
+    else:
+        rt = {}
     portfolio_value = float(args.portfolio_value)
     suggestions, skipped, cand_rows = [], [], []
 
@@ -148,7 +157,7 @@ def run(args) -> dict:
         ms = tm.match_sides(m)
         if not ms or any(s["price"] is None for s in ms["sides"]):
             _skip(slug, "could not map moneyline tokens/prices"); continue
-        surface = tm.surface_for(slug)
+        surface = args.surface or tm.surface_for(slug)
         pa_slug, pb_slug = tm.parse_players(slug)
         # Prefer the market's own outcome labels for rating resolution; fall back to slug.
         label_a, label_b = ms["sides"][0]["label"], ms["sides"][1]["label"]
@@ -275,7 +284,13 @@ def _match_url(slug: str) -> str:
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Suggest tennis match-winner entries on Polymarket.")
     p.add_argument("--date", default=None, help="Target day YYYY-MM-DD (UTC)")
-    p.add_argument("--ratings-csv", default=None, help="player,elo,hard,clay,grass CSV")
+    p.add_argument("--ratings-csv", default=None, help="player,elo,hard,clay,grass CSV (overrides auto)")
+    p.add_argument("--auto-ratings", dest="auto_ratings", action="store_true", default=True,
+                   help="Auto-compute surface Elo from Sackmann data (default on)")
+    p.add_argument("--no-auto-ratings", dest="auto_ratings", action="store_false")
+    p.add_argument("--tour", choices=("atp", "wta"), default="atp", help="Tour for auto ratings")
+    p.add_argument("--surface", choices=("hard", "clay", "grass"), default=None,
+                   help="Override surface (else inferred from the slug/tournament)")
     p.add_argument("--blend", type=float, default=elo.SURFACE_BLEND, help="overall/surface Elo blend")
     p.add_argument("--odds-min", type=float, default=elo.ODDS_MIN_DEFAULT)
     p.add_argument("--odds-max", type=float, default=elo.ODDS_MAX_DEFAULT)

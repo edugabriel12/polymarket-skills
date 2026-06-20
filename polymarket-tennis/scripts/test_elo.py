@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import elo  # noqa: E402
 import ratings as rmod  # noqa: E402
+import ratings_source  # noqa: E402
 
 
 class TestElo(unittest.TestCase):
@@ -98,6 +99,36 @@ class TestRatings(unittest.TestCase):
 
     def test_uncovered_player_is_none(self):
         self.assertIsNone(rmod.resolve("anyone", {}))
+
+
+class TestEloBuilder(unittest.TestCase):
+    def test_consistent_winner_rises_above_loser(self):
+        # 'winner' beats 'loser' 10x on hard -> higher overall and hard Elo.
+        matches = [{"date": f"2026010{i}", "surface": "hard",
+                    "winner": "Win Player", "loser": "Lose Player"} for i in range(1, 10)]
+        r = ratings_source.build_elo_from_matches(matches)
+        self.assertGreater(r["win player"]["elo"], r["lose player"]["elo"])
+        self.assertGreater(r["win player"]["elo"], elo.START_ELO)
+        self.assertGreater(r["win player"]["hard"], elo.START_ELO)
+        self.assertIsNone(r["win player"]["clay"])     # never played clay
+
+    def test_surface_specific_isolated_from_overall(self):
+        matches = [
+            {"date": "20260101", "surface": "clay", "winner": "Clay King", "loser": "B"},
+            {"date": "20260102", "surface": "clay", "winner": "Clay King", "loser": "C"},
+            {"date": "20260103", "surface": "hard", "winner": "D", "loser": "Clay King"},
+        ]
+        r = ratings_source.build_elo_from_matches(matches)
+        # Clay rating reflects 2 wins; hard rating reflects a loss -> clay > hard.
+        self.assertGreater(r["clay king"]["clay"], r["clay king"]["hard"])
+
+    def test_parse_match_row(self):
+        row = {"winner_name": "Daniel Altmaier", "loser_name": "Frances Tiafoe",
+               "surface": "Clay", "tourney_date": "20260601"}
+        pm = ratings_source.parse_match_row(row)
+        self.assertEqual(pm["surface"], "clay")
+        self.assertEqual(pm["winner"], "Daniel Altmaier")
+        self.assertIsNone(ratings_source.parse_match_row({"winner_name": "", "loser_name": "x"}))
 
 
 if __name__ == "__main__":

@@ -54,6 +54,23 @@ class TestMarket(unittest.TestCase):
         self.assertTrue(st.is_tennis_slug("atp-alcaraz-sinner-2026-06-20"))
         self.assertFalse(st.is_tennis_slug("cs2-spirit-falcons-2026-06-20"))  # esports
 
+    def test_real_polymarket_slug(self):
+        # The user's example: /sports/atp/atp-altmaie-tiafoe-2026-06-20
+        slug = "atp-altmaie-tiafoe-2026-06-20"
+        self.assertTrue(st.is_tennis_slug(slug))
+        self.assertEqual(tm.parse_players(slug), ("altmaie", "tiafoe"))
+        self.assertEqual(tm.base_match_slug(slug), slug)
+        # Truncated slug token 'altmaie' must resolve to 'Daniel Altmaier' via prefix match.
+        import ratings as rmod, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "r.csv")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("player,elo,hard,clay,grass\nDaniel Altmaier,1850,1840,1900,1800\n"
+                         "Frances Tiafoe,1980,2000,1850,1950\n")
+            rt = rmod.load_ratings(path)
+            self.assertIsNotNone(rmod.resolve("altmaie", rt))
+            self.assertEqual(rmod.resolve("altmaie", rt)["clay"], 1900.0)
+
 
 class TestStore(unittest.TestCase):
     def _row(self, side="Carlos Alcaraz", opp="Jannik Sinner", **kw):
@@ -102,9 +119,10 @@ class _NoNetAPI:
 class _Args:
     def __init__(self, **kw):
         import elo
-        d = dict(date="2026-06-20", ratings_csv=None, blend=elo.SURFACE_BLEND,
-                 odds_min=elo.ODDS_MIN_DEFAULT, odds_max=elo.ODDS_MAX_DEFAULT, min_edge=0.05,
-                 fee_rate=0.0, portfolio_value=10000.0, predictions_db=None, record=False,
+        d = dict(date="2026-06-20", ratings_csv=None, auto_ratings=False, tour="atp",
+                 surface=None, blend=elo.SURFACE_BLEND, odds_min=elo.ODDS_MIN_DEFAULT,
+                 odds_max=elo.ODDS_MAX_DEFAULT, min_edge=0.05, fee_rate=0.0,
+                 portfolio_value=10000.0, predictions_db=None, record=False,
                  output="json", verbose=False, debug=False, rate_limit=0)
         d.update(kw); self.__dict__.update(d)
 

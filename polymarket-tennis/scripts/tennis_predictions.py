@@ -290,3 +290,74 @@ def set_close_price(db_path: str, row_id: int, close_price: float) -> None:
             con.execute("UPDATE model_log SET close_price=? WHERE id=?", (close_price, row_id))
     finally:
         con.close()
+
+
+# ---------------------------------------------------------------------------
+# Performance analytics (ROI / P&L) — same Polymarket $1 binary payout as the others
+# ---------------------------------------------------------------------------
+
+
+def compute_pnl(row: dict) -> float:
+    """Realized P&L (USD) for one moneyline row. ACERTO -> size*(1/price-1); ERRO -> -size."""
+    status = row.get("status")
+    size = float(row.get("size_usd") or 0.0)
+    price = float(row.get("entry_price") or 0.0)
+    if status == "ACERTO" and price > 0:
+        return size * (1.0 / price - 1.0)
+    if status == "ERRO":
+        return -size
+    return 0.0
+
+
+def _window_bounds(window, today):
+    from datetime import timedelta
+    if window == "daily":
+        return today, today
+    if window == "weekly":
+        return today - timedelta(days=today.weekday()), today
+    return today.replace(day=1), today
+
+
+def performance(db_path: str = DEFAULT_DB, today=None) -> dict:
+    """Daily/weekly/monthly blocks. No Over/Under split for moneyline (those rates are None)."""
+    from datetime import date as _date
+    today = today or datetime.now(timezone.utc).date()
+    rows = get_predictions(db_path)
+    out = {}
+    for window in ("daily", "weekly", "monthly"):
+        start, end = _window_bounds(window, today)
+        counts = {"acerto": 0, "erro": 0, "pendente": 0, "anulado": 0}
+        pnl = invested = 0.0
+        for r in rows:
+            try:
+                d = _date.fromisoformat(r.get("match_date") or "")
+            except ValueError:
+                continue
+            if not (start <= d <= end):
+                continue
+            st = r.get("status")
+            counts[st.lower()] = counts.get(st.lower(), 0) + 1
+            pnl += compute_pnl(r)
+            if st in ("ACERTO", "ERRO"):
+                invested += float(r.get("size_usd") or 0.0)
+        settled = counts["acerto"] + counts["erro"]
+        out[window] = {
+            "window": window, "start": start.isoformat(), "end": end.isoformat(),
+            "counts": counts, "settled": settled, "pnl": round(pnl, 2),
+            "invested": round(invested, 2),
+            "roi": round(pnl / invested, 4) if invested > 0 else None,
+            "win_rate": round(counts["acerto"] / settled, 4) if settled else None,
+            "win_rate_over": None, "win_rate_under": None,
+        }
+    out["generated_at"] = datetime.now(timezone.utc).isoformat()
+    return out
+
+
+def pnl_by_day(db_path: str = DEFAULT_DB, days: int = 30) -> list[dict]:
+    by_day: dict[str, float] = {}
+    for r in get_predictions(db_path):
+        d = r.get("match_date")
+        if d:
+            by_day[d] = by_day.get(d, 0.0) + compute_pnl(r)
+    series = [{"date": d, "pnl": round(v, 2)} for d, v in sorted(by_day.items())]
+    return series[-days:]
