@@ -269,6 +269,7 @@ Scanner ──→ Analyzer ──→ Strategy Advisor ──→ Paper Trader ─
 | Get trade recommendations | polymarket-strategy-advisor | `advisor.py`, `daily_review.py` |
 | Suggest MLB total-runs entries | polymarket-mlb-totals | `suggest_totals.py`, `run_distribution.py` |
 | Suggest soccer total-goals/BTTS entries | polymarket-soccer-goals | `suggest_soccer.py`, `dixon_coles.py` |
+| Suggest tennis match-winner entries | polymarket-tennis | `suggest_tennis.py`, `elo.py` |
 | Simulate trades | polymarket-paper-trader | `paper_engine.py`, `execute_paper.py`, `portfolio_report.py` |
 | Execute real trades | polymarket-live-executor | `execute_live.py`, `check_positions.py` |
 | Analyze any public wallet | polymarket-wallet-analyzer | `analyze_wallet.py` |

@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""Suggest tennis MATCH-WINNER (moneyline) entries on Polymarket.
+
+Pipeline (analog of suggest_soccer.py): discover the day's tennis matches per real
+tour/tournament tag -> classify the moneyline market -> model P(winner) with the
+surface-aware Elo engine -> edge vs the Polymarket price -> half-Kelly sizing under
+the constitution caps -> record the best side per match (PENDENTE) + shadow-log all.
+
+Anti-fabrication (CLAUDE.md): if a player has no rating, the model is MARKET-IMPLIED
+(devigged price), so edge ~ 0 and nothing is suggested. Real edge appears only when a
+rating source moves P(win) off the market. Market text is untrusted (rule #5).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime, timezone
+
+import _bootstrap  # noqa: F401  (adds category-watcher scripts to sys.path)
+
+import elo
+import ratings as ratings_mod
+import tennis_market as tm
+import tennis_predictions as tdb
+
+from category_common import APIClient, discover_markets, game_date, log
+
+STRATEGY = "tennis-elo-moneyline"
+CAP_MODEL = 0.05            # per-trade cap (model edge)
+CAP_FIRST_TRADE = 0.01     # first trade with a new strategy
+PER_TAG_MAX = 400          # bound an unknown tag returning the global mix
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def is_tennis_slug(slug: str) -> bool:
+    """A match slug is tennis if its tag prefix is a known tour/tournament tag."""
+    s = (slug or "").lower()
+    return any(s.startswith(t + "-") for t in tm.TENNIS_TAGS)
+
+
+def group_by_match(markets: list[dict]) -> dict:
+    out: dict[str, list[dict]] = {}
+    for m in markets:
+        key = m.get("event_slug") or m.get("slug")
+        if key:
+            out.setdefault(key, []).append(m)
+    return out
+
+
+def discover_tennis(api, vlog) -> list[dict]:
+    """Union live markets across each tennis tag (deduped, per-tag capped)."""
+    markets, seen = [], set()
+    for tag in tm.TENNIS_TAGS:
+        try:
+            _t, ms = discover_markets(api, "tennis", [tag], min_volume=0.0,
+                                      max_markets=PER_TAG_MAX, include_closed=False)
+        except Exception as e:  # noqa: BLE001
+            vlog(f"  tag {tag!r} failed: {e}")
+            continue
+        added = tennis = 0
+        for m in ms:
+            key = m.get("condition_id") or m.get("slug")
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            markets.append(m)
+            added += 1
+            if is_tennis_slug(m.get("event_slug") or m.get("slug") or ""):
+                tennis += 1
+        if added:
+            vlog(f"  tag {tag!r}: +{added} markets ({tennis} tennis)")
+    return markets
+
+
+def model_probability(player_a, player_b, surface, rt, blend_w):
+    """Return (p_a, used_external, elo_a, elo_b). Market-implied fallback if uncovered."""
+    ra = ratings_mod.resolve(player_a, rt) if player_a else None
+    rb = ratings_mod.resolve(player_b, rt) if player_b else None
+    if ra and rb:
+        ea = elo.blended_elo(ra, surface, blend_w)
+        eb = elo.blended_elo(rb, surface, blend_w)
+        return elo.expected(ea, eb), True, ea, eb
+    return None, False, None, None
+
+
+def pick_side(sides, p_a, fee_rate, odds_min, odds_max):
+    """Choose the higher-edge side that passes the odds band. sides: [A, B] dicts with
+    label/token/price. p_a = model P(side A wins). Returns (chosen|None, notes)."""
+    probs = (p_a, 1.0 - p_a)
+    notes, cands = [], []
+    for i, s in enumerate(sides):
+        price = s["price"]
+        if price is None:
+            continue
+        p = probs[i]
+        e = elo.edge(p, price)
+        band = elo.passes_odds_band(price, odds_min, odds_max)
+        notes.append({"label": s["label"], "price": price, "p_model": round(p, 4),
+                      "edge": round(e, 4), "in_odds_band": band})
+        if band:
+            cands.append({"side": s["label"], "token": s["token"], "price": price,
+                          "opponent": sides[1 - i]["label"], "p_model": p, "edge": e})
+    if not cands:
+        return None, notes
+    cands.sort(key=lambda c: c["edge"], reverse=True)
+    return cands[0], notes
+
+
+def run(args) -> dict:
+    api = APIClient(rate_limit_ms=args.rate_limit, debug=args.debug)
+    vlog = log if getattr(args, "verbose", True) else (lambda *a, **k: None)
+    target = args.date or now_utc().date().isoformat()
+    vlog(f"=== Tennis match-winner analysis for {target} ===")
+
+    try:
+        markets = discover_tennis(api, vlog)
+    except Exception as e:  # noqa: BLE001
+        return {"date": target, "error": f"discovery failed: {e}", "suggestions": [], "skipped": []}
+
+    on_day = [m for m in markets if game_date(m) == target]
+    matches = group_by_match(on_day)
+    vlog(f"Discovery: {len(tm.TENNIS_TAGS)} tags -> {len(markets)} markets; "
+         f"{len(on_day)} dated {target}, {len(matches)} matches")
+
+    match_evts = {k: v for k, v in matches.items()
+                  if is_tennis_slug(k) and any(tm.is_match_market(x) for x in v)}
+    vlog(f"  {len(match_evts)} tennis moneyline matches "
+         f"({len(matches) - len(match_evts)} other events dropped)")
+
+    rt = ratings_mod.load_ratings(args.ratings_csv) if args.ratings_csv else {}
+    portfolio_value = float(args.portfolio_value)
+    suggestions, skipped, cand_rows = [], [], []
+
+    def _skip(slug, reason, **extra):
+        rec = {"match": slug, "reason": reason}; rec.update(extra)
+        skipped.append(rec); vlog(f"  [{slug}] SKIP — {reason}")
+
+    for slug, mks in match_evts.items():
+        m = next((x for x in mks if tm.is_match_market(x)), None)
+        if not m:
+            _skip(slug, "no moneyline market"); continue
+        ms = tm.match_sides(m)
+        if not ms or any(s["price"] is None for s in ms["sides"]):
+            _skip(slug, "could not map moneyline tokens/prices"); continue
+        surface = tm.surface_for(slug)
+        pa_slug, pb_slug = tm.parse_players(slug)
+        # Prefer the market's own outcome labels for rating resolution; fall back to slug.
+        label_a, label_b = ms["sides"][0]["label"], ms["sides"][1]["label"]
+        p_a, used, ea, eb = model_probability(label_a or pa_slug, label_b or pb_slug,
+                                              surface, rt, args.blend)
+        if p_a is None:                       # anti-fabrication: devig -> ~0 edge
+            fair = elo.devig_two_way(ms["sides"][0]["price"], ms["sides"][1]["price"])
+            p_a = fair[0] if fair else ms["sides"][0]["price"]
+        chosen, notes = pick_side(ms["sides"], p_a, args.fee_rate, args.odds_min, args.odds_max)
+        vlog(f"  [{slug}] {label_a} vs {label_b} ({surface}): P({label_a})={p_a:.3f} "
+             f"external={used}" + (f" elo={ea:.0f}/{eb:.0f}" if used else ""))
+        ref = ms["sides"][0]
+        cand = {"slug": slug, "surface": surface, "p_a": p_a, "used": used,
+                "elo_a": ea, "elo_b": eb, "sides": ms["sides"], "ou": ms, "m": m,
+                "chosen": chosen, "notes": notes, "ref_token": ref["token"],
+                "ref_label": label_a, "ref_price": ref["price"]}
+        if not chosen:
+            _skip(slug, "no side in odds band", price_sane=ms["price_sane"])
+            cand_rows.append({**cand, "bet": 0, "skip_reason": "no side in odds band"})
+            continue
+        if chosen["edge"] < args.min_edge:
+            _skip(slug, f"edge {chosen['edge']*100:.1f}% < {args.min_edge*100:.0f}%")
+            cand_rows.append({**cand, "bet": 0, "skip_reason": "edge below threshold"})
+            continue
+        cand_rows.append({**cand, "bet": 1, "skip_reason": None})
+
+    # Record bettable candidates (one row per match already), shadow-log everything.
+    recorded_ids: dict = {}
+    for c in cand_rows:
+        _shadow_log(c, args, target)
+        if c["bet"] != 1 or not c["chosen"]:
+            continue
+        ch = c["chosen"]
+        size_pct, size_usd, kelly, conf = _size(ch, args, portfolio_value)
+        rec_id = _record(c, ch, size_pct, size_usd, kelly, conf, args, target)
+        if rec_id is not None:
+            recorded_ids.setdefault(c["slug"], set()).add(rec_id)
+        suggestions.append({"match": c["slug"], "surface": c["surface"],
+                            "side": ch["side"], "opponent": ch["opponent"],
+                            "price": ch["price"], "edge": round(ch["edge"], 4),
+                            "p_model": round(ch["p_model"], 4),
+                            "size_pct": round(size_pct, 5), "prediction_id": rec_id})
+        vlog(f"  [{c['slug']}] >>> SUGGEST {ch['side']} @ {ch['price']:.3f} "
+             f"edge={ch['edge']*100:+.1f}% size={size_pct*100:.2f}% pred_id={rec_id}")
+
+    superseded = 0
+    if args.record:
+        for slug, keep in recorded_ids.items():
+            superseded += tdb.supersede_pending(args.predictions_db, slug, keep)
+
+    suggestions.sort(key=lambda s: s["edge"], reverse=True)
+    vlog(f"=== Done: {len(suggestions)} suggestion(s), {len(skipped)} skipped ===")
+    return {"date": target,
+            "counts": {"matches": len(match_evts), "suggestions": len(suggestions),
+                       "skipped": len(skipped), "superseded": superseded},
+            "suggestions": suggestions, "skipped": skipped,
+            "disclaimer": "Paper-trading simulation — not financial advice. Without "
+                          "player ratings the engine is market-implied (zero edge)."}
+
+
+def _size(chosen, args, portfolio_value):
+    kelly = elo.half_kelly(chosen["p_model"], chosen["price"])
+    conf = min(1.0, max(0.0, 0.5 + chosen["edge"]))
+    cap = CAP_FIRST_TRADE if not args.record else CAP_MODEL
+    size_pct = min(kelly, cap)
+    if conf < 0.7:
+        size_pct = min(size_pct, 0.05)
+    return size_pct, round(size_pct * portfolio_value, 2), kelly, conf
+
+
+def _record(c, chosen, size_pct, size_usd, kelly, conf, args, target):
+    if not args.record:
+        return None
+    stats = {"model": "surface_elo", "surface": c["surface"], "elo_side": c["elo_a"]
+             if chosen["side"] == c["ref_label"] else c["elo_b"],
+             "elo_opp": c["elo_b"] if chosen["side"] == c["ref_label"] else c["elo_a"],
+             "p_model": round(chosen["p_model"], 4), "edge": round(chosen["edge"], 4),
+             "used_external": c["used"], "blend": args.blend, "notes": c["notes"]}
+    try:
+        return tdb.record_prediction({
+            "match_slug": c["slug"], "match_date": target,
+            "tour": (c["slug"].split("-")[0] if c["slug"] else None),
+            "surface": c["surface"], "market_question": c["m"].get("question", ""),
+            "condition_id": c["m"].get("condition_id"), "token_id": chosen["token"],
+            "side": chosen["side"], "opponent": chosen["opponent"],
+            "entry_price": chosen["price"], "decimal_odds": elo.decimal_odds(chosen["price"]),
+            "model_prob": chosen["p_model"], "edge": chosen["edge"],
+            "elo_side": stats["elo_side"], "elo_opp": stats["elo_opp"], "confidence": conf,
+            "size_pct": size_pct, "size_usd": size_usd, "kelly_fraction": kelly,
+            "used_external": c["used"], "fee_rate": args.fee_rate, "strategy": STRATEGY,
+            "market_url": _match_url(c["slug"]), "stats": stats,
+        }, args.predictions_db)
+    except Exception as e:  # noqa: BLE001
+        if args.debug:
+            print(f"[record] failed: {e}", file=sys.stderr)
+        return None
+
+
+def _shadow_log(c, args, target):
+    if not args.record:
+        return
+    ch = c["chosen"]
+    try:
+        tdb.record_model_log({
+            "match_slug": c["slug"], "match_date": target,
+            "tour": (c["slug"].split("-")[0] if c["slug"] else None), "surface": c["surface"],
+            "ref_side": c["ref_label"], "ref_prob": round(c["p_a"], 4),
+            "ref_price": c["ref_price"], "ref_token": c["ref_token"],
+            "pick_side": ch["side"] if ch else None,
+            "pick_edge": round(ch["edge"], 4) if ch else None,
+            "used_external": c["used"],
+            "model_params": {"elo_a": c["elo_a"], "elo_b": c["elo_b"], "surface": c["surface"]},
+            "bet": c["bet"], "skip_reason": c["skip_reason"], "market_url": _match_url(c["slug"]),
+        }, args.predictions_db)
+    except Exception as e:  # noqa: BLE001
+        if args.debug:
+            print(f"[model_log] failed: {e}", file=sys.stderr)
+
+
+def _match_url(slug: str) -> str:
+    return f"https://polymarket.com/event/{tm.base_match_slug(slug)}"
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Suggest tennis match-winner entries on Polymarket.")
+    p.add_argument("--date", default=None, help="Target day YYYY-MM-DD (UTC)")
+    p.add_argument("--ratings-csv", default=None, help="player,elo,hard,clay,grass CSV")
+    p.add_argument("--blend", type=float, default=elo.SURFACE_BLEND, help="overall/surface Elo blend")
+    p.add_argument("--odds-min", type=float, default=elo.ODDS_MIN_DEFAULT)
+    p.add_argument("--odds-max", type=float, default=elo.ODDS_MAX_DEFAULT)
+    p.add_argument("--min-edge", type=float, default=0.05)
+    p.add_argument("--fee-rate", type=float, default=0.0)
+    p.add_argument("--portfolio-value", type=float, default=10000.0)
+    p.add_argument("--predictions-db", default=tdb.DEFAULT_DB)
+    p.add_argument("--record", dest="record", action="store_true", default=True)
+    p.add_argument("--no-record", dest="record", action="store_false")
+    p.add_argument("--output", choices=("json", "text"), default="json")
+    p.add_argument("--quiet", dest="verbose", action="store_false", default=True)
+    p.add_argument("--debug", action="store_true")
+    p.add_argument("--rate-limit", type=int, default=0)
+    return p
+
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
+    result = run(args)
+    if args.output == "json":
+        print(json.dumps(result, indent=2, default=str))
+    else:
+        for s in result.get("suggestions", []):
+            print(f"{s['match']}: {s['side']} @ {s['price']:.3f} "
+                  f"edge={s['edge']*100:+.1f}% ({s['surface']})")
+        if not result.get("suggestions"):
+            print("No actionable edge found.")
+
+
+if __name__ == "__main__":
+    main()
