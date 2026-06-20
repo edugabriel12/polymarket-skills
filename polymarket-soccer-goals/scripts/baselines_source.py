@@ -30,18 +30,21 @@ MIN_MATCHES_BY_PREFIX: dict[str, int] = {
 }
 
 # Our league prefix -> football-data.org competition code (free-tier coverage).
+# Prefix -> football-data.org competition code. Only the free-tier competitions are
+# covered (PL/ELC/PD/SA/BL1/FL1/DED/PPL/BSA/CL/EC/WC); other leagues calibrate via
+# API-Football instead (see calibrate_baselines).
 LEAGUE_FD_CODE: dict[str, str] = {
     "epl": "PL", "premier-league": "PL",
+    "efl": "ELC", "championship": "ELC", "elc": "ELC",
     "laliga": "PD", "la-liga": "PD",
-    "seriea": "SA", "serie-a": "SA",
-    "bundesliga": "BL1",
+    "seriea": "SA", "serie-a": "SA", "sea": "SA", "bkseriea": "SA",
+    "bundesliga": "BL1", "bund": "BL1", "ger": "BL1",
     "ligue1": "FL1", "ligue-1": "FL1",
-    "eredivisie": "DED",
-    "primeira": "PPL", "liga-portugal": "PPL",
-    "ucl": "CL", "champions-league": "CL",
+    "eredivisie": "DED", "ned": "DED",
+    "primeira": "PPL", "liga-portugal": "PPL", "por": "PPL",
+    "ucl": "CL", "champions-league": "CL", "bkcl": "CL",
     "fifwc": "WC", "world-cup": "WC", "wc": "WC",
-    "brasileirao": "BSA", "brasil": "BSA",
-    # football-data.org free tier also exposes ELC (Championship) and EC (Euro).
+    "brasileirao": "BSA", "brasil": "BSA", "bra": "BSA",
     "euro": "EC", "eur": "EC",
 }
 

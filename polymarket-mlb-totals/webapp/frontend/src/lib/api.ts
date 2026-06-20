@@ -114,6 +114,33 @@ export interface ResultsResponse {
   generated_at: string;
 }
 
+export interface ReliabilityBin {
+  bucket: string;
+  n: number;
+  avg_pred: number;
+  empirical: number;
+}
+
+export interface CalibrationResponse {
+  sport: Sport;
+  logged: number;
+  settled: number;
+  settled_bet: number;
+  all: { n: number; brier: number | null; log_loss: number | null; reliability: ReliabilityBin[] };
+  bet: { n: number; brier: number | null; log_loss: number | null };
+  clv: {
+    n: number;
+    avg_ref_price?: number;
+    avg_close_price?: number;
+    avg_clv?: number;
+    beat_close_pct?: number;
+  };
+  settled_offline?: number;
+  settled_feed?: number;
+  note?: string;
+  generated_at: string;
+}
+
 async function get<T>(url: string): Promise<T> {
   const r = await fetch(url);
   if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
@@ -126,6 +153,7 @@ export const api = {
       `/api/analyses?sport=${sport}&${date ? `date=${date}&` : ""}force=${force}`
     ),
   results: (sport: Sport) => get<ResultsResponse>(`/api/results?sport=${sport}`),
+  calibration: (sport: Sport) => get<CalibrationResponse>(`/api/calibration?sport=${sport}`),
   seedDemo: async (sport: Sport, reset = true) => {
     const r = await fetch(`/api/seed-demo?sport=${sport}&reset=${reset}`, { method: "POST" });
     if (!r.ok) throw new Error(`seed failed: ${r.status}`);

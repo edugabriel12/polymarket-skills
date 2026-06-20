@@ -27,8 +27,7 @@ import baselines_source as bsrc
 import soccer_predictions as spdb
 
 from category_common import (
-    APIClient, discover_markets, fetch_midpoint, game_date, log,
-    resolve_category, sanitize_text,
+    APIClient, discover_markets, fetch_midpoint, game_date, log, sanitize_text,
 )
 
 STRATEGY = "soccer-goals-dc"
@@ -66,6 +65,50 @@ def group_by_event(markets: list[dict]) -> dict[str, list[dict]]:
         if key:
             out.setdefault(key, []).append(m)
     return out
+
+
+# Real Polymarket soccer tag slugs (= the leagues' URL paths). The generic "soccer"/
+# "football" tags are NOT real Gamma tags, so Gamma ignores them and returns ALL
+# categories (esports, etc.) volume-ranked — burying the actual games past the offset
+# cap. Querying each real league tag keeps every page on-topic.
+SOCCER_TAGS = sorted(set(leagues.LEAGUE_URL_PATH.values()))
+
+# Per-tag fetch cap. A real league tag returns a small on-topic set (well under this);
+# an unknown tag makes Gamma return the global volume-ranked mix, so the cap stops it
+# after a few pages instead of paginating thousands of off-topic markets.
+PER_TAG_MAX = 400
+
+
+def discover_soccer(api, vlog) -> list[dict]:
+    """Union live markets across every real soccer league tag (deduped).
+
+    No date window: each league tag is a small, on-topic set well under the offset
+    cap, so the day's games are never crowded out; the caller filters to the date.
+    Unknown tags (Gamma returns the global mix) are bounded by PER_TAG_MAX and pruned
+    downstream by is_soccer_slug.
+    """
+    markets, seen = [], set()
+    for tag in SOCCER_TAGS:
+        try:
+            _t, ms = discover_markets(api, "soccer", [tag], min_volume=0.0,
+                                      max_markets=PER_TAG_MAX, include_closed=False)
+        except Exception as e:  # noqa: BLE001
+            vlog(f"  tag {tag!r} failed: {e}")
+            continue
+        added = soccer = 0
+        for m in ms:
+            key = m.get("condition_id") or m.get("slug")
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            markets.append(m)
+            added += 1
+            if leagues.is_soccer_slug(m.get("event_slug") or m.get("slug") or ""):
+                soccer += 1
+        if added:
+            vlog(f"  tag {tag!r}: +{added} markets ({soccer} soccer)")
+    return markets
 
 
 def derive_total_supremacy(inputs: dict, baseline: float, neutral: bool):
@@ -153,27 +196,17 @@ def run(args) -> dict:
     target = args.date or now_utc().date().isoformat()
     vlog(f"=== Soccer goals/BTTS analysis for {target} ===")
 
-    category_key, candidates = resolve_category("soccer")
-    window = date_window_params(target)
     try:
-        # Date-windowed discovery first (so low-volume leagues like Série B aren't
-        # lost behind the volume-ranked offset cap); fall back to the broad scan.
-        _tag, markets = discover_markets(api, category_key, candidates,
-                                         min_volume=0.0, include_closed=False,
-                                         extra_params=window)
-        if window:
-            vlog(f"Discovery: date-windowed [{window['start_date_min']} .. "
-                 f"{window['end_date_max']}] -> {len(markets)} markets")
-        if not markets:
-            vlog("  windowed discovery empty -> retrying unfiltered (volume-ranked)")
-            _tag, markets = discover_markets(api, category_key, candidates,
-                                             min_volume=0.0, include_closed=False)
+        # Per real league tag (world-cup, epl, bra2, …) and union: the generic
+        # "soccer" tag isn't a real Gamma tag and returns all categories.
+        markets = discover_soccer(api, vlog)
     except Exception as e:  # noqa: BLE001
         return {"date": target, "error": f"discovery failed: {e}", "suggestions": [], "skipped": []}
 
     on_day = [m for m in markets if game_date(m) == target]
     games = group_by_event(on_day)
-    vlog(f"Discovery: tag '{_tag}' -> {len(markets)} markets; {len(on_day)} dated {target}, {len(games)} events")
+    _tag = f"{len(SOCCER_TAGS)} league tags"
+    vlog(f"Discovery: {_tag} -> {len(markets)} markets; {len(on_day)} dated {target}, {len(games)} events")
 
     # Keep only soccer total-goals and BTTS markets. Gamma groups every market of a
     # game under one event_slug (no -total-/-btts suffix), so classify by the per-MARKET
@@ -196,14 +229,14 @@ def run(args) -> dict:
     # Diagnostic: when nothing classifies, dump a sample of the real market shapes so
     # the slug/outcome format can be inspected from the logs (Gamma changes formats).
     if not classified and games:
-        n_soccer = sum(1 for k in games if leagues.is_soccer_slug(k))
-        vlog(f"  [diag] 0 classified; {n_soccer}/{len(games)} events pass is_soccer_slug. Samples:")
-        for k, v in list(games.items())[:6]:
-            mk = v[0] if v else {}
-            vlog(f"  [diag] event={k!r} soccer={leagues.is_soccer_slug(k)} markets={len(v)}")
-            for x in v[:3]:
-                vlog(f"  [diag]    slug={x.get('slug')!r} event_slug={x.get('event_slug')!r} "
-                     f"outcomes={x.get('outcomes')} q={(x.get('question') or '')[:60]!r}")
+        soccer_evts = [(k, v) for k, v in games.items() if leagues.is_soccer_slug(k)]
+        vlog(f"  [diag] 0 classified; {len(soccer_evts)}/{len(games)} events pass "
+             f"is_soccer_slug. Sample soccer events + their markets:")
+        for k, v in soccer_evts[:8]:
+            vlog(f"  [diag] event={k!r} markets={len(v)}")
+            for x in v[:6]:
+                vlog(f"  [diag]    slug={x.get('slug')!r} outcomes={x.get('outcomes')} "
+                     f"q={(x.get('question') or '')[:70]!r}")
 
     portfolio_value = float(args.portfolio_value)
     first_trade = data_inputs.is_first_trade(STRATEGY, args.portfolio_db)

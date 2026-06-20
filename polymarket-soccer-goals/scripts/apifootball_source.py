@@ -33,24 +33,80 @@ HOME_TILT_DEFAULT = 1.105
 # Min matches played per team before the league table is trusted (else too noisy).
 MIN_PLAYED_DEFAULT = 5
 
-# Our league prefix -> API-Football league id.
+# Our league prefix -> API-Football league id (api-football.com). Keyed by every
+# plausible event-slug prefix so auto attack/defense ratings resolve regardless of
+# which form Polymarket uses.
 LEAGUE_API_ID: dict[str, int] = {
-    "bra2": 72, "serie-b": 72,                      # Brasileirão Série B
-    "brasileirao": 71, "brasil": 71,                # Série A
+    # England
     "epl": 39, "premier-league": 39,
+    "efl": 40, "championship": 40, "elc": 40,
+    "eng1": 41, "league-one": 41,
+    "eng2": 42, "league-two": 42, "efl2": 42,
+    # Spain
     "laliga": 140, "la-liga": 140,
-    "seriea": 135, "serie-a": 135,
-    "bundesliga": 78,
+    "es2": 141, "laliga2": 141, "segunda": 141,
+    # Italy
+    "seriea": 135, "serie-a": 135, "sea": 135, "bkseriea": 135,
+    "serieb": 136, "it2": 136,
+    # Germany
+    "bundesliga": 78, "bund": 78, "ger": 78,
+    "bundesliga2": 79, "ger2": 79,
+    # France
     "ligue1": 61, "ligue-1": 61,
-    "eredivisie": 88,
-    "primeira": 94, "liga-portugal": 94,
+    "ligue2": 62, "fr2": 62,
+    # Netherlands / Portugal
+    "eredivisie": 88, "ned": 88,
+    "primeira": 94, "liga-portugal": 94, "por": 94,
+    # Americas
     "mls": 253,
+    "ligamx": 262, "liga-mx": 262, "mex": 262,
+    "brasileirao": 71, "brasil": 71, "bra": 71,     # Série A
+    "bra2": 72, "serie-b": 72,                       # Série B
+    "argentina": 128, "arg": 128,
+    "colombia": 239, "col": 239,
+    "chile": 265, "chi": 265,
+    "bolivia": 344, "bol": 344,
+    "ecuador": 242, "ecu": 242,
+    "peru": 281, "per": 281,
+    "uruguay": 268, "uru": 268,
+    "paraguay": 250, "par": 250,
+    # Rest of Europe
+    "allsvenskan": 113, "swe": 113,
+    "eliteserien": 103, "nor": 103,
+    "superlig": 203, "tur": 203,
+    "belgium": 144, "bel": 144, "jpl": 144,
+    "spfl": 179, "scotland": 179, "sco": 179,
+    "swiss": 207, "sui": 207,
+    "austria": 218, "aut": 218,
+    "denmark": 119, "den": 119,
+    "greece": 197, "gre": 197,
+    "rpl": 235, "russia": 235,
+    "mar1": 200, "morocco": 200, "botola": 200,     # Morocco Botola Pro
+    # Asia
+    "csl": 169, "china": 169,
+    "jleague": 98, "j1": 98, "jpn": 98,
+    "kleague": 292, "k1": 292, "kor": 292,
+    "saudi": 307, "spl": 307, "ksa": 307,
+    # Continental clubs
+    "ucl": 2, "champions-league": 2, "bkcl": 2,
+    "uel": 3, "europa-league": 3,
+    "uecl": 848, "conference": 848,
+    "libertadores": 13, "copa-libertadores": 13,
+    "sudamericana": 11, "copa-sudamericana": 11,
 }
 
-# Cross-year (European) leagues: season label is the starting year.
+# Cross-year (mostly European) leagues: season label is the starting year. Calendar-year
+# leagues (Brazil, MLS, Nordics, Asia, internationals) are intentionally absent.
 EURO_CROSS_YEAR = {
-    "epl", "premier-league", "laliga", "la-liga", "seriea", "serie-a",
-    "bundesliga", "ligue1", "ligue-1", "eredivisie", "primeira", "liga-portugal",
+    "epl", "premier-league", "efl", "championship", "elc", "eng1", "league-one",
+    "eng2", "league-two", "efl2", "laliga", "la-liga", "es2", "laliga2", "segunda",
+    "seriea", "serie-a", "sea", "bkseriea", "serieb", "it2",
+    "bundesliga", "bund", "ger", "bundesliga2", "ger2", "ligue1", "ligue-1", "ligue2", "fr2",
+    "eredivisie", "ned", "primeira", "liga-portugal", "por",
+    "superlig", "tur", "belgium", "bel", "jpl", "spfl", "scotland", "sco",
+    "swiss", "sui", "austria", "aut", "denmark", "den", "greece", "gre", "rpl", "russia",
+    "mar1", "morocco", "botola",
+    "ucl", "champions-league", "bkcl", "uel", "europa-league", "uecl", "conference",
 }
 
 # Module-level cache so multiple games in one league cost one request per run.
