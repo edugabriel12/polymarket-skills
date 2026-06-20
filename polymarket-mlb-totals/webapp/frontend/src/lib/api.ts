@@ -11,7 +11,7 @@ export interface Recommendation {
   fee_rate: number;
 }
 
-export type Sport = "mlb" | "soccer";
+export type Sport = "mlb" | "soccer" | "tennis";
 
 export interface StatsLog {
   model?: string;

@@ -28,8 +28,10 @@ _MLB_SCRIPTS = os.path.normpath(os.path.join(_BACKEND_DIR, "..", "..", "scripts"
 _REPO_ROOT = os.path.normpath(os.path.join(_BACKEND_DIR, "..", "..", ".."))
 _SOCCER_SCRIPTS = os.path.join(_REPO_ROOT, "polymarket-soccer-goals", "scripts")
 _SOCCER_SUGGEST = os.path.join(_SOCCER_SCRIPTS, "suggest_soccer.py")
+_TENNIS_SCRIPTS = os.path.join(_REPO_ROOT, "polymarket-tennis", "scripts")
+_TENNIS_SUGGEST = os.path.join(_TENNIS_SCRIPTS, "suggest_tennis.py")
 
-for _d in (_MLB_SCRIPTS, _SOCCER_SCRIPTS):
+for _d in (_MLB_SCRIPTS, _SOCCER_SCRIPTS, _TENNIS_SCRIPTS):
     if _d not in sys.path:
         sys.path.append(_d)
 
@@ -41,6 +43,8 @@ import seed_demo                      # noqa: E402  (MLB seed)
 import suggest_totals                 # noqa: E402  (MLB model)
 import soccer_predictions as spdb     # noqa: E402  (soccer store; stdlib-only, safe import)
 import soccer_results                  # noqa: E402  (soccer auto-settlement; safe import)
+import tennis_predictions as tdb       # noqa: E402  (tennis store; stdlib-only, safe import)
+import tennis_results                  # noqa: E402  (tennis auto-settlement; safe import)
 
 
 def _load_dotenv() -> list[str]:
@@ -77,8 +81,11 @@ MLB_DB = os.environ.get("PREDICTIONS_DB", pdb.DEFAULT_DB)
 SOCCER_DB = os.environ.get("SOCCER_PREDICTIONS_DB", spdb.DEFAULT_DB)
 SOCCER_RATINGS_CSV = os.environ.get("SOCCER_RATINGS_CSV")
 FOOTBALL_DATA_TOKEN = os.environ.get("FOOTBALL_DATA_TOKEN")
+TENNIS_DB = os.environ.get("TENNIS_PREDICTIONS_DB", tdb.DEFAULT_DB)
+TENNIS_RATINGS_CSV = os.environ.get("TENNIS_RATINGS_CSV")
+TENNIS_TOUR = os.environ.get("TENNIS_TOUR", "atp")
 
-SPORTS = ("mlb", "soccer")
+SPORTS = ("mlb", "soccer", "tennis")
 
 
 class _QuickAPI:
@@ -112,7 +119,11 @@ def _norm_sport(sport: str | None) -> str:
 
 
 def _db_for(sport: str) -> str:
-    return SOCCER_DB if sport == "soccer" else MLB_DB
+    if sport == "soccer":
+        return SOCCER_DB
+    if sport == "tennis":
+        return TENNIS_DB
+    return MLB_DB
 
 
 # ---------------------------------------------------------------------------
@@ -206,9 +217,48 @@ def _run_soccer(date: str) -> dict:
         return {"error": "bad model output", "counts": {}, "suggestions": [], "skipped": []}
 
 
+def _run_tennis(date: str) -> dict:
+    """Run the tennis surface-Elo model in a subprocess; normalize to the frontend shape."""
+    cmd = [sys.executable, _TENNIS_SUGGEST, "--date", date, "--output", "json",
+           "--predictions-db", TENNIS_DB, "--tour", TENNIS_TOUR]
+    if TENNIS_RATINGS_CSV:
+        cmd += ["--ratings-csv", TENNIS_RATINGS_CSV]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"tennis model failed: {e}", "counts": {}, "suggestions": [], "skipped": []}
+    if proc.stderr:
+        print(proc.stderr, end="" if proc.stderr.endswith("\n") else "\n",
+              file=sys.stderr, flush=True)
+    if proc.returncode != 0:
+        return {"error": (proc.stderr or "")[-500:], "counts": {}, "suggestions": [], "skipped": []}
+    try:
+        raw = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        return {"error": "bad model output", "counts": {}, "suggestions": [], "skipped": []}
+    # Map moneyline suggestions onto the shared Suggestion contract (game/market/side/line/rec).
+    suggestions = []
+    for s in raw.get("suggestions", []):
+        suggestions.append({
+            "game": s.get("match"), "market": "MATCH", "side": s.get("side"),
+            "line": None, "edge": s.get("edge"), "prediction_id": s.get("prediction_id"),
+            "recommendation": {
+                "token_id": "", "side": s.get("side"), "size_pct": s.get("size_pct", 0.0),
+                "price": s.get("price", 0.0), "confidence": min(1.0, 0.5 + (s.get("edge") or 0)),
+                "reasoning": f"{s.get('side')} vs {s.get('opponent')} ({s.get('surface')})",
+                "strategy": "tennis-elo-moneyline", "fee_rate": 0.0,
+            },
+        })
+    skipped = [{"game": x.get("match"), "reason": x.get("reason"), "side": x.get("side")}
+               for x in raw.get("skipped", [])]
+    return {"counts": raw.get("counts", {}), "suggestions": suggestions, "skipped": skipped,
+            "disclaimer": raw.get("disclaimer", ""), "error": raw.get("error")}
+
+
 def _enrich(sport: str, suggestions: list[dict], date: str) -> list[dict]:
-    store = spdb if sport == "soccer" else pdb
-    by_id = {r["id"]: r for r in store.get_predictions(_db_for(sport), game_date=date)}
+    store = {"soccer": spdb, "tennis": tdb}.get(sport, pdb)
+    date_kw = {"match_date": date} if sport == "tennis" else {"game_date": date}
+    by_id = {r["id"]: r for r in store.get_predictions(_db_for(sport), **date_kw)}
     for s in suggestions:
         row = by_id.get(s.get("prediction_id"))
         if row:
@@ -230,9 +280,11 @@ def _enrich(sport: str, suggestions: list[dict], date: str) -> list[dict]:
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok", "sports": list(SPORTS), "mlb_db": MLB_DB, "soccer_db": SOCCER_DB,
-            "dotenv_loaded": _DOTENV_FILES,
+            "tennis_db": TENNIS_DB, "dotenv_loaded": _DOTENV_FILES,
             "football_data_token": bool(FOOTBALL_DATA_TOKEN),
-            "soccer_ratings_csv": bool(SOCCER_RATINGS_CSV), "time": _now()}
+            "soccer_ratings_csv": bool(SOCCER_RATINGS_CSV),
+            "tennis_ratings_csv": bool(TENNIS_RATINGS_CSV), "tennis_tour": TENNIS_TOUR,
+            "time": _now()}
 
 
 @app.get("/api/analyses")
@@ -246,7 +298,7 @@ def analyses(sport: str = Query("mlb"), date: str | None = Query(None),
             cached["cached"] = True
             return cached
 
-    result = _run_soccer(target) if sport == "soccer" else _run_mlb(target)
+    result = ({"soccer": _run_soccer, "tennis": _run_tennis}.get(sport, _run_mlb))(target)
     payload = {
         "sport": sport, "date": target, "computed_at": _now(), "cached": False,
         "counts": result.get("counts", {}),
@@ -269,6 +321,15 @@ def results(sport: str = Query("mlb")) -> dict:
         except Exception as e:  # noqa: BLE001
             settled = {"checked": 0, "settled": [], "error": str(e)}
         perf, series, recent = spdb.performance(db), spdb.pnl_by_day(db), spdb.get_predictions(db)
+    elif sport == "tennis":
+        try:
+            settled = tennis_results.settle_pending(db, tour=TENNIS_TOUR)
+        except Exception as e:  # noqa: BLE001
+            settled = {"checked": 0, "settled": [], "error": str(e)}
+        perf, series = tdb.performance(db), tdb.pnl_by_day(db)
+        # Normalize moneyline rows to the shared PredictionRow keys (game_slug/market/line).
+        recent = [dict(r, game_slug=r.get("match_slug"), game_date=r.get("match_date"),
+                       market="MATCH", line=None) for r in tdb.get_predictions(db)]
     else:
         try:
             settled = settlement.settle_pending(_QuickAPI(), db)
@@ -281,6 +342,8 @@ def results(sport: str = Query("mlb")) -> dict:
     try:
         if sport == "soccer":
             captured = soccer_results.capture_close_prices(db)
+        elif sport == "tennis":
+            captured = tennis_results.capture_close_prices(db)
         else:
             captured = settlement.capture_close_prices(_QuickAPI(), db)
     except Exception:  # noqa: BLE001 - never block results on price capture
@@ -316,6 +379,8 @@ def calibration_report(sport: str = Query("mlb")) -> dict:
     try:
         if sport == "soccer":
             settled_feed = soccer_results.settle_model_log_from_feed(db, token=FOOTBALL_DATA_TOKEN)
+        elif sport == "tennis":
+            settled_feed = tennis_results.settle_model_log_from_feed(db, tour=TENNIS_TOUR)
         else:
             settled_feed = settlement.settle_model_log_from_feed(_QuickAPI(), db)
     except Exception:  # noqa: BLE001 - feed best-effort
@@ -333,6 +398,9 @@ def calibration_report(sport: str = Query("mlb")) -> dict:
 def predictions(sport: str = Query("mlb"), status: str | None = Query(None),
                 date: str | None = Query(None)) -> dict:
     sport = _norm_sport(sport)
+    if sport == "tennis":
+        return {"sport": sport, "predictions": tdb.get_predictions(_db_for(sport),
+                status=status, match_date=date)}
     store = spdb if sport == "soccer" else pdb
     return {"sport": sport, "predictions": store.get_predictions(_db_for(sport), status=status, game_date=date)}
 

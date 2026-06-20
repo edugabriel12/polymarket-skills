@@ -11,7 +11,14 @@ import { cn } from "@/lib/utils";
 const SPORTS: { key: Sport; label: string; emoji: string }[] = [
   { key: "mlb", label: "MLB", emoji: "⚾" },
   { key: "soccer", label: "Futebol", emoji: "⚽" },
+  { key: "tennis", label: "Tênis", emoji: "🎾" },
 ];
+
+const SPORT_SUBTITLE: Record<Sport, string> = {
+  mlb: "MLB · total de runs (Binomial Negativa)",
+  soccer: "Futebol · total de gols + BTTS (Dixon-Coles)",
+  tennis: "Tênis · vencedor da partida (Elo por superfície)",
+};
 
 export default function App() {
   const { theme, toggle } = useTheme();
@@ -27,11 +34,7 @@ export default function App() {
             </div>
             <div>
               <h1 className="text-xl font-black tracking-tight">Polymarket Sports</h1>
-              <p className="text-xs text-muted-foreground">
-                {sport === "mlb"
-                  ? "MLB · total de runs (Binomial Negativa)"
-                  : "Futebol · total de gols + BTTS (Dixon-Coles)"}
-              </p>
+              <p className="text-xs text-muted-foreground">{SPORT_SUBTITLE[sport]}</p>
             </div>
           </div>
           <div className="flex items-center gap-2">
