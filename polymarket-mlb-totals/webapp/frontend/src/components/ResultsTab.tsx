@@ -17,6 +17,7 @@ import { Button } from "@/components/ui/button";
 import { KpiCard } from "@/components/KpiCard";
 import { StatusBadge } from "@/components/StatusBadge";
 import { WinRateDonut, PnlBar, OverUnderSplit } from "@/components/charts";
+import { CalibrationPanel } from "@/components/CalibrationPanel";
 import { cn, gameEventUrl, pct, signedUsd, usd } from "@/lib/utils";
 
 const PERIODS: { key: Period; label: string }[] = [
@@ -110,6 +111,8 @@ export function ResultsTab({ sport }: { sport: Sport }) {
               <CardContent><PnlBar data={data!.pnl_by_day} /></CardContent>
             </Card>
           </div>
+
+          <CalibrationPanel sport={sport} />
 
           <Card>
             <CardHeader className="flex flex-row items-center justify-between gap-2 space-y-0">

@@ -275,14 +275,58 @@ def results(sport: str = Query("mlb")) -> dict:
         except Exception as e:  # noqa: BLE001
             settled = {"checked": 0, "settled": [], "error": str(e)}
         perf, series, recent = analytics.performance(db), analytics.pnl_by_day(db), pdb.get_predictions(db)
+    # Best-effort: snapshot reference-side closing prices for CLV (sets each shadow
+    # row's close_price once; accumulates as games approach kickoff over repeat visits).
+    captured = 0
+    try:
+        if sport == "soccer":
+            captured = soccer_results.capture_close_prices(db)
+        else:
+            captured = settlement.capture_close_prices(_QuickAPI(), db)
+    except Exception:  # noqa: BLE001 - never block results on price capture
+        pass
     print(f"[results] {sport} settlement: checked={settled.get('checked', 0)} "
           f"finals_found={settled.get('finals_found', '-')} "
           f"settled={len(settled.get('settled', []))} "
-          f"backfilled_urls={settled.get('backfilled_urls', 0)}"
+          f"backfilled_urls={settled.get('backfilled_urls', 0)} close_captured={captured}"
           + (f" error={settled['error']}" if settled.get('error') else ""),
           file=sys.stderr, flush=True)
     return {"sport": sport, "settlement": settled, "performance": perf,
             "pnl_by_day": series, "recent": recent, "generated_at": _now()}
+
+
+@app.get("/api/calibration")
+def calibration_report(sport: str = Query("mlb")) -> dict:
+    """Model validation: Brier / log-loss / reliability + CLV over the shadow log.
+
+    Settles shadow rows first (offline propagation from settled predictions, then the
+    results feed for non-bet games), so the metrics reflect every modeled game, not
+    just the ones that were bet. This is the read-out for deciding whether the model
+    has real edge before scaling (or paying for data).
+    """
+    import calibration as calib
+    sport = _norm_sport(sport)
+    db = _db_for(sport)
+    if not os.path.exists(db):
+        return {"sport": sport, "logged": 0, "settled": 0, "settled_bet": 0,
+                "all": {"n": 0}, "bet": {"n": 0}, "clv": {"n": 0},
+                "note": "no predictions DB yet", "generated_at": _now()}
+    settled_offline = calib.settle_from_predictions(db)
+    settled_feed = 0
+    try:
+        if sport == "soccer":
+            settled_feed = soccer_results.settle_model_log_from_feed(db, token=FOOTBALL_DATA_TOKEN)
+        else:
+            settled_feed = settlement.settle_model_log_from_feed(_QuickAPI(), db)
+    except Exception:  # noqa: BLE001 - feed best-effort
+        pass
+    rep = calib.report(db)
+    rep.update({"sport": sport, "settled_offline": settled_offline,
+                "settled_feed": settled_feed, "generated_at": _now()})
+    print(f"[calibration] {sport}: logged={rep['logged']} settled={rep['settled']} "
+          f"(offline+{settled_offline}, feed+{settled_feed}) clv_n={rep['clv'].get('n', 0)}",
+          file=sys.stderr, flush=True)
+    return rep
 
 
 @app.get("/api/predictions")
