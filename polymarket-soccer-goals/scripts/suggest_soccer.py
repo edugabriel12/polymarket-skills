@@ -186,7 +186,10 @@ def run(args) -> dict:
                   if leagues.is_soccer_slug(k) and _has_market(v, sm.GAME_TOTAL_RE)}
     btts_evts = {k: v for k, v in games.items()
                  if leagues.is_soccer_slug(k) and _has_market(v, sm.GAME_BTTS_RE)}
-    filtered_non_soccer = len(games) - len(total_evts) - len(btts_evts)
+    # An event can carry BOTH a total and a BTTS market, so count distinct events
+    # to avoid double-subtracting (which made "dropped" go negative).
+    classified = set(total_evts) | set(btts_evts)
+    filtered_non_soccer = len(games) - len(classified)
     vlog(f"  {len(total_evts)} total-goals + {len(btts_evts)} BTTS soccer markets "
          f"({filtered_non_soccer} other events dropped)")
 
