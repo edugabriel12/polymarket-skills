@@ -185,8 +185,9 @@ class TestAutoRatings(unittest.TestCase):
             rs.fetch_club_elo = orig
 
 
-def _rich(slug, question, outcomes, prices, tokens, vol=40000):
-    return {"event_slug": slug, "slug": slug, "question": question, "outcomes": outcomes,
+def _rich(slug, question, outcomes, prices, tokens, vol=40000, event_slug=None):
+    return {"event_slug": event_slug if event_slug is not None else slug,
+            "slug": slug, "question": question, "outcomes": outcomes,
             "outcome_prices": prices, "token_ids": tokens, "volume_24h": vol,
             "end_date": "2027-01-01T00:00:00Z", "accepting_orders": True,
             "game_start_time": "2026-06-14T18:00:00Z", "condition_id": "0x" + slug}
@@ -255,6 +256,44 @@ class TestEndToEnd(unittest.TestCase):
             self.assertEqual(rec["side"], "YES")
             self.assertLessEqual(rec["size_pct"], 0.01)  # first-trade cap
             self.assertTrue(dc.passes_odds_filter(rec["price"]))
+
+    def test_event_slug_grouping_classifies_markets(self):
+        # Real Gamma shape: every market of a game shares one event_slug (the
+        # game-level slug, no -total-/-btts suffix); the suffix lives on each
+        # market's own slug. Classifying by the event key alone finds 0 markets
+        # (the reported bug) — classification must inspect the per-market slugs.
+        ev = "epl-ars-che-2026-06-14"
+        markets = [
+            _rich("epl-ars-che-2026-06-14-total-2pt5", "Arsenal vs Chelsea: O/U 2.5",
+                  ["Over 2.5", "Under 2.5"], [0.50, 0.50], ["T25_o", "T25_u"], event_slug=ev),
+            _rich("epl-ars-che-2026-06-14-total-3pt5", "Arsenal vs Chelsea: O/U 3.5",
+                  ["Over 3.5", "Under 3.5"], [0.50, 0.50], ["T35_o", "T35_u"], event_slug=ev),
+            _rich("epl-ars-che-2026-06-14-btts", "Arsenal vs Chelsea: Both teams to score?",
+                  ["Yes", "No"], [0.50, 0.50], ["B_yes", "B_no"], event_slug=ev),
+            _rich("epl-ars-che-2026-06-14", "Arsenal vs Chelsea",
+                  ["Arsenal", "Chelsea"], [0.5, 0.5], ["m1", "m2"], event_slug=ev),  # moneyline
+        ]
+        ss.discover_markets = lambda *a, **k: ("soccer", markets)
+        ss.game_date = lambda m: "2026-06-14"
+        ss.APIClient = _NoNetAPI
+
+        with tempfile.TemporaryDirectory() as d:
+            csv_path = os.path.join(d, "r.csv")
+            with open(csv_path, "w", encoding="utf-8") as fh:
+                fh.write("team,elo,att_factor,def_factor\nars,1850,1.25,1.25\nche,1550,1.2,1.2\n")
+            args = _Args(ratings_csv=csv_path, record=True,
+                         predictions_db=os.path.join(d, "p.db"))
+            result = ss.run(args)
+
+            # One TOTAL event + one BTTS event, despite two total lines under the event.
+            self.assertEqual(result["counts"]["total_markets"], 1)
+            self.assertEqual(result["counts"]["btts_markets"], 1)
+            # Both total lines are modeled (shadow-logged); best-line-only records one.
+            import soccer_predictions as spdb_
+            mlog = spdb_.get_model_log(args.predictions_db)
+            total_lines = sorted(r["line"] for r in mlog if r["market"] == "TOTAL")
+            self.assertEqual(total_lines, [2.5, 3.5])
+            self.assertEqual(sum(1 for r in mlog if r["market"] == "TOTAL" and r["bet"] == 1), 1)
 
     def test_world_cup_auto_no_csv(self):
         # World Cup game; no ratings CSV -> national Elo computes lambdas automatically.
