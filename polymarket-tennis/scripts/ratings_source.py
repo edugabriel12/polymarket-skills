@@ -23,6 +23,7 @@ import elo as _elo
 from ratings import normalize
 
 RAW_BASE = "https://raw.githubusercontent.com/JeffSackmann"
+GITHUB_BRANCHES = ("master", "main")     # tennis_atp uses master; try main as a fallback
 _CACHE_DIR = os.path.expanduser("~/.polymarket-tennis")
 _SURFACE_MAP = {"hard": "hard", "clay": "clay", "grass": "grass", "carpet": "hard"}
 
@@ -81,28 +82,64 @@ def build_elo_from_matches(matches: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def fetch_sackmann_matches(tour: str, years: list[int], timeout: int = 10) -> list[dict]:
+def _read_year_csv(repo: str, prefix: str, year: int, data_dir: str | None,
+                   timeout: int) -> str | None:
+    """Return the raw CSV text for one season, from a local dir or GitHub. None if absent.
+
+    Order: a local `{data_dir}/{prefix}_matches_{year}.csv` (clone the Sackmann repo or
+    drop the CSVs there when GitHub egress is blocked), then GitHub raw on each branch.
+    """
+    if data_dir:
+        path = os.path.join(data_dir, f"{prefix}_matches_{year}.csv")
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    return fh.read()
+            except Exception:  # noqa: BLE001
+                pass
+    try:
+        import requests  # lazy
+    except Exception:  # noqa: BLE001
+        return None
+    for branch in GITHUB_BRANCHES:
+        url = f"{RAW_BASE}/{repo}/{branch}/{prefix}_matches_{year}.csv"
+        try:
+            resp = requests.get(url, timeout=timeout)
+            if resp.status_code == 200 and resp.text:
+                return resp.text
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def fetch_sackmann_matches(tour: str, years: list[int], timeout: int = 10,
+                           data_dir: str | None = None, debug: bool = False) -> list[dict]:
     """Fetch + parse Sackmann match CSVs for the given years. [] on any failure."""
     try:
         import csv as _csv
         import io
-        import requests  # lazy
     except Exception:  # noqa: BLE001
         return []
     repo = "tennis_wta" if tour == "wta" else "tennis_atp"
     prefix = "wta" if tour == "wta" else "atp"
+    data_dir = data_dir or os.environ.get("TENNIS_DATA_DIR")
     rows: list[dict] = []
     for y in years:
-        url = f"{RAW_BASE}/{repo}/master/{prefix}_matches_{y}.csv"
-        try:
-            resp = requests.get(url, timeout=timeout)
-            resp.raise_for_status()
-            for r in _csv.DictReader(io.StringIO(resp.text)):
-                pm = parse_match_row(r)
-                if pm:
-                    rows.append(pm)
-        except Exception:  # noqa: BLE001
+        text = _read_year_csv(repo, prefix, y, data_dir, timeout)
+        if not text:
+            if debug:
+                print(f"[ratings_source] {prefix}_matches_{y}.csv: not found "
+                      f"(GitHub egress blocked? set TENNIS_DATA_DIR to a local clone)",
+                      file=__import__("sys").stderr)
             continue
+        n0 = len(rows)
+        for r in _csv.DictReader(io.StringIO(text)):
+            pm = parse_match_row(r)
+            if pm:
+                rows.append(pm)
+        if debug:
+            print(f"[ratings_source] {prefix}_matches_{y}.csv: +{len(rows) - n0} matches",
+                  file=__import__("sys").stderr)
     rows.sort(key=lambda m: m["date"])     # chronological -> no look-ahead
     return rows
 
@@ -125,10 +162,12 @@ def auto_ratings(tour: str = "atp", years: list[int] | None = None,
                 return json.load(fh)
         except Exception:  # noqa: BLE001
             pass
-    matches = fetch_sackmann_matches(tour, years)
+    matches = fetch_sackmann_matches(tour, years, debug=debug)
     if not matches:
-        if debug:
-            print(f"[ratings_source] no matches fetched for {tour} {years}")
+        import sys
+        print(f"[ratings_source] 0 matches for {tour} {years} — GitHub egress likely "
+              f"blocked; set TENNIS_DATA_DIR to a local Sackmann clone, or pass "
+              f"--ratings-csv. Falling back to market-implied (zero edge).", file=sys.stderr)
         return {}
     ratings = build_elo_from_matches(matches)
     try:
