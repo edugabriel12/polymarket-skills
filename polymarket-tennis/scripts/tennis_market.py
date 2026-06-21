@@ -33,13 +33,36 @@ SURFACE_KEYWORDS = (
 # Outcome labels that mark a market as NOT a moneyline (over/under, yes/no props).
 _NON_MONEYLINE = ("over", "under", "yes", "no")
 
+# Slug markers of NON-match-winner markets (handicaps, spreads, set/game props, doubles).
+# The base match-winner slug ends with the date and carries none of these.
+_PROP_MARKERS = ("handicap", "spread", "-total-", "set-betting", "correct-score",
+                 "-games-", "-sets-", "to-win-a-set", "tie-break", "tiebreak",
+                 "first-set", "exact-score")
+_DOUBLES_MARKERS = ("doubles", "/")
+
 _SUFFIX_RE = re.compile(r"-(?:winner|moneyline|ml|h2h|match-winner)$")
+_DATE_END_RE = re.compile(r"-\d{4}-\d{2}-\d{2}$")
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def base_match_slug(slug: str) -> str:
     """Strip a trailing market-type suffix to the base match-event slug."""
     return _SUFFIX_RE.sub("", slug or "")
+
+
+def is_doubles(market: dict) -> bool:
+    """Doubles match (singles Elo doesn't apply): slug says 'doubles' or names have '/'."""
+    blob = (market.get("slug", "") + " " + " ".join(market.get("outcomes") or [])).lower()
+    return any(mk in blob for mk in _DOUBLES_MARKERS)
+
+
+def is_moneyline_slug(slug: str) -> bool:
+    """True only for a base SINGLES match-winner slug: '<tag>-<a>-<b>-YYYY-MM-DD' with no
+    prop suffix (handicap/spread/set-betting/...) and not doubles."""
+    s = (slug or "").lower()
+    if any(mk in s for mk in _DOUBLES_MARKERS) or any(p in s for p in _PROP_MARKERS):
+        return False
+    return bool(_DATE_END_RE.search(base_match_slug(s)))
 
 
 def surface_for(slug: str, tag: str | None = None) -> str:
@@ -56,7 +79,8 @@ def _norm_label(text: str) -> str:
 
 
 def is_match_market(market: dict) -> bool:
-    """True for a 2-outcome moneyline whose outcomes are player labels."""
+    """True only for a base SINGLES match-winner moneyline: 2 player-label outcomes AND a
+    base match slug (no handicap/spread/set prop, no doubles)."""
     outs = market.get("outcomes") or []
     toks = market.get("token_ids") or []
     if len(outs) != 2 or len(toks) != 2:
@@ -67,7 +91,8 @@ def is_match_market(market: dict) -> bool:
     # Reject prop markets: over/under or yes/no (label is or starts with those words).
     if any(lbl == w or lbl.startswith(w + " ") for lbl in labels for w in _NON_MONEYLINE):
         return False
-    return True
+    # Reject handicap/spread/set props and doubles via the slug.
+    return is_moneyline_slug(market.get("slug", ""))
 
 
 def _price(prices, i):

@@ -36,6 +36,20 @@ class TestMarket(unittest.TestCase):
         self.assertTrue(tm.is_match_market(ml))
         self.assertFalse(tm.is_match_market(ou))      # over/under is not moneyline
 
+    def test_excludes_handicaps_and_doubles(self):
+        # Set-handicap has player-name outcomes but is NOT the match winner.
+        hcap = _mk("wta-pegula-noskova-2026-06-21-set-handicap-home-1pt5",
+                   ["Pegula", "Noskova"], [0.6, 0.4], ["a", "b"])
+        spread = _mk("atp-x-y-2026-06-21-games-spread-4pt5", ["X", "Y"], [0.5, 0.5], ["a", "b"])
+        # Doubles: singles Elo doesn't apply (pairs, '/' in names / 'doubles' in slug).
+        dbl = _mk("atp-doubles-helipat-arevpav-2026-06-21",
+                  ["Helioevaara/Patten", "Arevalo/Pavic"], [0.5, 0.5], ["a", "b"])
+        for m in (hcap, spread, dbl):
+            self.assertFalse(tm.is_match_market(m), m["slug"])
+        self.assertTrue(tm.is_doubles(dbl))
+        self.assertFalse(tm.is_moneyline_slug("wta-pegula-noskova-2026-06-21-set-handicap-home-1pt5"))
+        self.assertTrue(tm.is_moneyline_slug("wta-pegula-noskova-2026-06-21"))
+
     def test_match_sides_and_players(self):
         ml = _mk("wta-swiatek-gauff-2026-06-20", ["Iga Swiatek", "Coco Gauff"],
                  [0.62, 0.38], ["s", "g"])
