@@ -91,13 +91,17 @@ def _read_year_csv(repo: str, prefix: str, year: int, data_dir: str | None,
     when nothing was read, so the caller can surface the REAL cause (SSL/proxy/404/etc.).
     """
     if data_dir:
-        path = os.path.join(data_dir, f"{prefix}_matches_{year}.csv")
-        if os.path.isfile(path):
-            try:
-                with open(path, encoding="utf-8") as fh:
-                    return fh.read(), None
-            except Exception as e:  # noqa: BLE001
-                return None, f"local read failed: {e}"
+        # Accept the CSV directly in data_dir, or inside a cloned repo subfolder
+        # (tennis_atp/ or tennis_wta/), so one TENNIS_DATA_DIR can hold both clones.
+        fname = f"{prefix}_matches_{year}.csv"
+        for cand in (os.path.join(data_dir, fname),
+                     os.path.join(data_dir, repo, fname)):
+            if os.path.isfile(cand):
+                try:
+                    with open(cand, encoding="utf-8") as fh:
+                        return fh.read(), None
+                except Exception as e:  # noqa: BLE001
+                    return None, f"local read failed: {e}"
     try:
         import requests  # lazy
     except Exception as e:  # noqa: BLE001
