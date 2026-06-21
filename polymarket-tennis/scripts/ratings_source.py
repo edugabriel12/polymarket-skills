@@ -22,8 +22,16 @@ import time
 import elo as _elo
 from ratings import normalize
 
-RAW_BASE = "https://raw.githubusercontent.com/JeffSackmann"
 GITHUB_BRANCHES = ("master", "main")     # tennis_atp uses master; try main as a fallback
+# Hosts that serve the SAME Sackmann CSVs. raw.githubusercontent.com is blocked on some
+# networks (returns a synthetic 404); cdn.jsdelivr.net and cdn.statically.io are independent
+# CDNs on different domains that mirror the repo. Our per-year match CSVs are small (~1-3 MB),
+# well under jsDelivr's 20 MB/file cap. See references/deep-research.md.
+_SACKMANN_HOSTS = (
+    "https://raw.githubusercontent.com/JeffSackmann/{repo}/{branch}/{file}",
+    "https://cdn.jsdelivr.net/gh/JeffSackmann/{repo}@{branch}/{file}",
+    "https://cdn.statically.io/gh/JeffSackmann/{repo}/{branch}/{file}",
+)
 _CACHE_DIR = os.path.expanduser("~/.polymarket-tennis")
 _SURFACE_MAP = {"hard": "hard", "clay": "clay", "grass": "grass", "carpet": "hard"}
 
@@ -83,33 +91,45 @@ def build_elo_from_matches(matches: list[dict]) -> dict:
 
 
 def _read_year_csv(repo: str, prefix: str, year: int, data_dir: str | None,
-                   timeout: int) -> str | None:
-    """Return the raw CSV text for one season, from a local dir or GitHub. None if absent.
+                   timeout: int) -> tuple[str | None, str | None]:
+    """Return (csv_text, error) for one season, from a local dir or GitHub.
 
     Order: a local `{data_dir}/{prefix}_matches_{year}.csv` (clone the Sackmann repo or
-    drop the CSVs there when GitHub egress is blocked), then GitHub raw on each branch.
+    drop the CSVs there), then GitHub raw on each branch. `error` is a short reason string
+    when nothing was read, so the caller can surface the REAL cause (SSL/proxy/404/etc.).
     """
     if data_dir:
-        path = os.path.join(data_dir, f"{prefix}_matches_{year}.csv")
-        if os.path.isfile(path):
-            try:
-                with open(path, encoding="utf-8") as fh:
-                    return fh.read()
-            except Exception:  # noqa: BLE001
-                pass
+        # Accept the CSV directly in data_dir, or inside a cloned repo subfolder
+        # (tennis_atp/ or tennis_wta/), so one TENNIS_DATA_DIR can hold both clones.
+        fname = f"{prefix}_matches_{year}.csv"
+        for cand in (os.path.join(data_dir, fname),
+                     os.path.join(data_dir, repo, fname)):
+            if os.path.isfile(cand):
+                try:
+                    with open(cand, encoding="utf-8") as fh:
+                        return fh.read(), None
+                except Exception as e:  # noqa: BLE001
+                    return None, f"local read failed: {e}"
     try:
         import requests  # lazy
-    except Exception:  # noqa: BLE001
-        return None
+    except Exception as e:  # noqa: BLE001
+        return None, f"'requests' not importable: {e}"
+    last = "no response"
+    fname = f"{prefix}_matches_{year}.csv"
+    # Try each branch across each mirror host; first 200 wins. raw is freshest when
+    # reachable, the CDNs are the fallback when raw.githubusercontent.com is blocked.
     for branch in GITHUB_BRANCHES:
-        url = f"{RAW_BASE}/{repo}/{branch}/{prefix}_matches_{year}.csv"
-        try:
-            resp = requests.get(url, timeout=timeout)
-            if resp.status_code == 200 and resp.text:
-                return resp.text
-        except Exception:  # noqa: BLE001
-            continue
-    return None
+        for tmpl in _SACKMANN_HOSTS:
+            url = tmpl.format(repo=repo, branch=branch, file=fname)
+            host = url.split("/")[2]
+            try:
+                resp = requests.get(url, timeout=timeout)
+                if resp.status_code == 200 and resp.text:
+                    return resp.text, None
+                last = f"HTTP {resp.status_code} @ {host}/{branch}"
+            except Exception as e:  # noqa: BLE001
+                last = f"{type(e).__name__} @ {host}"
+    return None, last
 
 
 def fetch_sackmann_matches(tour: str, years: list[int], timeout: int = 10,
@@ -120,17 +140,18 @@ def fetch_sackmann_matches(tour: str, years: list[int], timeout: int = 10,
         import io
     except Exception:  # noqa: BLE001
         return []
+    import sys
     repo = "tennis_wta" if tour == "wta" else "tennis_atp"
     prefix = "wta" if tour == "wta" else "atp"
     data_dir = data_dir or os.environ.get("TENNIS_DATA_DIR")
     rows: list[dict] = []
+    errors: list[str] = []
     for y in years:
-        text = _read_year_csv(repo, prefix, y, data_dir, timeout)
+        text, err = _read_year_csv(repo, prefix, y, data_dir, timeout)
         if not text:
+            errors.append(f"{y}: {err}")
             if debug:
-                print(f"[ratings_source] {prefix}_matches_{y}.csv: not found "
-                      f"(GitHub egress blocked? set TENNIS_DATA_DIR to a local clone)",
-                      file=__import__("sys").stderr)
+                print(f"[ratings_source] {prefix}_matches_{y}.csv: {err}", file=sys.stderr)
             continue
         n0 = len(rows)
         for r in _csv.DictReader(io.StringIO(text)):
@@ -139,7 +160,10 @@ def fetch_sackmann_matches(tour: str, years: list[int], timeout: int = 10,
                 rows.append(pm)
         if debug:
             print(f"[ratings_source] {prefix}_matches_{y}.csv: +{len(rows) - n0} matches",
-                  file=__import__("sys").stderr)
+                  file=sys.stderr)
+    if not rows and errors:
+        # Surface the REAL cause (SSL/proxy/404/requests-missing), not a guess.
+        print(f"[ratings_source] {prefix} fetch failed -> {'; '.join(errors)}", file=sys.stderr)
     rows.sort(key=lambda m: m["date"])     # chronological -> no look-ahead
     return rows
 
@@ -165,9 +189,10 @@ def auto_ratings(tour: str = "atp", years: list[int] | None = None,
     matches = fetch_sackmann_matches(tour, years, debug=debug)
     if not matches:
         import sys
-        print(f"[ratings_source] 0 matches for {tour} {years} — GitHub egress likely "
-              f"blocked; set TENNIS_DATA_DIR to a local Sackmann clone, or pass "
-              f"--ratings-csv. Falling back to market-implied (zero edge).", file=sys.stderr)
+        # fetch_sackmann_matches already printed the concrete cause (SSL/proxy/404/...).
+        print(f"[ratings_source] 0 matches for {tour} {years} -> market-implied (zero edge). "
+              f"Fix the cause above, or set TENNIS_DATA_DIR / pass --ratings-csv.",
+              file=sys.stderr)
         return {}
     ratings = build_elo_from_matches(matches)
     try:

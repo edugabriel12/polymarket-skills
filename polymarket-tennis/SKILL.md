@@ -50,12 +50,18 @@ python polymarket-tennis/scripts/test_pipeline.py
   **FiveThirtyEight dynamic K-factor** `K = 250/(n+5)^0.4`. See `references/deep-research.md`.
 - **Ratings (automatic, default):** with `--auto-ratings` (on by default) the surface Elo is computed
   from Jeff Sackmann's match history (`tennis_atp`/`tennis_wta`), walked forward with the 538
-  K-factor and cached for 24h. **Needs egress to `raw.githubusercontent.com`** — if the environment's
-  network policy blocks GitHub, clone the Sackmann repo(s) and set **`TENNIS_DATA_DIR`** to the folder
-  with `{atp,wta}_matches_<year>.csv` (read from disk first; both `master` and `main` branches are
-  tried on GitHub). A `0 matches` log means neither source was reachable → it falls back to
-  market-implied (zero edge). `--ratings-csv player,elo,hard,clay,grass` overrides everything.
-  Players resolve by full name, surname, `C. Surname`, or a truncated slug token (`altmaie`).
+  K-factor and cached for 24h. The CSVs are fetched from **multiple mirror hosts** —
+  `raw.githubusercontent.com`, then **`cdn.jsdelivr.net`**, then **`cdn.statically.io`** — so if a
+  network blocks GitHub's raw host (a synthetic 404), the CDNs still serve the same files (no setup).
+  Offline/all-blocked, it logs the concrete cause and falls back to market-implied (zero edge).
+  - **If even the CDNs are blocked:** clone via git (`github.com` usually works) and set
+    **`TENNIS_DATA_DIR`** to the parent of the clones — `git clone --depth 1
+    https://github.com/JeffSackmann/tennis_atp.git` (and `tennis_wta`); the loader reads
+    `{TENNIS_DATA_DIR}/tennis_atp|tennis_wta/{prefix}_matches_<year>.csv`.
+  - **Or supply ratings directly:** `--ratings-csv player,elo,hard,clay,grass` overrides everything.
+    Direct surface-Elo sources (no compute) include **wheeloratings.com** (CSV export) and **Ultimate
+    Tennis Statistics** (`/rankingsTable?rankType=HARD_ELO_RANK`); see `references/deep-research.md`.
+  - Players resolve by full name, surname, `C. Surname`, or a truncated slug token (`altmaie`).
 - **Anti-fabrication:** if a player has no rating, the model is **market-implied** (devigged price),
   so edge ≈ 0 and nothing is suggested. Real edge appears only when ratings move P(win) off the
   market. The research is unambiguous: tennis moneyline markets are **near-efficient** — the edge is
