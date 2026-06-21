@@ -48,10 +48,14 @@ python polymarket-tennis/scripts/test_pipeline.py
   effective Elo is a **50/50 blend** of overall and per-surface Elo (hard/clay/grass) — the single
   highest-value enhancement over plain Elo (Tennis Abstract). Ratings update with the
   **FiveThirtyEight dynamic K-factor** `K = 250/(n+5)^0.4`. See `references/deep-research.md`.
-- **Ratings (CSV-driven):** `--ratings-csv player,elo,hard,clay,grass`. Self-host surface Elo from
-  Ultimate Tennis Statistics' open engine (`mcekovic/tennis-crystal-ball`, Apache 2.0) or the Tennis
-  Abstract Elo reports, then export to this CSV. Players resolve by full name, surname, or
-  `C. Surname` form.
+- **Ratings (automatic, default):** with `--auto-ratings` (on by default) the surface Elo is computed
+  from Jeff Sackmann's match history (`tennis_atp`/`tennis_wta`), walked forward with the 538
+  K-factor and cached for 24h. **Needs egress to `raw.githubusercontent.com`** — if the environment's
+  network policy blocks GitHub, clone the Sackmann repo(s) and set **`TENNIS_DATA_DIR`** to the folder
+  with `{atp,wta}_matches_<year>.csv` (read from disk first; both `master` and `main` branches are
+  tried on GitHub). A `0 matches` log means neither source was reachable → it falls back to
+  market-implied (zero edge). `--ratings-csv player,elo,hard,clay,grass` overrides everything.
+  Players resolve by full name, surname, `C. Surname`, or a truncated slug token (`altmaie`).
 - **Anti-fabrication:** if a player has no rating, the model is **market-implied** (devigged price),
   so edge ≈ 0 and nothing is suggested. Real edge appears only when ratings move P(win) off the
   market. The research is unambiguous: tennis moneyline markets are **near-efficient** — the edge is

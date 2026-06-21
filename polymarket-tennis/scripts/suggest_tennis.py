@@ -31,7 +31,12 @@ from category_common import APIClient, discover_markets, game_date, log
 STRATEGY = "tennis-elo-moneyline"
 CAP_MODEL = 0.05            # per-trade cap (model edge)
 CAP_FIRST_TRADE = 0.01     # first trade with a new strategy
-PER_TAG_MAX = 400          # bound an unknown tag returning the global mix
+# Discovery: probe a page to classify a tag honored vs global-mix (Gamma ignores unknown
+# tag slugs and returns the global volume mix). Mirrors the soccer skill.
+PROBE_MAX = 100            # one page, to classify the tag
+PER_TAG_MAX = 600          # full pull for an honored tag
+DEEP_MAX = 2500            # fallback broad pass when no tag is honored
+HONORED_FRAC = 0.60        # >= this tennis fraction in the probe => honored tag
 
 
 def now_utc() -> datetime:
@@ -53,29 +58,63 @@ def group_by_match(markets: list[dict]) -> dict:
     return out
 
 
+def _is_tennis(m) -> bool:
+    return is_tennis_slug(m.get("event_slug") or m.get("slug") or "")
+
+
 def discover_tennis(api, vlog) -> list[dict]:
-    """Union live markets across each tennis tag (deduped, per-tag capped)."""
+    """Union the day's tennis markets across the tour tags (deduped, tennis-only).
+
+    Probe one page per tag; honored tags (~all tennis) are paginated in full; tags that
+    return the global mix are not deep-paginated. If Gamma honors no tag, fall back to one
+    DEEP broad pass so matches aren't lost behind a 1-page probe. (Same approach as the
+    soccer skill — Gamma ignores unknown tag slugs and returns the global volume mix.)
+    """
     markets, seen = [], set()
-    for tag in tm.TENNIS_TAGS:
-        try:
-            _t, ms = discover_markets(api, "tennis", [tag], min_volume=0.0,
-                                      max_markets=PER_TAG_MAX, include_closed=False)
-        except Exception as e:  # noqa: BLE001
-            vlog(f"  tag {tag!r} failed: {e}")
-            continue
-        added = tennis = 0
+    honored = []
+
+    def _add(ms) -> int:
+        n = 0
         for m in ms:
+            if not _is_tennis(m):
+                continue
             key = m.get("condition_id") or m.get("slug")
             if key and key in seen:
                 continue
             if key:
                 seen.add(key)
             markets.append(m)
-            added += 1
-            if is_tennis_slug(m.get("event_slug") or m.get("slug") or ""):
-                tennis += 1
-        if added:
-            vlog(f"  tag {tag!r}: +{added} markets ({tennis} tennis)")
+            n += 1
+        return n
+
+    for tag in tm.TENNIS_TAGS:
+        try:
+            _t, probe = discover_markets(api, "tennis", [tag], min_volume=0.0,
+                                         max_markets=PROBE_MAX, include_closed=False)
+        except Exception as e:  # noqa: BLE001
+            vlog(f"  tag {tag!r} failed: {e}")
+            continue
+        if not probe:
+            continue
+        frac = sum(1 for m in probe if _is_tennis(m)) / len(probe)
+        if frac >= HONORED_FRAC:
+            try:
+                _t, full = discover_markets(api, "tennis", [tag], min_volume=0.0,
+                                            max_markets=PER_TAG_MAX, include_closed=False)
+            except Exception:  # noqa: BLE001
+                full = probe
+            vlog(f"  tag {tag!r}: HONORED +{_add(full)} tennis (probe {frac:.0%})")
+            honored.append(tag)
+        else:
+            _add(probe)            # global mix: keep its tennis subset, don't paginate deeper
+    if not honored:
+        try:
+            _t, deep = discover_markets(api, "tennis", ["tennis"], min_volume=0.0,
+                                        max_markets=DEEP_MAX, include_closed=False)
+            vlog(f"  no honored tags -> deep broad pass: +{_add(deep)} tennis "
+                 f"(of {len(deep)} scanned)")
+        except Exception as e:  # noqa: BLE001
+            vlog(f"  deep broad pass failed: {e}")
     return markets
 
 
