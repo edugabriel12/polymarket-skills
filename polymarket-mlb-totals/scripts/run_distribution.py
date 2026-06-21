@@ -27,6 +27,13 @@ ODDS_MAX_DEFAULT = 3.00
 # disagreeing with superior market information, not a real opportunity -> reject.
 MAX_PLAUSIBLE_EDGE = 0.15
 
+# Market anchor: the external factors carry bias/noise (a backtest showed the model's
+# mu sitting ~0.66 runs UNDER the market on average, and losing). So shrink the model's
+# mu toward the efficient market-implied mu and hard-cap the deviation, rather than
+# letting the factors fade the market wholesale.
+MARKET_ANCHOR_WEIGHT = 0.6   # model's weight when blending toward market_mu (0=market, 1=model)
+MAX_MU_DEVIATION = 0.75      # hard cap on |mu - market_mu| in runs
+
 # Plausible clamps so a bad input can never blow up the mean.
 _FACTOR_LO, _FACTOR_HI = 0.70, 1.30
 _MU_LO, _MU_HI = 3.0, 18.0
@@ -215,6 +222,20 @@ def market_implied_mu(line: float, market_p_over: float,
         else:
             b = mid
     return (a + b) / 2.0
+
+
+def anchor_to_market(mu_model: float, market_mu: float,
+                     weight: float = MARKET_ANCHOR_WEIGHT,
+                     cap: float = MAX_MU_DEVIATION) -> float:
+    """Shrink the factor-based mu toward the market-implied mu, then cap the deviation.
+
+    blended = market_mu + weight*(mu_model - market_mu); the result is then clamped so
+    |result - market_mu| <= cap. Removes the systematic bias/noise the raw factors add
+    while still letting a strong, plausible signal nudge mu off the market.
+    """
+    blended = market_mu + weight * (mu_model - market_mu)
+    dev = max(-cap, min(cap, blended - market_mu))
+    return market_mu + dev
 
 
 # ---------------------------------------------------------------------------
