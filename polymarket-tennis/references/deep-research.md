@@ -175,5 +175,46 @@ of Tennis Prediction Models" (log-loss/Brier/calibration).
 
 ---
 
+---
+
+## 9. Data access when `raw.githubusercontent.com` is blocked
+
+A follow-up research pass (some networks return a synthetic 404 for
+`raw.githubusercontent.com` while `github.com` works). Options for the SAME Sackmann
+match CSVs, and for Elo directly:
+
+**Same files, different host (drop-in):**
+- **jsDelivr** — `https://cdn.jsdelivr.net/gh/JeffSackmann/tennis_atp@master/atp_matches_2025.csv`.
+  Independent multi-CDN (not a raw redirect). 20 MB/file cap — fine for the per-year match CSVs
+  (~1-3 MB). Pin `@<sha>` for reproducibility; `@master` caches ~7 days.
+- **statically.io** — `https://cdn.statically.io/gh/JeffSackmann/tennis_atp/master/atp_matches_2025.csv`
+  (~25 MB cap). **raw.githack.com** is another caching proxy.
+- **GitHub Contents API (raw media type)** — `api.github.com/repos/.../contents/<file>?ref=master`
+  with `Accept: application/vnd.github.raw` (≤100 MB; 60 req/hr unauthenticated). ⚠️ Do NOT follow the
+  JSON `download_url` field — it points back to the blocked `raw.githubusercontent.com`.
+- **git clone / codeload** — `git clone --depth 1 https://github.com/JeffSackmann/tennis_atp.git`
+  (and `tennis_wta`), or `codeload.github.com/.../tar.gz/refs/heads/master`. Host `github.com`/
+  `codeload.github.com`, no size caps — the most reliable bulk path.
+
+The skill tries raw → jsDelivr → statically automatically; `TENNIS_DATA_DIR` reads a local clone.
+
+**Elo directly (skip computing from matches):**
+- **wheeloratings.com** — `tennis_atp_ratings.html` / `tennis_wta_ratings.html`, overall + Hard/Clay/
+  Grass Elo, CSV export on the stats pages.
+- **Ultimate Tennis Statistics** — `ultimatetennisstatistics.com/rankingsTable?rankType=ELO_RANK`
+  (and `HARD_ELO_RANK`/`CLAY_ELO_RANK`/`GRASS_ELO_RANK`, `&date=DD-MM-YYYY`), JSON-backed Bootgrid.
+  Fully self-hostable via `mcekovic/tennis-crystal-ball` (Apache-2.0) + the `mcekovic/uts-database`
+  Postgres image — zero external calls.
+- **Tennis Abstract** — `tennisabstract.com/reports/atp_elo_ratings.html` (overall + blended
+  hElo/cElo/gElo); JS-rendered report.
+- **Mirrors of the match data:** Kaggle `guillemservera/tennis` (faithful Sackmann mirror, ATP+WTA,
+  CSV/Parquet/SQLite), `Tennismylife/TML-Database` (GitHub, ATP, daily). Commercial tennis APIs
+  (Sportradar/Goalserve/API-Tennis/SportDevs) expose rankings/results but **not Elo**.
+
+*Sources: jsDelivr/GitHub/Statically docs; tennisabstract.com; ultimatetennisstatistics.com;
+wheeloratings.com; kaggle.com; github.com/Tennismylife/TML-Database.*
+
+---
+
 *Research synthesis — not financial advice. Real trading involves risk of loss.*
 </content>

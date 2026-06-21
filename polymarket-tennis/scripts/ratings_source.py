@@ -22,8 +22,16 @@ import time
 import elo as _elo
 from ratings import normalize
 
-RAW_BASE = "https://raw.githubusercontent.com/JeffSackmann"
 GITHUB_BRANCHES = ("master", "main")     # tennis_atp uses master; try main as a fallback
+# Hosts that serve the SAME Sackmann CSVs. raw.githubusercontent.com is blocked on some
+# networks (returns a synthetic 404); cdn.jsdelivr.net and cdn.statically.io are independent
+# CDNs on different domains that mirror the repo. Our per-year match CSVs are small (~1-3 MB),
+# well under jsDelivr's 20 MB/file cap. See references/deep-research.md.
+_SACKMANN_HOSTS = (
+    "https://raw.githubusercontent.com/JeffSackmann/{repo}/{branch}/{file}",
+    "https://cdn.jsdelivr.net/gh/JeffSackmann/{repo}@{branch}/{file}",
+    "https://cdn.statically.io/gh/JeffSackmann/{repo}/{branch}/{file}",
+)
 _CACHE_DIR = os.path.expanduser("~/.polymarket-tennis")
 _SURFACE_MAP = {"hard": "hard", "clay": "clay", "grass": "grass", "carpet": "hard"}
 
@@ -107,15 +115,20 @@ def _read_year_csv(repo: str, prefix: str, year: int, data_dir: str | None,
     except Exception as e:  # noqa: BLE001
         return None, f"'requests' not importable: {e}"
     last = "no response"
+    fname = f"{prefix}_matches_{year}.csv"
+    # Try each branch across each mirror host; first 200 wins. raw is freshest when
+    # reachable, the CDNs are the fallback when raw.githubusercontent.com is blocked.
     for branch in GITHUB_BRANCHES:
-        url = f"{RAW_BASE}/{repo}/{branch}/{prefix}_matches_{year}.csv"
-        try:
-            resp = requests.get(url, timeout=timeout)
-            if resp.status_code == 200 and resp.text:
-                return resp.text, None
-            last = f"HTTP {resp.status_code} on {branch}"
-        except Exception as e:  # noqa: BLE001
-            last = f"{type(e).__name__}: {e}"
+        for tmpl in _SACKMANN_HOSTS:
+            url = tmpl.format(repo=repo, branch=branch, file=fname)
+            host = url.split("/")[2]
+            try:
+                resp = requests.get(url, timeout=timeout)
+                if resp.status_code == 200 and resp.text:
+                    return resp.text, None
+                last = f"HTTP {resp.status_code} @ {host}/{branch}"
+            except Exception as e:  # noqa: BLE001
+                last = f"{type(e).__name__} @ {host}"
     return None, last
 
 
