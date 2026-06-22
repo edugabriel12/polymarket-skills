@@ -132,28 +132,59 @@ def _norm_date(s: str) -> str:
 
 
 def load_games(csv_path: str) -> list[dict]:
-    """Load + normalize the games CSV, sorted chronologically."""
-    out = []
+    """Load + normalize the games CSV, sorted chronologically.
+
+    Auto-detects two layouts:
+      - NORMALIZED: date,away,home,away_score,home_score,total_line,over_odds,under_odds[,close_*]
+      - LONG (one row per team): date,team,opponent,runs,oppRuns,total,overOdds,underOdds
+        (e.g. the public oddsDataMLB export) — the mirror rows are deduped by keeping the
+        team<opponent orientation; home/away is arbitrary (irrelevant for a TOTAL).
+    """
     with open(csv_path, newline="", encoding="utf-8-sig") as fh:
-        for r in csv.DictReader(fh):
+        reader = csv.DictReader(fh)
+        cols = {(c or "").strip().lower() for c in (reader.fieldnames or [])}
+        long_fmt = {"opponent", "runs", "oppruns", "total"} <= cols
+        out = []
+        for r in reader:
             row = {(k or "").strip().lower(): (v or "").strip() for k, v in r.items()}
-            try:
-                g = {
-                    "date": _norm_date(row.get("date", "")),
-                    "away": row.get("away", "").lower(), "home": row.get("home", "").lower(),
-                    "away_score": float(row["away_score"]), "home_score": float(row["home_score"]),
-                    "line": float(row["total_line"]),
-                    "over_imp": to_implied_prob(row.get("over_odds") or row.get("over_price")),
-                    "under_imp": to_implied_prob(row.get("under_odds") or row.get("under_price")),
-                    "close_over_imp": to_implied_prob(row.get("close_over_odds") or row.get("close_over_price")),
-                    "close_under_imp": to_implied_prob(row.get("close_under_odds") or row.get("close_under_price")),
-                }
-            except (KeyError, ValueError):
-                continue
-            if g["date"] and g["away"] and g["home"]:
+            g = _parse_long(row) if long_fmt else _parse_normalized(row)
+            if g and g["date"] and g["away"] and g["home"]:
                 out.append(g)
     out.sort(key=lambda g: g["date"])
     return out
+
+
+def _parse_normalized(row: dict) -> dict | None:
+    try:
+        return {
+            "date": _norm_date(row.get("date", "")),
+            "away": row.get("away", "").lower(), "home": row.get("home", "").lower(),
+            "away_score": float(row["away_score"]), "home_score": float(row["home_score"]),
+            "line": float(row["total_line"]),
+            "over_imp": to_implied_prob(row.get("over_odds") or row.get("over_price")),
+            "under_imp": to_implied_prob(row.get("under_odds") or row.get("under_price")),
+            "close_over_imp": to_implied_prob(row.get("close_over_odds") or row.get("close_over_price")),
+            "close_under_imp": to_implied_prob(row.get("close_under_odds") or row.get("close_under_price")),
+        }
+    except (KeyError, ValueError):
+        return None
+
+
+def _parse_long(row: dict) -> dict | None:
+    team, opp = row.get("team", "").lower(), row.get("opponent", "").lower()
+    if not team or not opp or team >= opp:        # keep one orientation -> dedup the mirror row
+        return None
+    try:
+        return {
+            "date": _norm_date(row.get("date", "")), "away": team, "home": opp,
+            "away_score": float(row["runs"]), "home_score": float(row["oppruns"]),
+            "line": float(row["total"]),
+            "over_imp": to_implied_prob(row.get("overodds")),
+            "under_imp": to_implied_prob(row.get("underodds")),
+            "close_over_imp": None, "close_under_imp": None,
+        }
+    except (KeyError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
