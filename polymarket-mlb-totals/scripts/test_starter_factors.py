@@ -83,5 +83,25 @@ class TestEndToEnd(unittest.TestCase):
         self.assertIsNone(sf.starter_factor(_BoomAPI(), "chc", "2026-06-16", 2026))
 
 
+class TestRecenter(unittest.TestCase):
+    def test_recenter_to_mean_one(self):
+        # Raw FIP/4.20 would put all these starters < 1.0 (the UNDER bias). Re-centering
+        # against the slate mean makes the average starter exactly 1.0, keeping only the
+        # RELATIVE signal (who's better than today's field).
+        fips = {"a": 3.0, "b": 3.5, "c": 4.0, "d": 4.5, "e": 5.0}   # mean 4.0
+        rec = sf.recenter_factors(fips)
+        self.assertAlmostEqual(sum(rec.values()) / len(rec), 1.0, places=6)
+        self.assertLess(rec["a"], 1.0)        # ace below the field
+        self.assertGreater(rec["e"], 1.0)     # worst above the field
+
+    def test_small_slate_falls_back_to_constant(self):
+        # Too few starters to trust the slate mean -> use LEAGUE_FIP baseline.
+        rec = sf.recenter_factors({"a": 4.2}, min_n=4)
+        self.assertAlmostEqual(rec["a"], 1.0, places=6)   # 4.2 / 4.20
+
+    def test_drops_none_fips(self):
+        self.assertEqual(sf.recenter_factors({"a": None, "b": None}), {})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

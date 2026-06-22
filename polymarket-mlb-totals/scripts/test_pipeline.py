@@ -83,18 +83,28 @@ class TestRealInputsCreateEdge(unittest.TestCase):
         self.assertAlmostEqual(m["mu"], m["market_mu"], places=6)
         self.assertAlmostEqual(m["p_over"], over_price, delta=2e-3)  # ~zero edge
 
-    def test_implausible_edge_rejected(self):
-        # Extreme inputs -> a >15% edge -> flagged implausible and excluded.
+    def test_market_anchor_caps_mu_deviation(self):
+        # Extreme inputs no longer let mu fade the market wholesale: the anchor shrinks
+        # + caps the deviation (the -0.66-run backtest bias). |mu - market_mu| <= cap.
+        import run_distribution as rd
         line, over_price = 12.5, 0.385
         inputs = {"home_off": 0.7, "away_off": 0.7, "home_sp": 0.8, "away_sp": 0.8}
         m = st.model_probabilities(line, over_price, 97.0, inputs,
                                    league_baseline=8.5, dispersion=2.0)
-        mkt = totals_market(line, over_price, 1 - over_price)
-        chosen, notes = st.pick_side(line, ou_of(mkt), m["p_over"], m["p_under"],
-                                     0.0, 1.60, 3.00)
-        self.assertIsNone(chosen)                       # implausible edge -> no bet
-        under = next(n for n in notes if n["side"] == "UNDER")
-        self.assertTrue(under["implausible"])
+        self.assertLess(m["model_mu"], m["market_mu"])                 # raw factors go under
+        self.assertLessEqual(abs(m["mu"] - m["market_mu"]), rd.MAX_MU_DEVIATION + 1e-9)
+        self.assertLess(abs(m["mu"] - m["market_mu"]),
+                        abs(m["model_mu"] - m["market_mu"]))           # anchored toward market
+
+    def test_implausible_edge_guard(self):
+        # MAX_PLAUSIBLE_EDGE still rejects a side whose post-fee edge exceeds the cap
+        # (defense in depth; tested directly since the anchor rarely produces one).
+        line = 8.5
+        mkt = totals_market(line, over=0.40, under=0.60)
+        chosen, notes = st.pick_side(line, ou_of(mkt), 0.95, 0.05, 0.0, 1.60, 3.00)
+        over = next(n for n in notes if n["side"] == "OVER")
+        self.assertTrue(over["implausible"])            # 0.95 - 0.40 = 0.55 > 0.15
+        self.assertIsNone(chosen)
 
 
 class TestOddsFilter(unittest.TestCase):
@@ -288,7 +298,8 @@ class TestBestLineOneBetPerGame(unittest.TestCase):
             db = os.path.join(d, "p.db")
             csv = os.path.join(d, "proj.csv")
             with open(csv, "w", encoding="utf-8") as fh:
-                fh.write("team,off_factor,pitch_factor\nkc,1.10,1.06\nhou,1.10,1.06\n")
+                # Strong enough that the OVER edge survives the market anchor (cap 0.75).
+                fh.write("team,off_factor,pitch_factor\nkc,1.22,1.14\nhou,1.22,1.14\n")
             result = st.run(_Args(date="2026-06-14", projections_csv=csv, use_external=True,
                                   record=True, predictions_db=db, best_line_only=True))
             # Exactly one bet recorded for the matchup (the higher-edge 8.5 line).
@@ -356,8 +367,8 @@ class TestEndToEndRun(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             csv_path = os.path.join(d, "proj.csv")
             with open(csv_path, "w", encoding="utf-8") as fh:
-                # Moderate offenses/pitching -> mu modestly above 8.5 -> plausible Over edge.
-                fh.write("team,off_factor,pitch_factor\nkc,1.08,1.05\nhou,1.08,1.05\n")
+                # Strong offenses/pitching -> Over edge survives the market anchor (cap 0.75).
+                fh.write("team,off_factor,pitch_factor\nkc,1.22,1.14\nhou,1.22,1.14\n")
 
             preds_db = os.path.join(d, "preds.db")
             args = _Args(date="2026-06-14", projections_csv=csv_path,

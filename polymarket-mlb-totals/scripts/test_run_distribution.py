@@ -223,5 +223,21 @@ class TestTotalsMarket(unittest.TestCase):
         self.assertFalse(tm.is_totals_market(ml))
 
 
+class TestMarketAnchor(unittest.TestCase):
+    def test_shrinks_toward_market(self):
+        # weight<1 -> the anchored mu sits between model and market, closer to market.
+        a = rd.anchor_to_market(10.0, 9.0, weight=0.6, cap=10.0)
+        self.assertAlmostEqual(a, 9.0 + 0.6 * 1.0, places=9)   # 9.6
+        self.assertLess(abs(a - 9.0), abs(10.0 - 9.0))
+
+    def test_caps_deviation(self):
+        # A huge raw gap is hard-capped at +/- cap runs from the market.
+        self.assertAlmostEqual(rd.anchor_to_market(13.0, 9.0, weight=1.0, cap=0.75), 9.75)
+        self.assertAlmostEqual(rd.anchor_to_market(5.0, 9.0, weight=1.0, cap=0.75), 8.25)
+
+    def test_equal_is_noop(self):
+        self.assertAlmostEqual(rd.anchor_to_market(9.0, 9.0), 9.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

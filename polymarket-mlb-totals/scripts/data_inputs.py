@@ -208,9 +208,12 @@ def get_game_inputs(api, event_slug: str, target_date: str, *,
                 inputs.setdefault("home_field", HOME_FIELD_DELTA)
 
             # Starter-level refinement (#1 input): blend today's probable starter's
-            # FIP factor with the team's season pitching (bullpen) factor.
+            # FIP factor with the team's season pitching (bullpen) factor. Factors are
+            # re-centered across the day's slate (mean starter == 1.0) to remove the
+            # systematic UNDER bias from the raw FIP/LEAGUE_FIP baseline.
+            sf_table = starter_factors.starter_factors_for_date(api, target_date, int(season))
             for side, abbr in (("home", home), ("away", away)):
-                sf = starter_factors.starter_factor(api, _canon(abbr), target_date, int(season))
+                sf = sf_table.get(_canon(abbr))
                 if sf is not None:
                     team_sp = inputs.get(f"{side}_sp", 1.0)
                     inputs[f"{side}_sp"] = round(

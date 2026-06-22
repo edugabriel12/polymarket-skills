@@ -120,10 +120,41 @@ def _pitcher_fip(api, pid: int, season: int) -> float | None:
 
 
 def starter_factor(api, abbr: str | None, date: str, season: int) -> float | None:
-    """Run-prevention factor for a team's probable starter on a date, or None."""
+    """Run-prevention factor for a team's probable starter on a date, or None.
+
+    NOTE: this raw FIP/LEAGUE_FIP form is biased low (starters out-pitch the all-pitcher
+    LEAGUE_FIP), which systematically suppressed mu. Prefer `starter_factors_for_date`,
+    which re-centers against the slate so the average starter == 1.0.
+    """
     if not abbr or not date or not season:
         return None
     pid = _probables(api, date).get(abbr)
     if not pid:
         return None
     return pitcher_factor(_pitcher_fip(api, pid, season))
+
+
+MIN_STARTERS_TO_RECENTER = 4
+
+
+def recenter_factors(fips: dict, min_n: int = MIN_STARTERS_TO_RECENTER) -> dict:
+    """Pure: {abbr: FIP} -> {abbr: factor} re-centered so the mean starter == 1.0.
+
+    Uses the slate's own mean FIP as the baseline (the league-average STARTER FIP, which
+    is below the all-pitcher LEAGUE_FIP). Falls back to LEAGUE_FIP for tiny slates where
+    the mean is too noisy. Removes the systematic UNDER bias at the source.
+    """
+    valid = {a: f for a, f in (fips or {}).items() if f is not None}
+    if not valid:
+        return {}
+    baseline = (sum(valid.values()) / len(valid)) if len(valid) >= min_n else LEAGUE_FIP
+    return {a: pitcher_factor(f, baseline) for a, f in valid.items()}
+
+
+def starter_factors_for_date(api, date: str, season: int) -> dict:
+    """Re-centered probable-starter factors for every team on a date ({abbr: factor})."""
+    if not date or not season:
+        return {}
+    probs = _probables(api, date)
+    fips = {abbr: _pitcher_fip(api, pid, season) for abbr, pid in probs.items()}
+    return recenter_factors(fips)

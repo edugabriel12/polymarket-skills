@@ -95,9 +95,13 @@ def model_probabilities(line, over_price, park_factor, inputs, *,
     """
     market_mu = rd.market_implied_mu(line, over_price, dispersion)
     used_external = any(k in inputs for k in STRONG_INPUT_KEYS)
+    model_mu = None
     if used_external:
         base = rd.baseline_mu(park_factor, league_baseline)
-        mu = rd.adjust_mu(base, **inputs)
+        model_mu = rd.adjust_mu(base, **inputs)
+        # Anchor the factor-based mu to the efficient market (shrink + cap the deviation):
+        # the raw factors backtested ~0.66 runs UNDER the market and lost.
+        mu = rd.anchor_to_market(model_mu, market_mu)
     else:
         mu = market_mu
     var = rd.variance_from_mu(mu, dispersion)
@@ -106,7 +110,8 @@ def model_probabilities(line, over_price, park_factor, inputs, *,
     r, p = rd.negbin_params_from_moments(mu, var)
     return {
         "p_over": probs["p_over_eff"], "p_under": probs["p_under_eff"],
-        "mu": mu, "market_mu": market_mu, "var": var, "used_external": used_external,
+        "mu": mu, "market_mu": market_mu, "model_mu": model_mu, "var": var,
+        "used_external": used_external,
         "p_push": probs["p_push"], "need": probs["need"],
         "negbin_r": r, "negbin_p": p,
     }
@@ -248,6 +253,7 @@ def record_prediction_row(db_path, game_slug, game_date, totals, line, chosen, m
     stats = {
         "model": "negative_binomial",
         "mu": round(m["mu"], 4), "market_mu": round(m["market_mu"], 4),
+        "model_mu": round(m["model_mu"], 4) if m.get("model_mu") is not None else None,
         "variance": round(m["var"], 4),
         "dispersion": args.dispersion,
         "negbin_r": round(m["negbin_r"], 4), "negbin_p": round(m["negbin_p"], 4),
@@ -308,6 +314,7 @@ def _shadow_log_mlb(args, target, slug, line, side_notes, chosen, m, bet, skip_r
             "pick_edge": round(chosen["edge"], 4) if chosen else None,
             "used_external": m["used_external"],
             "model_params": {"mu": round(m["mu"], 4), "market_mu": round(m["market_mu"], 4),
+                             "model_mu": round(m["model_mu"], 4) if m.get("model_mu") is not None else None,
                              "variance": round(m["var"], 4)},
             "bet": bet, "skip_reason": skip_reason, "market_url": url,
         }, args.predictions_db)
