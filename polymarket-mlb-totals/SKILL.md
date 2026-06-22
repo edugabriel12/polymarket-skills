@@ -196,6 +196,31 @@ ROI/CLV vs the devigged **closing** line are the real validation; `mean(μ − m
 Over/Under bias. Team factors are point-in-time from the results; per-start starter FIP is a documented
 extension (needs a probables history).
 
+### Sharp anchor — the divergence detector (`sharp_odds.py`)
+The deep research (`references/edge-pathways-deep-research.md`) is blunt: a predictive run-total model
+does **not** beat the MLB closing line — the **sharp close (Pinnacle, devigged) IS the efficient
+probability**. So with a sharp reference the model stops trying to out-predict and instead acts on
+**divergence**: `model_probabilities(..., sharp_over_price=...)` anchors fair value to the sharp price,
+so the edge (`p_model − Polymarket price`) measures how far Polymarket strays from the sharp line —
+bet a side only when Polymarket prices it cheaper than the sharp fair value. Without a sharp ref the
+model stays Polymarket-anchored (zero edge — anti-fabrication).
+```bash
+# Live: The Odds API (includes Pinnacle).            Backtest/offline: a CSV.
+python polymarket-mlb-totals/scripts/suggest_totals.py --odds-api-key $ODDS_API_KEY
+python polymarket-mlb-totals/scripts/suggest_totals.py --sharp-odds-csv sharp.csv
+```
+
+### CLV vs the sharp close (`clv_vs_sharp.py`) — the validated edge metric
+`CLV(side) = sharp_close_fair_prob(side) − entry_price`. Beating the sharp close is the only proxy that
+confirms a real edge (in ~50 bets, vs thousands for raw P&L). Scores recorded entries against a sharp
+closing source (CSV `close_over_odds`/`close_under_odds`, or The Odds API near game time):
+```bash
+python polymarket-mlb-totals/scripts/clv_vs_sharp.py --sharp-odds-csv sharp_close.csv
+```
+`avg_CLV > 0` and `beat_close > 50%` = real edge. Backtest validation on 10 real seasons showed the
+*predictive* model has no edge (ROI ~0, Brier ≈ coin-flip); the sharp anchor + CLV is how you find and
+prove the only durable edge — Polymarket diverging from the sharp consensus.
+
 ## Web dashboard (`webapp/`)
 
 A modern React + FastAPI dashboard to interact with the model visually — two tabs:

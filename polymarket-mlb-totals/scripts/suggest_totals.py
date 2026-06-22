@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -27,6 +28,7 @@ import park_factors as pf
 import totals_market as tm
 import data_inputs
 import predictions_db
+import sharp_odds
 
 from category_common import (
     APIClient,
@@ -84,33 +86,38 @@ STRONG_INPUT_KEYS = ("home_off", "away_off", "home_sp", "away_sp")
 
 
 def model_probabilities(line, over_price, park_factor, inputs, *,
-                        league_baseline, dispersion):
+                        league_baseline, dispersion, sharp_over_price=None):
     """Model the total-runs distribution and return the full math as a dict.
 
-    mu is anchored to the **market-implied total** unless we have a STRONG input
-    (team offense / pitching factors); weather/park alone keep mu at the market
-    (edge ~ 0 — never fabricated). The market-implied mu is always reported for
-    transparency. Returns p_over/p_under (effective), mu, market_mu, var,
-    used_external, p_push, need, and the NegBin params (r, p).
+    The FAIR-VALUE anchor is the SHARP reference price when one is supplied
+    (`sharp_over_price`, the devigged Pinnacle/consensus P(Over)) — because the deep
+    research shows the sharp close, not our model, is the efficient probability. The
+    edge (computed later in pick_side as p_model − over_price) then measures how far the
+    POLYMARKET price diverges from the sharp fair value: a true mispricing detector.
+
+    Without a sharp price, the anchor falls back to the Polymarket price itself, so the
+    model stays market-implied (edge ≈ 0 — anti-fabrication). `over_price` is always the
+    Polymarket price we trade against; both the sharp and Polymarket mu are reported.
     """
-    market_mu = rd.market_implied_mu(line, over_price, dispersion)
+    poly_mu = rd.market_implied_mu(line, over_price, dispersion)
+    anchor_price = sharp_over_price if sharp_over_price is not None else over_price
+    anchor_mu = rd.market_implied_mu(line, anchor_price, dispersion)
     used_external = any(k in inputs for k in STRONG_INPUT_KEYS)
     model_mu = None
     if used_external:
         base = rd.baseline_mu(park_factor, league_baseline)
         model_mu = rd.adjust_mu(base, **inputs)
-        # Anchor the factor-based mu to the efficient market (shrink + cap the deviation):
-        # the raw factors backtested ~0.66 runs UNDER the market and lost.
-        mu = rd.anchor_to_market(model_mu, market_mu)
+        mu = rd.anchor_to_market(model_mu, anchor_mu)   # factors nudge off the fair anchor
     else:
-        mu = market_mu
+        mu = anchor_mu
     var = rd.variance_from_mu(mu, dispersion)
     pmf = rd.negbin_total_runs_pmf(mu, var)
     probs = rd.prob_over(line, pmf)
     r, p = rd.negbin_params_from_moments(mu, var)
     return {
         "p_over": probs["p_over_eff"], "p_under": probs["p_under_eff"],
-        "mu": mu, "market_mu": market_mu, "model_mu": model_mu, "var": var,
+        "mu": mu, "market_mu": anchor_mu, "model_mu": model_mu, "poly_mu": poly_mu,
+        "sharp_anchored": sharp_over_price is not None, "var": var,
         "used_external": used_external,
         "p_push": probs["p_push"], "need": probs["need"],
         "negbin_r": r, "negbin_p": p,
@@ -254,6 +261,8 @@ def record_prediction_row(db_path, game_slug, game_date, totals, line, chosen, m
         "model": "negative_binomial",
         "mu": round(m["mu"], 4), "market_mu": round(m["market_mu"], 4),
         "model_mu": round(m["model_mu"], 4) if m.get("model_mu") is not None else None,
+        "poly_mu": round(m["poly_mu"], 4) if m.get("poly_mu") is not None else None,
+        "sharp_anchored": m.get("sharp_anchored", False),
         "variance": round(m["var"], 4),
         "dispersion": args.dispersion,
         "negbin_r": round(m["negbin_r"], 4), "negbin_p": round(m["negbin_p"], 4),
@@ -367,6 +376,20 @@ def run(args) -> dict:
     if games:
         vlog("  run-total markets: " + ", ".join(sorted(games)))
 
+    # Sharp reference (Pinnacle/consensus, devigged) -> the fair-value anchor. With it the
+    # model becomes a divergence detector (edge = Polymarket price vs sharp fair); without
+    # it the model stays Polymarket-anchored (zero edge). CSV first, then The Odds API.
+    sharp_lookup = {}
+    if getattr(args, "sharp_odds_csv", None):
+        try:
+            sharp_lookup = sharp_odds.load_sharp_csv(args.sharp_odds_csv)
+        except OSError as e:
+            vlog(f"  sharp CSV load failed: {e}")
+    elif getattr(args, "odds_api_key", None) or os.environ.get("ODDS_API_KEY"):
+        sharp_lookup = sharp_odds.fetch_sharp(getattr(args, "odds_api_key", None), target)
+    if sharp_lookup:
+        vlog(f"  sharp reference loaded: {len(sharp_lookup)} game(s) (divergence-detector mode)")
+
     portfolio_value = float(args.portfolio_value)
     first_trade = data_inputs.is_first_trade(STRATEGY, args.portfolio_db)
 
@@ -414,12 +437,17 @@ def run(args) -> dict:
                 api, event_slug, target, projections_csv=args.projections_csv,
                 debug=args.debug) or {}
 
+        away, home = pf.parse_slug_teams(event_slug)
+        sharp_over = sharp_odds.sharp_over_prob(sharp_lookup, target, away, home, line) \
+            if sharp_lookup else None
         m = model_probabilities(
             line, ou["over_price"], park_factor, inputs,
-            league_baseline=args.league_baseline, dispersion=args.dispersion)
+            league_baseline=args.league_baseline, dispersion=args.dispersion,
+            sharp_over_price=sharp_over)
         vlog(f"  [{event_slug}] model: park={park_factor} mu={m['mu']:.2f} "
              f"P(over)={m['p_over']:.3f} P(under)={m['p_under']:.3f} "
              f"external_inputs={m['used_external']}"
+             + (f" sharp_over={sharp_over:.3f}" if sharp_over is not None else " (no sharp ref)")
              + (f" inputs={inputs}" if inputs else ""))
 
         chosen, side_notes = pick_side(line, ou, m["p_over"], m["p_under"],
@@ -606,6 +634,11 @@ def main() -> None:
     p.add_argument("--no-external", dest="use_external", action="store_false",
                    help="Disable external inputs -> market-implied (zero-edge) model")
     p.add_argument("--projections-csv", default=None, help="Path to a projections CSV (ToS-clean run-rate source)")
+    p.add_argument("--sharp-odds-csv", default=None,
+                   help="Sharp reference odds CSV (date,away,home,total_line,over_odds,under_odds) "
+                        "-> fair-value anchor; turns the model into a divergence detector")
+    p.add_argument("--odds-api-key", default=None,
+                   help="The Odds API key (or $ODDS_API_KEY) for live Pinnacle/consensus totals")
     p.add_argument("--refresh-prices", action="store_true", help="Refresh prices via CLOB midpoint")
     p.add_argument("--portfolio-value", type=float, default=10000.0, help="Portfolio USD for sizing")
     p.add_argument("--portfolio-db", default=None, help="Paper portfolio DB (to detect first trade)")
