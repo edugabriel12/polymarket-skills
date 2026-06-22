@@ -177,6 +177,25 @@ Reports Brier, log-loss, and a reliability table (predicted vs empirical) for al
 for bet-only. **CLV** (needs a closing-price snapshot) and settling games with no bet line (needs the
 results feed) are the documented follow-ups.
 
+### Historical backtest (`backtest.py`)
+Walk-forward validation over past seasons — the way the model trades. For each game it builds
+**point-in-time** team run factors from only the games already played (no look-ahead), runs the same
+`model_probabilities` + `pick_side` as the live skill, settles against the final score, and aggregates
+**ROI / win rate / Brier / log-loss / calibration / CLV / μ-vs-market bias** by season.
+
+Needs a normalized games+odds CSV (one row/game):
+`date,away,home,away_score,home_score,total_line,over_odds,under_odds[,close_over_odds,close_under_odds]`
+— odds may be American (`-110`), decimal (`1.91`), or implied prob (`0.524`); sportsbook vig is
+devigged to a Polymarket-equivalent fair price. Free source: **sportsbookreviewsonline.com** MLB odds
+(one workbook/year → export to this CSV) or a Kaggle MLB odds dataset.
+```bash
+python polymarket-mlb-totals/scripts/backtest.py --games-csv mlb_odds.csv --seasons 2021-2025
+python polymarket-mlb-totals/scripts/backtest.py --games-csv mlb_odds.csv --json --out bt.json
+```
+ROI/CLV vs the devigged **closing** line are the real validation; `mean(μ − market_μ)` flags residual
+Over/Under bias. Team factors are point-in-time from the results; per-start starter FIP is a documented
+extension (needs a probables history).
+
 ## Web dashboard (`webapp/`)
 
 A modern React + FastAPI dashboard to interact with the model visually — two tabs:
