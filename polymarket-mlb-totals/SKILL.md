@@ -221,6 +221,20 @@ python polymarket-mlb-totals/scripts/clv_vs_sharp.py --sharp-odds-csv sharp_clos
 *predictive* model has no edge (ROI ~0, Brier ≈ coin-flip); the sharp anchor + CLV is how you find and
 prove the only durable edge — Polymarket diverging from the sharp consensus.
 
+### Player-prop feasibility scan (`props_scan.py`)
+The research's one "superior prediction" path is **player props** (strikeouts/HR/hits), and Polymarket
+added MLB props in 2026 — but their liquidity is thinner than game lines. Before building a prop model,
+this verifies the premise: discovers the day's MLB markets, classifies them (moneyline / game total /
+**player prop** / team prop) and measures liquidity (24h volume, on-book liquidity, spread, and CLOB
+order-book **depth** within 5¢ for the top props), then prints a VIABLE / THIN / NONE verdict.
+```bash
+python polymarket-mlb-totals/scripts/props_scan.py --date 2026-06-21
+python polymarket-mlb-totals/scripts/props_scan.py --json --top 20
+```
+Run on a networked machine (sandbox blocks Polymarket). It also dumps sample slugs per class so the
+classifier can be confirmed against the real market format. Decision gate: only build a strikeout/HR
+prop model if the scan shows enough props with real book depth (else the edge is liquidity-capped).
+
 ## Web dashboard (`webapp/`)
 
 A modern React + FastAPI dashboard to interact with the model visually — two tabs:
