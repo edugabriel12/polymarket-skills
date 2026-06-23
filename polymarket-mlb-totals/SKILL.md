@@ -192,8 +192,13 @@ python polymarket-mlb-totals/scripts/calibration.py --sport soccer --settle --js
 Reports Brier, log-loss, **ECE/MCE**, the **Murphy Brier decomposition** (reliability − resolution +
 uncertainty), and a reliability table (predicted vs empirical) for all modeled markets and for
 bet-only. `--fit-calibrator` fits a post-hoc calibrator and reports the before/after ECE
-(**suggestion-only** — it never rewrites the live model). **CLV** (needs a closing-price snapshot)
-and settling games with no bet line (needs the results feed) are the documented follow-ups.
+(**suggestion-only** — it never rewrites the live model). It also reports **empirical interval
+coverage** over settled games — reconstructs each game's pmf from its logged (mu, variance), takes
+the 50%/80% prediction interval, and checks whether the actual total landed inside (target 50%/80%)
+plus mean CRPS. This is the thermometer for whether the NegBin intervals are honest on REAL data (and
+thus whether distribution-free conformal intervals would add anything — if coverage already ≈ nominal,
+they wouldn't). **CLV** (needs a closing-price snapshot) and settling games with no bet line (needs
+the results feed) are the documented follow-ups.
 
 ### Historical backtest (`backtest.py`)
 Walk-forward validation over past seasons — the way the model trades. For each game it builds

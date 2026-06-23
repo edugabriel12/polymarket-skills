@@ -167,6 +167,74 @@ def clv_stats(db_path: str) -> dict:
             "beat_close_pct": sum(1 for c in clvs if c > 0) / len(clvs)}
 
 
+def interval_coverage(db_path: str) -> dict:
+    """Empirical coverage of the 50%/80% prediction intervals over SETTLED totals games.
+
+    The thermometer for whether the Negative-Binomial distribution is well calibrated on
+    REAL outcomes (and thus whether distribution-free conformal intervals would add
+    anything). For each settled game it reconstructs the pmf from the logged (mu,
+    variance), takes the central 50%/80% interval, and checks whether the actual total
+    landed inside. Deduped to one forecast per GAME (the interval is a per-game property,
+    not per-line). Also reports mean CRPS (run units) and the mean 80% interval width.
+
+    Reads the unbiased `model_log` (every modeled game, bet or not). Best-effort: rows
+    whose model_params lack mu/variance (e.g. soccer Dixon-Coles, BTTS) are skipped, so
+    this is a no-op (n=0) where it does not apply.
+    """
+    import json as _json
+    import run_distribution as rd
+    import forecast as fc
+    import scoring
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = [dict(r) for r in con.execute(
+            "SELECT game_slug, market, model_params, actual_total FROM model_log "
+            "WHERE actual_total IS NOT NULL AND model_params IS NOT NULL")]
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        con.close()
+
+    seen: set[str] = set()
+    recs = []
+    for r in rows:
+        if (r.get("market") or "TOTAL").upper() != "TOTAL":
+            continue
+        key = base_slug(r.get("game_slug", ""))
+        if key in seen:
+            continue
+        mp = r.get("model_params")
+        try:
+            mp = _json.loads(mp) if isinstance(mp, str) else (mp or {})
+            mu = float(mp["mu"])
+            var = float(mp["variance"])
+            actual = float(r["actual_total"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if var <= mu:               # NegBin needs overdispersion; skip degenerate rows
+            continue
+        seen.add(key)
+        pmf = rd.negbin_total_runs_pmf(mu, var)
+        lo50, hi50 = fc.prediction_interval(pmf, 0.50)
+        lo80, hi80 = fc.prediction_interval(pmf, 0.80)
+        recs.append({"in50": 1 if lo50 <= actual <= hi50 else 0,
+                     "in80": 1 if lo80 <= actual <= hi80 else 0,
+                     "crps": scoring.crps_pmf(pmf, actual),
+                     "width80": hi80 - lo80})
+    n = len(recs)
+    if not n:
+        return {"n": 0}
+    return {
+        "n": n,
+        "coverage50": sum(x["in50"] for x in recs) / n,   # target 0.50
+        "coverage80": sum(x["in80"] for x in recs) / n,   # target 0.80
+        "mean_crps": sum(x["crps"] for x in recs) / n,
+        "mean_width80": sum(x["width80"] for x in recs) / n,
+    }
+
+
 def report(db_path: str, fit_method: str | None = None) -> dict:
     """Calibration metrics over the settled shadow log (all games + bet-only).
 
@@ -192,6 +260,7 @@ def report(db_path: str, fit_method: str | None = None) -> dict:
                 "brier_decomposition": cc.brier_decomposition(pairs)},
         "bet": {"n": len(betr), "brier": brier(betr), "log_loss": log_loss(betr)},
         "clv": clv_stats(db_path),
+        "interval_coverage": interval_coverage(db_path),
         "note": "CLV uses captured closing prices (run --capture-close near game time). "
                 "Reference side = OVER (totals) / YES (BTTS).",
     }
@@ -243,6 +312,19 @@ def format_report(rep: dict) -> str:
     for b in a["reliability"]:
         lines.append(f"  {b['bucket']:<10} {b['n']:>5} {b['avg_pred']:>9.3f} "
                      f"{b['empirical']:>10.3f}")
+    ic = rep.get("interval_coverage", {})
+    if ic.get("n", 0) > 0:
+        lines += [
+            "", f"Interval coverage (n={ic['n']} settled games) — should track nominal:",
+            f"  50% interval -> {ic['coverage50']:.1%} (target 50%)   "
+            f"80% interval -> {ic['coverage80']:.1%} (target 80%)",
+            f"  mean CRPS {ic['mean_crps']:.3f} runs   mean 80% width "
+            f"{ic['mean_width80']:.1f} runs",
+            "  (coverage ≈ nominal => the NegBin intervals are honest; conformal would add "
+            "little)",
+        ]
+    elif rep.get("settled", 0) > 0:
+        lines += ["", "Interval coverage: no settled totals with a logged (mu,var) yet."]
     clv = rep.get("clv", {})
     if clv.get("n", 0) > 0:
         lines += [
