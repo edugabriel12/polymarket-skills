@@ -112,6 +112,23 @@ class TestMarketParsing(unittest.TestCase):
         self.assertEqual((t["yes_token"], t["no_token"]), ("y", "n"))
 
 
+class TestImplausibleEdgeCap(unittest.TestCase):
+    def test_large_edge_is_capped(self):
+        # The eng-gha BTTS case from the live log: model 0.578 vs price 0.385 -> +19.3%
+        # edge, above the 15% cap -> flagged implausible and excluded (no bet).
+        sides = [("YES", "y", 0.385, 0.578), ("NO", "n", 0.615, 0.422)]
+        chosen, notes = ss.pick_side(sides, 0.0, 1.50, 3.00)
+        self.assertIsNone(chosen)
+        yes = next(n for n in notes if n["side"] == "YES")
+        self.assertTrue(yes["implausible"])
+
+    def test_plausible_edge_passes(self):
+        sides = [("OVER", "o", 0.50, 0.58), ("UNDER", "u", 0.50, 0.42)]  # +8% edge, within cap
+        chosen, _ = ss.pick_side(sides, 0.0, 1.50, 3.00)
+        self.assertIsNotNone(chosen)
+        self.assertEqual(chosen["side"], "OVER")
+
+
 class TestPredictions(unittest.TestCase):
     def _row(self, market, side, line=2.5, **kw):
         base = dict(game_slug="epl-ars-che-2026-06-14", game_date="2026-06-14", league="epl",
@@ -239,7 +256,7 @@ class _NoNetAPI:
 
 class _Args:
     def __init__(self, **kw):
-        d = dict(date="2026-06-14", min_volume=1000.0, min_edge=0.05, min_hours=0.0,
+        d = dict(date="2026-06-14", min_volume=1000.0, min_edge=0.05, max_edge=1.0, min_hours=0.0,
                  odds_min=1.60, odds_max=3.00, rho=dc.DEFAULT_RHO, ratings_csv=None,
                  auto_ratings=False, home_first=True, best_line_only=True, fee_rate=0.0,
                  portfolio_value=10000.0, portfolio_db=None, record=False,
