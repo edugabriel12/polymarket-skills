@@ -32,7 +32,7 @@ SURFACE_BLEND = 0.5
 
 # Decimal-payout band for moneyline entries. Wider than the soccer goals band because
 # match-winner favorites trade at short prices; tune per appetite.
-ODDS_MIN_DEFAULT = 1.10       # price <= 0.909 (allows odds-on favorites)
+ODDS_MIN_DEFAULT = 1.40       # price <= 0.714 (skip short odds-on favorites below 1.40x payout)
 ODDS_MAX_DEFAULT = 5.00       # price >= 0.20  (caps how big an underdog we back)
 
 
