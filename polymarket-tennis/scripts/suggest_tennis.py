@@ -50,6 +50,30 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def pregame_status(market: dict, min_hours: float = 0.0,
+                   now: datetime | None = None) -> tuple[bool, str | None]:
+    """(ok, reason): only model a match that is PRE-LIVE — not closed and not yet started.
+
+    A match is rejected if it isn't accepting orders (closed/live) or its `game_start_time`
+    is less than `min_hours` in the future (default 0 → already started = live). A missing
+    start time can't be judged, so it falls through to the accepting-orders check.
+    """
+    now = now or now_utc()
+    if market.get("accepting_orders") is False:
+        return False, "not accepting orders (closed/live)"
+    start = market.get("game_start_time") or ""
+    if start:
+        try:
+            dt = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+            hours = (dt - now).total_seconds() / 3600.0
+            if hours < min_hours:
+                return (False, f"match already started ({-hours:.1f}h ago) — live, not pre-game"
+                        if hours < 0 else f"match starts in {hours:.1f}h < {min_hours:.0f}h lead")
+        except ValueError:
+            pass
+    return True, None
+
+
 def is_tennis_slug(slug: str) -> bool:
     """A match slug is tennis if its tag prefix is a known tour/tournament tag."""
     s = (slug or "").lower()
@@ -242,6 +266,9 @@ def run(args) -> dict:
         ms = tm.match_sides(m)
         if not ms or any(s["price"] is None for s in ms["sides"]):
             _skip(slug, "could not map moneyline tokens/prices"); continue
+        live_ok, live_why = pregame_status(m, getattr(args, "min_hours", 0.0))
+        if not live_ok:
+            _skip(slug, live_why); continue
         surface = args.surface or tm.surface_for(slug)
         pa_slug, pb_slug = tm.parse_players(slug)
         # Prefer the market's own outcome labels for rating resolution; fall back to slug.
@@ -405,6 +432,9 @@ def _match_url(slug: str) -> str:
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Suggest tennis match-winner entries on Polymarket.")
     p.add_argument("--date", default=None, help="Target day YYYY-MM-DD (UTC)")
+    p.add_argument("--min-hours", type=float, default=0.0,
+                   help="Min hours until match start (default 0 = pre-live only; a started match "
+                        "is skipped as live)")
     p.add_argument("--no-congruence", action="store_true",
                    help="Disable model↔sharp congruence sizing (default on: shrink size/confidence "
                         "when the Elo disagrees with the sharp; skip when the gap exceeds the cap)")

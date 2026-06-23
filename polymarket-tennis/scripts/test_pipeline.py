@@ -19,12 +19,14 @@ import tennis_predictions as tdb  # noqa: E402
 import suggest_tennis as st  # noqa: E402
 
 
-def _mk(slug, outcomes, prices, tokens, event_slug=None, vol=40000):
+def _mk(slug, outcomes, prices, tokens, event_slug=None, vol=40000, start="2099-01-01T00:00:00Z"):
+    # start defaults to the far future so the pre-game filter (skip live/started matches) is a
+    # no-op in logic tests; TestPregame exercises the filter directly with an explicit `now`.
     return {"event_slug": event_slug if event_slug is not None else slug, "slug": slug,
             "question": " vs ".join(outcomes), "outcomes": outcomes,
             "outcome_prices": prices, "token_ids": tokens, "volume_24h": vol,
             "end_date": "2027-01-01T00:00:00Z", "accepting_orders": True,
-            "game_start_time": "2026-06-20T14:00:00Z", "condition_id": "0x" + slug}
+            "game_start_time": start, "condition_id": "0x" + slug}
 
 
 class TestMarket(unittest.TestCase):
@@ -152,6 +154,40 @@ class _Args:
                  portfolio_value=10000.0, predictions_db=None, record=False,
                  output="json", verbose=False, debug=False, rate_limit=0)
         d.update(kw); self.__dict__.update(d)
+
+
+class TestPregame(unittest.TestCase):
+    """Only pre-live matches are modeled — a started match is skipped as live."""
+
+    def setUp(self):
+        from datetime import datetime, timezone
+        self.now = datetime(2026, 6, 20, 15, 0, tzinfo=timezone.utc)
+
+    def test_started_match_is_live(self):
+        m = _mk("atp-a-b-2026-06-20", ["A", "B"], [0.5, 0.5], ["a", "b"],
+                start="2026-06-20T14:00:00Z")          # started 1h ago
+        ok, why = st.pregame_status(m, now=self.now)
+        self.assertFalse(ok)
+        self.assertIn("live", why)
+
+    def test_future_match_is_pregame(self):
+        m = _mk("atp-a-b-2026-06-20", ["A", "B"], [0.5, 0.5], ["a", "b"],
+                start="2026-06-20T18:00:00Z")          # starts in 3h
+        ok, why = st.pregame_status(m, now=self.now)
+        self.assertTrue(ok)
+        self.assertIsNone(why)
+
+    def test_not_accepting_orders_is_rejected(self):
+        m = _mk("atp-a-b-2026-06-20", ["A", "B"], [0.5, 0.5], ["a", "b"],
+                start="2026-06-20T18:00:00Z")
+        m["accepting_orders"] = False
+        ok, why = st.pregame_status(m, now=self.now)
+        self.assertFalse(ok)
+        self.assertIn("not accepting orders", why)
+
+    def test_missing_start_falls_through_to_accepting(self):
+        m = _mk("atp-a-b-2026-06-20", ["A", "B"], [0.5, 0.5], ["a", "b"], start="")
+        self.assertTrue(st.pregame_status(m, now=self.now)[0])     # can't judge -> allow
 
 
 class TestEndToEnd(unittest.TestCase):
