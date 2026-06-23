@@ -109,7 +109,7 @@ export function AnalysesTab({ sport }: { sport: Sport }) {
             )}
             <span
               className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 font-semibold"
-              title="O modelo recalcula automaticamente ~10 min antes de cada jogo"
+              title="O modelo recalcula automaticamente ~1 hora antes de cada jogo"
             >
               <Clock className="h-3 w-3" />
               {nextWave ? `próximo recálculo · ${hhmm(nextWave)}` : "sem mais recálculos hoje"}
