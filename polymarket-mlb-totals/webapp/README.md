@@ -18,18 +18,19 @@ API endpoints take `?sport=mlb|soccer`.
 
 ### Auto-recalc + sharp-close capture (MLB) — built-in per-game scheduler
 
-A game can only be predicted while it's **pregame** (in-progress games are filtered) and its Polymarket
-volume builds toward first pitch — so the model is recomputed **~1 hour before each game starts**, not
-on a fixed clock. With `ODDS_API_KEY` set, the backend schedules a recompute per game; near-simultaneous
-starts are grouped into one **wave** = one Odds-API fetch covering the whole slate (so a block of games
-costs a single call, staying well within the free quota). Each wave also snapshots the sharp line into a
-season-long CSV that `GET /api/clv` scores recorded entries against. **No manual "Recalcular" button** —
-the Análises tab just serves the auto-updated day cache (it shows the last `auto · HH:MM` time).
+By default the Análises tab serves a once-per-day cache and is recomputed **on demand** via the
+**Recalcular** button (a `force` recompute that overwrites the day cache), exactly like soccer/tennis.
+
+Optionally, an automatic per-game recompute loop can be enabled with `AUTO_RECALC=1` (off by default):
+a game can only be predicted while it's **pregame**, so with the loop on the model is recomputed
+**~1 hour before each game starts**; near-simultaneous starts are grouped into one **wave** = one
+Odds-API fetch covering the whole slate (a block of games costs a single call), and each wave also
+snapshots the sharp line into a season-long CSV that `GET /api/clv` scores recorded entries against.
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `ODDS_API_KEY` | — | The Odds API key. **Required** to enable auto-recalc + the live sharp anchor. |
-| `AUTO_RECALC` | `1` | Set `0` to disable the per-game recompute loop. |
+| `ODDS_API_KEY` | — | The Odds API key. **Required** for the live sharp anchor (and the optional auto-recalc loop). |
+| `AUTO_RECALC` | `0` | Set `1` to enable the optional per-game recompute loop (off by default; the Recalcular button is the default path). |
 | `WAVE_LEAD_MIN` | `60` | Minutes before first pitch to recompute a game. |
 | `WAVE_BUCKET_MIN` | `10` | Merge starts within this window into one wave (one fetch). |
 | `WAVE_POLL_SEC` | `300` | How often the loop checks for a due wave (no API cost). |

@@ -108,13 +108,13 @@ TENNIS_SHARP_RESERVE = int(os.environ.get("TENNIS_SHARP_RESERVE", "200") or 0)
 SPORTS = ("mlb", "soccer", "tennis")
 
 # --- Per-game recalc + sharp-close capture (MLB) ---------------------------------------
-# While the backend is up, the model is recomputed ~WAVE_LEAD_MIN minutes before each game
-# starts — the moment a game is still PREGAME but its Polymarket volume has built. Near-
-# simultaneous starts are grouped into one "wave" = ONE Odds-API fetch covering the whole
-# slate, so the daily cost is ~one call per start-block (well within the free quota). Each
-# wave also snapshots the sharp line into the close CSV for CLV. Disable with AUTO_RECALC=0.
+# OFF by default: MLB is recomputed on demand via the dashboard's "Recalcular" button (a
+# force recompute that overwrites the day cache), same as soccer/tennis. The optional
+# per-game "wave" loop — recompute ~WAVE_LEAD_MIN min before each game and snapshot the
+# sharp line into the close CSV for CLV — is opt-in with AUTO_RECALC=1 (one Odds-API fetch
+# per start-block; needs ODDS_API_KEY).
 ODDS_API_KEY = os.environ.get("ODDS_API_KEY")
-AUTO_RECALC = os.environ.get("AUTO_RECALC", "1") not in ("0", "false", "False", "no", "")
+AUTO_RECALC = os.environ.get("AUTO_RECALC", "0") not in ("0", "false", "False", "no", "")
 WAVE_LEAD_MIN = int(os.environ.get("WAVE_LEAD_MIN", "60"))      # recompute this many min before first pitch
 WAVE_BUCKET_MIN = int(os.environ.get("WAVE_BUCKET_MIN", "10"))  # merge starts within this window into one wave
 WAVE_POLL_SEC = int(os.environ.get("WAVE_POLL_SEC", "300"))     # how often the loop checks for a due wave
