@@ -286,6 +286,9 @@ def _mlb_args(date: str, sharp_csv: str | None = None) -> argparse.Namespace:
         fee_rate=0.0, use_external=True, projections_csv=None, refresh_prices=False,
         portfolio_value=10000.0, portfolio_db=None, record=True, predictions_db=MLB_DB,
         paper=False, paper_execute=False, output="json", rate_limit=100, verbose=True, debug=False,
+        # forecast_all off on the dashboard path: the "all games" forecast view was removed, so
+        # don't pay the per-game inputs fetch for it (the CLI keeps it on by default).
+        forecast_all=False,
         # Divergence detector: use the sharp slate as the authoritative game list and bet
         # ONLY on a sharp anchor. A wave passes its just-written CSV (reuse, no extra API
         # call); a manual recompute leaves it None and fetches via env ODDS_API_KEY.
