@@ -16,6 +16,23 @@ auto-calibrates each league's baseline goals/game from the current season), `API
 Brasileirão Série B). The backend subprocess inherits these, so the dashboard uses them automatically.
 API endpoints take `?sport=mlb|soccer`.
 
+### Sharp-close capture (MLB CLV) — built-in scheduler
+
+CLV vs the sharp close is the only metric that validates a real edge in ~50 bets, and it needs the
+sharp's **closing** line (near first pitch). With `ODDS_API_KEY` set, the backend runs a built-in
+scheduler that snapshots the Pinnacle/consensus close **once a day while it's up** — no external cron.
+It merges into a season-long CSV that `GET /api/clv` scores recorded entries against.
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `ODDS_API_KEY` | — | The Odds API key. **Required** to enable capture + the live sharp anchor. |
+| `SHARP_CLOSE_CAPTURE` | `1` | Set `0` to disable the scheduler. |
+| `SHARP_CLOSE_TIMES` | `23:00` | Comma-separated **UTC** times to capture (e.g. `23:00,01:30` for late games). One/day ≈ 30 Odds-API calls/month. |
+| `SHARP_CLOSE_CSV` | `<predictions-db dir>/sharp_close.csv` | Where the accumulated closes are written. |
+
+Endpoints: `GET /api/clv?sport=mlb` (avg_CLV / beat_close), `POST /api/capture-close` (force a snapshot now),
+and `GET /api/health` reports the scheduler's `sharp_close` state. The API key is never logged.
+
 Two tabs:
 
 - **Análises** — the day's Over/Under entry suggestions, rendered as cards with the full NegBin

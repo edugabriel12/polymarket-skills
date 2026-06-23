@@ -40,6 +40,24 @@ class TestApi(unittest.TestCase):
         self.assertIn("mlb", r.json()["sports"])
         self.assertIn("soccer", r.json()["sports"])
 
+    def test_health_reports_sharp_close_scheduler(self):
+        body = client.get("/api/health").json()
+        self.assertIn("sharp_close", body)
+        self.assertIn("enabled", body["sharp_close"])
+        self.assertIn("csv", body["sharp_close"])
+        self.assertIn("odds_api_key", body)
+
+    def test_clv_endpoint_handles_missing_csv(self):
+        # No sharp-close CSV in the temp dir -> graceful note, not an error.
+        backend.SHARP_CLOSE_CSV = os.path.join(_TMP, "no_such_close.csv")
+        body = client.get("/api/clv?sport=mlb").json()
+        self.assertEqual(body["sport"], "mlb")
+        self.assertEqual(body["scored"], 0)
+        self.assertIn("note", body)
+
+    def test_clv_endpoint_mlb_only(self):
+        self.assertFalse(client.get("/api/clv?sport=soccer").json().get("supported", True))
+
     def test_seed_and_results_both_sports(self):
         for sport in ("mlb", "soccer"):
             self.assertGreater(client.post(f"/api/seed-demo?sport={sport}&reset=true").json()["seeded"], 0)

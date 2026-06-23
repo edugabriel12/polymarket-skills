@@ -14,6 +14,7 @@ directly for results/seed.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import subprocess
@@ -41,6 +42,10 @@ import analytics                      # noqa: E402  (MLB analytics)
 import settlement                     # noqa: E402  (MLB settlement)
 import seed_demo                      # noqa: E402  (MLB seed)
 import suggest_totals                 # noqa: E402  (MLB model)
+import sharp_odds                     # noqa: E402  (sharp reference + CSV loader)
+import capture_close                  # noqa: E402  (sharp-close snapshot)
+import clv_vs_sharp as clv_mod        # noqa: E402  (CLV scoring)
+import sharp_close_scheduler as scl   # noqa: E402  (backend-local daily scheduler)
 import soccer_predictions as spdb     # noqa: E402  (soccer store; stdlib-only, safe import)
 import soccer_results                  # noqa: E402  (soccer auto-settlement; safe import)
 import tennis_predictions as tdb       # noqa: E402  (tennis store; stdlib-only, safe import)
@@ -87,6 +92,32 @@ TENNIS_TOUR = os.environ.get("TENNIS_TOUR", "atp")
 
 SPORTS = ("mlb", "soccer", "tennis")
 
+# --- Sharp-close capture scheduler (MLB CLV) -------------------------------------------
+# Snapshots the Pinnacle/consensus closing line daily while the backend is up, so CLV vs
+# the sharp close can be scored without an external cron. Quota-conscious: defaults to one
+# capture/day (~30 Odds-API calls/month). Disable with SHARP_CLOSE_CAPTURE=0.
+ODDS_API_KEY = os.environ.get("ODDS_API_KEY")
+SHARP_CLOSE_CAPTURE = os.environ.get("SHARP_CLOSE_CAPTURE", "1") not in ("0", "false", "False", "no", "")
+SHARP_CLOSE_TIMES = os.environ.get("SHARP_CLOSE_TIMES", "23:00")  # comma-separated UTC HH:MM
+SHARP_CLOSE_CSV = os.environ.get(
+    "SHARP_CLOSE_CSV", os.path.join(os.path.dirname(MLB_DB) or ".", "sharp_close.csv"))
+
+_capture_state: dict = {"runs": 0, "last_run": None, "last_rows": 0, "total_rows": 0,
+                        "last_error": None, "enabled": SHARP_CLOSE_CAPTURE,
+                        "has_key": bool(ODDS_API_KEY), "times": SHARP_CLOSE_TIMES,
+                        "csv": SHARP_CLOSE_CSV, "started": False}
+
+
+def _sched_vlog(*a) -> None:
+    print(*a, file=sys.stderr, flush=True)
+
+
+def _do_capture_sync(date: str) -> tuple[list, int]:
+    new, total = capture_close.capture(ODDS_API_KEY, date, SHARP_CLOSE_CSV, vlog=_sched_vlog)
+    _capture_state.update(runs=_capture_state["runs"] + 1, last_run=_now(),
+                          last_rows=len(new), total_rows=total, last_error=None)
+    return new, total
+
 
 class _QuickAPI:
     """Single-attempt HTTP client so settlement never stalls the dashboard."""
@@ -103,6 +134,31 @@ class _QuickAPI:
 
 app = FastAPI(title="Polymarket Sports Dashboard API", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.on_event("startup")
+async def _start_sharp_close_scheduler() -> None:
+    """Launch the daily sharp-close capture loop (no-op if disabled or no key)."""
+    if not SHARP_CLOSE_CAPTURE:
+        print("[sharp-close] scheduler disabled (SHARP_CLOSE_CAPTURE=0)", file=sys.stderr, flush=True)
+        return
+    if not ODDS_API_KEY:
+        print("[sharp-close] no ODDS_API_KEY -> scheduler NOT started (set it to enable CLV capture)",
+              file=sys.stderr, flush=True)
+        return
+    times = scl.parse_times(SHARP_CLOSE_TIMES)
+    if not times:
+        print(f"[sharp-close] no valid times in {SHARP_CLOSE_TIMES!r} -> scheduler NOT started",
+              file=sys.stderr, flush=True)
+        return
+
+    async def _capture():
+        await asyncio.to_thread(_do_capture_sync, _today())
+
+    _capture_state["started"] = True
+    print(f"[sharp-close] scheduler ON: times(UTC)={times} -> {SHARP_CLOSE_CSV}",
+          file=sys.stderr, flush=True)
+    asyncio.create_task(scl.run_loop(times, _capture, _sched_vlog))
 
 
 def _today() -> str:
@@ -284,7 +340,45 @@ def health() -> dict:
             "football_data_token": bool(FOOTBALL_DATA_TOKEN),
             "soccer_ratings_csv": bool(SOCCER_RATINGS_CSV),
             "tennis_ratings_csv": bool(TENNIS_RATINGS_CSV), "tennis_tour": TENNIS_TOUR,
+            "odds_api_key": bool(ODDS_API_KEY), "sharp_close": _capture_state,
             "time": _now()}
+
+
+@app.get("/api/clv")
+def clv(sport: str = Query("mlb")) -> dict:
+    """CLV of recorded MLB entries vs the captured sharp close (the validated edge metric).
+
+    Scores against the season-long CSV the scheduler accumulates. avg_CLV > 0 and
+    beat_close > 50% = real edge (you bought cheaper than the sharp closed).
+    """
+    sport = _norm_sport(sport)
+    if sport != "mlb":
+        return {"sport": sport, "supported": False,
+                "note": "CLV vs the sharp close is MLB-only for now", "generated_at": _now()}
+    if not os.path.exists(SHARP_CLOSE_CSV):
+        return {"sport": sport, "scored": 0, "report": {"all": {"n": 0}},
+                "csv": SHARP_CLOSE_CSV, "capture": _capture_state,
+                "note": "no sharp-close CSV yet — the scheduler captures it daily "
+                        "(or POST /api/capture-close)", "generated_at": _now()}
+    sharp = sharp_odds.load_sharp_csv(SHARP_CLOSE_CSV)
+    scored = clv_mod.score(pdb.get_predictions(MLB_DB), sharp)
+    return {"sport": sport, "scored": len(scored), "report": clv_mod.report(scored),
+            "csv": SHARP_CLOSE_CSV, "capture": _capture_state, "generated_at": _now()}
+
+
+@app.post("/api/capture-close")
+async def capture_close_now(date: str | None = Query(None)) -> dict:
+    """Force a sharp-close snapshot now (for testing or an ad-hoc capture)."""
+    if not ODDS_API_KEY:
+        return {"ok": False, "error": "no ODDS_API_KEY configured", "csv": SHARP_CLOSE_CSV}
+    target = date or _today()
+    try:
+        new, total = await asyncio.to_thread(_do_capture_sync, target)
+    except Exception as e:  # noqa: BLE001
+        _capture_state.update(last_error=str(e))
+        return {"ok": False, "error": str(e), "csv": SHARP_CLOSE_CSV}
+    return {"ok": True, "date": target, "captured": len(new), "total_rows": total,
+            "csv": SHARP_CLOSE_CSV, "capture": _capture_state}
 
 
 @app.get("/api/analyses")

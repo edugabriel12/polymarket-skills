@@ -228,11 +228,17 @@ the books no longer drops the reference.
 
 ### CLV vs the sharp close (`clv_vs_sharp.py`) — the validated edge metric
 `CLV(side) = sharp_close_fair_prob(side) − entry_price`. Beating the sharp close is the only proxy that
-confirms a real edge (in ~50 bets, vs thousands for raw P&L). Scores recorded entries against a sharp
-closing source (CSV `close_over_odds`/`close_under_odds`, or The Odds API near game time):
+confirms a real edge (in ~50 bets, vs thousands for raw P&L). The close prob is taken **at the bet's own
+line** even when the sharp closed at a different line (same μ-inversion as the model anchor — alternate-line
+bets are no longer dropped). Two-step workflow:
 ```bash
+# 1) Near first pitch each day, snapshot the sharp CLOSE (merge into one season-long CSV):
+python polymarket-mlb-totals/scripts/capture_close.py --out sharp_close.csv   # uses $ODDS_API_KEY
+# 2) Once you have ~50 settled entries, score them against the accumulated closes:
 python polymarket-mlb-totals/scripts/clv_vs_sharp.py --sharp-odds-csv sharp_close.csv
 ```
+`capture_close.py` fetches the current Pinnacle/consensus totals, devigs them, and merges
+`close_over_odds`/`close_under_odds` rows keyed by (date, team-set) so re-runs upsert.
 `avg_CLV > 0` and `beat_close > 50%` = real edge. Backtest validation on 10 real seasons showed the
 *predictive* model has no edge (ROI ~0, Brier ≈ coin-flip); the sharp anchor + CLV is how you find and
 prove the only durable edge — Polymarket diverging from the sharp consensus.
