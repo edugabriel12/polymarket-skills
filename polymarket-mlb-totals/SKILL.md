@@ -204,6 +204,14 @@ probability**. So with a sharp reference the model stops trying to out-predict a
 so the edge (`p_model − Polymarket price`) measures how far Polymarket strays from the sharp line —
 bet a side only when Polymarket prices it cheaper than the sharp fair value. Without a sharp ref the
 model stays Polymarket-anchored (zero edge — anti-fabrication).
+
+**Pure anchor in divergence mode.** When a sharp ref is present, μ is anchored *purely* to the sharp
+line — the factor model is **not** blended in (it has no proven predictive edge, so blending only adds
+noise and can mask a corrupt sharp line as a small "plausible" edge). With a pure anchor, bad sharp data
+instead yields an implausibly large edge that the cap rejects. Games with **no** sharp match are skipped,
+not bet via factors (`--no-require-sharp` to override). Consequence: because Polymarket MLB totals track
+the sharp closely, **most games show no edge and most sessions bet nothing** — that is the correct,
+honest result, not a bug.
 ```bash
 # Live: The Odds API (includes Pinnacle).            Backtest/offline: a CSV.
 python polymarket-mlb-totals/scripts/suggest_totals.py --odds-api-key $ODDS_API_KEY

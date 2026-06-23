@@ -121,6 +121,19 @@ class TestDivergenceDetector(unittest.TestCase):
                                     dispersion=2.0, sharp_over_price=0.50)
         self.assertLess(m2["market_mu"], m["market_mu"])
 
+    def test_sharp_present_ignores_factor_model(self):
+        # Strong factor inputs would push mu well above the line, but with a sharp ref the
+        # model must use the PURE sharp anchor (no blend) — the divergence detector trusts
+        # only the sharp value, so bad sharp data surfaces as an implausible edge (caught by
+        # the cap) instead of being masked by a half-blend with the factor mu.
+        inputs = {"home_off": 1.2, "away_off": 1.2, "home_sp": 1.3, "away_sp": 1.3}
+        m = st.model_probabilities(8.5, 0.52, 100.0, inputs, league_baseline=8.5,
+                                   dispersion=2.0, sharp_over_price=0.50, sharp_line=8.5)
+        self.assertTrue(m["sharp_anchored"])
+        self.assertIsNotNone(m["model_mu"])                          # still reported
+        self.assertAlmostEqual(m["mu"], m["market_mu"], places=6)    # mu == pure sharp anchor
+        self.assertGreater(m["model_mu"], m["mu"] + 0.5)             # factors did NOT move mu
+
     def test_no_sharp_is_market_implied(self):
         # Without a sharp ref, fair == Polymarket price -> ~zero edge (anti-fabrication).
         m = st.model_probabilities(8.5, 0.55, 100.0, {}, league_baseline=8.5, dispersion=2.0)
