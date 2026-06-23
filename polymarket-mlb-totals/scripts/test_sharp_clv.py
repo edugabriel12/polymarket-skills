@@ -194,18 +194,28 @@ class TestDivergenceDetector(unittest.TestCase):
                                     dispersion=2.0, sharp_over_price=0.50)
         self.assertLess(m2["market_mu"], m["market_mu"])
 
-    def test_sharp_present_ignores_factor_model(self):
-        # Strong factor inputs would push mu well above the line, but with a sharp ref the
-        # model must use the PURE sharp anchor (no blend) — the divergence detector trusts
-        # only the sharp value, so bad sharp data surfaces as an implausible edge (caught by
-        # the cap) instead of being masked by a half-blend with the factor mu.
+    def test_sharp_present_model_drives_sharp_is_veto(self):
+        # NEW behavior: the factor MODEL is the prediction engine — with factors present, mu
+        # comes from the model (not the sharp). The sharp is a separate edge-sign veto, exposed
+        # as p_over_sharp / sharp_mu. Strong offense pushes the model mu well above the sharp.
         inputs = {"home_off": 1.2, "away_off": 1.2, "home_sp": 1.3, "away_sp": 1.3}
         m = st.model_probabilities(8.5, 0.52, 100.0, inputs, league_baseline=8.5,
                                    dispersion=2.0, sharp_over_price=0.50, sharp_line=8.5)
+        self.assertFalse(m["sharp_anchored"])                        # NOT sharp-anchored anymore
+        self.assertTrue(m["sharp_gated"])                            # sharp present -> used as veto
+        self.assertAlmostEqual(m["mu"], m["model_mu"], places=6)     # mu == the model's mu
+        self.assertGreater(m["mu"], m["sharp_mu"] + 0.5)             # factors moved mu off the sharp
+        self.assertGreater(m["p_over"], 0.5)                         # model forecasts Over
+        # The sharp's fair P(over)@8.5 ≈ 0.50 (the veto reference), distinct from the model.
+        self.assertAlmostEqual(m["p_over_sharp"], 0.50, delta=0.02)
+
+    def test_sharp_present_no_factors_falls_back_to_sharp(self):
+        # With a sharp ref but NO factors, there's nothing to predict from -> mu = the sharp.
+        m = st.model_probabilities(8.5, 0.58, 100.0, {}, league_baseline=8.5,
+                                   dispersion=2.0, sharp_over_price=0.50, sharp_line=8.5)
         self.assertTrue(m["sharp_anchored"])
-        self.assertIsNotNone(m["model_mu"])                          # still reported
-        self.assertAlmostEqual(m["mu"], m["market_mu"], places=6)    # mu == pure sharp anchor
-        self.assertGreater(m["model_mu"], m["mu"] + 0.5)             # factors did NOT move mu
+        self.assertAlmostEqual(m["mu"], m["sharp_mu"], places=6)
+        self.assertAlmostEqual(m["p_over"], 0.50, delta=0.02)
 
     def test_no_sharp_is_market_implied(self):
         # Without a sharp ref, fair == Polymarket price -> ~zero edge (anti-fabrication).

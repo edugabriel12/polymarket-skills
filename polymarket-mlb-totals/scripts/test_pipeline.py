@@ -435,6 +435,50 @@ class _Args:
         self.__dict__.update(defaults)
 
 
+class TestSharpVeto(unittest.TestCase):
+    """Model drives the prediction; the sharp is an edge-sign veto (suggest only if +EV)."""
+
+    def setUp(self):
+        self._orig = (st.discover_markets, st.game_date, st.APIClient,
+                      st._load_sharp_lookup, st.sharp_odds.sharp_ref, st.data_inputs.get_game_inputs)
+
+    def tearDown(self):
+        (st.discover_markets, st.game_date, st.APIClient, st._load_sharp_lookup,
+         st.sharp_odds.sharp_ref, st.data_inputs.get_game_inputs) = self._orig
+
+    def _run(self, sharp_over):
+        # Modest-offense game: the model forecasts Over with a plausible edge (~7%, below the
+        # 15% implausible cap) at price 0.50.
+        markets = [_rich_market("mlb-aaa-bbb-2026-06-14-total-8pt5",
+                                "AAA vs. BBB: O/U 8.5", ["Over 8.5", "Under 8.5"],
+                                [0.50, 0.50], ["o1", "u1"])]
+        st.discover_markets = lambda *a, **k: ("mlb", markets)
+        st.game_date = lambda m: "2026-06-14"
+        st.APIClient = _NoNetAPI
+        st._load_sharp_lookup = lambda args, target, vlog: {"slate": 1}     # truthy
+        st.sharp_odds.sharp_ref = lambda lk, date, away, home: (8.5, sharp_over)
+        st.data_inputs.get_game_inputs = lambda *a, **k: {
+            "home_off": 1.10, "away_off": 1.10, "home_sp": 1.10, "away_sp": 1.10, "home_field": 0.0}
+        return st.run(_Args(date="2026-06-14", use_external=True, record=False,
+                            sharp_discovery=False))
+
+    def test_sharp_confirms_positive_edge_suggests(self):
+        # Sharp fair Over ~0.60 @ 8.5 -> sharp edge on Over = 0.60-0.50 = +0.10 -> confirm.
+        result = self._run(sharp_over=0.60)
+        self.assertEqual(len(result["suggestions"]), 1)
+        sug = result["suggestions"][0]
+        self.assertGreater(sug["sharp_edge"], 0)
+        self.assertEqual(sug["recommendation"]["token_id"], "o1")    # bet Over
+
+    def test_sharp_vetoes_negative_edge_skips(self):
+        # Sharp fair Over ~0.45 @ 8.5 -> sharp edge on Over = 0.45-0.50 = -0.05 -> veto, even
+        # though the model loves the Over.
+        result = self._run(sharp_over=0.45)
+        self.assertEqual(len(result["suggestions"]), 0)
+        self.assertTrue(any("sharp edge" in s["reason"] and "≤ 0" in s["reason"]
+                            for s in result["skipped"]))
+
+
 class TestForecastLayer(unittest.TestCase):
     """The forecast layer predicts EVERY game, independent of the trade filters."""
 
