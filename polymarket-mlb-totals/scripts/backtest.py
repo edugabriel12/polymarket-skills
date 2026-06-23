@@ -42,6 +42,9 @@ from collections import defaultdict
 import _bootstrap  # noqa: F401
 import run_distribution as rd
 import suggest_totals as st
+import forecast as fc
+import scoring
+import calibration_core as cc
 
 WARMUP_GAMES = 20            # a team needs this many prior games before we trust its factor
 DEFAULT_LEAGUE_BASELINE = 8.5
@@ -226,7 +229,7 @@ def run_backtest(games: list[dict], *, league_baseline=DEFAULT_LEAGUE_BASELINE,
         actual = g["away_score"] + g["home_score"]
         over_won = None if abs(actual - g["line"]) < 1e-9 else (actual > g["line"])
         rows_by_season[s].append(_score_game(g, m, chosen, over_won, over_price,
-                                             under_price, min_edge))
+                                             under_price, min_edge, actual))
         tf.update(g["away"], g["home"], g["away_score"], g["home_score"])  # AFTER modeling
 
     for s, rows in rows_by_season.items():
@@ -237,13 +240,27 @@ def run_backtest(games: list[dict], *, league_baseline=DEFAULT_LEAGUE_BASELINE,
             "seasons": dict(sorted(seasons.items())), "overall": overall}
 
 
-def _score_game(g, m, chosen, over_won, over_price, under_price, min_edge) -> dict:
-    """One modeled game -> a flat record for aggregation."""
+def _score_game(g, m, chosen, over_won, over_price, under_price, min_edge,
+                actual=None) -> dict:
+    """One modeled game -> a flat record for aggregation.
+
+    Layer 4 distributional scores (CRPS) and Layer 3 interval coverage are computed for
+    EVERY modeled game from its full pmf — they judge the forecast distribution against
+    the realized total, independent of whether a bet was placed or the line pushed.
+    """
     rec = {"season": _season(g["date"]), "modeled": True,
            "ref_prob": m["p_over"], "ref_outcome": (None if over_won is None else int(over_won)),
            "mu": m["mu"], "market_mu": m["market_mu"], "used_external": m["used_external"],
            "bet": False, "side": None, "pnl": 0.0, "stake": 0.0, "edge": None,
-           "clv": None, "won": None}
+           "clv": None, "won": None,
+           "crps": None, "cover50": None, "cover80": None}
+    if actual is not None:
+        pmf = rd.negbin_total_runs_pmf(m["mu"], m["var"])
+        rec["crps"] = scoring.crps_pmf(pmf, actual)
+        lo50, hi50 = fc.prediction_interval(pmf, 0.50)
+        lo80, hi80 = fc.prediction_interval(pmf, 0.80)
+        rec["cover50"] = 1 if lo50 <= actual <= hi50 else 0
+        rec["cover80"] = 1 if lo80 <= actual <= hi80 else 0
     if not chosen or over_won is None:
         return rec                              # no bet, or a push (no settle)
     edge = chosen["edge"]
@@ -274,6 +291,9 @@ def _aggregate(rows: list[dict]) -> dict:
     gaps = [r["mu"] - r["market_mu"] for r in modeled if r["used_external"]]
     over_bets = [r for r in settled_bets if r["side"] == "OVER"]
     under_bets = [r for r in settled_bets if r["side"] == "UNDER"]
+    crpss = [r["crps"] for r in modeled if r["crps"] is not None]
+    cover50 = [r["cover50"] for r in modeled if r["cover50"] is not None]
+    cover80 = [r["cover80"] for r in modeled if r["cover80"] is not None]
 
     def wr(rs): return (sum(1 for r in rs if r["won"]) / len(rs)) if rs else None
     return {
@@ -282,6 +302,14 @@ def _aggregate(rows: list[dict]) -> dict:
         "roi": (pnl / stake) if stake else None, "pnl_units": round(pnl, 3),
         "brier": _brier(pairs), "log_loss": _log_loss(pairs),
         "reliability": _reliability(pairs),
+        # Layer 2 — calibration (all modeled over/under forecasts).
+        "ece": cc.ece(pairs), "mce": cc.mce(pairs),
+        "brier_decomposition": cc.brier_decomposition(pairs),
+        # Layer 4 — distributional score (CRPS, run units) over all modeled games.
+        "crps": (sum(crpss) / len(crpss)) if crpss else None,
+        # Layer 3 — empirical interval coverage (should ≈ 0.50 / 0.80).
+        "coverage50": (sum(cover50) / len(cover50)) if cover50 else None,
+        "coverage80": (sum(cover80) / len(cover80)) if cover80 else None,
         "avg_edge": (sum(r["edge"] for r in bets) / len(bets)) if bets else None,
         "avg_clv": (sum(clvs) / len(clvs)) if clvs else None,
         "beat_close_pct": (sum(1 for c in clvs if c > 0) / len(clvs)) if clvs else None,
@@ -326,6 +354,15 @@ def _reliability(pairs, nbins=10):
 # ---------------------------------------------------------------------------
 
 
+def _decomp_line(d, f) -> str:
+    """One-line Murphy Brier decomposition (reliability / resolution / uncertainty)."""
+    if not d:
+        return "- **Brier decomposition:** n/a"
+    return (f"- **Brier decomposition:** reliability {f(d['reliability'])} (↓ better) − "
+            f"resolution {f(d['resolution'])} (↑ better) + uncertainty {f(d['uncertainty'])} "
+            f"= {f(d['recombined'])}")
+
+
 def format_report(rep: dict) -> str:
     def f(x, pct=False, plus=False):
         if x is None:
@@ -337,12 +374,14 @@ def format_report(rep: dict) -> str:
              f"Walk-forward (warmup {rep['warmup']} games), min_edge {rep['min_edge']*100:.0f}%, "
              f"odds band {rep['odds_band'][0]}x–{rep['odds_band'][1]}x, "
              f"baseline {rep['league_baseline']}, dispersion {rep['dispersion']}.", "",
-             "| Season | Modeled | Bets | Win% | ROI | P&L(u) | Brier | LogLoss | μ gap | CLV | Beat% |",
-             "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+             "| Season | Modeled | Bets | Win% | ROI | P&L(u) | Brier | LogLoss | CRPS | "
+             "Cov80 | μ gap | CLV | Beat% |",
+             "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for s, m in list(rep["seasons"].items()) + [("ALL", rep["overall"])]:
         lines.append(f"| {s} | {m['modeled']} | {m['bets']} | {f(m['win_rate'],pct=True)} | "
                      f"{f(m['roi'],pct=True,plus=True)} | {m['pnl_units']:+.1f} | "
-                     f"{f(m['brier'])} | {f(m['log_loss'])} | {f(m['mean_mu_gap'],plus=True)} | "
+                     f"{f(m['brier'])} | {f(m['log_loss'])} | {f(m.get('crps'))} | "
+                     f"{f(m.get('coverage80'),pct=True)} | {f(m['mean_mu_gap'],plus=True)} | "
                      f"{f(m['avg_clv'],plus=True)} | {f(m['beat_close_pct'],pct=True)} |")
     o = rep["overall"]
     lines += ["", "## Overall",
@@ -351,7 +390,12 @@ def format_report(rep: dict) -> str:
               f"- **ROI (flat 1u):** {f(o['roi'],pct=True,plus=True)} over {o['bets']} bets; "
               f"P&L {o['pnl_units']:+.1f}u",
               f"- **Calibration:** Brier {f(o['brier'])} (coin-flip 0.250, market ~0.196), "
-              f"log-loss {f(o['log_loss'])}",
+              f"log-loss {f(o['log_loss'])}, ECE {f(o.get('ece'))}, MCE {f(o.get('mce'))}",
+              f"- **Distribution (CRPS):** {f(o.get('crps'))} runs (mean abs miss of the "
+              f"forecast distribution; lower is better)",
+              f"- **Interval coverage:** 50% band {f(o.get('coverage50'),pct=True)} "
+              f"(target 50%), 80% band {f(o.get('coverage80'),pct=True)} (target 80%)",
+              _decomp_line(o.get("brier_decomposition"), f),
               f"- **Bias:** mean(μ − market_μ) = {f(o['mean_mu_gap'],plus=True)} runs "
               f"(0 = unbiased vs market)",
               f"- **CLV:** avg {f(o['avg_clv'],plus=True)}, beat close {f(o['beat_close_pct'],pct=True)}",

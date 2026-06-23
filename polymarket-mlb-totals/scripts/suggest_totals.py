@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 import _bootstrap  # noqa: F401  (wires sys.path for the reused skills)
 
 import run_distribution as rd
+import forecast as fc
 import park_factors as pf
 import totals_market as tm
 import data_inputs
@@ -148,6 +149,29 @@ def model_probabilities(line, over_price, park_factor, inputs, *,
     }
 
 
+def forecast_block(m, line) -> dict:
+    """Layer 1 + 3 per-prediction confidence: the full distribution summarized.
+
+    From the game's (mu, var) NegBin distribution: the expected total + most-likely
+    total, the 50% / 80% PREDICTION INTERVALS (the honest range the total will land in
+    — wide, because a single MLB game is irreducibly uncertain), and the predictive
+    entropy (spread). This turns "P(Over)=0.62" into a forecast with stated confidence.
+    The heavy pmf is dropped; only the human-readable summary is stored.
+    """
+    s = fc.forecast_summary(m["mu"], m["var"], line)
+    return {
+        "mean_total": round(s["mean"], 2),
+        "median_total": s["median"],
+        "most_likely_total": s["mode"],
+        "pi50": list(s["pi50"]),
+        "pi80": list(s["pi80"]),
+        "pi80_mass": round(s["pi80_mass"], 4),
+        "entropy_bits": round(s["entropy_bits"], 3),
+        "p_over": round(s["p_over"], 4),
+        "p_under": round(s["p_under"], 4),
+    }
+
+
 def pick_side(line, ou, p_over, p_under, fee_rate, odds_min, odds_max,
               max_edge=rd.MAX_PLAUSIBLE_EDGE):
     """Choose Over/Under by post-fee edge among odds-filter-eligible sides.
@@ -232,7 +256,7 @@ def size_position(p_model, price, portfolio_value, first_trade, kelly_half):
 
 
 def build_recommendation(game_slug, totals, line, chosen, mu, used_external,
-                         size_pct, size_usd, confidence, fee_rate, ou):
+                         size_pct, size_usd, confidence, fee_rate, ou, forecast=None):
     """Assemble the execute_paper-compatible recommendation + a human text block."""
     side_word = chosen["side"].capitalize()
     price = chosen["price"]
@@ -261,7 +285,10 @@ def build_recommendation(game_slug, totals, line, chosen, mu, used_external,
         f"(payout {rd.decimal_odds(price):.2f}x)\n"
         f"Size: ${size_usd:,.2f} ({size_pct*100:.2f}% of portfolio)\n"
         f"Confidence: {confidence:.2f}\n"
-        f"Edge: {chosen['edge']*100:+.1f}% after fees\n"
+        + (f"Forecast: ~{forecast['mean_total']} runs "
+           f"(80% PI {forecast['pi80'][0]}-{forecast['pi80'][1]}, "
+           f"entropy {forecast['entropy_bits']:.2f} bits)\n" if forecast else "")
+        + f"Edge: {chosen['edge']*100:+.1f}% after fees\n"
         f"Reasoning: {sanitize_text(reasoning)}"
     )
     return rec, text
@@ -277,6 +304,7 @@ def record_prediction_row(db_path, game_slug, game_date, totals, line, chosen, m
     """
     price = chosen["price"]
     odds = rd.decimal_odds(price)
+    forecast = forecast_block(m, line)
     # Link to the game event, not the specific total line (strip "-total-9pt5").
     event = predictions_db.model_log_base(game_slug or totals.get("slug") or "")
     market_url = (f"https://polymarket.com/event/{event}" if event
@@ -295,6 +323,7 @@ def record_prediction_row(db_path, game_slug, game_date, totals, line, chosen, m
         "line": line, "need": m["need"],
         "p_over_eff": round(m["p_over"], 4), "p_under_eff": round(m["p_under"], 4),
         "p_push": round(m["p_push"], 4),
+        "forecast": forecast,
         "chosen_side": chosen["side"], "entry_price": price,
         "decimal_odds": round(odds, 4), "model_prob": round(chosen["p_model"], 4),
         "fee_rate": args.fee_rate, "fee_applied": round(fee_for(price, args.fee_rate), 5),
@@ -584,7 +613,8 @@ def run(args) -> dict:
                       if m["used_external"] else 0.5)
         rec, text = build_recommendation(event_slug, totals, line, chosen, m["mu"],
                                          m["used_external"], size_pct, size_usd,
-                                         confidence, args.fee_rate, ou)
+                                         confidence, args.fee_rate, ou,
+                                         forecast_block(m, line))
         # Defer recording until best-line selection (avoids correlated multi-line bets).
         candidates.append({
             "event_slug": event_slug, "line": line, "totals": totals, "ou": ou,
@@ -623,6 +653,7 @@ def run(args) -> dict:
                         c["chosen"], c["m"], 1, None, c["totals"], c["ou"])
         suggestions.append({"game": c["event_slug"], "line": c["line"],
                             "mu": round(c["m"]["mu"], 3), "edge": round(c["chosen"]["edge"], 4),
+                            "forecast": forecast_block(c["m"], c["line"]),
                             "prediction_id": prediction_id, "recommendation": c["rec"],
                             "_text": c["text"]})
         vlog(f"  [{c['event_slug']}] >>> SUGGEST {c['chosen']['side']} {c['line']} "

@@ -23,6 +23,8 @@ import re
 import sqlite3
 import sys
 
+import calibration_core as cc
+
 DEFAULT_DBS = {
     "mlb": os.path.expanduser("~/.polymarket-mlb-totals/predictions.db"),
     "soccer": os.path.expanduser("~/.polymarket-soccer/predictions.db"),
@@ -165,8 +167,15 @@ def clv_stats(db_path: str) -> dict:
             "beat_close_pct": sum(1 for c in clvs if c > 0) / len(clvs)}
 
 
-def report(db_path: str) -> dict:
-    """Calibration metrics over the settled shadow log (all games + bet-only)."""
+def report(db_path: str, fit_method: str | None = None) -> dict:
+    """Calibration metrics over the settled shadow log (all games + bet-only).
+
+    Layer 2 metrics (ECE/MCE + Murphy Brier decomposition) come from `calibration_core`.
+    If `fit_method` is given, a post-hoc calibrator is FIT on the settled pairs and the
+    before/after ECE is reported — a SUGGESTION-ONLY diagnostic (it does not alter the
+    live model; the operator decides whether to apply it). With little data a held-out
+    split is unreliable, so the fit is in-sample and flagged as such.
+    """
     con = sqlite3.connect(db_path)
     try:
         total = con.execute("SELECT COUNT(*) FROM model_log").fetchone()[0]
@@ -174,15 +183,31 @@ def report(db_path: str) -> dict:
         con.close()
     allr = _settled_rows(db_path)
     betr = [r for r in allr if r.get("bet") == 1]
-    return {
+    pairs = _pairs(allr)
+    rep = {
         "logged": total, "settled": len(allr), "settled_bet": len(betr),
         "all": {"n": len(allr), "brier": brier(allr), "log_loss": log_loss(allr),
-                "reliability": reliability(allr)},
+                "reliability": reliability(allr),
+                "ece": cc.ece(pairs), "mce": cc.mce(pairs),
+                "brier_decomposition": cc.brier_decomposition(pairs)},
         "bet": {"n": len(betr), "brier": brier(betr), "log_loss": log_loss(betr)},
         "clv": clv_stats(db_path),
         "note": "CLV uses captured closing prices (run --capture-close near game time). "
                 "Reference side = OVER (totals) / YES (BTTS).",
     }
+    if fit_method and pairs:
+        cal = cc.fit_calibrator(fit_method, pairs)
+        after = [(cal.predict(p), o) for p, o in pairs]
+        params = ({"temperature": round(cal.temperature, 4)}
+                  if fit_method == "temperature"
+                  else {"a": round(cal.a, 4), "b": round(cal.b, 4)}
+                  if fit_method == "platt" else {"knots": len(cal._x)})
+        rep["calibrator"] = {
+            "method": fit_method, "params": params, "n": len(pairs),
+            "ece_before": cc.ece(pairs), "ece_after": cc.ece(after),
+            "in_sample": True,
+        }
+    return rep
 
 
 def format_report(rep: dict) -> str:
@@ -195,8 +220,23 @@ def format_report(rep: dict) -> str:
         f"(bet: {rep['settled_bet']})", "",
         f"ALL modeled markets (n={a['n']}):  Brier={fmt(a['brier'])}  "
         f"LogLoss={fmt(a['log_loss'])}",
+        f"  Calibration: ECE={fmt(a.get('ece'))}  MCE={fmt(a.get('mce'))}",
         f"BET only          (n={rep['bet']['n']}):  Brier={fmt(rep['bet']['brier'])}  "
         f"LogLoss={fmt(rep['bet']['log_loss'])}",
+    ]
+    d = a.get("brier_decomposition")
+    if d:
+        lines.append(
+            f"  Brier = reliability {fmt(d['reliability'])} (↓) − resolution "
+            f"{fmt(d['resolution'])} (↑) + uncertainty {fmt(d['uncertainty'])}")
+    cal = rep.get("calibrator")
+    if cal:
+        lines += [
+            "", f"Post-hoc calibrator [{cal['method']}] (suggestion-only, in-sample):",
+            f"  params={cal['params']}   ECE {fmt(cal['ece_before'])} -> "
+            f"{fmt(cal['ece_after'])}  (apply manually if it improves on held-out data)",
+        ]
+    lines += [
         "", "Reliability (predicted P(ref) vs empirical):",
         f"  {'bucket':<10} {'n':>5} {'avg_pred':>9} {'empirical':>10}",
     ]
@@ -229,6 +269,10 @@ def main() -> None:
                    help="Settle model_log via results feed (covers non-bet games)")
     p.add_argument("--capture-close", action="store_true",
                    help="Snapshot closing CLOB prices for CLV (run near game time)")
+    p.add_argument("--fit-calibrator", choices=("temperature", "platt", "isotonic"),
+                   default=None,
+                   help="Fit a post-hoc calibrator on the settled pairs and report "
+                        "before/after ECE (suggestion-only; does not change the model)")
     p.add_argument("--json", action="store_true")
     a = p.parse_args()
     db = a.db or DEFAULT_DBS[a.sport]
@@ -244,7 +288,7 @@ def main() -> None:
     if a.capture_close:
         n = _capture_close(a.sport, db)
         print(f"Captured {n} closing price(s).\n", file=sys.stderr)
-    rep = report(db)
+    rep = report(db, fit_method=a.fit_calibrator)
     if a.json:
         import json
         print(json.dumps(rep, indent=2, default=str))

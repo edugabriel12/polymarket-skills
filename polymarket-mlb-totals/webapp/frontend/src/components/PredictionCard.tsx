@@ -26,6 +26,7 @@ export function PredictionCard({ s }: { s: Suggestion }) {
   const isPositive = side === "OVER" || side === "YES";
   const sides = market === "BTTS" ? ["YES", "NO"] : ["OVER", "UNDER"];
   const otherSide = sides.find((x) => x !== side) ?? sides[1];
+  const fcast = s.forecast ?? st.forecast;
 
   const marketLabel =
     market === "BTTS" ? "Ambos Marcam (BTTS)" : `Total ${line ?? ""} O/U`;
@@ -63,6 +64,37 @@ export function PredictionCard({ s }: { s: Suggestion }) {
               <div className="bg-violet-500" style={{ width: `${(1 - pChosen) * 100}%` }} />
             </div>
           </div>
+
+          {/* Layer 1 + 3: distributional forecast with a stated confidence range */}
+          {fcast && (
+            <div className="mt-4 rounded-xl border border-border bg-muted/30 px-3 py-2.5">
+              <div className="flex items-center justify-between text-[11px]">
+                <span className="font-bold uppercase tracking-wider text-muted-foreground">
+                  Previsão · total esperado
+                </span>
+                <span className="font-black tabular-nums text-foreground">
+                  ~{fcast.mean_total} runs
+                </span>
+              </div>
+              <div className="mt-1.5 flex items-center justify-between text-[11px] text-muted-foreground">
+                <span>
+                  Intervalo 80%:{" "}
+                  <span className="font-semibold text-foreground tabular-nums">
+                    {fcast.pi80[0]}–{fcast.pi80[1]}
+                  </span>
+                </span>
+                <span>
+                  Incerteza:{" "}
+                  <span className="font-semibold text-foreground tabular-nums">
+                    {fcast.entropy_bits.toFixed(2)} bits
+                  </span>
+                </span>
+              </div>
+              <div className="mt-0.5 text-[10px] text-muted-foreground">
+                50%: {fcast.pi50[0]}–{fcast.pi50[1]} · mais provável {fcast.most_likely_total}
+              </div>
+            </div>
+          )}
 
           <div className="mt-4 flex items-center justify-between">
             <button onClick={() => setOpen((o) => !o)}
