@@ -737,8 +737,9 @@ def render_text(result: dict) -> str:
 def main() -> None:
     p = argparse.ArgumentParser(description="Suggest MLB total-runs entries on Polymarket.")
     p.add_argument("--date", default=None, help="Target day YYYY-MM-DD (default today UTC)")
-    p.add_argument("--min-volume", type=float, default=1000.0,
-                   help="Min 24h volume (default 1000; lower than the generic 10k for MLB totals)")
+    p.add_argument("--min-volume", type=float, default=0.0,
+                   help="Min 24h volume to consider a game (default 0 = no volume filter; "
+                        "pass a value to re-enable)")
     p.add_argument("--min-hours", type=float, default=0.0,
                    help="Min hours until game start (default 0 = pre-game only, not started)")
     p.add_argument("--all-lines", dest="best_line_only", action="store_false", default=True,

@@ -698,7 +698,9 @@ def render_text(result: dict) -> str:
 def main() -> None:
     p = argparse.ArgumentParser(description="Suggest soccer total-goals/BTTS entries on Polymarket.")
     p.add_argument("--date", default=None, help="Target day YYYY-MM-DD (default today UTC)")
-    p.add_argument("--min-volume", type=float, default=1000.0)
+    p.add_argument("--min-volume", type=float, default=0.0,
+                   help="Min 24h volume to consider a game (default 0 = no volume filter; "
+                        "pass a value to re-enable)")
     p.add_argument("--min-edge", type=float, default=0.05)
     p.add_argument("--max-edge", type=float, default=MAX_PLAUSIBLE_EDGE,
                    help=f"Reject a side whose edge exceeds this as likely model error "

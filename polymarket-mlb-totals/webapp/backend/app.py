@@ -281,7 +281,7 @@ def _cache_put(sport: str, date: str, payload: dict) -> None:
 
 def _mlb_args(date: str, sharp_csv: str | None = None) -> argparse.Namespace:
     return argparse.Namespace(
-        date=date, min_volume=1000.0, min_edge=0.05, min_hours=0.0, best_line_only=True,
+        date=date, min_volume=0.0, min_edge=0.05, min_hours=0.0, best_line_only=True,
         odds_min=1.50, odds_max=3.00, dispersion=2.0, league_baseline=8.5, league_prefix="mlb-",
         fee_rate=0.0, use_external=True, projections_csv=None, refresh_prices=False,
         portfolio_value=10000.0, portfolio_db=None, record=True, predictions_db=MLB_DB,
