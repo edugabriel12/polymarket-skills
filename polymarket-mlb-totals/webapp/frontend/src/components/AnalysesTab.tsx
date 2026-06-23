@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   RefreshCw,
@@ -11,7 +11,6 @@ import {
   ChevronRight,
 } from "lucide-react";
 import { api, type Sport } from "@/lib/api";
-import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { PredictionCard } from "@/components/PredictionCard";
 import { cn } from "@/lib/utils";
@@ -24,25 +23,14 @@ function msUntilEndOfDay() {
 }
 
 export function AnalysesTab({ sport }: { sport: Sport }) {
-  const qc = useQueryClient();
-  const [recalculating, setRecalculating] = useState(false);
-  const { data, isLoading, isFetching } = useQuery({
+  // Read-only: the backend recomputes automatically ~10 min before each game (per-game
+  // "waves"), so the page just serves the day's cache. No manual recalc button.
+  const { data, isLoading } = useQuery({
     queryKey: ["analyses", sport],
     queryFn: () => api.analyses(sport),
     staleTime: msUntilEndOfDay(),
     refetchOnWindowFocus: false,
   });
-
-  const recalc = async () => {
-    setRecalculating(true);
-    try {
-      await api.analyses(sport, undefined, true);
-      await qc.invalidateQueries({ queryKey: ["analyses", sport] });
-    } finally {
-      setRecalculating(false);
-    }
-  };
-  const busy = isFetching || recalculating;
 
   const items = data?.suggestions ?? [];
   const n = items.length;
@@ -88,10 +76,13 @@ export function AnalysesTab({ sport }: { sport: Sport }) {
             </span>
           )}
         </div>
-        <Button variant="outline" size="sm" onClick={recalc} disabled={busy}>
-          <RefreshCw className={busy ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
-          Recalcular
-        </Button>
+        {data?.computed_at && (
+          <span className="inline-flex items-center gap-1 text-xs text-muted-foreground" title="Recalculado automaticamente ~10 min antes de cada jogo">
+            <RefreshCw className="h-3 w-3" />
+            auto ·{" "}
+            {new Date(data.computed_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+          </span>
+        )}
       </div>
 
       {isLoading ? (

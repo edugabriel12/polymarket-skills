@@ -16,22 +16,29 @@ auto-calibrates each league's baseline goals/game from the current season), `API
 Brasileirão Série B). The backend subprocess inherits these, so the dashboard uses them automatically.
 API endpoints take `?sport=mlb|soccer`.
 
-### Sharp-close capture (MLB CLV) — built-in scheduler
+### Auto-recalc + sharp-close capture (MLB) — built-in per-game scheduler
 
-CLV vs the sharp close is the only metric that validates a real edge in ~50 bets, and it needs the
-sharp's **closing** line (near first pitch). With `ODDS_API_KEY` set, the backend runs a built-in
-scheduler that snapshots the Pinnacle/consensus close **once a day while it's up** — no external cron.
-It merges into a season-long CSV that `GET /api/clv` scores recorded entries against.
+A game can only be predicted while it's **pregame** (in-progress games are filtered) and its Polymarket
+volume builds toward first pitch — so the model is recomputed **~10 min before each game starts**, not
+on a fixed clock. With `ODDS_API_KEY` set, the backend schedules a recompute per game; near-simultaneous
+starts are grouped into one **wave** = one Odds-API fetch covering the whole slate (so a block of games
+costs a single call, staying well within the free quota). Each wave also snapshots the sharp line into a
+season-long CSV that `GET /api/clv` scores recorded entries against. **No manual "Recalcular" button** —
+the Análises tab just serves the auto-updated day cache (it shows the last `auto · HH:MM` time).
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `ODDS_API_KEY` | — | The Odds API key. **Required** to enable capture + the live sharp anchor. |
-| `SHARP_CLOSE_CAPTURE` | `1` | Set `0` to disable the scheduler. |
-| `SHARP_CLOSE_TIMES` | `16:00,17:00,20:00,22:00,23:00` | Comma-separated **UTC** capture times (the defaults = 13h/14h/17h/19h/20h BRT, to catch afternoon + night first pitches). 5/day ≈ 150 Odds-API calls/month. |
-| `SHARP_CLOSE_CSV` | `<predictions-db dir>/sharp_close.csv` | Where the accumulated closes are written. |
+| `ODDS_API_KEY` | — | The Odds API key. **Required** to enable auto-recalc + the live sharp anchor. |
+| `AUTO_RECALC` | `1` | Set `0` to disable the per-game recompute loop. |
+| `WAVE_LEAD_MIN` | `10` | Minutes before first pitch to recompute a game. |
+| `WAVE_BUCKET_MIN` | `10` | Merge starts within this window into one wave (one fetch). |
+| `WAVE_POLL_SEC` | `300` | How often the loop checks for a due wave (no API cost). |
+| `SHARP_CLOSE_CSV` | `<predictions-db dir>/sharp_close.csv` | Where the accumulated sharp lines/closes are written. |
 
-Endpoints: `GET /api/clv?sport=mlb` (avg_CLV / beat_close), `POST /api/capture-close` (force a snapshot now),
-and `GET /api/health` reports the scheduler's `sharp_close` state. The API key is never logged.
+Endpoints: `GET /api/clv?sport=mlb` (avg_CLV / beat_close), `GET /api/analyses?force=true` (hidden manual
+recompute), `POST /api/capture-close` (force a snapshot), and `GET /api/health` reports the scheduler
+state under `sharp_close`. The API key is never logged. Each wave = ~1 Odds-API call; a daily slate of
+~5–8 start-blocks ≈ 150–240 calls/month.
 
 Two tabs:
 

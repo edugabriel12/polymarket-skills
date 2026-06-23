@@ -29,15 +29,19 @@ import sharp_odds
 from category_common import log
 
 # load_sharp_csv understands these columns; the fair probs (0<p<1) are written directly as
-# the "odds" — american_to_implied accepts an implied prob as-is.
-FIELDS = ["date", "away", "home", "total_line", "close_over_odds", "close_under_odds"]
+# the "odds". A snapshot near first pitch is BOTH the current anchor (over_odds, used by the
+# model) and the best available close (close_over_odds, used by CLV) — so we write both from
+# the same devigged values.
+FIELDS = ["date", "away", "home", "total_line",
+          "over_odds", "under_odds", "close_over_odds", "close_under_odds"]
 
 
 def lookup_to_rows(lookup: dict, date: str) -> list[dict]:
     """Sharp lookup (from fetch_sharp) -> close CSV rows for `date`.
 
     Team order is alphabetical — matching is order-free (load_sharp_csv keys by the team
-    SET) — and the devigged fair probs are written straight into the close odds columns.
+    SET) — and the devigged fair probs are written into BOTH the open and close odds columns
+    (a snapshot taken near first pitch serves as both the model anchor and the close).
     """
     rows = []
     for key, rec in lookup.items():
@@ -48,9 +52,10 @@ def lookup_to_rows(lookup: dict, date: str) -> list[dict]:
         if over is None or under is None or line is None:
             continue
         a, b = sorted(teams)
+        over, under = round(float(over), 6), round(float(under), 6)
         rows.append({"date": d, "away": a, "home": b, "total_line": line,
-                     "close_over_odds": round(float(over), 6),
-                     "close_under_odds": round(float(under), 6)})
+                     "over_odds": over, "under_odds": under,
+                     "close_over_odds": over, "close_under_odds": under})
     return rows
 
 
