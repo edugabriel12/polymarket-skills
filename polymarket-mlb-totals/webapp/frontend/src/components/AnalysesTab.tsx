@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   RefreshCw,
@@ -11,6 +11,7 @@ import {
   ChevronRight,
 } from "lucide-react";
 import { api, type Sport } from "@/lib/api";
+import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { PredictionCard } from "@/components/PredictionCard";
 import { cn } from "@/lib/utils";
@@ -23,25 +24,42 @@ function msUntilEndOfDay() {
 }
 
 export function AnalysesTab({ sport }: { sport: Sport }) {
-  // Read-only: the backend recomputes automatically ~10 min before each game (per-game
-  // "waves"), so the page just serves the day's cache. No manual recalc button.
-  const { data, isLoading } = useQuery({
+  // Auto-recalc (per-game "waves") is MLB-only. Other sports keep the manual Recalcular
+  // button and serve their day cache until recomputed by hand.
+  const isMlb = sport === "mlb";
+  const qc = useQueryClient();
+  const [recalculating, setRecalculating] = useState(false);
+  const { data, isLoading, isFetching } = useQuery({
     queryKey: ["analyses", sport],
     queryFn: () => api.analyses(sport),
     staleTime: msUntilEndOfDay(),
     refetchOnWindowFocus: false,
   });
 
-  // Live schedule for the "next recalc" indicator (the loop reports next_wave to /api/health).
+  // Live schedule for the MLB "next recalc" indicator (the loop reports next_wave to
+  // /api/health). Only polled for MLB — the wave scheduler is baseball-only.
   const { data: health } = useQuery({
     queryKey: ["health"],
     queryFn: () => api.health(),
     refetchInterval: 60_000,
     refetchOnWindowFocus: false,
+    enabled: isMlb,
   });
   const nextWave = health?.sharp_close?.next_wave;
   const hhmm = (iso: string) =>
     new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+  // Manual recompute (non-MLB sports only).
+  const recalc = async () => {
+    setRecalculating(true);
+    try {
+      await api.analyses(sport, undefined, true);
+      await qc.invalidateQueries({ queryKey: ["analyses", sport] });
+    } finally {
+      setRecalculating(false);
+    }
+  };
+  const busy = isFetching || recalculating;
 
   const items = data?.suggestions ?? [];
   const n = items.length;
@@ -81,21 +99,28 @@ export function AnalysesTab({ sport }: { sport: Sport }) {
             </span>
           )}
         </div>
-        <div className="flex items-center gap-3 text-xs text-muted-foreground">
-          {data?.computed_at && (
-            <span className="inline-flex items-center gap-1" title="Última atualização automática">
-              <RefreshCw className="h-3 w-3" />
-              auto · {hhmm(data.computed_at)}
+        {isMlb ? (
+          <div className="flex items-center gap-3 text-xs text-muted-foreground">
+            {data?.computed_at && (
+              <span className="inline-flex items-center gap-1" title="Última atualização automática">
+                <RefreshCw className="h-3 w-3" />
+                auto · {hhmm(data.computed_at)}
+              </span>
+            )}
+            <span
+              className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 font-semibold"
+              title="O modelo recalcula automaticamente ~10 min antes de cada jogo"
+            >
+              <Clock className="h-3 w-3" />
+              {nextWave ? `próximo recálculo · ${hhmm(nextWave)}` : "sem mais recálculos hoje"}
             </span>
-          )}
-          <span
-            className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 font-semibold"
-            title="O modelo recalcula automaticamente ~10 min antes de cada jogo"
-          >
-            <Clock className="h-3 w-3" />
-            {nextWave ? `próximo recálculo · ${hhmm(nextWave)}` : "sem mais recálculos hoje"}
-          </span>
-        </div>
+          </div>
+        ) : (
+          <Button variant="outline" size="sm" onClick={recalc} disabled={busy}>
+            <RefreshCw className={busy ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
+            Recalcular
+          </Button>
+        )}
       </div>
 
       {isLoading ? (
