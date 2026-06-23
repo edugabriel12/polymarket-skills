@@ -29,6 +29,7 @@ import totals_market as tm
 import data_inputs
 import predictions_db
 import sharp_odds
+import sharp_discovery
 
 from category_common import (
     APIClient,
@@ -332,6 +333,29 @@ def _shadow_log_mlb(args, target, slug, line, side_notes, chosen, m, bet, skip_r
             print(f"[model_log] failed: {e}", file=sys.stderr)
 
 
+def _load_sharp_lookup(args, target, vlog) -> dict:
+    """Load the sharp reference (Pinnacle/consensus, devigged) -> the fair-value anchor.
+
+    CSV first, then The Odds API. With it the model is a divergence detector (edge =
+    Polymarket price vs sharp fair); without it the model stays Polymarket-anchored
+    (zero edge). It also doubles as the authoritative game list for sharp-driven
+    discovery, so it is loaded BEFORE market discovery.
+    """
+    sharp_lookup: dict = {}
+    if getattr(args, "sharp_odds_csv", None):
+        try:
+            sharp_lookup = sharp_odds.load_sharp_csv(args.sharp_odds_csv)
+        except OSError as e:
+            vlog(f"  sharp CSV load failed: {e}")
+    elif getattr(args, "odds_api_key", None) or os.environ.get("ODDS_API_KEY"):
+        sharp_lookup = sharp_odds.fetch_sharp(getattr(args, "odds_api_key", None), target)
+    if sharp_lookup:
+        dated = sum(1 for k in sharp_lookup if k[0] == target)
+        vlog(f"  sharp reference loaded: {len(sharp_lookup)} game(s) "
+             f"({dated} dated {target}) (divergence-detector mode)")
+    return sharp_lookup
+
+
 def run(args) -> dict:
     api = APIClient(rate_limit_ms=args.rate_limit, debug=args.debug)
     # Robust terminal logging (stderr -> shows in the uvicorn console). On unless --quiet.
@@ -354,16 +378,37 @@ def run(args) -> dict:
     # global volume-ranked mix (crypto/politics/other sports), and pagination is capped
     # (HTTP 422 past offset ~2100). So low-volume MLB games can fall past the cut and be
     # invisible. Surface the MLB-vs-mix split + a truncation flag so this is auditable.
+    # The truncation check uses DATED MLB GAMES (distinct events on the target day), not
+    # the raw count of mlb- markets — a fat backlog of future/other-day games masks the
+    # fact that today's low-volume games were cut.
     def _is_mlb(m):
         return (m.get("event_slug") or m.get("slug") or "").lower().startswith("mlb-")
     mlb_all = [m for m in markets if _is_mlb(m)]
+    mlb_events_today = {(m.get("event_slug") or m.get("slug"))
+                        for m in mlb_all if game_date(m) == target}
     vlog(f"Discovery: tag '{_tag}' -> {len(markets)} active market(s); "
-         f"{len(mlb_all)} are MLB (mlb- prefix), {len(markets) - len(mlb_all)} other "
-         f"(the tag's global mix)")
-    if len(markets) >= 2000 and len(mlb_all) < 30:
-        vlog(f"  ⚠️ COVERAGE WARNING: discovery likely TRUNCATED by the volume-ranked "
-             f"offset cap — only {len(mlb_all)} mlb- markets in the top {len(markets)}; "
-             f"low-volume MLB games are probably being cut.")
+         f"{len(mlb_all)} are MLB (mlb- prefix), {len(mlb_events_today)} MLB event(s) "
+         f"dated {target}; {len(markets) - len(mlb_all)} other (the tag's global mix)")
+    if len(markets) >= 2000 and len(mlb_events_today) < 6:
+        vlog(f"  ⚠️ COVERAGE WARNING: only {len(mlb_events_today)} MLB game(s) dated "
+             f"{target} surfaced in the top {len(markets)} by volume — low-volume games "
+             f"are being cut by the offset cap. Sharp-driven discovery will recover them.")
+
+    # Load the sharp reference EARLY: it doubles as the authoritative game list.
+    sharp_lookup = _load_sharp_lookup(args, target, vlog)
+
+    # Sharp-source-driven discovery: the sharp slate carries the FULL daily card, so we
+    # fetch each sharp game's Polymarket markets by event slug and UNION them in. This
+    # fixes coverage (every game found regardless of volume rank) AND matching (every
+    # added game already has a sharp ref). On by default when a sharp slate is loaded.
+    if sharp_lookup and getattr(args, "sharp_discovery", True):
+        existing = {m.get("slug") for m in markets if m.get("slug")}
+        extra = sharp_discovery.discover_from_sharp(api, sharp_lookup, target, vlog=vlog)
+        added = [m for m in extra if m.get("slug") and m.get("slug") not in existing]
+        if added:
+            markets = markets + added
+            vlog(f"  sharp-driven discovery added {len(added)} market(s) the tag missed "
+                 f"(total now {len(markets)})")
 
     on_day = [m for m in markets if game_date(m) == target]
     games = group_by_event(on_day)
@@ -390,20 +435,6 @@ def run(args) -> dict:
          f"(moneyline/spread/F5/K-prop/NRFI); {len(games)} run-total market(s) to analyze")
     if games:
         vlog("  run-total markets: " + ", ".join(sorted(games)))
-
-    # Sharp reference (Pinnacle/consensus, devigged) -> the fair-value anchor. With it the
-    # model becomes a divergence detector (edge = Polymarket price vs sharp fair); without
-    # it the model stays Polymarket-anchored (zero edge). CSV first, then The Odds API.
-    sharp_lookup = {}
-    if getattr(args, "sharp_odds_csv", None):
-        try:
-            sharp_lookup = sharp_odds.load_sharp_csv(args.sharp_odds_csv)
-        except OSError as e:
-            vlog(f"  sharp CSV load failed: {e}")
-    elif getattr(args, "odds_api_key", None) or os.environ.get("ODDS_API_KEY"):
-        sharp_lookup = sharp_odds.fetch_sharp(getattr(args, "odds_api_key", None), target)
-    if sharp_lookup:
-        vlog(f"  sharp reference loaded: {len(sharp_lookup)} game(s) (divergence-detector mode)")
 
     portfolio_value = float(args.portfolio_value)
     first_trade = data_inputs.is_first_trade(STRATEGY, args.portfolio_db)
@@ -654,6 +685,11 @@ def main() -> None:
                         "-> fair-value anchor; turns the model into a divergence detector")
     p.add_argument("--odds-api-key", default=None,
                    help="The Odds API key (or $ODDS_API_KEY) for live Pinnacle/consensus totals")
+    p.add_argument("--no-sharp-discovery", dest="sharp_discovery", action="store_false",
+                   default=True,
+                   help="Disable using the sharp slate as the authoritative game list "
+                        "(default on when a sharp reference is loaded; recovers low-volume "
+                        "games the volume-truncated tag misses)")
     p.add_argument("--refresh-prices", action="store_true", help="Refresh prices via CLOB midpoint")
     p.add_argument("--portfolio-value", type=float, default=10000.0, help="Portfolio USD for sizing")
     p.add_argument("--portfolio-db", default=None, help="Paper portfolio DB (to detect first trade)")

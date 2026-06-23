@@ -22,7 +22,69 @@ from __future__ import annotations
 import csv
 import os
 
+import ballparks
+
 ODDS_API = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
+
+# Full team names / cities / nicknames -> the lowercase abbreviation Polymarket uses
+# in its game slugs (mlb-chc-nym-...). Sharp sources disagree on team identifiers: a
+# CSV (e.g. oddsDataMLB) uses abbreviations ("CHC","NYM"), while The Odds API uses full
+# names ("Chicago Cubs"). Normalizing BOTH to the Polymarket abbreviation is what lets a
+# sharp game key MATCH its Polymarket market (the cause of the earlier "0 of N matched").
+MLB_TEAM_ABBR: dict[str, str] = {
+    "diamondbacks": "ari", "arizona": "ari", "arizona diamondbacks": "ari", "dbacks": "ari",
+    "braves": "atl", "atlanta": "atl", "atlanta braves": "atl",
+    "orioles": "bal", "baltimore": "bal", "baltimore orioles": "bal",
+    "red sox": "bos", "boston": "bos", "boston red sox": "bos", "redsox": "bos",
+    "cubs": "chc", "chicago cubs": "chc",
+    "white sox": "cws", "chicago white sox": "cws", "whitesox": "cws",
+    "reds": "cin", "cincinnati": "cin", "cincinnati reds": "cin",
+    "guardians": "cle", "cleveland": "cle", "cleveland guardians": "cle", "indians": "cle",
+    "rockies": "col", "colorado": "col", "colorado rockies": "col",
+    "tigers": "det", "detroit": "det", "detroit tigers": "det",
+    "astros": "hou", "houston": "hou", "houston astros": "hou",
+    "royals": "kc", "kansas city": "kc", "kansas city royals": "kc",
+    "angels": "laa", "los angeles angels": "laa", "la angels": "laa", "anaheim": "laa",
+    "dodgers": "lad", "los angeles dodgers": "lad", "la dodgers": "lad",
+    "marlins": "mia", "miami": "mia", "miami marlins": "mia",
+    "brewers": "mil", "milwaukee": "mil", "milwaukee brewers": "mil",
+    "twins": "min", "minnesota": "min", "minnesota twins": "min",
+    "mets": "nym", "new york mets": "nym", "ny mets": "nym",
+    "yankees": "nyy", "new york yankees": "nyy", "ny yankees": "nyy",
+    "athletics": "oak", "oakland": "oak", "oakland athletics": "oak", "a's": "oak", "as": "oak",
+    "phillies": "phi", "philadelphia": "phi", "philadelphia phillies": "phi",
+    "pirates": "pit", "pittsburgh": "pit", "pittsburgh pirates": "pit",
+    "padres": "sd", "san diego": "sd", "san diego padres": "sd",
+    "giants": "sf", "san francisco": "sf", "san francisco giants": "sf",
+    "mariners": "sea", "seattle": "sea", "seattle mariners": "sea",
+    "cardinals": "stl", "st louis": "stl", "st. louis": "stl",
+    "st louis cardinals": "stl", "st. louis cardinals": "stl",
+    "rays": "tb", "tampa bay": "tb", "tampa bay rays": "tb",
+    "rangers": "tex", "texas": "tex", "texas rangers": "tex",
+    "blue jays": "tor", "toronto": "tor", "toronto blue jays": "tor", "bluejays": "tor",
+    "nationals": "wsh", "washington": "wsh", "washington nationals": "wsh", "nats": "wsh",
+}
+
+
+def normalize_team(token: str) -> str:
+    """Normalize any sharp team token to the lowercase Polymarket slug abbreviation.
+
+    Handles abbreviations ("CHC"), full names ("Chicago Cubs"), and the ballparks
+    alias table ("chw"->"cws", "az"->"ari"). Falls back to the cleaned token so an
+    unknown team still keys consistently (away/home stay symmetric).
+    """
+    t = (token or "").strip().lower()
+    if not t:
+        return t
+    if t in MLB_TEAM_ABBR:
+        return MLB_TEAM_ABBR[t]
+    canon = ballparks._canon(t)          # abbrev aliases (chw->cws, az->ari, ...)
+    if ballparks.park_for(canon):
+        return canon
+    last = t.replace(".", "").split()[-1] if t.split() else t   # "n.y. yankees" -> "yankees"
+    if last in MLB_TEAM_ABBR:
+        return MLB_TEAM_ABBR[last]
+    return canon
 
 
 def american_to_implied(value) -> float | None:
@@ -51,7 +113,9 @@ def devig(over_imp: float | None, under_imp: float | None) -> tuple[float, float
 
 
 def _key(date: str, away: str, home: str) -> tuple:
-    return (date, frozenset((away.lower().strip(), home.lower().strip())))
+    # Normalize team identifiers to Polymarket abbreviations so a sharp game keyed
+    # from "Chicago Cubs"/"CHC" matches a Polymarket slug game keyed from "chc".
+    return (date, frozenset((normalize_team(away), normalize_team(home))))
 
 
 # ---------------------------------------------------------------------------
