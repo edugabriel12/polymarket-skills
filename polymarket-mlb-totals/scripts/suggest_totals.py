@@ -350,7 +350,21 @@ def run(args) -> dict:
         return {"date": target, "error": f"discovery failed: {e}",
                 "suggestions": [], "skipped": []}
 
-    vlog(f"Discovery: tag '{_tag}' -> {len(markets)} active market(s)")
+    # Coverage diagnostics: the `mlb` tag is NOT honored by Gamma — it returns the
+    # global volume-ranked mix (crypto/politics/other sports), and pagination is capped
+    # (HTTP 422 past offset ~2100). So low-volume MLB games can fall past the cut and be
+    # invisible. Surface the MLB-vs-mix split + a truncation flag so this is auditable.
+    def _is_mlb(m):
+        return (m.get("event_slug") or m.get("slug") or "").lower().startswith("mlb-")
+    mlb_all = [m for m in markets if _is_mlb(m)]
+    vlog(f"Discovery: tag '{_tag}' -> {len(markets)} active market(s); "
+         f"{len(mlb_all)} are MLB (mlb- prefix), {len(markets) - len(mlb_all)} other "
+         f"(the tag's global mix)")
+    if len(markets) >= 2000 and len(mlb_all) < 30:
+        vlog(f"  ⚠️ COVERAGE WARNING: discovery likely TRUNCATED by the volume-ranked "
+             f"offset cap — only {len(mlb_all)} mlb- markets in the top {len(markets)}; "
+             f"low-volume MLB games are probably being cut.")
+
     on_day = [m for m in markets if game_date(m) == target]
     games = group_by_event(on_day)
     vlog(f"  {len(on_day)} market(s) dated {target} across {len(games)} event(s)")
@@ -365,7 +379,8 @@ def run(args) -> dict:
         games = {k: v for k, v in games.items() if k.lower().startswith(prefix)}
         filtered_non_league = before - len(games)
         vlog(f"  filtered out {filtered_non_league} non-'{prefix}' event(s); "
-             f"{len(games)} MLB event(s)")
+             f"{len(games)} MLB event(s) dated {target}: "
+             + (", ".join(sorted(games)) if games else "(none)"))
 
     # Keep only full-GAME total-runs markets (drop moneyline/spread/F5/K-prop/NRFI).
     before_total = len(games)
