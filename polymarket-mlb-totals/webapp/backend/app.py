@@ -238,7 +238,10 @@ def _mlb_args(date: str) -> argparse.Namespace:
         odds_min=1.50, odds_max=3.00, dispersion=2.0, league_baseline=8.5, league_prefix="mlb-",
         fee_rate=0.0, use_external=True, projections_csv=None, refresh_prices=False,
         portfolio_value=10000.0, portfolio_db=None, record=True, predictions_db=MLB_DB,
-        paper=False, paper_execute=False, output="json", rate_limit=100, verbose=True, debug=False)
+        paper=False, paper_execute=False, output="json", rate_limit=100, verbose=True, debug=False,
+        # Divergence detector: anchor to the live sharp (env ODDS_API_KEY), use the sharp
+        # slate as the authoritative game list, and bet ONLY on a sharp anchor.
+        sharp_odds_csv=None, odds_api_key=None, sharp_discovery=True, require_sharp=True)
 
 
 def _run_mlb(date: str) -> dict:

@@ -102,9 +102,18 @@ def model_probabilities(line, over_price, park_factor, inputs, *,
     correctly price a Polymarket alternate line of 7.5/11.5 — line drift no longer breaks
     the anchor. When `sharp_line` is omitted the sharp prob is taken at the Polymarket line.
 
+    In divergence mode mu is anchored PURELY to the sharp line — the factor model is NOT
+    blended in. The 10-season backtest showed the factor model has no predictive edge, so
+    nudging mu off the efficient sharp value with factors only adds noise AND masks bad
+    sharp data (a wrong sharp line, blended halfway to the factor mu, can slip past the
+    implausible-edge cap as a false signal). With a pure sharp anchor, a corrupt sharp line
+    instead produces an implausibly large edge that the cap correctly rejects. `model_mu`
+    is still computed and reported for transparency, but it does not move mu.
+
     Without a sharp price, the anchor falls back to the Polymarket price itself, so the
-    model stays market-implied (edge ≈ 0 — anti-fabrication). `over_price` is always the
-    Polymarket price we trade against; both the sharp and Polymarket mu are reported.
+    model stays market-implied (edge ≈ 0 — anti-fabrication); only there do the factors
+    nudge mu (the legacy no-sharp path). `over_price` is always the Polymarket price we
+    trade against; both the sharp and Polymarket mu are reported.
     """
     poly_mu = rd.market_implied_mu(line, over_price, dispersion)
     if sharp_over_price is not None:
@@ -119,7 +128,10 @@ def model_probabilities(line, over_price, park_factor, inputs, *,
     if used_external:
         base = rd.baseline_mu(park_factor, league_baseline)
         model_mu = rd.adjust_mu(base, **inputs)
-        mu = rd.anchor_to_market(model_mu, anchor_mu)   # factors nudge off the fair anchor
+    if sharp_over_price is not None:
+        mu = anchor_mu                                  # pure sharp anchor (divergence detector)
+    elif used_external:
+        mu = rd.anchor_to_market(model_mu, anchor_mu)   # no sharp: factors nudge off poly anchor
     else:
         mu = anchor_mu
     var = rd.variance_from_mu(mu, dispersion)
@@ -506,10 +518,17 @@ def run(args) -> dict:
         away, home = pf.parse_slug_teams(event_slug)
         sharp = sharp_odds.sharp_ref(sharp_lookup, target, away, home) if sharp_lookup else None
         sharp_line, sharp_over = (sharp if sharp else (None, None))
+        # Divergence mode: with a sharp slate loaded, bet ONLY on a sharp anchor. A game
+        # with no sharp match must be skipped, not fall back to the factor model (which the
+        # backtest proved is -EV) — otherwise the loophole reintroduces factor-noise bets.
         if sharp_lookup and sharp is None:
             vlog(f"  [{event_slug}] ⚠️ no sharp match for parsed teams "
                  f"away={away} home={home} — not in the {len(sharp_lookup)}-game sharp slate "
                  f"(check team-abbrev mapping)")
+            if getattr(args, "require_sharp", True):
+                _skip(event_slug, "no sharp reference (divergence mode bets only on a sharp anchor)",
+                      line=line)
+                continue
         m = model_probabilities(
             line, ou["over_price"], park_factor, inputs,
             league_baseline=args.league_baseline, dispersion=args.dispersion,
@@ -716,6 +735,11 @@ def main() -> None:
                    help="Disable using the sharp slate as the authoritative game list "
                         "(default on when a sharp reference is loaded; recovers low-volume "
                         "games the volume-truncated tag misses)")
+    p.add_argument("--no-require-sharp", dest="require_sharp", action="store_false",
+                   default=True,
+                   help="In divergence mode (sharp slate loaded), also evaluate games with NO "
+                        "sharp match via the factor model (default OFF: skip them — the factor "
+                        "model has no proven edge, so bet only on a sharp anchor)")
     p.add_argument("--refresh-prices", action="store_true", help="Refresh prices via CLOB midpoint")
     p.add_argument("--portfolio-value", type=float, default=10000.0, help="Portfolio USD for sizing")
     p.add_argument("--portfolio-db", default=None, help="Paper portfolio DB (to detect first trade)")
