@@ -94,6 +94,26 @@ class TestSharpOdds(unittest.TestCase):
         self.assertEqual(rows[0]["line"], 10.5)
         self.assertEqual(rows[0]["n_lines"], 2)
 
+    def test_oddsapi_skips_in_progress_games(self):
+        # A game that already started serves a LIVE total (low remaining runs); with `now`
+        # set past its commence_time it must be dropped so it never anchors the model.
+        from datetime import datetime, timezone
+        events = [
+            {"home_team": "Rockies", "away_team": "Red Sox", "commence_time": "2026-06-23T18:00:00Z",
+             "bookmakers": [{"key": "pinnacle", "markets": [{"key": "totals", "outcomes": [
+                 {"name": "Over", "price": -105, "point": 2.5},     # live remaining-runs total
+                 {"name": "Under", "price": -105, "point": 2.5}]}]}]},
+            {"home_team": "Padres", "away_team": "Braves", "commence_time": "2026-06-23T23:30:00Z",
+             "bookmakers": [{"key": "pinnacle", "markets": [{"key": "totals", "outcomes": [
+                 {"name": "Over", "price": -105, "point": 8.5},     # pregame
+                 {"name": "Under", "price": -105, "point": 8.5}]}]}]},
+        ]
+        now = datetime(2026, 6, 23, 22, 0, tzinfo=timezone.utc)     # 10pm UTC
+        rows = so.oddsapi_rows(events, now=now)
+        self.assertEqual(len(rows), 1)                              # only the pregame game
+        self.assertEqual(rows[0]["home"], "Padres")
+        self.assertEqual(len(so.oddsapi_rows(events)), 2)           # no filter -> both
+
     def test_parse_oddsapi_flags_doubleheader_collision(self):
         logs = []
         events = [
