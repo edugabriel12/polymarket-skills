@@ -25,6 +25,35 @@ class TestSharpOdds(unittest.TestCase):
         self.assertAlmostEqual(fair[0], 0.5, places=6)
         self.assertIsNone(so.devig(0, 0.5))
 
+    def test_mask_key_never_reveals_full(self):
+        self.assertEqual(so._mask_key(None), "(none)")
+        self.assertEqual(so._mask_key(""), "(none)")
+        self.assertEqual(so._mask_key("short"), "*****")            # short keys fully masked
+        masked = so._mask_key("abcd1234efgh5678")
+        self.assertIn("abcd", masked)
+        self.assertIn("5678", masked)
+        self.assertNotIn("1234efgh", masked)                       # middle never shown
+
+    def test_fetch_sharp_no_key_logs_and_returns_empty(self):
+        logs = []
+        old = os.environ.pop("ODDS_API_KEY", None)
+        try:
+            out = so.fetch_sharp(None, "2026-06-23", vlog=logs.append)
+        finally:
+            if old is not None:
+                os.environ["ODDS_API_KEY"] = old
+        self.assertEqual(out, {})
+        self.assertTrue(any("no API key" in m for m in logs))
+
+    def test_fetch_sharp_never_logs_raw_key(self):
+        logs = []
+        secret = "supersecretkey0123456789"
+        # No network in the sandbox -> request fails, but key resolution is logged first.
+        so.fetch_sharp(secret, "2026-06-23", vlog=logs.append)
+        joined = "\n".join(logs)
+        self.assertNotIn(secret, joined)                           # raw key must never appear
+        self.assertTrue(any("key source: argument" in m for m in logs))
+
     def test_parse_oddsapi(self):
         events = [{"home_team": "Yankees", "away_team": "Red Sox",
                    "commence_time": "2026-06-21T23:00:00Z",

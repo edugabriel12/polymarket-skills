@@ -21,8 +21,18 @@ from __future__ import annotations
 
 import csv
 import os
+import re
 
 import ballparks
+
+# The Odds API takes the key as an `apiKey=` query param, so requests' own error
+# strings (HTTPError "...for url: ...apiKey=SECRET...") and any echoed URL would leak
+# it. Redact the value from anything we log (CLAUDE.md: never echo secrets).
+_APIKEY_RE = re.compile(r"(apiKey=)[^&\s]+", re.IGNORECASE)
+
+
+def _redact(text) -> str:
+    return _APIKEY_RE.sub(r"\1***", str(text))
 
 ODDS_API = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
 
@@ -184,21 +194,62 @@ def parse_oddsapi(events: list, book: str = "pinnacle") -> dict:
     return out
 
 
-def fetch_sharp(api_key: str | None, date: str, book: str = "pinnacle", timeout: int = 10) -> dict:
-    """Best-effort sharp totals for a date via The Odds API. {} on any failure."""
+def _mask_key(key: str | None) -> str:
+    """A non-revealing fingerprint of an API key for logs (never the key itself)."""
+    if not key:
+        return "(none)"
+    if len(key) <= 8:
+        return "*" * len(key)
+    return f"{key[:4]}…{key[-4:]} (len={len(key)})"
+
+
+def fetch_sharp(api_key: str | None, date: str, book: str = "pinnacle",
+                timeout: int = 10, vlog=None) -> dict:
+    """Best-effort sharp totals for a date via The Odds API. {} on any failure.
+
+    Pass `vlog` (a print-like callback) to trace key resolution and the HTTP call
+    (source, masked key fingerprint, status, quota headers, event/parse counts, and
+    any error). The API key is NEVER logged in full — only a masked fingerprint
+    (CLAUDE.md: never echo secrets).
+    """
+    vlog = vlog or (lambda *a, **k: None)
+    source = ("argument (--odds-api-key)" if api_key
+              else "env $ODDS_API_KEY" if os.environ.get("ODDS_API_KEY") else "none")
     api_key = api_key or os.environ.get("ODDS_API_KEY")
+    vlog(f"  [odds-api] key source: {source}; key {_mask_key(api_key)}")
     if not api_key:
+        vlog("  [odds-api] no API key found — set $ODDS_API_KEY or pass --odds-api-key; "
+             "skipping live sharp fetch")
         return {}
     try:
         import requests  # lazy
         resp = requests.get(ODDS_API, params={
             "apiKey": api_key, "regions": "us,eu", "markets": "totals",
             "oddsFormat": "american", "bookmakers": book}, timeout=timeout)
+        # The Odds API reports quota in headers — invaluable for confirming the key works.
+        used, remaining = resp.headers.get("x-requests-used"), resp.headers.get("x-requests-remaining")
+        vlog(f"  [odds-api] GET {ODDS_API} (book={book}) -> HTTP {resp.status_code} "
+             f"(quota: used={used} remaining={remaining})")
+        if resp.status_code >= 400:
+            # 401=bad key, 422=bad params, 429=quota exhausted. Body carries the reason.
+            vlog(f"  [odds-api] error body: {_redact((resp.text or '')[:200])}")
         resp.raise_for_status()
         events = resp.json()
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        vlog(f"  [odds-api] request FAILED: {type(e).__name__}: {_redact(e)}")
         return {}
-    return {k: v for k, v in parse_oddsapi(events, book).items() if k[0] == date} or parse_oddsapi(events, book)
+    n_events = len(events) if isinstance(events, list) else 0
+    parsed = parse_oddsapi(events, book)
+    dated = {k: v for k, v in parsed.items() if k[0] == date}
+    vlog(f"  [odds-api] response: {n_events} event(s); {len(parsed)} parsed with a totals "
+         f"line; {len(dated)} dated {date}")
+    if n_events == 0:
+        vlog("  [odds-api] ⚠️ 0 events returned — verify the key is valid/active and that "
+             "games are scheduled (off-season/no-slate days return empty)")
+    elif not dated:
+        vlog(f"  [odds-api] ⚠️ {n_events} event(s) but none dated {date} — the slate may be "
+             "for another day (timezone); using all parsed games as a fallback")
+    return dated or parsed
 
 
 def sharp_over_prob(lookup: dict, date: str, away: str, home: str, line: float | None = None,

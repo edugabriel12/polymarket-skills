@@ -343,16 +343,25 @@ def _load_sharp_lookup(args, target, vlog) -> dict:
     """
     sharp_lookup: dict = {}
     if getattr(args, "sharp_odds_csv", None):
+        vlog(f"  sharp source: CSV {args.sharp_odds_csv}")
         try:
             sharp_lookup = sharp_odds.load_sharp_csv(args.sharp_odds_csv)
         except OSError as e:
             vlog(f"  sharp CSV load failed: {e}")
     elif getattr(args, "odds_api_key", None) or os.environ.get("ODDS_API_KEY"):
-        sharp_lookup = sharp_odds.fetch_sharp(getattr(args, "odds_api_key", None), target)
+        vlog("  sharp source: The Odds API (live)")
+        sharp_lookup = sharp_odds.fetch_sharp(
+            getattr(args, "odds_api_key", None), target, vlog=vlog)
+    else:
+        vlog("  sharp source: NONE (no --sharp-odds-csv and no --odds-api-key/$ODDS_API_KEY) "
+             "-> Polymarket-anchored, zero-edge fallback")
     if sharp_lookup:
         dated = sum(1 for k in sharp_lookup if k[0] == target)
         vlog(f"  sharp reference loaded: {len(sharp_lookup)} game(s) "
              f"({dated} dated {target}) (divergence-detector mode)")
+    else:
+        vlog("  sharp reference EMPTY — divergence detector OFF "
+             "(model stays Polymarket-anchored, zero edge)")
     return sharp_lookup
 
 
