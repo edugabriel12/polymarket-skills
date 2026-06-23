@@ -22,7 +22,7 @@ from __future__ import annotations
 import csv
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import ballparks
 
@@ -127,6 +127,30 @@ def _key(date: str, away: str, home: str) -> tuple:
     # Normalize team identifiers to Polymarket abbreviations so a sharp game keyed
     # from "Chicago Cubs"/"CHC" matches a Polymarket slug game keyed from "chc".
     return (date, frozenset((normalize_team(away), normalize_team(home))))
+
+
+def _adjacent_dates(date: str) -> list[str]:
+    """The target date AND the next UTC day.
+
+    A game listed on Polymarket for a US local date (e.g. a late West-coast game) can have a
+    UTC commence_time on the FOLLOWING calendar day, so the sharp event is keyed one day ahead.
+    Matching both recovers those games instead of dropping them as "no sharp reference".
+    """
+    out = [date]
+    try:
+        out.append((datetime.strptime(date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d"))
+    except (ValueError, TypeError):
+        pass
+    return out
+
+
+def _find_rec(lookup: dict, date: str, away: str, home: str) -> dict | None:
+    """Look up a game's sharp record by team pair, trying `date` then the next UTC day."""
+    for d in _adjacent_dates(date):
+        rec = lookup.get(_key(d, away, home))
+        if rec:
+            return rec
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +349,9 @@ def fetch_sharp(api_key: str | None, date: str, book: str = "pinnacle",
     n_events = len(events) if isinstance(events, list) else 0
     now = datetime.now(timezone.utc)
     parsed = parse_oddsapi(events, book, vlog=vlog, now=now)   # drops live games + flags dups
-    dated = {k: v for k, v in parsed.items() if k[0] == date}
+    # Keep today's games AND the next UTC day's (late games commence after UTC midnight).
+    keep_dates = set(_adjacent_dates(date))
+    dated = {k: v for k, v in parsed.items() if k[0] in keep_dates}
     n_live = len(oddsapi_rows(events, book)) - len(oddsapi_rows(events, book, now=now))
     vlog(f"  [odds-api] response: {n_events} event(s); {len(parsed)} pregame with a totals "
          f"line; {len(dated)} dated {date}"
@@ -354,7 +380,7 @@ def sharp_over_prob(lookup: dict, date: str, away: str, home: str, line: float |
     Line is matched leniently (sharp line within 0.5 of ours), since books may differ.
     Used by CLV scoring, which compares at the bet's own line.
     """
-    rec = lookup.get(_key(date, away, home))
+    rec = _find_rec(lookup, date, away, home)
     if not rec:
         return None
     if line is not None and rec.get("line") is not None and abs(float(rec["line"]) - float(line)) > 0.51:
@@ -373,7 +399,7 @@ def sharp_ref(lookup: dict, date: str, away: str, home: str,
     robust to line drift: the sharp book's main line (e.g. 8.5) and Polymarket's possibly
     alternate line (e.g. 7.5 or 11.5) no longer have to match for the ref to attach.
     """
-    rec = lookup.get(_key(date, away, home))
+    rec = _find_rec(lookup, date, away, home)
     if not rec:
         return None
     over = rec.get("close_over_fair" if use_close else "over_fair") or rec.get("over_fair")

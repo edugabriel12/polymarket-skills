@@ -181,6 +181,19 @@ measure**, built in four layers (full write-up in `references/calibrated-forecas
 Pure-stdlib cores, offline-tested by `test_forecast.py` / `test_calibration_core.py` /
 `test_scoring.py`.
 
+**Forecast layer — predict EVERY game** (`forecast_all_mlb`, on by default; `--no-forecast-all`):
+beyond the tradeable `suggestions` (which still respect edge/odds-band/volume), the run also emits
+a `forecasts` array with a calibrated run-total prediction for **every** discovered MLB game —
+including games Polymarket lists **without** a totals market, or with no actionable edge. Each
+forecast picks the best basis (**sharp → factors → market price**), reports the full distribution
+(mean/median/mode, 50%/80% intervals, entropy, P(over) at the game's line) plus `edge_vs_market`
+when a price exists. This is prediction, not a trade signal — the dashboard shows it under
+"Previsão de todos os jogos". Games with no basis are listed with `forecast: null`.
+
+**Sharp date tolerance**: the sharp lookup matches a game's teams on the target date **and the next
+UTC day**, so late West-coast games (whose UTC commence rolls past midnight) keep their sharp anchor
+instead of falling to "no sharp reference".
+
 ### Calibration report (`calibration.py`)
 Settles the shadow log (a game's actual outcome is propagated to **all** its lines, bet or not) and
 scores the model. Pure stdlib; `--sport mlb|soccer`.

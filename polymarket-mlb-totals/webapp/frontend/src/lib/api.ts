@@ -78,6 +78,29 @@ export interface Skipped {
   reason: string;
 }
 
+// A calibrated prediction for EVERY game, independent of the trade filters.
+export interface GameForecast {
+  game: string;
+  line: number;
+  has_market: boolean;
+  basis: "sharp" | "factors" | "market" | null;
+  mu?: number;
+  forecast: {
+    mean_total: number;
+    median_total: number;
+    most_likely_total: number;
+    pi50: [number, number];
+    pi80: [number, number];
+    pi80_mass: number;
+    entropy_bits: number;
+    p_over: number;
+    p_under: number;
+  } | null;
+  over_price: number | null;
+  edge_vs_market: number | null;
+  reason?: string;
+}
+
 export interface AnalysesResponse {
   sport: Sport;
   date: string;
@@ -85,6 +108,7 @@ export interface AnalysesResponse {
   cached: boolean;
   counts: Record<string, number>;
   suggestions: Suggestion[];
+  forecasts?: GameForecast[];
   skipped: Skipped[];
   disclaimer: string;
   error?: string | null;

@@ -180,6 +180,76 @@ def forecast_block(m, line) -> dict:
     }
 
 
+def _forecast_mu(line, over_price, sharp, inputs, park, dispersion, league_baseline):
+    """Best-available expected total for a FORECAST (not a trade): sharp → factors → market.
+
+    Returns (mu, basis) or (None, None) when there's nothing to model from. Mirrors the trade
+    path's anchor priority, but never requires a Polymarket price — so a game with no totals
+    market can still be forecast from the sharp line or the team factors.
+    """
+    sharp_line, sharp_over = (sharp if sharp else (None, None))
+    if sharp_over is not None:
+        return rd.market_implied_mu(sharp_line, sharp_over, dispersion), "sharp"
+    if any(k in inputs for k in STRONG_INPUT_KEYS):
+        return rd.adjust_mu(rd.baseline_mu(park, league_baseline), **inputs), "factors"
+    if over_price is not None:
+        return rd.market_implied_mu(line, over_price, dispersion), "market"
+    return None, None
+
+
+def forecast_all_mlb(api, mlb_events, sharp_lookup, target, args, vlog):
+    """One run-total forecast per MLB game — independent of the trade filters.
+
+    Every game with a model basis (sharp → factors → market price) gets the full distribution
+    (mean/median/mode, 50%/80% intervals, entropy, P(over) at its main line), even when it has
+    no Polymarket totals market or no actionable edge. This is PREDICTION, not a trade signal:
+    no edge/odds-band/volume gating. Games with no basis are reported with forecast=None.
+    """
+    out = []
+    for event_slug, gmarkets in sorted(mlb_events.items()):
+        totals = tm.find_totals_market({"markets": gmarkets})
+        line = tm.parse_total_line(totals) if totals else None
+        ou = tm.over_under_tokens(totals) if totals else None
+        over_price = ou["over_price"] if (ou and ou.get("over_price") is not None) else None
+        park = pf.park_factor_for_slug(event_slug)
+        inputs = {}
+        if args.use_external:
+            try:
+                inputs = data_inputs.get_game_inputs(
+                    api, event_slug, target, projections_csv=args.projections_csv,
+                    debug=args.debug) or {}
+            except Exception:  # noqa: BLE001 - a forecast must never crash the run
+                inputs = {}
+        away, home = pf.parse_slug_teams(event_slug)
+        sharp = sharp_odds.sharp_ref(sharp_lookup, target, away, home) if sharp_lookup else None
+        eval_line = line if line is not None else (sharp[0] if sharp else 8.5)
+        mu, basis = _forecast_mu(eval_line, over_price, sharp, inputs, park,
+                                 args.dispersion, args.league_baseline)
+        if mu is None:
+            out.append({"game": event_slug, "line": eval_line, "has_market": totals is not None,
+                        "basis": None, "forecast": None,
+                        "reason": "no model basis (no sharp, no factors, no market price)"})
+            continue
+        s = fc.forecast_summary(mu, rd.variance_from_mu(mu, args.dispersion), eval_line)
+        rec = {
+            "game": event_slug, "line": eval_line, "has_market": totals is not None, "basis": basis,
+            "mu": round(mu, 3),
+            "forecast": {
+                "mean_total": round(s["mean"], 2), "median_total": s["median"],
+                "most_likely_total": s["mode"], "pi50": list(s["pi50"]), "pi80": list(s["pi80"]),
+                "pi80_mass": round(s["pi80_mass"], 4), "entropy_bits": round(s["entropy_bits"], 3),
+                "p_over": round(s["p_over"], 4), "p_under": round(s["p_under"], 4),
+            },
+            "over_price": over_price,
+            "edge_vs_market": (round(s["p_over"] - over_price, 4) if over_price is not None else None),
+        }
+        out.append(rec)
+    n_fc = sum(1 for r in out if r["forecast"] is not None)
+    vlog(f"  forecast layer: {n_fc}/{len(out)} MLB game(s) forecast "
+         f"({sum(1 for r in out if not r['has_market'])} without a Polymarket totals market)")
+    return out
+
+
 def pick_side(line, ou, p_over, p_under, fee_rate, odds_min, odds_max,
               max_edge=rd.MAX_PLAUSIBLE_EDGE):
     """Choose Over/Under by post-fee edge among odds-filter-eligible sides.
@@ -498,6 +568,10 @@ def run(args) -> dict:
              f"{len(games)} MLB event(s) dated {target}: "
              + (", ".join(sorted(games)) if games else "(none)"))
 
+    # Snapshot ALL MLB events (pre-totals-filter) so the forecast layer can predict every
+    # game — including those Polymarket lists without a run-total market.
+    all_mlb_events = dict(games)
+
     # Keep only full-GAME total-runs markets (drop moneyline/spread/F5/K-prop/NRFI).
     before_total = len(games)
     games = {k: v for k, v in games.items() if _GAME_TOTAL_RE.search(k.lower())}
@@ -693,8 +767,15 @@ def run(args) -> dict:
                 vlog(f"  [{game_slug}] superseded {n} stale PENDENTE entry(ies) from an earlier run")
     suggestions.sort(key=lambda s: s["edge"], reverse=True)
 
+    # Forecast layer: a calibrated prediction for EVERY MLB game, independent of the trade
+    # filters (so a no-edge / no-market game still shows its run distribution).
+    forecasts = []
+    if getattr(args, "forecast_all", True):
+        forecasts = forecast_all_mlb(api, all_mlb_events, sharp_lookup, target, args, vlog)
+
     texts = [s.pop("_text") for s in suggestions]
     vlog(f"=== Done: {len(suggestions)} suggestion(s), {len(skipped)} skipped, "
+         f"{len(forecasts)} forecast(s), "
          f"{filtered_non_league} non-MLB + {filtered_non_total} non-run-total filtered ===")
 
     result = {
@@ -702,11 +783,12 @@ def run(args) -> dict:
         "portfolio_value": portfolio_value,
         "first_trade_strategy": first_trade,
         "counts": {"games": len(games), "suggestions": len(suggestions),
-                   "skipped": len(skipped),
+                   "skipped": len(skipped), "forecasts": len(forecasts),
                    "filtered_non_mlb": filtered_non_league,
                    "filtered_non_total": filtered_non_total,
                    "superseded": superseded},
         "suggestions": suggestions,
+        "forecasts": forecasts,
         "skipped": skipped,
         "disclaimer": "Paper-trading simulation — not financial advice. Real "
                       "trading involves risk of loss. Edge is reconstructed from a "
@@ -765,6 +847,9 @@ def main() -> None:
     p.add_argument("--no-congruence", action="store_true",
                    help="Disable model↔sharp congruence sizing (default on: shrink size/confidence "
                         "when the NegBin disagrees with the sharp anchor)")
+    p.add_argument("--no-forecast-all", dest="forecast_all", action="store_false", default=True,
+                   help="Disable the forecast layer (default on: a calibrated run-total prediction "
+                        "for every MLB game, independent of edge/volume/market filters)")
     p.add_argument("--min-hours", type=float, default=0.0,
                    help="Min hours until game start (default 0 = pre-game only, not started)")
     p.add_argument("--all-lines", dest="best_line_only", action="store_false", default=True,
