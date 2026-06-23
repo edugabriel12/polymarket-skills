@@ -163,13 +163,16 @@ def load_sharp_csv(path: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def parse_oddsapi(events: list, book: str = "pinnacle") -> dict:
-    """Parse a The Odds API /odds response into {(date,{teams}): {line,over_fair,under_fair}}.
+def oddsapi_rows(events: list, book: str = "pinnacle") -> list[dict]:
+    """Extract one MAIN totals row per event from a The Odds API /odds response.
 
-    Pure: pass the decoded JSON list. Prefers `book` (Pinnacle); falls back to the first
-    bookmaker that prices a totals market. Devigs the Over/Under to fair probabilities.
+    Returns [{date, away, home, line, over_fair, under_fair, book, n_lines}] with team
+    names PRESERVED (unlike the frozenset lookup). A totals market can bundle several
+    points (alternate lines); the MAIN line is the one whose Over price is closest to even
+    (0.5 implied) — the balanced-juice line. Picking that, rather than the last outcome
+    seen, avoids grabbing a stray alternate line (the cause of e.g. a Coors total of 5).
     """
-    out: dict = {}
+    rows: list[dict] = []
     for ev in events or []:
         home, away = (ev.get("home_team") or ""), (ev.get("away_team") or "")
         date = (ev.get("commence_time") or "")[:10]
@@ -180,17 +183,42 @@ def parse_oddsapi(events: list, book: str = "pinnacle") -> dict:
         mk = next((m for m in chosen.get("markets", []) if m.get("key") == "totals"), None)
         if not mk:
             continue
-        over = under = line = None
+        by_point: dict = {}
         for o in mk.get("outcomes", []):
             name = (o.get("name") or "").lower()
-            if name == "over":
-                over = american_to_implied(o.get("price")); line = o.get("point")
-            elif name == "under":
-                under = american_to_implied(o.get("price"))
-        fair = devig(over, under)
-        if fair and line is not None:
-            rec = {"line": float(line), "over_fair": fair[0], "under_fair": fair[1]}
-            out[_key(date, away, home)] = rec
+            pt = o.get("point")
+            if pt is None or name not in ("over", "under"):
+                continue
+            by_point.setdefault(pt, {})[name] = american_to_implied(o.get("price"))
+        complete = {pt: v for pt, v in by_point.items()
+                    if v.get("over") and v.get("under")}
+        if not complete:
+            continue
+        main_pt = min(complete, key=lambda pt: abs(complete[pt]["over"] - 0.5))
+        fair = devig(complete[main_pt]["over"], complete[main_pt]["under"])
+        if fair:
+            rows.append({"date": date, "away": away, "home": home, "line": float(main_pt),
+                         "over_fair": fair[0], "under_fair": fair[1],
+                         "book": chosen.get("key"), "n_lines": len(complete)})
+    return rows
+
+
+def parse_oddsapi(events: list, book: str = "pinnacle", vlog=None) -> dict:
+    """Parse a The Odds API /odds response into {(date,{teams}): {line,over_fair,under_fair}}.
+
+    Pure: pass the decoded JSON list. Prefers `book` (Pinnacle); falls back to the first
+    bookmaker that prices a totals market. Devigs the MAIN Over/Under to fair probabilities.
+    Pass `vlog` to surface duplicate-game collisions (e.g. a doubleheader maps both games to
+    the same (date, team-set) key, so the second silently overwrites the first).
+    """
+    out: dict = {}
+    for r in oddsapi_rows(events, book):
+        k = _key(r["date"], r["away"], r["home"])
+        if k in out and vlog:
+            vlog(f"  [odds-api] ⚠️ duplicate game {r['away']} @ {r['home']} {r['date']} "
+                 f"(doubleheader?) — line {out[k]['line']:g} overwritten by {r['line']:g}; "
+                 f"the (date, team-set) key can't hold both")
+        out[k] = {"line": r["line"], "over_fair": r["over_fair"], "under_fair": r["under_fair"]}
     return out
 
 
@@ -239,10 +267,18 @@ def fetch_sharp(api_key: str | None, date: str, book: str = "pinnacle",
         vlog(f"  [odds-api] request FAILED: {type(e).__name__}: {_redact(e)}")
         return {}
     n_events = len(events) if isinstance(events, list) else 0
-    parsed = parse_oddsapi(events, book)
+    parsed = parse_oddsapi(events, book, vlog=vlog)   # vlog surfaces doubleheader collisions
     dated = {k: v for k, v in parsed.items() if k[0] == date}
     vlog(f"  [odds-api] response: {n_events} event(s); {len(parsed)} parsed with a totals "
          f"line; {len(dated)} dated {date}")
+    # Dump the raw sharp line per game so a bad line (e.g. a Coors total of 5, or an
+    # alternate line picked by mistake) is visible and auditable at the source.
+    rows = oddsapi_rows(events, book)
+    for r in sorted((x for x in rows if x["date"] == date) or rows,
+                    key=lambda x: (x["away"], x["home"])):
+        multi = f" ⚠️ {r['n_lines']} lines bundled — picked the balanced one" if r["n_lines"] > 1 else ""
+        vlog(f"  [odds-api] {r['away']} @ {r['home']} {r['date']}: line={r['line']:g} "
+             f"over_fair={r['over_fair']:.3f} (book={r['book']}){multi}")
     if n_events == 0:
         vlog("  [odds-api] ⚠️ 0 events returned — verify the key is valid/active and that "
              "games are scheduled (off-season/no-slate days return empty)")

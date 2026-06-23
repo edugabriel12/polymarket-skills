@@ -79,6 +79,37 @@ class TestSharpOdds(unittest.TestCase):
         self.assertAlmostEqual(over, 0.5, places=6)
         self.assertIsNone(so.sharp_ref(lk, "2026-06-23", "bos", "nyy"))  # not in slate
 
+    def test_oddsapi_picks_balanced_line_not_alternate(self):
+        # A totals market bundling alternate lines: a stray 5.5 (over priced 0.95) plus the
+        # real main 10.5 (over ~0.5). oddsapi_rows must pick the BALANCED main line, 10.5.
+        events = [{"home_team": "Rockies", "away_team": "Red Sox",
+                   "commence_time": "2026-06-23T23:00:00Z",
+                   "bookmakers": [{"key": "pinnacle", "markets": [{"key": "totals", "outcomes": [
+                       {"name": "Over", "price": -2000, "point": 5.5},
+                       {"name": "Under", "price": 1200, "point": 5.5},
+                       {"name": "Over", "price": -105, "point": 10.5},
+                       {"name": "Under", "price": -105, "point": 10.5}]}]}]}]
+        rows = so.oddsapi_rows(events)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["line"], 10.5)
+        self.assertEqual(rows[0]["n_lines"], 2)
+
+    def test_parse_oddsapi_flags_doubleheader_collision(self):
+        logs = []
+        events = [
+            {"home_team": "Rockies", "away_team": "Red Sox", "commence_time": "2026-06-23T20:00:00Z",
+             "bookmakers": [{"key": "pinnacle", "markets": [{"key": "totals", "outcomes": [
+                 {"name": "Over", "price": -105, "point": 10.5},
+                 {"name": "Under", "price": -105, "point": 10.5}]}]}]},
+            {"home_team": "Rockies", "away_team": "Red Sox", "commence_time": "2026-06-23T02:00:00Z",
+             "bookmakers": [{"key": "pinnacle", "markets": [{"key": "totals", "outcomes": [
+                 {"name": "Over", "price": -105, "point": 7.5},
+                 {"name": "Under", "price": -105, "point": 7.5}]}]}]},
+        ]
+        d = so.parse_oddsapi(events, vlog=logs.append)
+        self.assertEqual(len(d), 1)                                   # both collapse to one key
+        self.assertTrue(any("duplicate game" in m for m in logs))     # collision surfaced
+
     def test_csv_and_lookup(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "s.csv")
