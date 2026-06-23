@@ -68,7 +68,9 @@ def _load_sharp_lookup(args, target, vlog) -> dict:
         keys = [k for k in keys if any(w in k.lower() for w in wanted)]
         vlog(f"  sharp leagues filtered to {only!r}: {len(keys)} key(s)")
     lookup = sosh.fetch_sharp_soccer(key, keys, date=target,
-                                     with_btts=getattr(args, "sharp_btts", True), vlog=vlog)
+                                     with_btts=getattr(args, "sharp_btts", True),
+                                     min_quota_reserve=int(getattr(args, "sharp_min_reserve", 0) or 0),
+                                     vlog=vlog)
     if lookup:
         vlog(f"  sharp reference loaded: {len(lookup)} game(s) (divergence-detector mode)")
     return lookup
@@ -694,6 +696,9 @@ def main() -> None:
                    help="Skip the per-event BTTS sharp fetch (cheaper; BTTS stays predictive)")
     p.add_argument("--sharp-leagues", default=None,
                    help="Comma substrings to limit sharp leagues (e.g. 'world_cup,epl'); default all active")
+    p.add_argument("--sharp-min-reserve", type=int, default=0,
+                   help="Stop the sharp fetch once Odds-API remaining quota hits this floor "
+                        "(reserves credits for other sports, e.g. MLB; 0 = no reserve)")
     p.add_argument("--no-require-sharp", dest="require_sharp", action="store_false", default=True,
                    help="With a sharp slate loaded, still model games with NO sharp match (default OFF: "
                         "skip them — bet only on a sharp anchor)")

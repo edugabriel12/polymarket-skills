@@ -237,14 +237,25 @@ def fetch_active_soccer_keys(api_key: str | None, timeout: int = 10, vlog=None) 
     return [k for k in keys if k]
 
 
+def _rem_int(resp) -> int | None:
+    try:
+        return int(resp.headers.get("x-requests-remaining"))
+    except (TypeError, ValueError):
+        return None
+
+
 def fetch_sharp_soccer(api_key: str | None, keys: list[str], *, date: str | None = None,
                        with_btts: bool = True, book: str = "pinnacle", regions: str = "eu",
-                       timeout: int = 10, vlog=None) -> dict:
+                       timeout: int = 10, vlog=None, min_quota_reserve: int = 0) -> dict:
     """Sharp totals (+ optional BTTS) across the given leagues -> merged lookup. {} offline.
 
     Totals come from the bulk per-league `/odds` endpoint (one call/league). BTTS is an
     additional market fetched per event (`/events/{id}/odds`), so it costs more calls — kept
     behind `with_btts`. `date` (YYYY-MM-DD) filters to that day's games when given.
+
+    `min_quota_reserve`: stop fetching once The Odds API's remaining quota drops to this
+    floor, leaving credits for other consumers (e.g. the MLB divergence detector). All-leagues
+    + BTTS can otherwise exhaust a free plan in days and starve MLB of its sharp anchor.
     """
     vlog = vlog or (lambda *a, **k: None)
     api_key = api_key or os.environ.get("ODDS_API_KEY")
@@ -254,11 +265,23 @@ def fetch_sharp_soccer(api_key: str | None, keys: list[str], *, date: str | None
     base = {"apiKey": api_key, "regions": regions, "oddsFormat": "american", "bookmakers": book}
     totals_all: list = []
     btts_all: list = []
+    remaining: int | None = None
+
+    def _reserve_hit() -> bool:
+        if min_quota_reserve and remaining is not None and remaining <= min_quota_reserve:
+            vlog(f"  [odds-api] quota reserve reached (remaining={remaining} <= "
+                 f"{min_quota_reserve}) -> stopping soccer fetch to preserve quota for MLB")
+            return True
+        return False
+
     for key in keys:
+        if _reserve_hit():
+            break
         try:
             r = requests.get(f"{ODDS_API}/sports/{key}/odds",
                              params={**base, "markets": "totals"}, timeout=timeout)
-            used, rem = r.headers.get("x-requests-used"), r.headers.get("x-requests-remaining")
+            remaining = _rem_int(r) if _rem_int(r) is not None else remaining
+            used = r.headers.get("x-requests-used")
             r.raise_for_status()
             events = r.json() or []
         except Exception as e:  # noqa: BLE001
@@ -267,19 +290,24 @@ def fetch_sharp_soccer(api_key: str | None, keys: list[str], *, date: str | None
         if date:
             events = [e for e in events if (e.get("commence_time") or "")[:10] == date] or events
         totals_all += events
-        vlog(f"  [odds-api] {key}: {len(events)} game(s) (quota used={used} remaining={rem})")
+        vlog(f"  [odds-api] {key}: {len(events)} game(s) (quota used={used} remaining={remaining})")
         if with_btts:
             for ev in events:
+                if _reserve_hit():
+                    break
                 eid = ev.get("id")
                 if not eid:
                     continue
                 try:
                     rb = requests.get(f"{ODDS_API}/sports/{key}/events/{eid}/odds",
                                       params={**base, "markets": "btts"}, timeout=timeout)
+                    remaining = _rem_int(rb) if _rem_int(rb) is not None else remaining
                     rb.raise_for_status()
                     btts_all.append(rb.json())
                 except Exception as e:  # noqa: BLE001
                     vlog(f"  [odds-api] {key}/{eid} btts failed: {_redact(e)}")
+            if _reserve_hit():
+                break
     lookup = merge_lookup(parse_totals(totals_all, book), parse_btts(btts_all, book))
     vlog(f"  [odds-api] sharp soccer lookup: {len(lookup)} game(s) "
          f"({sum('btts_yes_fair' in v for v in lookup.values())} with BTTS)")
