@@ -111,6 +111,34 @@ python polymarket-soccer-goals/scripts/track_soccer.py --auto-settle           #
 python polymarket-soccer-goals/scripts/track_soccer.py --settle-game fifwc-nld-jpn-2026-06-14 --total 3 --btts yes
 ```
 
+## Calibrated forecasting — the 4-layer architecture
+Beyond edge detection, the skill produces an **accurate goals/BTTS prediction with a trustworthy,
+validated confidence** (research write-up: `references/calibrated-forecasting-research.md`):
+1. **Distribution** — the Dixon-Coles score matrix → the full **total-goals pmf** (anti-diagonal
+   sums) and **BTTS** from one consistent forecast (`forecast_soccer.py`).
+2. **Calibration** — reliability diagram, ECE/MCE, Murphy Brier decomposition + post-hoc calibrators
+   via the shared `calibration_core` / `calibration.py --sport soccer`. Calibrate **O/U and BTTS
+   separately** (different biases); prefer temperature/Platt over isotonic (a season ≈ 380 games is
+   far below isotonic's ~1000-sample need).
+3. **Per-prediction confidence** — 50%/80% total-goals prediction intervals + predictive entropy on
+   every forecast (`forecast_soccer.forecast_block`), stored in `stats_log.forecast`, the
+   recommendation text, and the dashboard. A single match is ~99% aleatoric, so the 80% interval is
+   wide (~1–5 goals) — that width is the honest signal.
+4. **Validation** — `backtest_soccer.py` scores the forecast walk-forward: **CRPS** (total goals),
+   **Brier + log-loss** (O/U and BTTS — note **RPS reduces to Brier** for these binaries), **interval
+   coverage**, and **ECE**, vs the devigged closing line.
+
+```bash
+python polymarket-soccer-goals/scripts/backtest_soccer.py --games-csv matches.csv
+```
+CSV: `date,home,away,home_goals,away_goals[,total_line,over_odds,under_odds]`. Pure-stdlib cores,
+offline-tested (`test_forecast_soccer.py`, `test_backtest_soccer.py`).
+
+**Verified finding** (numerically, against `dixon_coles.py`): the ρ low-score correction moves the
+**O/U 2.5 line by 0.00pp** (all four corrected cells are ≤2 goals, so the Under-2.5 mass is conserved)
+but moves **BTTS by ~1pp** (only the 1-1 cell is BTTS=Yes). So for O/U 2.5, getting **λ** right is
+everything; ρ matters only on the 0.5/1.5 lines and (slightly) on BTTS.
+
 ## Honest limitations
 - **Market near-efficient at close; realistic O/U yield ~0.8%** (research). Any model implying >10%
   yield is overfit. Validate with Brier/log-loss + CLV over **~1,000+ entries** before real capital.
