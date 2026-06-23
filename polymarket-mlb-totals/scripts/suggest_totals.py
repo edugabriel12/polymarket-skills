@@ -25,6 +25,7 @@ import _bootstrap  # noqa: F401  (wires sys.path for the reused skills)
 
 import run_distribution as rd
 import forecast as fc
+import congruence as cg
 import park_factors as pf
 import totals_market as tm
 import data_inputs
@@ -139,9 +140,16 @@ def model_probabilities(line, over_price, park_factor, inputs, *,
     pmf = rd.negbin_total_runs_pmf(mu, var)
     probs = rd.prob_over(line, pmf)
     r, p = rd.negbin_params_from_moments(mu, var)
+    # Independent factor-model P(over) (NOT sharp-anchored) for the congruence check: does our
+    # own NegBin corroborate the sharp? None when there are no factors to form an independent view.
+    p_over_model = None
+    if model_mu is not None:
+        m_pmf = rd.negbin_total_runs_pmf(model_mu, rd.variance_from_mu(model_mu, dispersion))
+        p_over_model = rd.prob_over(line, m_pmf)["p_over_eff"]
     return {
         "p_over": probs["p_over_eff"], "p_under": probs["p_under_eff"],
         "mu": mu, "market_mu": anchor_mu, "model_mu": model_mu, "poly_mu": poly_mu,
+        "p_over_model": p_over_model,
         "sharp_anchored": sharp_over_price is not None, "var": var,
         "used_external": used_external,
         "p_push": probs["p_push"], "need": probs["need"],
@@ -323,6 +331,8 @@ def record_prediction_row(db_path, game_slug, game_date, totals, line, chosen, m
         "line": line, "need": m["need"],
         "p_over_eff": round(m["p_over"], 4), "p_under_eff": round(m["p_under"], 4),
         "p_push": round(m["p_push"], 4),
+        "p_over_model": round(m["p_over_model"], 4) if m.get("p_over_model") is not None else None,
+        "congruence": m.get("congruence"),
         "forecast": forecast,
         "chosen_side": chosen["side"], "entry_price": price,
         "decimal_odds": round(odds, 4), "model_prob": round(chosen["p_model"], 4),
@@ -599,6 +609,13 @@ def run(args) -> dict:
         size_pct, size_usd, kelly = size_position(
             chosen["p_model"], chosen["price"], portfolio_value, first_trade,
             advisor_kelly_half())
+        # Congruence: shrink size when our independent NegBin disagrees with the sharp anchor
+        # (factor 0 → size 0 → tripped by the $10 minimum below). Never moves the edge.
+        cong = (cg.assess(m.get("p_over_model"), m["p_over"]) if m["sharp_anchored"]
+                else dict(cg.NEUTRAL))
+        if cong.get("applied") and not getattr(args, "no_congruence", False):
+            size_pct *= cong["factor"]
+            size_usd = portfolio_value * size_pct
         if kelly <= 0:
             _shadow_log_mlb(args, target, event_slug, line, side_notes, chosen, m, 0, "Kelly <= 0", totals, ou)
             _skip(event_slug, "Kelly <= 0", line=line, side=chosen["side"])
@@ -611,6 +628,8 @@ def run(args) -> dict:
 
         confidence = (max(0.5, min(0.5 + chosen["edge"], 0.65))
                       if m["used_external"] else 0.5)
+        if cong.get("applied") and not getattr(args, "no_congruence", False):
+            confidence = cg.apply_confidence(confidence, cong["factor"])
         rec, text = build_recommendation(event_slug, totals, line, chosen, m["mu"],
                                          m["used_external"], size_pct, size_usd,
                                          confidence, args.fee_rate, ou,
@@ -621,6 +640,7 @@ def run(args) -> dict:
             "inputs": inputs, "park_factor": park_factor, "m": m, "chosen": chosen,
             "side_notes": side_notes, "size_pct": size_pct, "size_usd": size_usd,
             "kelly": kelly, "confidence": confidence, "rec": rec, "text": text,
+            "cong": cong,
         })
 
     # Best-line-per-game: record/score only the highest-edge line per matchup; the other
@@ -641,6 +661,7 @@ def run(args) -> dict:
 
     recorded_ids: dict[str, set] = {}
     for c in final:
+        c["m"]["congruence"] = c.get("cong")     # carried into the recorded stats_log
         prediction_id = None
         if args.record:
             prediction_id = record_prediction_row(
@@ -654,6 +675,7 @@ def run(args) -> dict:
         suggestions.append({"game": c["event_slug"], "line": c["line"],
                             "mu": round(c["m"]["mu"], 3), "edge": round(c["chosen"]["edge"], 4),
                             "forecast": forecast_block(c["m"], c["line"]),
+                            "congruence": c.get("cong"),
                             "prediction_id": prediction_id, "recommendation": c["rec"],
                             "_text": c["text"]})
         vlog(f"  [{c['event_slug']}] >>> SUGGEST {c['chosen']['side']} {c['line']} "
@@ -740,6 +762,9 @@ def main() -> None:
     p.add_argument("--min-volume", type=float, default=0.0,
                    help="Min 24h volume to consider a game (default 0 = no volume filter; "
                         "pass a value to re-enable)")
+    p.add_argument("--no-congruence", action="store_true",
+                   help="Disable model↔sharp congruence sizing (default on: shrink size/confidence "
+                        "when the NegBin disagrees with the sharp anchor)")
     p.add_argument("--min-hours", type=float, default=0.0,
                    help="Min hours until game start (default 0 = pre-game only, not started)")
     p.add_argument("--all-lines", dest="best_line_only", action="store_false", default=True,
