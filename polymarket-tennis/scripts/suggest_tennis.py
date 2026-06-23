@@ -183,7 +183,15 @@ def _load_sharp_lookup(args, target, vlog) -> dict:
                                     min_quota_reserve=int(getattr(args, "sharp_min_reserve", 0) or 0),
                                     vlog=vlog)
     if lookup:
-        vlog(f"  sharp reference loaded: {len(lookup)} match(es) (divergence-detector mode)")
+        # k = (date, frozenset(surnames)); count how many are dated for today's slate so a
+        # date-boundary mismatch (a night match crossing UTC midnight) is visible in the log.
+        dated = sum(1 for k in lookup if k[0] == target)
+        vlog(f"  sharp reference loaded: {len(lookup)} match(es) "
+             f"({dated} dated {target}) (divergence-detector mode)")
+    else:
+        vlog("  sharp reference EMPTY — divergence detector OFF "
+             "(model stays Elo-predictive, edge-capped). Check the [odds-api] lines above: "
+             "0 tours, quota reserve hit, or no h2h parsed.")
     return lookup
 
 
