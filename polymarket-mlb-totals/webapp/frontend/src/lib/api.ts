@@ -147,7 +147,22 @@ async function get<T>(url: string): Promise<T> {
   return r.json() as Promise<T>;
 }
 
+export interface HealthResponse {
+  odds_api_key: boolean;
+  sharp_close: {
+    enabled: boolean;
+    has_key: boolean;
+    started: boolean;
+    lead_min: number;
+    next_wave: string | null;
+    waves_today?: string[];
+    last_run: string | null;
+    last_suggestions: number | null;
+  };
+}
+
 export const api = {
+  health: () => get<HealthResponse>("/api/health"),
   analyses: (sport: Sport, date?: string, force = false) =>
     get<AnalysesResponse>(
       `/api/analyses?sport=${sport}&${date ? `date=${date}&` : ""}force=${force}`

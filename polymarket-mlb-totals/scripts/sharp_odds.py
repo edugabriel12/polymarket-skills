@@ -250,6 +250,65 @@ def _mask_key(key: str | None) -> str:
     return f"{key[:4]}…{key[-4:]} (len={len(key)})"
 
 
+def _get_oddsapi_events(api_key: str | None, book: str = "pinnacle",
+                        timeout: int = 10, vlog=None) -> list | None:
+    """The raw The Odds API /odds events for a book, or None on any failure.
+
+    Isolates the (single) HTTP call so fetch_sharp and fetch_commence_times can share it
+    — one network round-trip yields the sharp lines AND the schedule. The API key is never
+    logged in full (CLAUDE.md: never echo secrets).
+    """
+    vlog = vlog or (lambda *a, **k: None)
+    source = ("argument (--odds-api-key)" if api_key
+              else "env $ODDS_API_KEY" if os.environ.get("ODDS_API_KEY") else "none")
+    api_key = api_key or os.environ.get("ODDS_API_KEY")
+    vlog(f"  [odds-api] key source: {source}; key {_mask_key(api_key)}")
+    if not api_key:
+        vlog("  [odds-api] no API key found — set $ODDS_API_KEY or pass --odds-api-key; "
+             "skipping live sharp fetch")
+        return None
+    try:
+        import requests  # lazy
+        resp = requests.get(ODDS_API, params={
+            "apiKey": api_key, "regions": "us,eu", "markets": "totals",
+            "oddsFormat": "american", "bookmakers": book}, timeout=timeout)
+        used, remaining = resp.headers.get("x-requests-used"), resp.headers.get("x-requests-remaining")
+        vlog(f"  [odds-api] GET {ODDS_API} (book={book}) -> HTTP {resp.status_code} "
+             f"(quota: used={used} remaining={remaining})")
+        if resp.status_code >= 400:
+            vlog(f"  [odds-api] error body: {_redact((resp.text or '')[:200])}")
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:  # noqa: BLE001
+        vlog(f"  [odds-api] request FAILED: {type(e).__name__}: {_redact(e)}")
+        return None
+
+
+def oddsapi_commence_times(events: list, now: datetime | None = None,
+                           horizon_hours: float = 20.0) -> list[datetime]:
+    """Sorted UPCOMING game start times (UTC) from a The Odds API response.
+
+    For scheduling per-game recalcs. Returns commence_times strictly in the future and
+    within `horizon_hours` (default 20h, so tonight's full slate is covered even for late
+    games that cross UTC midnight). Pure — pass `now` for deterministic tests.
+    """
+    now = now or datetime.now(timezone.utc)
+    horizon = now.timestamp() + horizon_hours * 3600
+    out = []
+    for ev in events or []:
+        ct = _commence_utc(ev)
+        if ct is not None and ct > now and ct.timestamp() <= horizon:
+            out.append(ct)
+    return sorted(out)
+
+
+def fetch_commence_times(api_key: str | None, book: str = "pinnacle",
+                         timeout: int = 10, vlog=None, now: datetime | None = None) -> list[datetime]:
+    """Best-effort upcoming game start times (UTC) via The Odds API. [] on failure."""
+    events = _get_oddsapi_events(api_key, book, timeout, vlog)
+    return oddsapi_commence_times(events or [], now=now)
+
+
 def fetch_sharp(api_key: str | None, date: str, book: str = "pinnacle",
                 timeout: int = 10, vlog=None) -> dict:
     """Best-effort sharp totals for a date via The Odds API. {} on any failure.
@@ -260,30 +319,8 @@ def fetch_sharp(api_key: str | None, date: str, book: str = "pinnacle",
     (CLAUDE.md: never echo secrets).
     """
     vlog = vlog or (lambda *a, **k: None)
-    source = ("argument (--odds-api-key)" if api_key
-              else "env $ODDS_API_KEY" if os.environ.get("ODDS_API_KEY") else "none")
-    api_key = api_key or os.environ.get("ODDS_API_KEY")
-    vlog(f"  [odds-api] key source: {source}; key {_mask_key(api_key)}")
-    if not api_key:
-        vlog("  [odds-api] no API key found — set $ODDS_API_KEY or pass --odds-api-key; "
-             "skipping live sharp fetch")
-        return {}
-    try:
-        import requests  # lazy
-        resp = requests.get(ODDS_API, params={
-            "apiKey": api_key, "regions": "us,eu", "markets": "totals",
-            "oddsFormat": "american", "bookmakers": book}, timeout=timeout)
-        # The Odds API reports quota in headers — invaluable for confirming the key works.
-        used, remaining = resp.headers.get("x-requests-used"), resp.headers.get("x-requests-remaining")
-        vlog(f"  [odds-api] GET {ODDS_API} (book={book}) -> HTTP {resp.status_code} "
-             f"(quota: used={used} remaining={remaining})")
-        if resp.status_code >= 400:
-            # 401=bad key, 422=bad params, 429=quota exhausted. Body carries the reason.
-            vlog(f"  [odds-api] error body: {_redact((resp.text or '')[:200])}")
-        resp.raise_for_status()
-        events = resp.json()
-    except Exception as e:  # noqa: BLE001
-        vlog(f"  [odds-api] request FAILED: {type(e).__name__}: {_redact(e)}")
+    events = _get_oddsapi_events(api_key, book, timeout, vlog)
+    if events is None:
         return {}
     n_events = len(events) if isinstance(events, list) else 0
     now = datetime.now(timezone.utc)

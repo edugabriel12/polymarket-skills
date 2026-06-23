@@ -30,7 +30,9 @@ class TestLookupToRows(unittest.TestCase):
         self.assertEqual(r["date"], "2026-06-23")
         self.assertEqual({r["away"], r["home"]}, {"chc", "nym"})
         self.assertEqual(r["total_line"], 8.5)
+        # The snapshot is written into BOTH the open (model anchor) and close (CLV) columns.
         self.assertAlmostEqual(float(r["close_over_odds"]), 0.52)
+        self.assertAlmostEqual(float(r["over_odds"]), 0.52)
 
 
 class TestMergeAndRoundTrip(unittest.TestCase):
@@ -44,7 +46,7 @@ class TestMergeAndRoundTrip(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertEqual(float(merged[0]["total_line"]), 9.0)
 
-    def test_write_then_load_sharp_csv_resolves_close(self):
+    def test_write_then_load_sharp_csv_resolves_open_and_close(self):
         lookup = {so._key("2026-06-23", "CHC", "NYM"):
                   {"line": 8.5, "over_fair": 0.40, "under_fair": 0.60}}
         rows = cc.lookup_to_rows(lookup, "2026-06-23")
@@ -52,11 +54,12 @@ class TestMergeAndRoundTrip(unittest.TestCase):
             p = os.path.join(d, "close.csv")
             cc.write_csv(p, rows)
             loaded = so.load_sharp_csv(p)
-        ref = so.sharp_ref(loaded, "2026-06-23", "chc", "nym", use_close=True)
-        self.assertIsNotNone(ref)
-        line, close_over = ref
-        self.assertEqual(line, 8.5)
-        self.assertAlmostEqual(close_over, 0.40, places=6)
+        # CLV close ref AND the model's open anchor both resolve from the same CSV.
+        close = so.sharp_ref(loaded, "2026-06-23", "chc", "nym", use_close=True)
+        openref = so.sharp_ref(loaded, "2026-06-23", "chc", "nym", use_close=False)
+        self.assertEqual(close[0], 8.5)
+        self.assertAlmostEqual(close[1], 0.40, places=6)
+        self.assertAlmostEqual(openref[1], 0.40, places=6)
 
 
 class TestLineDriftCLV(unittest.TestCase):

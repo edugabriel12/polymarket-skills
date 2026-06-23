@@ -45,7 +45,7 @@ import suggest_totals                 # noqa: E402  (MLB model)
 import sharp_odds                     # noqa: E402  (sharp reference + CSV loader)
 import capture_close                  # noqa: E402  (sharp-close snapshot)
 import clv_vs_sharp as clv_mod        # noqa: E402  (CLV scoring)
-import sharp_close_scheduler as scl   # noqa: E402  (backend-local daily scheduler)
+import wave_scheduler as wsch         # noqa: E402  (per-game recalc scheduler)
 import soccer_predictions as spdb     # noqa: E402  (soccer store; stdlib-only, safe import)
 import soccer_results                  # noqa: E402  (soccer auto-settlement; safe import)
 import tennis_predictions as tdb       # noqa: E402  (tennis store; stdlib-only, safe import)
@@ -92,24 +92,31 @@ TENNIS_TOUR = os.environ.get("TENNIS_TOUR", "atp")
 
 SPORTS = ("mlb", "soccer", "tennis")
 
-# --- Sharp-close capture scheduler (MLB CLV) -------------------------------------------
-# Snapshots the Pinnacle/consensus closing line throughout the day while the backend is up,
-# so CLV vs the sharp close can be scored without an external cron. Disable with
-# SHARP_CLOSE_CAPTURE=0. Default schedule is 5 captures/day (~150 Odds-API calls/month,
-# well within the free tier) to also catch afternoon first pitches (a game's last PREGAME
-# snapshot before it starts is its close; in-progress games are filtered out).
+# --- Per-game recalc + sharp-close capture (MLB) ---------------------------------------
+# While the backend is up, the model is recomputed ~WAVE_LEAD_MIN minutes before each game
+# starts — the moment a game is still PREGAME but its Polymarket volume has built. Near-
+# simultaneous starts are grouped into one "wave" = ONE Odds-API fetch covering the whole
+# slate, so the daily cost is ~one call per start-block (well within the free quota). Each
+# wave also snapshots the sharp line into the close CSV for CLV. Disable with AUTO_RECALC=0.
 ODDS_API_KEY = os.environ.get("ODDS_API_KEY")
-SHARP_CLOSE_CAPTURE = os.environ.get("SHARP_CLOSE_CAPTURE", "1") not in ("0", "false", "False", "no", "")
-# Comma-separated UTC HH:MM. Brazil is UTC-3 year-round, so the defaults are
-# 13h/14h/17h/19h/20h BRT = 16:00/17:00/20:00/22:00/23:00 UTC.
-SHARP_CLOSE_TIMES = os.environ.get("SHARP_CLOSE_TIMES", "16:00,17:00,20:00,22:00,23:00")
+AUTO_RECALC = os.environ.get("AUTO_RECALC", "1") not in ("0", "false", "False", "no", "")
+WAVE_LEAD_MIN = int(os.environ.get("WAVE_LEAD_MIN", "10"))      # recompute this many min before first pitch
+WAVE_BUCKET_MIN = int(os.environ.get("WAVE_BUCKET_MIN", "10"))  # merge starts within this window into one wave
+WAVE_POLL_SEC = int(os.environ.get("WAVE_POLL_SEC", "300"))     # how often the loop checks for a due wave
 SHARP_CLOSE_CSV = os.environ.get(
     "SHARP_CLOSE_CSV", os.path.join(os.path.dirname(MLB_DB) or ".", "sharp_close.csv"))
 
-_capture_state: dict = {"runs": 0, "last_run": None, "last_rows": 0, "total_rows": 0,
-                        "last_error": None, "enabled": SHARP_CLOSE_CAPTURE,
-                        "has_key": bool(ODDS_API_KEY), "times": SHARP_CLOSE_TIMES,
-                        "csv": SHARP_CLOSE_CSV, "started": False}
+_capture_state: dict = {"runs": 0, "last_run": None, "last_suggestions": None,
+                        "last_rows": 0, "total_rows": 0, "last_error": None,
+                        "enabled": AUTO_RECALC, "has_key": bool(ODDS_API_KEY),
+                        "lead_min": WAVE_LEAD_MIN, "csv": SHARP_CLOSE_CSV, "started": False,
+                        "next_wave": None, "waves_today": []}
+
+
+def _on_wave_update(info: dict) -> None:
+    """Mirror the wave loop's live schedule into the health state (for the UI)."""
+    _capture_state.update(next_wave=info.get("next_wave"),
+                          waves_today=info.get("waves", []))
 
 
 def _sched_vlog(*a) -> None:
@@ -117,10 +124,28 @@ def _sched_vlog(*a) -> None:
 
 
 def _do_capture_sync(date: str) -> tuple[list, int]:
+    """Snapshot the sharp line into the close CSV only (manual /api/capture-close)."""
     new, total = capture_close.capture(ODDS_API_KEY, date, SHARP_CLOSE_CSV, vlog=_sched_vlog)
     _capture_state.update(runs=_capture_state["runs"] + 1, last_run=_now(),
                           last_rows=len(new), total_rows=total, last_error=None)
     return new, total
+
+
+def _do_wave_sync(date: str) -> dict:
+    """One recompute wave: fetch the sharp ONCE, snapshot it to the close CSV, then run the
+    model reusing that CSV (zero extra Odds-API calls) and refresh the analysis cache."""
+    lookup = sharp_odds.fetch_sharp(ODDS_API_KEY, date, vlog=_sched_vlog)   # the only API call
+    rows = capture_close.lookup_to_rows(lookup, date)
+    total = capture_close.write_csv(
+        SHARP_CLOSE_CSV, capture_close.merge_rows(capture_close.read_csv(SHARP_CLOSE_CSV), rows))
+    result = suggest_totals.run(_mlb_args(date, sharp_csv=SHARP_CLOSE_CSV))
+    result.pop("_texts", None)
+    payload = _payload("mlb", date, result)
+    _cache_put("mlb", date, payload)
+    _capture_state.update(runs=_capture_state["runs"] + 1, last_run=_now(),
+                          last_suggestions=len(payload.get("suggestions", [])),
+                          last_rows=len(rows), total_rows=total, last_error=None)
+    return payload
 
 
 class _QuickAPI:
@@ -141,28 +166,31 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 
 @app.on_event("startup")
-async def _start_sharp_close_scheduler() -> None:
-    """Launch the daily sharp-close capture loop (no-op if disabled or no key)."""
-    if not SHARP_CLOSE_CAPTURE:
-        print("[sharp-close] scheduler disabled (SHARP_CLOSE_CAPTURE=0)", file=sys.stderr, flush=True)
+async def _start_auto_recalc() -> None:
+    """Launch the per-game recalc wave loop (no-op if disabled or no key)."""
+    if not AUTO_RECALC:
+        print("[waves] auto-recalc disabled (AUTO_RECALC=0)", file=sys.stderr, flush=True)
         return
     if not ODDS_API_KEY:
-        print("[sharp-close] no ODDS_API_KEY -> scheduler NOT started (set it to enable CLV capture)",
-              file=sys.stderr, flush=True)
-        return
-    times = scl.parse_times(SHARP_CLOSE_TIMES)
-    if not times:
-        print(f"[sharp-close] no valid times in {SHARP_CLOSE_TIMES!r} -> scheduler NOT started",
+        print("[waves] no ODDS_API_KEY -> auto-recalc NOT started (set it to enable)",
               file=sys.stderr, flush=True)
         return
 
-    async def _capture():
-        await asyncio.to_thread(_do_capture_sync, _today())
+    async def _get_commences():
+        return await asyncio.to_thread(
+            sharp_odds.fetch_commence_times, ODDS_API_KEY, "pinnacle", 10, _sched_vlog)
+
+    async def _do_wave():
+        await asyncio.to_thread(_do_wave_sync, _today())
 
     _capture_state["started"] = True
-    print(f"[sharp-close] scheduler ON: times(UTC)={times} -> {SHARP_CLOSE_CSV}",
+    print(f"[waves] auto-recalc ON: {WAVE_LEAD_MIN}min before each game "
+          f"(bucket {WAVE_BUCKET_MIN}min, poll {WAVE_POLL_SEC}s) -> {SHARP_CLOSE_CSV}",
           file=sys.stderr, flush=True)
-    asyncio.create_task(scl.run_loop(times, _capture, _sched_vlog))
+    asyncio.create_task(wsch.run_wave_loop(
+        _today, _get_commences, _do_wave, _sched_vlog,
+        lead_min=WAVE_LEAD_MIN, bucket_min=WAVE_BUCKET_MIN, poll_sec=WAVE_POLL_SEC,
+        on_update=_on_wave_update))
 
 
 def _today() -> str:
@@ -236,16 +264,17 @@ def _cache_put(sport: str, date: str, payload: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _mlb_args(date: str) -> argparse.Namespace:
+def _mlb_args(date: str, sharp_csv: str | None = None) -> argparse.Namespace:
     return argparse.Namespace(
         date=date, min_volume=1000.0, min_edge=0.05, min_hours=0.0, best_line_only=True,
         odds_min=1.50, odds_max=3.00, dispersion=2.0, league_baseline=8.5, league_prefix="mlb-",
         fee_rate=0.0, use_external=True, projections_csv=None, refresh_prices=False,
         portfolio_value=10000.0, portfolio_db=None, record=True, predictions_db=MLB_DB,
         paper=False, paper_execute=False, output="json", rate_limit=100, verbose=True, debug=False,
-        # Divergence detector: anchor to the live sharp (env ODDS_API_KEY), use the sharp
-        # slate as the authoritative game list, and bet ONLY on a sharp anchor.
-        sharp_odds_csv=None, odds_api_key=None, sharp_discovery=True, require_sharp=True)
+        # Divergence detector: use the sharp slate as the authoritative game list and bet
+        # ONLY on a sharp anchor. A wave passes its just-written CSV (reuse, no extra API
+        # call); a manual recompute leaves it None and fetches via env ODDS_API_KEY.
+        sharp_odds_csv=sharp_csv, odds_api_key=None, sharp_discovery=True, require_sharp=True)
 
 
 def _run_mlb(date: str) -> dict:
@@ -335,6 +364,18 @@ def _enrich(sport: str, suggestions: list[dict], date: str) -> list[dict]:
     return suggestions
 
 
+def _payload(sport: str, target: str, result: dict) -> dict:
+    """Build the /api/analyses response (and the cached payload) from a model result."""
+    return {
+        "sport": sport, "date": target, "computed_at": _now(), "cached": False,
+        "counts": result.get("counts", {}),
+        "suggestions": _enrich(sport, result.get("suggestions", []), target),
+        "skipped": result.get("skipped", []),
+        "disclaimer": result.get("disclaimer", ""),
+        "error": result.get("error"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -400,14 +441,7 @@ def analyses(sport: str = Query("mlb"), date: str | None = Query(None),
             return cached
 
     result = ({"soccer": _run_soccer, "tennis": _run_tennis}.get(sport, _run_mlb))(target)
-    payload = {
-        "sport": sport, "date": target, "computed_at": _now(), "cached": False,
-        "counts": result.get("counts", {}),
-        "suggestions": _enrich(sport, result.get("suggestions", []), target),
-        "skipped": result.get("skipped", []),
-        "disclaimer": result.get("disclaimer", ""),
-        "error": result.get("error"),
-    }
+    payload = _payload(sport, target, result)
     _cache_put(sport, target, payload)
     return payload
 
