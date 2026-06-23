@@ -99,6 +99,11 @@ SOCCER_SHARP_RESERVE = int(os.environ.get("SOCCER_SHARP_RESERVE", "200") or 0)
 TENNIS_DB = os.environ.get("TENNIS_PREDICTIONS_DB", tdb.DEFAULT_DB)
 TENNIS_RATINGS_CSV = os.environ.get("TENNIS_RATINGS_CSV")
 TENNIS_TOUR = os.environ.get("TENNIS_TOUR", "atp")
+# Tennis sharp anchor: cheap (h2h only, a couple of tour keys), so ON by default with a quota
+# reserve for MLB. TENNIS_SHARP=0 disables; TENNIS_SHARP_TOURS bounds the tours.
+TENNIS_SHARP = os.environ.get("TENNIS_SHARP", "1") not in ("0", "false", "False", "no", "")
+TENNIS_SHARP_TOURS = os.environ.get("TENNIS_SHARP_TOURS")
+TENNIS_SHARP_RESERVE = int(os.environ.get("TENNIS_SHARP_RESERVE", "200") or 0)
 
 SPORTS = ("mlb", "soccer", "tennis")
 
@@ -333,6 +338,12 @@ def _run_tennis(date: str) -> dict:
            "--predictions-db", TENNIS_DB, "--tour", TENNIS_TOUR]
     if TENNIS_RATINGS_CSV:
         cmd += ["--ratings-csv", TENNIS_RATINGS_CSV]
+    if TENNIS_SHARP:   # sharp anchor (h2h), quota-reserved for MLB
+        cmd += ["--sharp-min-reserve", str(TENNIS_SHARP_RESERVE)]
+        if TENNIS_SHARP_TOURS:
+            cmd += ["--sharp-tours", TENNIS_SHARP_TOURS]
+    else:
+        cmd += ["--no-sharp"]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     except Exception as e:  # noqa: BLE001

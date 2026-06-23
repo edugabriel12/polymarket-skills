@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 
@@ -25,12 +26,16 @@ import ratings as ratings_mod
 import ratings_source
 import tennis_market as tm
 import tennis_predictions as tdb
+import sharp_odds_tennis as sot
 
 from category_common import APIClient, discover_markets, game_date, log
 
 STRATEGY = "tennis-elo-moneyline"
 CAP_MODEL = 0.05            # per-trade cap (model edge)
 CAP_FIRST_TRADE = 0.01     # first trade with a new strategy
+# On a near-efficient match-winner market, an edge this large signals MODEL error (the Elo
+# over/under-rating a player), not value -> flagged implausible and skipped. Same as MLB/soccer.
+MAX_PLAUSIBLE_EDGE = 0.15
 # Discovery: probe a page to classify a tag honored vs global-mix (Gamma ignores unknown
 # tag slugs and returns the global volume mix). Mirrors the soccer skill.
 PROBE_MAX = 100            # one page, to classify the tag
@@ -129,9 +134,12 @@ def model_probability(player_a, player_b, surface, rt, blend_w):
     return None, False, None, None
 
 
-def pick_side(sides, p_a, fee_rate, odds_min, odds_max):
+def pick_side(sides, p_a, fee_rate, odds_min, odds_max, max_edge=MAX_PLAUSIBLE_EDGE):
     """Choose the higher-edge side that passes the odds band. sides: [A, B] dicts with
-    label/token/price. p_a = model P(side A wins). Returns (chosen|None, notes)."""
+    label/token/price. p_a = model P(side A wins). Returns (chosen|None, notes).
+
+    A side whose edge exceeds `max_edge` is flagged `implausible` and excluded — on a
+    near-efficient market a huge edge signals model error, not value."""
     probs = (p_a, 1.0 - p_a)
     notes, cands = [], []
     for i, s in enumerate(sides):
@@ -141,15 +149,41 @@ def pick_side(sides, p_a, fee_rate, odds_min, odds_max):
         p = probs[i]
         e = elo.edge(p, price)
         band = elo.passes_odds_band(price, odds_min, odds_max)
+        implausible = e > max_edge
         notes.append({"label": s["label"], "price": price, "p_model": round(p, 4),
-                      "edge": round(e, 4), "in_odds_band": band})
-        if band:
+                      "edge": round(e, 4), "in_odds_band": band, "implausible": implausible})
+        if band and not implausible:
             cands.append({"side": s["label"], "token": s["token"], "price": price,
                           "opponent": sides[1 - i]["label"], "p_model": p, "edge": e})
     if not cands:
         return None, notes
     cands.sort(key=lambda c: c["edge"], reverse=True)
     return cands[0], notes
+
+
+def _load_sharp_lookup(args, target, vlog) -> dict:
+    """Load the sharp h2h reference (Pinnacle via The Odds API) -> divergence detector.
+
+    Lists active tennis tours, then queries each. Best-effort / {} offline. With it the
+    model anchors P(win) to the sharp; without it it stays Elo-predictive (edge-capped).
+    """
+    if getattr(args, "no_sharp", False):
+        return {}
+    key = getattr(args, "odds_api_key", None) or os.environ.get("ODDS_API_KEY")
+    if not key:
+        vlog("  sharp source: none (no ODDS_API_KEY) -> Elo model (edge-capped)")
+        return {}
+    keys = sot.fetch_active_tennis_keys(key, vlog=vlog)
+    only = getattr(args, "sharp_tours", None)
+    if only:
+        wanted = {x.strip().lower() for x in only.split(",") if x.strip()}
+        keys = [k for k in keys if any(w in k.lower() for w in wanted)]
+    lookup = sot.fetch_sharp_tennis(key, keys, date=target,
+                                    min_quota_reserve=int(getattr(args, "sharp_min_reserve", 0) or 0),
+                                    vlog=vlog)
+    if lookup:
+        vlog(f"  sharp reference loaded: {len(lookup)} match(es) (divergence-detector mode)")
+    return lookup
 
 
 def run(args) -> dict:
@@ -183,6 +217,8 @@ def run(args) -> dict:
     else:
         rt = {}
     portfolio_value = float(args.portfolio_value)
+    sharp_lookup = _load_sharp_lookup(args, target, vlog)
+    require_sharp = bool(sharp_lookup) and getattr(args, "require_sharp", True)
     suggestions, skipped, cand_rows = [], [], []
 
     def _skip(slug, reason, **extra):
@@ -202,20 +238,37 @@ def run(args) -> dict:
         label_a, label_b = ms["sides"][0]["label"], ms["sides"][1]["label"]
         p_a, used, ea, eb = model_probability(label_a or pa_slug, label_b or pb_slug,
                                               surface, rt, args.blend)
-        if p_a is None:                       # anti-fabrication: devig -> ~0 edge
+        # Sharp anchor (divergence detector): when the sharp prices this match, use its fair
+        # P(win) directly — edge then measures Polymarket vs sharp, not Elo vs market.
+        sharp_pa = (sot.sharp_win_ref(sharp_lookup, target, label_a or pa_slug, label_b or pb_slug)
+                    if sharp_lookup else None)
+        if sharp_pa is not None:
+            p_a, used = sharp_pa, used
+        elif require_sharp:
+            _skip(slug, "no sharp reference (divergence mode bets only on a sharp anchor)",
+                  price_sane=ms["price_sane"])
+            continue
+        elif p_a is None:                     # anti-fabrication: devig -> ~0 edge
             fair = elo.devig_two_way(ms["sides"][0]["price"], ms["sides"][1]["price"])
             p_a = fair[0] if fair else ms["sides"][0]["price"]
-        chosen, notes = pick_side(ms["sides"], p_a, args.fee_rate, args.odds_min, args.odds_max)
+        chosen, notes = pick_side(ms["sides"], p_a, args.fee_rate, args.odds_min, args.odds_max,
+                                  getattr(args, "max_edge", MAX_PLAUSIBLE_EDGE))
         vlog(f"  [{slug}] {label_a} vs {label_b} ({surface}): P({label_a})={p_a:.3f} "
-             f"external={used}" + (f" elo={ea:.0f}/{eb:.0f}" if used else ""))
+             f"external={used}"
+             + (f" sharp={sharp_pa:.3f}" if sharp_pa is not None else (" (no sharp ref)" if sharp_lookup else ""))
+             + (f" elo={ea:.0f}/{eb:.0f}" if used and sharp_pa is None else ""))
         ref = ms["sides"][0]
         cand = {"slug": slug, "surface": surface, "p_a": p_a, "used": used,
                 "elo_a": ea, "elo_b": eb, "sides": ms["sides"], "ou": ms, "m": m,
                 "chosen": chosen, "notes": notes, "ref_token": ref["token"],
                 "ref_label": label_a, "ref_price": ref["price"]}
         if not chosen:
-            _skip(slug, "no side in odds band", price_sane=ms["price_sane"])
-            cand_rows.append({**cand, "bet": 0, "skip_reason": "no side in odds band"})
+            impl = next((n for n in notes
+                         if n.get("implausible") and n["edge"] > 0 and n["in_odds_band"]), None)
+            reason = (f"edge {impl['edge']:.1%} implausibly large (> {MAX_PLAUSIBLE_EDGE:.0%} cap) "
+                      f"— likely model error" if impl else "no side in odds band")
+            _skip(slug, reason, price_sane=ms["price_sane"])
+            cand_rows.append({**cand, "bet": 0, "skip_reason": reason})
             continue
         if chosen["edge"] < args.min_edge:
             _skip(slug, f"edge {chosen['edge']*100:.1f}% < {args.min_edge*100:.0f}%")
@@ -334,6 +387,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--odds-min", type=float, default=elo.ODDS_MIN_DEFAULT)
     p.add_argument("--odds-max", type=float, default=elo.ODDS_MAX_DEFAULT)
     p.add_argument("--min-edge", type=float, default=0.05)
+    p.add_argument("--max-edge", type=float, default=MAX_PLAUSIBLE_EDGE,
+                   help=f"Reject a side whose edge exceeds this as likely model error (default {MAX_PLAUSIBLE_EDGE})")
+    p.add_argument("--odds-api-key", default=None,
+                   help="The Odds API key (or $ODDS_API_KEY) -> sharp anchor (divergence detector)")
+    p.add_argument("--no-sharp", action="store_true", help="Disable the sharp anchor (Elo model, capped)")
+    p.add_argument("--sharp-tours", default=None,
+                   help="Comma substrings to limit sharp tours (e.g. 'atp,wta'); default all active")
+    p.add_argument("--no-require-sharp", dest="require_sharp", action="store_false", default=True,
+                   help="With a sharp slate loaded, still model matches with NO sharp match "
+                        "(default OFF: skip them — bet only on a sharp anchor)")
+    p.add_argument("--sharp-min-reserve", type=int, default=0,
+                   help="Stop the sharp fetch once Odds-API remaining quota hits this floor (0 = no reserve)")
     p.add_argument("--fee-rate", type=float, default=0.0)
     p.add_argument("--portfolio-value", type=float, default=10000.0)
     p.add_argument("--predictions-db", default=tdb.DEFAULT_DB)

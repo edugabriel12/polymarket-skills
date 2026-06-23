@@ -146,7 +146,9 @@ class _Args:
         import elo
         d = dict(date="2026-06-20", ratings_csv=None, auto_ratings=False, tour="atp",
                  surface=None, blend=elo.SURFACE_BLEND, odds_min=elo.ODDS_MIN_DEFAULT,
-                 odds_max=elo.ODDS_MAX_DEFAULT, min_edge=0.05, fee_rate=0.0,
+                 odds_max=elo.ODDS_MAX_DEFAULT, min_edge=0.05, max_edge=1.0, fee_rate=0.0,
+                 no_sharp=True, odds_api_key=None, sharp_tours=None, require_sharp=True,
+                 sharp_min_reserve=0,
                  portfolio_value=10000.0, predictions_db=None, record=False,
                  output="json", verbose=False, debug=False, rate_limit=0)
         d.update(kw); self.__dict__.update(d)
