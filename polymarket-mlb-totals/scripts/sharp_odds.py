@@ -21,8 +21,80 @@ from __future__ import annotations
 
 import csv
 import os
+import re
+
+import ballparks
+
+# The Odds API takes the key as an `apiKey=` query param, so requests' own error
+# strings (HTTPError "...for url: ...apiKey=SECRET...") and any echoed URL would leak
+# it. Redact the value from anything we log (CLAUDE.md: never echo secrets).
+_APIKEY_RE = re.compile(r"(apiKey=)[^&\s]+", re.IGNORECASE)
+
+
+def _redact(text) -> str:
+    return _APIKEY_RE.sub(r"\1***", str(text))
 
 ODDS_API = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
+
+# Full team names / cities / nicknames -> the lowercase abbreviation Polymarket uses
+# in its game slugs (mlb-chc-nym-...). Sharp sources disagree on team identifiers: a
+# CSV (e.g. oddsDataMLB) uses abbreviations ("CHC","NYM"), while The Odds API uses full
+# names ("Chicago Cubs"). Normalizing BOTH to the Polymarket abbreviation is what lets a
+# sharp game key MATCH its Polymarket market (the cause of the earlier "0 of N matched").
+MLB_TEAM_ABBR: dict[str, str] = {
+    "diamondbacks": "ari", "arizona": "ari", "arizona diamondbacks": "ari", "dbacks": "ari",
+    "braves": "atl", "atlanta": "atl", "atlanta braves": "atl",
+    "orioles": "bal", "baltimore": "bal", "baltimore orioles": "bal",
+    "red sox": "bos", "boston": "bos", "boston red sox": "bos", "redsox": "bos",
+    "cubs": "chc", "chicago cubs": "chc",
+    "white sox": "cws", "chicago white sox": "cws", "whitesox": "cws",
+    "reds": "cin", "cincinnati": "cin", "cincinnati reds": "cin",
+    "guardians": "cle", "cleveland": "cle", "cleveland guardians": "cle", "indians": "cle",
+    "rockies": "col", "colorado": "col", "colorado rockies": "col",
+    "tigers": "det", "detroit": "det", "detroit tigers": "det",
+    "astros": "hou", "houston": "hou", "houston astros": "hou",
+    "royals": "kc", "kansas city": "kc", "kansas city royals": "kc",
+    "angels": "laa", "los angeles angels": "laa", "la angels": "laa", "anaheim": "laa",
+    "dodgers": "lad", "los angeles dodgers": "lad", "la dodgers": "lad",
+    "marlins": "mia", "miami": "mia", "miami marlins": "mia",
+    "brewers": "mil", "milwaukee": "mil", "milwaukee brewers": "mil",
+    "twins": "min", "minnesota": "min", "minnesota twins": "min",
+    "mets": "nym", "new york mets": "nym", "ny mets": "nym",
+    "yankees": "nyy", "new york yankees": "nyy", "ny yankees": "nyy",
+    "athletics": "oak", "oakland": "oak", "oakland athletics": "oak", "a's": "oak", "as": "oak",
+    "phillies": "phi", "philadelphia": "phi", "philadelphia phillies": "phi",
+    "pirates": "pit", "pittsburgh": "pit", "pittsburgh pirates": "pit",
+    "padres": "sd", "san diego": "sd", "san diego padres": "sd",
+    "giants": "sf", "san francisco": "sf", "san francisco giants": "sf",
+    "mariners": "sea", "seattle": "sea", "seattle mariners": "sea",
+    "cardinals": "stl", "st louis": "stl", "st. louis": "stl",
+    "st louis cardinals": "stl", "st. louis cardinals": "stl",
+    "rays": "tb", "tampa bay": "tb", "tampa bay rays": "tb",
+    "rangers": "tex", "texas": "tex", "texas rangers": "tex",
+    "blue jays": "tor", "toronto": "tor", "toronto blue jays": "tor", "bluejays": "tor",
+    "nationals": "wsh", "washington": "wsh", "washington nationals": "wsh", "nats": "wsh",
+}
+
+
+def normalize_team(token: str) -> str:
+    """Normalize any sharp team token to the lowercase Polymarket slug abbreviation.
+
+    Handles abbreviations ("CHC"), full names ("Chicago Cubs"), and the ballparks
+    alias table ("chw"->"cws", "az"->"ari"). Falls back to the cleaned token so an
+    unknown team still keys consistently (away/home stay symmetric).
+    """
+    t = (token or "").strip().lower()
+    if not t:
+        return t
+    if t in MLB_TEAM_ABBR:
+        return MLB_TEAM_ABBR[t]
+    canon = ballparks._canon(t)          # abbrev aliases (chw->cws, az->ari, ...)
+    if ballparks.park_for(canon):
+        return canon
+    last = t.replace(".", "").split()[-1] if t.split() else t   # "n.y. yankees" -> "yankees"
+    if last in MLB_TEAM_ABBR:
+        return MLB_TEAM_ABBR[last]
+    return canon
 
 
 def american_to_implied(value) -> float | None:
@@ -51,7 +123,9 @@ def devig(over_imp: float | None, under_imp: float | None) -> tuple[float, float
 
 
 def _key(date: str, away: str, home: str) -> tuple:
-    return (date, frozenset((away.lower().strip(), home.lower().strip())))
+    # Normalize team identifiers to Polymarket abbreviations so a sharp game keyed
+    # from "Chicago Cubs"/"CHC" matches a Polymarket slug game keyed from "chc".
+    return (date, frozenset((normalize_team(away), normalize_team(home))))
 
 
 # ---------------------------------------------------------------------------
@@ -120,21 +194,62 @@ def parse_oddsapi(events: list, book: str = "pinnacle") -> dict:
     return out
 
 
-def fetch_sharp(api_key: str | None, date: str, book: str = "pinnacle", timeout: int = 10) -> dict:
-    """Best-effort sharp totals for a date via The Odds API. {} on any failure."""
+def _mask_key(key: str | None) -> str:
+    """A non-revealing fingerprint of an API key for logs (never the key itself)."""
+    if not key:
+        return "(none)"
+    if len(key) <= 8:
+        return "*" * len(key)
+    return f"{key[:4]}…{key[-4:]} (len={len(key)})"
+
+
+def fetch_sharp(api_key: str | None, date: str, book: str = "pinnacle",
+                timeout: int = 10, vlog=None) -> dict:
+    """Best-effort sharp totals for a date via The Odds API. {} on any failure.
+
+    Pass `vlog` (a print-like callback) to trace key resolution and the HTTP call
+    (source, masked key fingerprint, status, quota headers, event/parse counts, and
+    any error). The API key is NEVER logged in full — only a masked fingerprint
+    (CLAUDE.md: never echo secrets).
+    """
+    vlog = vlog or (lambda *a, **k: None)
+    source = ("argument (--odds-api-key)" if api_key
+              else "env $ODDS_API_KEY" if os.environ.get("ODDS_API_KEY") else "none")
     api_key = api_key or os.environ.get("ODDS_API_KEY")
+    vlog(f"  [odds-api] key source: {source}; key {_mask_key(api_key)}")
     if not api_key:
+        vlog("  [odds-api] no API key found — set $ODDS_API_KEY or pass --odds-api-key; "
+             "skipping live sharp fetch")
         return {}
     try:
         import requests  # lazy
         resp = requests.get(ODDS_API, params={
             "apiKey": api_key, "regions": "us,eu", "markets": "totals",
             "oddsFormat": "american", "bookmakers": book}, timeout=timeout)
+        # The Odds API reports quota in headers — invaluable for confirming the key works.
+        used, remaining = resp.headers.get("x-requests-used"), resp.headers.get("x-requests-remaining")
+        vlog(f"  [odds-api] GET {ODDS_API} (book={book}) -> HTTP {resp.status_code} "
+             f"(quota: used={used} remaining={remaining})")
+        if resp.status_code >= 400:
+            # 401=bad key, 422=bad params, 429=quota exhausted. Body carries the reason.
+            vlog(f"  [odds-api] error body: {_redact((resp.text or '')[:200])}")
         resp.raise_for_status()
         events = resp.json()
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        vlog(f"  [odds-api] request FAILED: {type(e).__name__}: {_redact(e)}")
         return {}
-    return {k: v for k, v in parse_oddsapi(events, book).items() if k[0] == date} or parse_oddsapi(events, book)
+    n_events = len(events) if isinstance(events, list) else 0
+    parsed = parse_oddsapi(events, book)
+    dated = {k: v for k, v in parsed.items() if k[0] == date}
+    vlog(f"  [odds-api] response: {n_events} event(s); {len(parsed)} parsed with a totals "
+         f"line; {len(dated)} dated {date}")
+    if n_events == 0:
+        vlog("  [odds-api] ⚠️ 0 events returned — verify the key is valid/active and that "
+             "games are scheduled (off-season/no-slate days return empty)")
+    elif not dated:
+        vlog(f"  [odds-api] ⚠️ {n_events} event(s) but none dated {date} — the slate may be "
+             "for another day (timezone); using all parsed games as a fallback")
+    return dated or parsed
 
 
 def sharp_over_prob(lookup: dict, date: str, away: str, home: str, line: float | None = None,

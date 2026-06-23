@@ -210,6 +210,17 @@ python polymarket-mlb-totals/scripts/suggest_totals.py --odds-api-key $ODDS_API_
 python polymarket-mlb-totals/scripts/suggest_totals.py --sharp-odds-csv sharp.csv
 ```
 
+### Sharp-driven discovery (`sharp_discovery.py`)
+The `mlb` Gamma tag is **not honored** — it returns the global volume-ranked mix and pagination caps
+at offset ~2100 (HTTP 422), so low-volume MLB games are truncated (only ~2 of the day's ~11 surface).
+When a sharp slate is loaded it carries the **full daily card**, so it becomes the **authoritative game
+list**: for each sharp game we fetch its Polymarket markets directly by event slug (`mlb-<away>-<home>-
+<date>`, both orderings tried) and **union** them into discovery. This fixes coverage (every game found
+regardless of volume rank) **and** matching — every added game already has its sharp reference, because
+team identifiers from any source (abbrev `CHC` or full name `Chicago Cubs`) are normalized to the
+Polymarket slug abbreviation (`sharp_odds.normalize_team`). On by default when a sharp reference is
+present; disable with `--no-sharp-discovery`.
+
 ### CLV vs the sharp close (`clv_vs_sharp.py`) — the validated edge metric
 `CLV(side) = sharp_close_fair_prob(side) − entry_price`. Beating the sharp close is the only proxy that
 confirms a real edge (in ~50 bets, vs thousands for raw P&L). Scores recorded entries against a sharp
