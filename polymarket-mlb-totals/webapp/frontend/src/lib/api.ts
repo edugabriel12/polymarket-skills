@@ -13,17 +13,28 @@ export interface Recommendation {
 
 export type Sport = "mlb" | "soccer" | "tennis";
 
-// Layer 1 + 3: full predictive distribution summary per prediction.
+// Layer 1 + 3: per-prediction forecast. Shape varies by sport — a runs/goals DISTRIBUTION
+// (MLB/soccer, with intervals) or a BINARY Bernoulli (tennis match-winner). All fields optional.
 export interface Forecast {
-  mean_total: number;
-  median_total: number;
-  most_likely_total: number;
-  pi50: [number, number];
-  pi80: [number, number];
-  pi80_mass: number;
   entropy_bits: number;
-  p_over: number;
-  p_under: number;
+  // distribution (MLB = runs, soccer = goals)
+  mean_total?: number;
+  median_total?: number;
+  most_likely_total?: number;
+  mean_goals?: number;
+  median_goals?: number;
+  most_likely_goals?: number;
+  pi50?: [number, number];
+  pi80?: [number, number];
+  pi80_mass?: number;
+  p_over?: number;
+  p_under?: number;
+  p_btts?: number;
+  // binary (tennis match-winner)
+  p_win?: number;
+  p_lose?: number;
+  confidence?: string;
+  uncertainty_flag?: boolean;
 }
 
 export interface StatsLog {
@@ -78,6 +89,29 @@ export interface Skipped {
   reason: string;
 }
 
+// A calibrated prediction for EVERY game, independent of the trade filters.
+export interface GameForecast {
+  game: string;
+  line: number;
+  has_market: boolean;
+  basis: "sharp" | "factors" | "market" | null;
+  mu?: number;
+  forecast: {
+    mean_total: number;
+    median_total: number;
+    most_likely_total: number;
+    pi50: [number, number];
+    pi80: [number, number];
+    pi80_mass: number;
+    entropy_bits: number;
+    p_over: number;
+    p_under: number;
+  } | null;
+  over_price: number | null;
+  edge_vs_market: number | null;
+  reason?: string;
+}
+
 export interface AnalysesResponse {
   sport: Sport;
   date: string;
@@ -85,6 +119,7 @@ export interface AnalysesResponse {
   cached: boolean;
   counts: Record<string, number>;
   suggestions: Suggestion[];
+  forecasts?: GameForecast[];
   skipped: Skipped[];
   disclaimer: string;
   error?: string | null;

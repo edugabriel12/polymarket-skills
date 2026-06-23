@@ -79,6 +79,28 @@ class TestSharpOdds(unittest.TestCase):
         self.assertAlmostEqual(over, 0.5, places=6)
         self.assertIsNone(so.sharp_ref(lk, "2026-06-23", "bos", "nyy"))  # not in slate
 
+    def test_adjacent_dates(self):
+        self.assertEqual(so._adjacent_dates("2026-06-23"), ["2026-06-23", "2026-06-24"])
+        self.assertEqual(so._adjacent_dates("2026-06-30"), ["2026-06-30", "2026-07-01"])  # month rollover
+        self.assertEqual(so._adjacent_dates("bad"), ["bad"])                               # graceful
+
+    def test_sharp_ref_tolerates_next_utc_day(self):
+        # A late West-coast game listed on Polymarket for 06-23 has a UTC commence on 06-24,
+        # so the sharp event is keyed one day ahead — the ref must still attach (the bug the
+        # 2026-06-23 log surfaced: oak-sf / bal-laa / bos-col fell to "no sharp reference").
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "s.csv")
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write("date,away,home,total_line,over_odds,under_odds\n")
+                fh.write("2026-06-24,OAK,SF,8.5,-110,-110\n")
+            lk = so.load_sharp_csv(p)
+        ref = so.sharp_ref(lk, "2026-06-23", "oak", "sf")     # queried at the US local date
+        self.assertIsNotNone(ref)
+        self.assertEqual(ref[0], 8.5)
+        self.assertIsNotNone(so.sharp_over_prob(lk, "2026-06-23", "oak", "sf", 8.5))
+        self.assertIsNone(so.sharp_ref(lk, "2026-06-23", "bos", "nyy"))   # truly absent
+        self.assertIsNone(so.sharp_ref(lk, "2026-06-22", "oak", "sf"))    # +1 only, not +2
+
     def test_oddsapi_picks_balanced_line_not_alternate(self):
         # A totals market bundling alternate lines: a stray 5.5 (over priced 0.95) plus the
         # real main 10.5 (over ~0.5). oddsapi_rows must pick the BALANCED main line, 10.5.

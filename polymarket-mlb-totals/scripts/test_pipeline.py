@@ -435,5 +435,58 @@ class _Args:
         self.__dict__.update(defaults)
 
 
+class TestForecastLayer(unittest.TestCase):
+    """The forecast layer predicts EVERY game, independent of the trade filters."""
+
+    def _totals_event(self, slug, line=8.5, over=0.52):
+        m = totals_market(line=line, over=over, under=round(1 - over, 2))
+        m["slug"] = slug
+        return m
+
+    def _moneyline_event(self, slug):
+        return {"slug": slug, "question": "Who wins?", "outcomes": ["AAA", "BBB"],
+                "outcome_prices": [0.5, 0.5], "token_ids": ["a", "b"],
+                "volume_24h": 500, "accepting_orders": True}
+
+    def test_market_basis_forecast(self):
+        # No external inputs, no sharp -> the forecast falls back to the market price.
+        args = _Args(use_external=False)
+        events = {"mlb-ari-stl-2026-06-23": [self._totals_event("mlb-ari-stl-2026-06-23-total-8pt5")]}
+        out = st.forecast_all_mlb(None, events, {}, "2026-06-23", args, lambda *a, **k: None)
+        self.assertEqual(len(out), 1)
+        r = out[0]
+        self.assertEqual(r["basis"], "market")
+        self.assertTrue(r["has_market"])
+        self.assertIsNotNone(r["forecast"])
+        self.assertAlmostEqual(r["forecast"]["p_over"] + r["forecast"]["p_under"], 1.0, places=6)
+        self.assertEqual(len(r["forecast"]["pi80"]), 2)          # an 80% interval is present
+        self.assertGreater(r["forecast"]["pi80"][1] - r["forecast"]["pi80"][0], 4)  # wide, honest
+
+    def test_game_without_market_and_no_inputs_has_no_basis(self):
+        args = _Args(use_external=False)
+        events = {"mlb-ccc-ddd-2026-06-23": [self._moneyline_event("mlb-ccc-ddd-2026-06-23")]}
+        out = st.forecast_all_mlb(None, events, {}, "2026-06-23", args, lambda *a, **k: None)
+        self.assertEqual(len(out), 1)
+        self.assertIsNone(out[0]["forecast"])                    # nothing to model from
+        self.assertFalse(out[0]["has_market"])
+
+    def test_factors_basis_without_any_market(self):
+        # A game with only a moneyline market is still forecast from team factors (no Polymarket
+        # totals market needed) — the core of "predict every game".
+        args = _Args(use_external=True)
+        events = {"mlb-eee-fff-2026-06-23": [self._moneyline_event("mlb-eee-fff-2026-06-23")]}
+        orig = st.data_inputs.get_game_inputs
+        st.data_inputs.get_game_inputs = lambda *a, **k: {
+            "home_off": 1.10, "away_off": 1.05, "home_sp": 0.95, "away_sp": 1.0}
+        try:
+            out = st.forecast_all_mlb(None, events, {}, "2026-06-23", args, lambda *a, **k: None)
+        finally:
+            st.data_inputs.get_game_inputs = orig
+        self.assertEqual(out[0]["basis"], "factors")
+        self.assertIsNotNone(out[0]["forecast"])
+        self.assertFalse(out[0]["has_market"])
+        self.assertIsNone(out[0]["edge_vs_market"])              # no price -> no edge
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -13,6 +13,7 @@ import { api, type Sport } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { PredictionCard } from "@/components/PredictionCard";
+import { ForecastList } from "@/components/ForecastList";
 import { cn } from "@/lib/utils";
 
 // Until next UTC midnight — matches the backend's once-per-day cache.
@@ -177,6 +178,10 @@ export function AnalysesTab({ sport }: { sport: Sport }) {
             </p>
           </Card>
         </motion.div>
+      )}
+
+      {data?.forecasts && data.forecasts.length > 0 && (
+        <ForecastList forecasts={data.forecasts} />
       )}
 
       {data && data.skipped.length > 0 && (
