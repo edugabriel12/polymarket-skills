@@ -384,5 +384,47 @@ class TestEndToEnd(unittest.TestCase):
             self.assertLess(abs(s["edge"]), 0.05)
 
 
+class TestLoadSharpLogging(unittest.TestCase):
+    """The loader's log must say whether the sharp slate loaded, is empty, or had no key."""
+
+    def _run(self, lookup, key="k"):
+        import sharp_odds_soccer as so
+        logs = []
+        vlog = lambda *a, **k: logs.append(" ".join(str(x) for x in a))  # noqa: E731
+        orig = (so.fetch_active_soccer_keys, so.fetch_sharp_soccer)
+        saved_env = os.environ.pop("ODDS_API_KEY", None)
+        try:
+            so.fetch_active_soccer_keys = lambda *a, **k: ["soccer_epl"]
+            so.fetch_sharp_soccer = lambda *a, **k: lookup
+            args = argparse.Namespace(no_sharp=False, odds_api_key=key, sharp_leagues=None,
+                                      sharp_btts=True, sharp_min_reserve=0)
+            out = ss._load_sharp_lookup(args, "2026-06-21", vlog)
+        finally:
+            so.fetch_active_soccer_keys, so.fetch_sharp_soccer = orig
+            if saved_env is not None:
+                os.environ["ODDS_API_KEY"] = saved_env
+        return out, "\n".join(logs)
+
+    def test_empty_with_key_logs_off(self):
+        out, log = self._run({})
+        self.assertEqual(out, {})
+        self.assertIn("divergence detector OFF", log)
+
+    def test_loaded_logs_dated_count(self):
+        import sharp_odds_soccer as so
+        lookup = {
+            so._key("2026-06-21", "Arsenal", "Chelsea"): {"total_line": 2.5, "over_fair": 0.5},
+            so._key("2026-06-22", "Real Madrid", "Barcelona"): {"total_line": 2.5, "over_fair": 0.5},
+        }
+        out, log = self._run(lookup)
+        self.assertEqual(len(out), 2)
+        self.assertIn("2 game(s) (1 dated 2026-06-21)", log)    # only one is today's slate
+
+    def test_no_key_logs_none(self):
+        out, log = self._run({}, key=None)
+        self.assertEqual(out, {})
+        self.assertIn("no ODDS_API_KEY", log)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

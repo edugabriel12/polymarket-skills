@@ -73,7 +73,15 @@ def _load_sharp_lookup(args, target, vlog) -> dict:
                                      min_quota_reserve=int(getattr(args, "sharp_min_reserve", 0) or 0),
                                      vlog=vlog)
     if lookup:
-        vlog(f"  sharp reference loaded: {len(lookup)} game(s) (divergence-detector mode)")
+        # k = (date, frozenset(teams)); count how many are dated for today's slate so a
+        # date-boundary mismatch (a late kickoff crossing UTC midnight) is visible in the log.
+        dated = sum(1 for k in lookup if k[0] == target)
+        vlog(f"  sharp reference loaded: {len(lookup)} game(s) "
+             f"({dated} dated {target}) (divergence-detector mode)")
+    else:
+        vlog("  sharp reference EMPTY — divergence detector OFF "
+             "(model stays predictive/Elo, edge-capped). Check the [odds-api] lines above: "
+             "0 leagues, quota reserve hit, or no games parsed.")
     return lookup
 
 
