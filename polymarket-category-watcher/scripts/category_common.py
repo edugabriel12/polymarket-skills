@@ -292,7 +292,16 @@ def discover_markets(
             try:
                 page = _fetch_tag_page(api, tag, offset, include_closed, extra_params)
             except requests.exceptions.RequestException as e:
-                log(f"  tag {tag!r} page@{offset} failed: {e}")
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if status == 422:
+                    # Gamma rejects offsets past ~2100 (HTTP 422). This is its known
+                    # pagination cap, NOT a real error — a broad/unhonored tag's global
+                    # mix simply exceeds the window. Stop here; callers that need the
+                    # long tail (e.g. MLB sharp-driven discovery) recover it by other means.
+                    log(f"  tag {tag!r}: reached Gamma's offset cap at {offset} "
+                        f"(HTTP 422) — stopping pagination (expected, not an error)")
+                else:
+                    log(f"  tag {tag!r} page@{offset} failed: {e}")
                 break
             if not page:
                 break
@@ -322,7 +331,12 @@ def discover_markets(
                 "order": "volume24hr", "ascending": "false",
             })
         except requests.exceptions.RequestException as e:
-            log(f"  text search failed: {e}")
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 422:
+                log(f"  text search {query!r}: reached Gamma's offset cap at {offset} "
+                    f"(HTTP 422) — stopping pagination (expected, not an error)")
+            else:
+                log(f"  text search failed: {e}")
             break
         if not isinstance(page, list) or not page:
             break
