@@ -27,6 +27,12 @@ export function PredictionCard({ s }: { s: Suggestion }) {
   const sides = market === "BTTS" ? ["YES", "NO"] : ["OVER", "UNDER"];
   const otherSide = sides.find((x) => x !== side) ?? sides[1];
   const fcast = s.forecast ?? st.forecast;
+  // Forecast shape varies by sport: a runs/goals DISTRIBUTION (has pi80) or a BINARY
+  // Bernoulli (tennis, has p_win). Guard so tennis never hits the interval fields.
+  const fcDist = !!fcast && Array.isArray(fcast.pi80);
+  const fcMean = fcast?.mean_total ?? fcast?.mean_goals;
+  const fcUnit = fcast?.mean_goals != null ? "gols" : "runs";
+  const fcMostLikely = fcast?.most_likely_total ?? fcast?.most_likely_goals;
 
   const marketLabel =
     market === "BTTS" ? "Ambos Marcam (BTTS)" : `Total ${line ?? ""} O/U`;
@@ -65,22 +71,22 @@ export function PredictionCard({ s }: { s: Suggestion }) {
             </div>
           </div>
 
-          {/* Layer 1 + 3: distributional forecast with a stated confidence range */}
-          {fcast && (
+          {/* Layer 1 + 3: distributional forecast (runs/goals) with a stated confidence range */}
+          {fcast && fcDist && (
             <div className="mt-4 rounded-xl border border-border bg-muted/30 px-3 py-2.5">
               <div className="flex items-center justify-between text-[11px]">
                 <span className="font-bold uppercase tracking-wider text-muted-foreground">
                   Previsão · total esperado
                 </span>
                 <span className="font-black tabular-nums text-foreground">
-                  ~{fcast.mean_total} runs
+                  ~{fcMean} {fcUnit}
                 </span>
               </div>
               <div className="mt-1.5 flex items-center justify-between text-[11px] text-muted-foreground">
                 <span>
                   Intervalo 80%:{" "}
                   <span className="font-semibold text-foreground tabular-nums">
-                    {fcast.pi80[0]}–{fcast.pi80[1]}
+                    {fcast.pi80![0]}–{fcast.pi80![1]}
                   </span>
                 </span>
                 <span>
@@ -91,7 +97,34 @@ export function PredictionCard({ s }: { s: Suggestion }) {
                 </span>
               </div>
               <div className="mt-0.5 text-[10px] text-muted-foreground">
-                50%: {fcast.pi50[0]}–{fcast.pi50[1]} · mais provável {fcast.most_likely_total}
+                {fcast.pi50 && <>50%: {fcast.pi50[0]}–{fcast.pi50[1]} · </>}
+                mais provável {fcMostLikely}
+                {fcast.p_btts != null && <> · BTTS {Math.round(fcast.p_btts * 100)}%</>}
+              </div>
+            </div>
+          )}
+
+          {/* Binary (tennis match-winner): no interval — the calibrated prob + entropy + label */}
+          {fcast && !fcDist && fcast.p_win != null && (
+            <div className="mt-4 rounded-xl border border-border bg-muted/30 px-3 py-2.5">
+              <div className="flex items-center justify-between text-[11px]">
+                <span className="font-bold uppercase tracking-wider text-muted-foreground">
+                  Previsão · vitória
+                </span>
+                <span className="font-black tabular-nums text-foreground">
+                  {Math.round(fcast.p_win * 100)}%
+                </span>
+              </div>
+              <div className="mt-1 flex items-center justify-between text-[11px] text-muted-foreground">
+                <span>
+                  Incerteza:{" "}
+                  <span className="font-semibold text-foreground tabular-nums">
+                    {fcast.entropy_bits.toFixed(2)} bits
+                  </span>
+                </span>
+                {fcast.confidence && (
+                  <span className="font-semibold text-foreground">{fcast.confidence}</span>
+                )}
               </div>
             </div>
           )}

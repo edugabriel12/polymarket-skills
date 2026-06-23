@@ -13,17 +13,28 @@ export interface Recommendation {
 
 export type Sport = "mlb" | "soccer" | "tennis";
 
-// Layer 1 + 3: full predictive distribution summary per prediction.
+// Layer 1 + 3: per-prediction forecast. Shape varies by sport — a runs/goals DISTRIBUTION
+// (MLB/soccer, with intervals) or a BINARY Bernoulli (tennis match-winner). All fields optional.
 export interface Forecast {
-  mean_total: number;
-  median_total: number;
-  most_likely_total: number;
-  pi50: [number, number];
-  pi80: [number, number];
-  pi80_mass: number;
   entropy_bits: number;
-  p_over: number;
-  p_under: number;
+  // distribution (MLB = runs, soccer = goals)
+  mean_total?: number;
+  median_total?: number;
+  most_likely_total?: number;
+  mean_goals?: number;
+  median_goals?: number;
+  most_likely_goals?: number;
+  pi50?: [number, number];
+  pi80?: [number, number];
+  pi80_mass?: number;
+  p_over?: number;
+  p_under?: number;
+  p_btts?: number;
+  // binary (tennis match-winner)
+  p_win?: number;
+  p_lose?: number;
+  confidence?: string;
+  uncertainty_flag?: boolean;
 }
 
 export interface StatsLog {
