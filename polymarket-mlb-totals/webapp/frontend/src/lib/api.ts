@@ -13,7 +13,21 @@ export interface Recommendation {
 
 export type Sport = "mlb" | "soccer" | "tennis";
 
+// Layer 1 + 3: full predictive distribution summary per prediction.
+export interface Forecast {
+  mean_total: number;
+  median_total: number;
+  most_likely_total: number;
+  pi50: [number, number];
+  pi80: [number, number];
+  pi80_mass: number;
+  entropy_bits: number;
+  p_over: number;
+  p_under: number;
+}
+
 export interface StatsLog {
+  forecast?: Forecast;
   model?: string;
   market?: string; // soccer: TOTAL | BTTS
   chosen_side?: string; // OVER/UNDER/YES/NO
@@ -48,6 +62,7 @@ export interface Suggestion {
   lam_home?: number;
   lam_away?: number;
   edge?: number;
+  forecast?: Forecast;
   prediction_id: number | null;
   recommendation: Recommendation;
   stats?: StatsLog;
@@ -126,7 +141,20 @@ export interface CalibrationResponse {
   logged: number;
   settled: number;
   settled_bet: number;
-  all: { n: number; brier: number | null; log_loss: number | null; reliability: ReliabilityBin[] };
+  all: {
+    n: number;
+    brier: number | null;
+    log_loss: number | null;
+    reliability: ReliabilityBin[];
+    ece?: number | null;
+    mce?: number | null;
+    brier_decomposition?: {
+      reliability: number;
+      resolution: number;
+      uncertainty: number;
+      brier: number;
+    } | null;
+  };
   bet: { n: number; brier: number | null; log_loss: number | null };
   clv: {
     n: number;

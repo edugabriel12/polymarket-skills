@@ -53,6 +53,34 @@ export function CalibrationPanel({ sport }: { sport: Sport }) {
                 positive={clv.n > 0 ? clvPos : null} />
             </div>
 
+            {/* Layer 2: ECE/MCE + Murphy Brier decomposition */}
+            {(a.ece !== undefined || a.brier_decomposition) && (
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="rounded-xl border border-border bg-muted/30 p-3">
+                  <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                    Erro de calibração
+                  </div>
+                  <div className="mt-1 flex gap-4 text-sm">
+                    <span>ECE <span className="font-bold tabular-nums">{f4(a.ece)}</span></span>
+                    <span>MCE <span className="font-bold tabular-nums">{f4(a.mce)}</span></span>
+                  </div>
+                  <div className="text-[10px] text-muted-foreground">média / pior desvio · ideal → 0</div>
+                </div>
+                {a.brier_decomposition && (
+                  <div className="rounded-xl border border-border bg-muted/30 p-3">
+                    <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                      Decomposição de Murphy
+                    </div>
+                    <div className="mt-1 text-xs tabular-nums">
+                      conf. {f4(a.brier_decomposition.reliability)} (↓) − resol.{" "}
+                      {f4(a.brier_decomposition.resolution)} (↑) + incerteza{" "}
+                      {f4(a.brier_decomposition.uncertainty)}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
             <div className="overflow-x-auto">
               <p className="mb-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
                 Confiabilidade — P(ref) previsto vs. frequência real

@@ -166,22 +166,46 @@ for OVER), the market price, the model params, and the pick. This avoids selecti
 compute **Brier / log-loss / reliability over all games**, not just the bet ones. Read it with
 `predictions_db.get_model_log()` / `soccer_predictions.get_model_log()`.
 
+### Calibrated forecasting — the 4-layer architecture
+Beyond edge detection, the skill produces an **accurate prediction with a trustworthy confidence
+measure**, built in four layers (full write-up in `references/calibrated-forecasting.md`):
+1. **Distribution** — forecast the whole Negative-Binomial pmf, not a point (`forecast.py`).
+2. **Calibration** — make "70%" mean 70%: reliability diagram, Murphy Brier decomposition, ECE/MCE,
+   and post-hoc calibrators (temperature / Platt / isotonic) in `calibration_core.py`.
+3. **Per-prediction confidence** — 50%/80% prediction intervals + predictive entropy on every
+   forecast (`forecast.forecast_summary`, surfaced via `suggest_totals.forecast_block` and the
+   PredictionCard).
+4. **Validation** — proper scoring rules walk-forward: **CRPS** (run units), log-loss/Brier, and
+   **interval coverage** (`scoring.py`, wired into `backtest.py`).
+
+Pure-stdlib cores, offline-tested by `test_forecast.py` / `test_calibration_core.py` /
+`test_scoring.py`.
+
 ### Calibration report (`calibration.py`)
 Settles the shadow log (a game's actual outcome is propagated to **all** its lines, bet or not) and
 scores the model. Pure stdlib; `--sport mlb|soccer`.
 ```bash
 python polymarket-mlb-totals/scripts/calibration.py --sport mlb --settle      # settle + report
+python polymarket-mlb-totals/scripts/calibration.py --sport mlb --settle --fit-calibrator temperature
 python polymarket-mlb-totals/scripts/calibration.py --sport soccer --settle --json
 ```
-Reports Brier, log-loss, and a reliability table (predicted vs empirical) for all modeled markets and
-for bet-only. **CLV** (needs a closing-price snapshot) and settling games with no bet line (needs the
-results feed) are the documented follow-ups.
+Reports Brier, log-loss, **ECE/MCE**, the **Murphy Brier decomposition** (reliability − resolution +
+uncertainty), and a reliability table (predicted vs empirical) for all modeled markets and for
+bet-only. `--fit-calibrator` fits a post-hoc calibrator and reports the before/after ECE
+(**suggestion-only** — it never rewrites the live model). It also reports **empirical interval
+coverage** over settled games — reconstructs each game's pmf from its logged (mu, variance), takes
+the 50%/80% prediction interval, and checks whether the actual total landed inside (target 50%/80%)
+plus mean CRPS. This is the thermometer for whether the NegBin intervals are honest on REAL data (and
+thus whether distribution-free conformal intervals would add anything — if coverage already ≈ nominal,
+they wouldn't). **CLV** (needs a closing-price snapshot) and settling games with no bet line (needs
+the results feed) are the documented follow-ups.
 
 ### Historical backtest (`backtest.py`)
 Walk-forward validation over past seasons — the way the model trades. For each game it builds
 **point-in-time** team run factors from only the games already played (no look-ahead), runs the same
 `model_probabilities` + `pick_side` as the live skill, settles against the final score, and aggregates
-**ROI / win rate / Brier / log-loss / calibration / CLV / μ-vs-market bias** by season.
+**ROI / win rate / Brier / log-loss / CRPS / interval coverage / ECE / CLV / μ-vs-market bias** by
+season (CRPS and the 80%/50% coverage validate the full distribution and its intervals — Layer 4).
 
 Needs a normalized games+odds CSV (one row/game):
 `date,away,home,away_score,home_score,total_line,over_odds,under_odds[,close_over_odds,close_under_odds]`

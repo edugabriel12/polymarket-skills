@@ -82,5 +82,66 @@ class TestSettleAndReport(unittest.TestCase):
             self.assertIn("Brier", cal.format_report(rep))
 
 
+class TestIntervalCoverage(unittest.TestCase):
+    def _mlog_with_params(self, db, slug, line, mu, var):
+        pdb.record_model_log({
+            "game_slug": slug, "game_date": "2026-06-14", "market": "TOTAL",
+            "line": line, "ref_side": "OVER", "ref_prob": 0.5, "ref_price": 0.5,
+            "bet": 1, "model_params": {"mu": mu, "variance": var}}, db)
+
+    def test_coverage_over_settled_games(self):
+        import run_distribution as rd
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "p.db")
+            # 40 games, all forecast mu=8.5; settle each with its actual total. Draw the
+            # actuals FROM the model's own NegBin pmf so coverage should track nominal.
+            pmf = rd.negbin_total_runs_pmf(8.5, rd.variance_from_mu(8.5))
+            cdf = []
+            acc = 0.0
+            for p in pmf:
+                acc += p
+                cdf.append(acc)
+            # Deterministic spread of quantiles 0.012..0.988 -> sampled totals.
+            import bisect
+            totals = [bisect.bisect_left(cdf, (i + 0.5) / 40) for i in range(40)]
+            for i, actual in enumerate(totals):
+                slug = f"mlb-a{i}-b{i}-2026-06-14-total-8pt5"
+                self._mlog_with_params(db, slug, 8.5, 8.5, rd.variance_from_mu(8.5))
+                pid = pdb.record_prediction({
+                    "game_slug": slug, "game_date": "2026-06-14", "line": 8.5,
+                    "side": "OVER", "entry_price": 0.5, "strategy": "x"}, db)
+                pdb.settle_prediction(pid, float(actual), db)
+            cal.settle_from_predictions(db)
+            ic = cal.interval_coverage(db)
+            self.assertEqual(ic["n"], 40)                       # one forecast per game
+            # Coverage of a sampled-from-itself distribution tracks nominal (±tolerance).
+            self.assertGreaterEqual(ic["coverage80"], 0.70)
+            self.assertLessEqual(ic["coverage50"], 0.75)
+            self.assertGreater(ic["mean_crps"], 0.0)
+            self.assertGreater(ic["mean_width80"], 5)          # wide for a single game
+
+    def test_dedup_per_game_and_skip_non_total(self):
+        import run_distribution as rd
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "p.db")
+            v = rd.variance_from_mu(8.5)
+            # Two lines of ONE game -> counted once. Plus a degenerate (var<=mu) row -> skipped.
+            self._mlog_with_params(db, "mlb-x-y-2026-06-14-total-8pt5", 8.5, 8.5, v)
+            self._mlog_with_params(db, "mlb-x-y-2026-06-14-total-9pt5", 9.5, 8.5, v)
+            pid = pdb.record_prediction({
+                "game_slug": "mlb-x-y-2026-06-14-total-8pt5", "game_date": "2026-06-14",
+                "line": 8.5, "side": "OVER", "entry_price": 0.5, "strategy": "x"}, db)
+            pdb.settle_prediction(pid, 9.0, db)
+            cal.settle_from_predictions(db)
+            ic = cal.interval_coverage(db)
+            self.assertEqual(ic["n"], 1)                        # deduped to one game
+
+    def test_no_settled_returns_zero(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "p.db")
+            self._mlog_with_params(db, "mlb-x-y-2026-06-14-total-8pt5", 8.5, 8.5, 17.0)
+            self.assertEqual(cal.interval_coverage(db)["n"], 0)  # not settled -> no actual
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
