@@ -27,7 +27,7 @@ It merges into a season-long CSV that `GET /api/clv` scores recorded entries aga
 |---|---|---|
 | `ODDS_API_KEY` | — | The Odds API key. **Required** to enable capture + the live sharp anchor. |
 | `SHARP_CLOSE_CAPTURE` | `1` | Set `0` to disable the scheduler. |
-| `SHARP_CLOSE_TIMES` | `23:00` | Comma-separated **UTC** times to capture (e.g. `23:00,01:30` for late games). One/day ≈ 30 Odds-API calls/month. |
+| `SHARP_CLOSE_TIMES` | `16:00,17:00,20:00,22:00,23:00` | Comma-separated **UTC** capture times (the defaults = 13h/14h/17h/19h/20h BRT, to catch afternoon + night first pitches). 5/day ≈ 150 Odds-API calls/month. |
 | `SHARP_CLOSE_CSV` | `<predictions-db dir>/sharp_close.csv` | Where the accumulated closes are written. |
 
 Endpoints: `GET /api/clv?sport=mlb` (avg_CLV / beat_close), `POST /api/capture-close` (force a snapshot now),

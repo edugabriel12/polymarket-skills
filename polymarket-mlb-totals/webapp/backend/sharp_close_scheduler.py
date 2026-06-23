@@ -6,8 +6,8 @@ only the CURRENT line — so the close has to be captured at the right moment. R
 an external cron, this runs capture_close.capture() at configured UTC times each day
 (default 23:00, ≈ evening first pitches) for as long as the FastAPI process is alive.
 
-Quota-conscious by design: one capture/day is ~30 Odds-API calls/month, well within the
-free tier. Add more times (comma-separated) to also catch late games.
+Quota-conscious by design: the default 5 captures/day is ~150 Odds-API calls/month, well
+within the free tier. The schedule (UTC) is injected by the caller.
 
 Pure time math (parse_times / seconds_until_next) is offline-testable; the loop is
 best-effort and never raises out of itself.

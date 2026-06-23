@@ -93,12 +93,16 @@ TENNIS_TOUR = os.environ.get("TENNIS_TOUR", "atp")
 SPORTS = ("mlb", "soccer", "tennis")
 
 # --- Sharp-close capture scheduler (MLB CLV) -------------------------------------------
-# Snapshots the Pinnacle/consensus closing line daily while the backend is up, so CLV vs
-# the sharp close can be scored without an external cron. Quota-conscious: defaults to one
-# capture/day (~30 Odds-API calls/month). Disable with SHARP_CLOSE_CAPTURE=0.
+# Snapshots the Pinnacle/consensus closing line throughout the day while the backend is up,
+# so CLV vs the sharp close can be scored without an external cron. Disable with
+# SHARP_CLOSE_CAPTURE=0. Default schedule is 5 captures/day (~150 Odds-API calls/month,
+# well within the free tier) to also catch afternoon first pitches (a game's last PREGAME
+# snapshot before it starts is its close; in-progress games are filtered out).
 ODDS_API_KEY = os.environ.get("ODDS_API_KEY")
 SHARP_CLOSE_CAPTURE = os.environ.get("SHARP_CLOSE_CAPTURE", "1") not in ("0", "false", "False", "no", "")
-SHARP_CLOSE_TIMES = os.environ.get("SHARP_CLOSE_TIMES", "23:00")  # comma-separated UTC HH:MM
+# Comma-separated UTC HH:MM. Brazil is UTC-3 year-round, so the defaults are
+# 13h/14h/17h/19h/20h BRT = 16:00/17:00/20:00/22:00/23:00 UTC.
+SHARP_CLOSE_TIMES = os.environ.get("SHARP_CLOSE_TIMES", "16:00,17:00,20:00,22:00,23:00")
 SHARP_CLOSE_CSV = os.environ.get(
     "SHARP_CLOSE_CSV", os.path.join(os.path.dirname(MLB_DB) or ".", "sharp_close.csv"))
 
