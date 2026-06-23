@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Per-game recalc scheduler: recompute the model ~10 min before each game starts.
+"""Per-game recalc scheduler: recompute the model ~1 hour before each game starts.
 
 Replaces the fixed-time sharp-close schedule. The model can only predict PREGAME games
 (in-progress games are filtered), and Polymarket volume builds toward first pitch — so the

@@ -19,7 +19,7 @@ API endpoints take `?sport=mlb|soccer`.
 ### Auto-recalc + sharp-close capture (MLB) — built-in per-game scheduler
 
 A game can only be predicted while it's **pregame** (in-progress games are filtered) and its Polymarket
-volume builds toward first pitch — so the model is recomputed **~10 min before each game starts**, not
+volume builds toward first pitch — so the model is recomputed **~1 hour before each game starts**, not
 on a fixed clock. With `ODDS_API_KEY` set, the backend schedules a recompute per game; near-simultaneous
 starts are grouped into one **wave** = one Odds-API fetch covering the whole slate (so a block of games
 costs a single call, staying well within the free quota). Each wave also snapshots the sharp line into a
@@ -30,7 +30,7 @@ the Análises tab just serves the auto-updated day cache (it shows the last `aut
 |---|---|---|
 | `ODDS_API_KEY` | — | The Odds API key. **Required** to enable auto-recalc + the live sharp anchor. |
 | `AUTO_RECALC` | `1` | Set `0` to disable the per-game recompute loop. |
-| `WAVE_LEAD_MIN` | `10` | Minutes before first pitch to recompute a game. |
+| `WAVE_LEAD_MIN` | `60` | Minutes before first pitch to recompute a game. |
 | `WAVE_BUCKET_MIN` | `10` | Merge starts within this window into one wave (one fetch). |
 | `WAVE_POLL_SEC` | `300` | How often the loop checks for a due wave (no API cost). |
 | `SHARP_CLOSE_CSV` | `<predictions-db dir>/sharp_close.csv` | Where the accumulated sharp lines/closes are written. |
