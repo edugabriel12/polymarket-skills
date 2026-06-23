@@ -100,6 +100,43 @@ class TestParse(unittest.TestCase):
         self.assertIsNone(so.sharp_btts_ref({}, "2026-06-23", "a", "b"))
 
 
+class TestQuotaReserve(unittest.TestCase):
+    def test_stops_at_reserve(self):
+        # A fake requests whose /odds responses report a decreasing remaining quota; the
+        # fetch must stop querying further leagues once remaining <= the reserve.
+        import types
+
+        class _Resp:
+            def __init__(self, rem, payload):
+                self.headers = {"x-requests-remaining": str(rem), "x-requests-used": "0"}
+                self._p = payload
+            def raise_for_status(self): pass
+            def json(self): return self._p
+
+        calls = {"n": 0}
+        seq = [250, 150]  # second league call drops below a reserve of 200
+
+        def fake_get(url, params=None, timeout=None):
+            calls["n"] += 1
+            rem = seq[min(calls["n"] - 1, len(seq) - 1)]
+            return _Resp(rem, [_totals_event("A", "B", "2026-06-23", 2.5)])
+
+        fake_requests = types.SimpleNamespace(get=fake_get)
+        orig = sys.modules.get("requests")
+        sys.modules["requests"] = fake_requests
+        try:
+            so.fetch_sharp_soccer("k", ["soccer_a", "soccer_b", "soccer_c"], with_btts=False,
+                                  min_quota_reserve=200)
+        finally:
+            if orig is not None:
+                sys.modules["requests"] = orig
+            else:
+                sys.modules.pop("requests", None)
+        # league A (rem 250) queried, league B (rem 150) queried, then reserve hit -> stop
+        # before league C. So at most 2 league calls, never 3.
+        self.assertLessEqual(calls["n"], 2)
+
+
 class TestEndToEndMatch(unittest.TestCase):
     def test_question_teams_resolve_sharp_ref(self):
         # The whole point: teams parsed from a Polymarket question resolve the sharp ref.
