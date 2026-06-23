@@ -162,6 +162,28 @@ class TestPredictions(unittest.TestCase):
             self.assertEqual(s["acerto"], 2)
             self.assertEqual(s["win_rate"], 1.0)
 
+    def test_settle_by_base_slug_matches_full_market_slugs(self):
+        # Real predictions are stored under FULL market slugs; settling by the BASE game slug
+        # (the manual --settle-game path) must still update them — else winners stay PENDENTE
+        # and never reach the Resultados tab.
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "p.db")
+            spdb.record_prediction(self._row("TOTAL", "OVER", 2.5,
+                                   game_slug="epl-ars-che-2026-06-14-total-2pt5"), db)
+            spdb.record_prediction(self._row("BTTS", "YES", line=None,
+                                   game_slug="epl-ars-che-2026-06-14-btts"), db)
+            res = spdb.settle_game("epl-ars-che-2026-06-14", db, actual_total=4, actual_btts=True)
+            self.assertEqual(sorted(r["status"] for r in res), ["ACERTO", "ACERTO"])
+            self.assertEqual(spdb.summary(db)["acerto"], 2)
+            self.assertEqual(spdb.summary(db)["pendente"], 0)
+            # Settling by a full market slug settles the whole game too (same base).
+            spdb.record_prediction(self._row("TOTAL", "UNDER", 2.5,
+                                   game_slug="epl-x-y-2026-06-15-total-2pt5"), db)
+            spdb.record_prediction(self._row("BTTS", "NO", line=None,
+                                   game_slug="epl-x-y-2026-06-15-btts"), db)
+            res2 = spdb.settle_game("epl-x-y-2026-06-15-total-2pt5", db, actual_total=1, actual_btts=False)
+            self.assertEqual(sorted(r["status"] for r in res2), ["ACERTO", "ACERTO"])
+
     def test_btts_yes_no_both_allowed(self):
         with tempfile.TemporaryDirectory() as d:
             db = os.path.join(d, "p.db")
