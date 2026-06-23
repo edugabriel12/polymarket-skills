@@ -375,6 +375,25 @@ def run(args) -> dict:
     sharp_lookup = _load_sharp_lookup(args, target, vlog)
     require_sharp = bool(sharp_lookup) and getattr(args, "require_sharp", True)
 
+    # Cross-check the sharp slate against ALL discovered Polymarket events (not just goals
+    # markets): tells whether the sharp's other-league games are on Polymarket without a
+    # goals market, vs absent/truncated entirely. Matched by normalized team-set + date.
+    if sharp_lookup:
+        def _nk(gm):
+            t = _game_names(gm)
+            return frozenset(t) if t else None
+        poly_all = {nk for v in games.values() if (nk := _nk(v))}
+        poly_goals = {nk for k in classified if (nk := _nk(games[k]))}
+        sharp_today = {teams for (d, teams) in sharp_lookup if d == target}
+        on_poly, with_goals = sharp_today & poly_all, sharp_today & poly_goals
+        not_on_poly = sharp_today - poly_all
+        vlog(f"  sharp×Polymarket: {len(sharp_today)} sharp game(s) dated {target} -> "
+             f"{len(on_poly)} on Polymarket ({len(with_goals)} with goals markets), "
+             f"{len(not_on_poly)} NOT on Polymarket")
+        if not_on_poly:
+            sample = "; ".join(" v ".join(sorted(t)) for t in list(not_on_poly)[:10])
+            vlog(f"    not on Polymarket (sample): {sample}")
+
     suggestions, skipped, cand_rows = [], [], []
 
     def _skip(slug, reason, **extra):
