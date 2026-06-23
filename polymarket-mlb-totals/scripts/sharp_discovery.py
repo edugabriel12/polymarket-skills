@@ -75,9 +75,12 @@ def fetch_event_markets(api, event_slug: str, category_key: str = "baseball") ->
         for m in (ev.get("markets") or []):
             if not isinstance(m, dict):
                 continue
-            # The event row may not stamp eventSlug onto each nested market; backfill
-            # it so downstream date/prefix filters key off the real game slug.
-            m.setdefault("eventSlug", ev.get("slug") or event_slug)
+            # Group each market by its OWN slug — a totals market slug encodes the line
+            # (e.g. mlb-chc-nym-2026-06-23-total-8pt5), and the downstream run-total
+            # filter keys off that `-total-<line>` suffix. Forcing the base event slug
+            # here would strip the suffix and drop every total market. Moneyline/spread
+            # markets keep their own (non-total) slugs and are dropped, as intended.
+            m["eventSlug"] = m.get("slug") or ev.get("slug") or event_slug
             out.append(parse_market(m, category_key))
     return out
 

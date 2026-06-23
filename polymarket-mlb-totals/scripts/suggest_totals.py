@@ -87,22 +87,33 @@ STRONG_INPUT_KEYS = ("home_off", "away_off", "home_sp", "away_sp")
 
 
 def model_probabilities(line, over_price, park_factor, inputs, *,
-                        league_baseline, dispersion, sharp_over_price=None):
+                        league_baseline, dispersion, sharp_over_price=None, sharp_line=None):
     """Model the total-runs distribution and return the full math as a dict.
 
-    The FAIR-VALUE anchor is the SHARP reference price when one is supplied
+    The FAIR-VALUE anchor is the SHARP reference when one is supplied
     (`sharp_over_price`, the devigged Pinnacle/consensus P(Over)) — because the deep
     research shows the sharp close, not our model, is the efficient probability. The
     edge (computed later in pick_side as p_model − over_price) then measures how far the
     POLYMARKET price diverges from the sharp fair value: a true mispricing detector.
+
+    Crucially the sharp anchor is interpreted AT THE SHARP'S OWN LINE (`sharp_line`): we
+    invert the sharp prob to an expected total (mu) at the sharp line, then evaluate the
+    distribution at whatever Polymarket line is on offer. So a sharp main line of 8.5 can
+    correctly price a Polymarket alternate line of 7.5/11.5 — line drift no longer breaks
+    the anchor. When `sharp_line` is omitted the sharp prob is taken at the Polymarket line.
 
     Without a sharp price, the anchor falls back to the Polymarket price itself, so the
     model stays market-implied (edge ≈ 0 — anti-fabrication). `over_price` is always the
     Polymarket price we trade against; both the sharp and Polymarket mu are reported.
     """
     poly_mu = rd.market_implied_mu(line, over_price, dispersion)
-    anchor_price = sharp_over_price if sharp_over_price is not None else over_price
-    anchor_mu = rd.market_implied_mu(line, anchor_price, dispersion)
+    if sharp_over_price is not None:
+        anchor_price = sharp_over_price
+        anchor_line = sharp_line if sharp_line is not None else line
+    else:
+        anchor_price = over_price
+        anchor_line = line
+    anchor_mu = rd.market_implied_mu(anchor_line, anchor_price, dispersion)
     used_external = any(k in inputs for k in STRONG_INPUT_KEYS)
     model_mu = None
     if used_external:
@@ -493,16 +504,22 @@ def run(args) -> dict:
                 debug=args.debug) or {}
 
         away, home = pf.parse_slug_teams(event_slug)
-        sharp_over = sharp_odds.sharp_over_prob(sharp_lookup, target, away, home, line) \
-            if sharp_lookup else None
+        sharp = sharp_odds.sharp_ref(sharp_lookup, target, away, home) if sharp_lookup else None
+        sharp_line, sharp_over = (sharp if sharp else (None, None))
+        if sharp_lookup and sharp is None:
+            vlog(f"  [{event_slug}] ⚠️ no sharp match for parsed teams "
+                 f"away={away} home={home} — not in the {len(sharp_lookup)}-game sharp slate "
+                 f"(check team-abbrev mapping)")
         m = model_probabilities(
             line, ou["over_price"], park_factor, inputs,
             league_baseline=args.league_baseline, dispersion=args.dispersion,
-            sharp_over_price=sharp_over)
+            sharp_over_price=sharp_over, sharp_line=sharp_line)
         vlog(f"  [{event_slug}] model: park={park_factor} mu={m['mu']:.2f} "
              f"P(over)={m['p_over']:.3f} P(under)={m['p_under']:.3f} "
              f"external_inputs={m['used_external']}"
-             + (f" sharp_over={sharp_over:.3f}" if sharp_over is not None else " (no sharp ref)")
+             + (f" sharp_over={sharp_over:.3f}@line{sharp_line:g} "
+                f"(sharp_mu={m['market_mu']:.2f} vs poly_mu={m['poly_mu']:.2f})"
+                if sharp_over is not None else " (no sharp ref)")
              + (f" inputs={inputs}" if inputs else ""))
 
         chosen, side_notes = pick_side(line, ou, m["p_over"], m["p_under"],

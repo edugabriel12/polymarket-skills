@@ -258,6 +258,7 @@ def sharp_over_prob(lookup: dict, date: str, away: str, home: str, line: float |
 
     use_close pulls the CLOSING fair prob (for CLV); else the entry/open fair prob.
     Line is matched leniently (sharp line within 0.5 of ours), since books may differ.
+    Used by CLV scoring, which compares at the bet's own line.
     """
     rec = lookup.get(_key(date, away, home))
     if not rec:
@@ -265,3 +266,24 @@ def sharp_over_prob(lookup: dict, date: str, away: str, home: str, line: float |
     if line is not None and rec.get("line") is not None and abs(float(rec["line"]) - float(line)) > 0.51:
         return None
     return rec.get("close_over_fair" if use_close else "over_fair") or rec.get("over_fair")
+
+
+def sharp_ref(lookup: dict, date: str, away: str, home: str,
+              use_close: bool = False) -> tuple[float, float] | None:
+    """Return the sharp's own (line, fair P(over)) for a game, or None.
+
+    Unlike sharp_over_prob (which gates on the bet line, for CLV), this returns the
+    sharp's NATIVE line and fair P(over) at that line — with NO line-tolerance gate. The
+    model anchors its expected total (mu) to the sharp line via that prob, then prices
+    whatever Polymarket line is on offer off that mu. This makes the divergence detector
+    robust to line drift: the sharp book's main line (e.g. 8.5) and Polymarket's possibly
+    alternate line (e.g. 7.5 or 11.5) no longer have to match for the ref to attach.
+    """
+    rec = lookup.get(_key(date, away, home))
+    if not rec:
+        return None
+    over = rec.get("close_over_fair" if use_close else "over_fair") or rec.get("over_fair")
+    line = rec.get("line")
+    if over is None or line is None:
+        return None
+    return float(line), float(over)

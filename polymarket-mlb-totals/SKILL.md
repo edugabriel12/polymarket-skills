@@ -219,7 +219,12 @@ list**: for each sharp game we fetch its Polymarket markets directly by event sl
 regardless of volume rank) **and** matching — every added game already has its sharp reference, because
 team identifiers from any source (abbrev `CHC` or full name `Chicago Cubs`) are normalized to the
 Polymarket slug abbreviation (`sharp_odds.normalize_team`). On by default when a sharp reference is
-present; disable with `--no-sharp-discovery`.
+present; disable with `--no-sharp-discovery`. Each game's total markets are grouped by their
+line-encoding slug (`...-total-8pt5`) so the run-total filter keeps them. The sharp anchor is then
+interpreted **at the sharp's own line** (`sharp_ref` returns line + fair P(over)): the model inverts it
+to an expected total (μ) at the sharp line and prices whatever Polymarket line is on offer off that μ,
+so a sharp main line of 8.5 correctly prices a Polymarket alternate of 7.5/11.5 — line drift between
+the books no longer drops the reference.
 
 ### CLV vs the sharp close (`clv_vs_sharp.py`) — the validated edge metric
 `CLV(side) = sharp_close_fair_prob(side) − entry_price`. Beating the sharp close is the only proxy that

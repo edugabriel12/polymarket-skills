@@ -65,6 +65,20 @@ class TestSharpOdds(unittest.TestCase):
         self.assertEqual(rec["line"], 8.5)
         self.assertAlmostEqual(rec["over_fair"], 0.5, places=6)
 
+    def test_sharp_ref_returns_line_and_prob_no_tolerance_gate(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "s.csv")
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write("date,away,home,total_line,over_odds,under_odds\n")
+                fh.write("2026-06-23,CHC,NYM,8.5,-110,-110\n")
+            lk = so.load_sharp_csv(p)
+        ref = so.sharp_ref(lk, "2026-06-23", "chc", "nym")
+        self.assertIsNotNone(ref)
+        line, over = ref
+        self.assertEqual(line, 8.5)
+        self.assertAlmostEqual(over, 0.5, places=6)
+        self.assertIsNone(so.sharp_ref(lk, "2026-06-23", "bos", "nyy"))  # not in slate
+
     def test_csv_and_lookup(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "s.csv")
@@ -90,6 +104,22 @@ class TestDivergenceDetector(unittest.TestCase):
         # Edge vs the Polymarket price: Under is +EV (model 0.50 over vs 0.58 priced).
         self.assertLess(m["p_over"], 0.58)             # Over overpriced on Polymarket
         self.assertGreater(m["p_under"], 0.42)         # Under underpriced -> edge
+
+    def test_sharp_line_drift_anchors_mu_at_sharp_line(self):
+        # Sharp main line 8.5 @ fair 0.50 -> sharp mu ~8.5. Polymarket offers an ALTERNATE
+        # line of 7.5. The anchor must price 7.5 off the sharp mu (P(over 7.5) > 0.50),
+        # NOT treat 0.50 as the prob at 7.5.
+        m = st.model_probabilities(7.5, 0.55, 100.0, {}, league_baseline=8.5,
+                                   dispersion=2.0, sharp_over_price=0.50, sharp_line=8.5)
+        self.assertTrue(m["sharp_anchored"])
+        # mu is inverted from P(over 8.5)=0.50 (right-skewed NegBin -> mu ~9.0), anchored
+        # at the SHARP line (8.5), not the poly line (7.5).
+        self.assertGreater(m["market_mu"], 8.6)
+        self.assertGreater(m["p_over"], 0.55)                     # P(over 7.5 | high mu) is high
+        # Without the sharp_line, the same prob would be (wrongly) pinned at 7.5 -> lower mu.
+        m2 = st.model_probabilities(7.5, 0.55, 100.0, {}, league_baseline=8.5,
+                                    dispersion=2.0, sharp_over_price=0.50)
+        self.assertLess(m2["market_mu"], m["market_mu"])
 
     def test_no_sharp_is_market_implied(self):
         # Without a sharp ref, fair == Polymarket price -> ~zero edge (anti-fabrication).
