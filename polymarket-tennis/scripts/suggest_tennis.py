@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 import _bootstrap  # noqa: F401  (adds category-watcher scripts to sys.path)
 
 import elo
+import forecast_tennis as fct
 import ratings as ratings_mod
 import ratings_source
 import tennis_market as tm
@@ -291,6 +292,7 @@ def run(args) -> dict:
                             "side": ch["side"], "opponent": ch["opponent"],
                             "price": ch["price"], "edge": round(ch["edge"], 4),
                             "p_model": round(ch["p_model"], 4),
+                            "forecast": fct.forecast_block(ch["p_model"]),
                             "size_pct": round(size_pct, 5), "prediction_id": rec_id})
         vlog(f"  [{c['slug']}] >>> SUGGEST {ch['side']} @ {ch['price']:.3f} "
              f"edge={ch['edge']*100:+.1f}% size={size_pct*100:.2f}% pred_id={rec_id}")
@@ -327,6 +329,7 @@ def _record(c, chosen, size_pct, size_usd, kelly, conf, args, target):
              if chosen["side"] == c["ref_label"] else c["elo_b"],
              "elo_opp": c["elo_b"] if chosen["side"] == c["ref_label"] else c["elo_a"],
              "p_model": round(chosen["p_model"], 4), "edge": round(chosen["edge"], 4),
+             "forecast": fct.forecast_block(chosen["p_model"]),
              "used_external": c["used"], "blend": args.blend, "notes": c["notes"]}
     try:
         return tdb.record_prediction({
