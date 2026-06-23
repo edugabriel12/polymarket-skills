@@ -307,16 +307,23 @@ def compute_status(market: str, side: str, line, actual_total=None, actual_btts=
 
 def settle_game(game_slug: str, db_path: str = DEFAULT_DB, *,
                 actual_total=None, actual_btts=None) -> list[dict]:
-    """Settle all pending predictions for a game from its final goals/BTTS."""
-    if actual_btts is None and actual_total is not None:
-        actual_btts = None  # caller may pass goals only; BTTS rows stay pending
+    """Settle all pending predictions for a game from its final goals/BTTS.
+
+    `game_slug` may be the BASE game slug (`fifwc-nld-jpn-2026-06-14`) OR a full market slug
+    (`…-total-2pt5` / `…-btts`): predictions are stored under their full market slug, so we
+    match by the BASE game (suffix stripped) — otherwise settling by the event slug (as the
+    manual `--settle-game` path and the auto-settle both do) updates nothing.
+    """
+    base = model_log_base(game_slug)
     con = connect(db_path)
     try:
-        rows = con.execute("SELECT id, market, side, line FROM predictions "
-                           "WHERE game_slug=? AND status='PENDENTE'", (game_slug,)).fetchall()
+        rows = con.execute("SELECT id, market, side, line, game_slug FROM predictions "
+                           "WHERE status='PENDENTE'").fetchall()
         out = []
         with con:
             for r in rows:
+                if model_log_base(r["game_slug"]) != base:
+                    continue
                 st = compute_status(r["market"], r["side"], r["line"],
                                     actual_total=actual_total, actual_btts=actual_btts)
                 if st == "PENDENTE":
