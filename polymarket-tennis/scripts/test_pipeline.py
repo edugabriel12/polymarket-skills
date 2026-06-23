@@ -156,10 +156,10 @@ class _Args:
 
 class TestEndToEnd(unittest.TestCase):
     def setUp(self):
-        self._orig = (st.discover_markets, st.game_date, st.APIClient)
+        self._orig = (st.discover_markets, st.game_date, st.APIClient, st._load_sharp_lookup)
 
     def tearDown(self):
-        st.discover_markets, st.game_date, st.APIClient = self._orig
+        (st.discover_markets, st.game_date, st.APIClient, st._load_sharp_lookup) = self._orig
 
     def test_strong_favorite_with_ratings_suggests(self):
         markets = [
@@ -200,6 +200,44 @@ class TestEndToEnd(unittest.TestCase):
         result = _Args() and st.run(_Args())   # no ratings csv -> market-implied
         # Devig fair price ~0.524 vs price 0.55 -> negative edge -> no suggestion.
         self.assertEqual(len(result["suggestions"]), 0)
+
+    def _congruence_run(self, alcaraz_elo, djokovic_elo, sharp_alcaraz):
+        """Run the pipeline with a sharp anchor injected; ratings set the independent Elo."""
+        markets = [_mk("atp-alcaraz-djokovic-2026-06-20",
+                       ["Carlos Alcaraz", "Novak Djokovic"], [0.50, 0.52], ["a", "d"])]
+        st.discover_markets = lambda *a, **k: ("tennis", markets)
+        st.game_date = lambda m: "2026-06-20"
+        st.APIClient = _NoNetAPI
+        # Sharp anchor: P(Alcaraz) = sharp_alcaraz, keyed by surname+date like the live loader.
+        st._load_sharp_lookup = lambda args, target, vlog: {
+            st.sot._key("2026-06-20", "Carlos Alcaraz", "Novak Djokovic"):
+                {"alcaraz": sharp_alcaraz, "djokovic": 1.0 - sharp_alcaraz}}
+        d = tempfile.mkdtemp()
+        csv_path = os.path.join(d, "r.csv")
+        with open(csv_path, "w", encoding="utf-8") as fh:
+            fh.write("player,elo,hard,clay,grass\n"
+                     f"Carlos Alcaraz,{alcaraz_elo},{alcaraz_elo},{alcaraz_elo},{alcaraz_elo}\n"
+                     f"Novak Djokovic,{djokovic_elo},{djokovic_elo},{djokovic_elo},{djokovic_elo}\n")
+        return st.run(_Args(ratings_csv=csv_path, record=False, no_sharp=False,
+                            predictions_db=os.path.join(d, "p.db")))
+
+    def test_congruent_sharp_suggests_full_size(self):
+        # Elo P(Alcaraz)≈0.60 agrees with the sharp 0.62 (gap ~0.02) -> bet at full conviction.
+        result = self._congruence_run(2230, 2160, sharp_alcaraz=0.62)
+        self.assertEqual(len(result["suggestions"]), 1)
+        sug = result["suggestions"][0]
+        self.assertEqual(sug["side"], "Carlos Alcaraz")
+        cong = sug["congruence"]
+        self.assertTrue(cong["applied"])
+        self.assertEqual(cong["factor"], 1.0)       # high agreement -> no size shrink
+        self.assertEqual(cong["agreement"], "high")
+
+    def test_incongruent_sharp_is_skipped(self):
+        # Elo P(Alcaraz)≈0.42 disagrees with the sharp 0.62 (gap ~0.20 >= cap) -> not bet,
+        # even though the sharp-vs-price edge (0.12) is otherwise tradeable.
+        result = self._congruence_run(2150, 2206, sharp_alcaraz=0.62)
+        self.assertEqual(len(result["suggestions"]), 0)
+        self.assertTrue(any("incongruent" in s["reason"] for s in result["skipped"]))
 
 
 if __name__ == "__main__":

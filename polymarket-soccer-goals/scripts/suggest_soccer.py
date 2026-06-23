@@ -23,6 +23,7 @@ import _bootstrap  # noqa: F401
 
 import dixon_coles as dc
 import forecast_soccer as fcs
+import congruence as cg
 import leagues
 import soccer_market as sm
 import data_inputs
@@ -73,7 +74,15 @@ def _load_sharp_lookup(args, target, vlog) -> dict:
                                      min_quota_reserve=int(getattr(args, "sharp_min_reserve", 0) or 0),
                                      vlog=vlog)
     if lookup:
-        vlog(f"  sharp reference loaded: {len(lookup)} game(s) (divergence-detector mode)")
+        # k = (date, frozenset(teams)); count how many are dated for today's slate so a
+        # date-boundary mismatch (a late kickoff crossing UTC midnight) is visible in the log.
+        dated = sum(1 for k in lookup if k[0] == target)
+        vlog(f"  sharp reference loaded: {len(lookup)} game(s) "
+             f"({dated} dated {target}) (divergence-detector mode)")
+    else:
+        vlog("  sharp reference EMPTY — divergence detector OFF "
+             "(model stays predictive/Elo, edge-capped). Check the [odds-api] lines above: "
+             "0 leagues, quota reserve hit, or no games parsed.")
     return lookup
 
 
@@ -443,6 +452,12 @@ def run(args) -> dict:
             else:
                 lam_h, lam_a = dc.market_implied_lambdas(line, ou["over_price"])
             probs = dc.prob_over(line, dc.score_matrix(lam_h, lam_a, args.rho))
+            # Congruence: independent Dixon-Coles P(over) (from Elo supremacy) vs the sharp anchor.
+            cong = dict(cg.NEUTRAL)
+            if sharp_tot is not None and used:
+                ml_h, ml_a = dc.lambdas_from_total_supremacy(total, sup)
+                model_p_over = dc.prob_over(line, dc.score_matrix(ml_h, ml_a, args.rho))["p_over_eff"]
+                cong = cg.assess(model_p_over, probs["p_over_eff"])
             chosen, notes = pick_side([("OVER", ou["over_token"], ou["over_price"], probs["p_over_eff"]),
                                        ("UNDER", ou["under_token"], ou["under_price"], probs["p_under_eff"])],
                                       args.fee_rate, args.odds_min, args.odds_max,
@@ -457,7 +472,7 @@ def run(args) -> dict:
                 f"band={n['in_odds_band']}" for n in notes))
             c = _evaluate("TOTAL", slug, m, line, chosen, notes, lam_h, lam_a, used,
                           ou["book_sum"], ou["price_sane"], args, portfolio_value, first_trade, kh,
-                          _skip, target, ref_token=ou.get("over_token"))
+                          _skip, target, ref_token=ou.get("over_token"), cong=cong)
             if c:
                 cand_rows.append(c)
 
@@ -482,7 +497,10 @@ def run(args) -> dict:
         else:
             lam_h, lam_a = dc.market_implied_from_btts(bt["yes_price"])
         probs = dc.prob_btts(dc.score_matrix(lam_h, lam_a, args.rho))
+        model_p_yes = probs["p_yes"]             # independent Dixon-Coles P(BTTS) before any anchor
+        cong = dict(cg.NEUTRAL)
         if sharp_btts is not None:
+            cong = cg.assess(model_p_yes if used else None, sharp_btts)  # model vs sharp agreement
             probs = {"p_yes": sharp_btts, "p_no": 1.0 - sharp_btts}   # pure sharp anchor
         chosen, notes = pick_side([("YES", bt["yes_token"], bt["yes_price"], probs["p_yes"]),
                                    ("NO", bt["no_token"], bt["no_price"], probs["p_no"])],
@@ -498,7 +516,7 @@ def run(args) -> dict:
             f"band={n['in_odds_band']}" for n in notes))
         c = _evaluate("BTTS", slug, m, None, chosen, notes, lam_h, lam_a, used,
                       bt["book_sum"], bt["price_sane"], args, portfolio_value, first_trade, kh,
-                      _skip, target, ref_token=bt.get("yes_token"))
+                      _skip, target, ref_token=bt.get("yes_token"), cong=cong)
         if c:
             cand_rows.append(c)
 
@@ -531,6 +549,7 @@ def run(args) -> dict:
                             "edge": round(c["chosen"]["edge"], 4),
                             "lam_home": round(c["lam_h"], 3), "lam_away": round(c["lam_a"], 3),
                             "forecast": c["stats"].get("forecast"),
+                            "congruence": c["stats"].get("congruence"),
                             "prediction_id": pred_id, "recommendation": c["rec"], "_text": c["text"]})
 
     # A re-run may pick a different best line per (game, market); void this game's
@@ -589,7 +608,7 @@ def _shadow_log(market_type, slug, line, notes, chosen, lam_h, lam_a, used, args
 
 def _evaluate(market_type, slug, m, line, chosen, notes, lam_h, lam_a, used,
               book_sum, price_sane, args, portfolio_value, first_trade, kh, _skip, target,
-              ref_token=None):
+              ref_token=None, cong=None):
     """Return a candidate dict for a passing market, or None (skip handled inline).
 
     Recording is deferred to the caller's best-line selection so we never place
@@ -616,6 +635,11 @@ def _evaluate(market_type, slug, m, line, chosen, notes, lam_h, lam_a, used,
         _skip(slug, reason, market=market_type, side=chosen["side"]); return None
     size_pct, size_usd, kelly = size_position(chosen["p_model"], chosen["price"],
                                               portfolio_value, first_trade, kh)
+    # Congruence: shrink size when our independent Dixon-Coles disagrees with the sharp anchor
+    # (factor 0 → size 0 → tripped by the $10 minimum below). Never moves the edge.
+    cong = cong or dict(cg.NEUTRAL)
+    if cong.get("applied") and not getattr(args, "no_congruence", False):
+        size_pct *= cong["factor"]; size_usd = portfolio_value * size_pct
     if kelly <= 0:
         _shadow(0, "Kelly <= 0")
         _skip(slug, "Kelly <= 0", market=market_type); return None
@@ -624,6 +648,8 @@ def _evaluate(market_type, slug, m, line, chosen, notes, lam_h, lam_a, used,
         _skip(slug, f"size ${size_usd:.2f} below $10 minimum", market=market_type); return None
 
     confidence = max(0.5, min(0.5 + chosen["edge"], 0.65)) if used else 0.5
+    if cong.get("applied") and not getattr(args, "no_congruence", False):
+        confidence = cg.apply_confidence(confidence, cong["factor"])
     price = chosen["price"]
     odds = dc.decimal_odds(price)
     market_url = leagues.game_url(slug)
@@ -640,7 +666,8 @@ def _evaluate(market_type, slug, m, line, chosen, notes, lam_h, lam_a, used,
         "used_external": used, "book_sum": book_sum, "price_sane": price_sane,
         "kelly_fraction": round(kelly, 5), "size_pct": round(size_pct, 5),
         "size_usd": round(size_usd, 2), "confidence": round(confidence, 3),
-        "forecast": forecast, "sides": notes,
+        "forecast": forecast, "congruence": cong if cong.get("applied") else None,
+        "sides": notes,
     }
     rec = {"token_id": chosen["token"], "side": "YES", "action": "BUY",
            "size_pct": round(size_pct, 4), "price": round(price, 4),
@@ -701,6 +728,9 @@ def main() -> None:
     p.add_argument("--min-volume", type=float, default=0.0,
                    help="Min 24h volume to consider a game (default 0 = no volume filter; "
                         "pass a value to re-enable)")
+    p.add_argument("--no-congruence", action="store_true",
+                   help="Disable model↔sharp congruence sizing (default on: shrink size/confidence "
+                        "when the Dixon-Coles disagrees with the sharp anchor)")
     p.add_argument("--min-edge", type=float, default=0.05)
     p.add_argument("--max-edge", type=float, default=MAX_PLAUSIBLE_EDGE,
                    help=f"Reject a side whose edge exceeds this as likely model error "
