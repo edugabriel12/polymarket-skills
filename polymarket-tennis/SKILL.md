@@ -78,7 +78,7 @@ python polymarket-tennis/scripts/test_pipeline.py
 | `--date YYYY-MM-DD` | today (UTC) | Target day |
 | `--ratings-csv PATH` | — | `player,elo,hard,clay,grass` CSV (no ratings → market-implied) |
 | `--blend F` | 0.50 | Overall/surface Elo blend weight |
-| `--odds-min / --odds-max` | 1.10 / 5.00 | Decimal payout band (allows odds-on favorites) |
+| `--odds-min / --odds-max` | 1.40 / 5.00 | Decimal payout band (entry floor 1.40x → price ≤ 0.714) |
 | `--min-edge F` | 0.05 | Min edge (P_model − price) |
 | `--fee-rate F` | 0.0 | Taker fee rate |
 | `--portfolio-value N` | 10000 | Portfolio size for sizing |

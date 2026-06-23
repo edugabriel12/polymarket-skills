@@ -63,8 +63,11 @@ class TestPricing(unittest.TestCase):
     def test_decimal_odds_and_band(self):
         self.assertAlmostEqual(elo.decimal_odds(0.5), 2.0)
         self.assertTrue(elo.passes_odds_band(0.5))
-        self.assertFalse(elo.passes_odds_band(0.95))   # too short (below 1.10x)
+        self.assertFalse(elo.passes_odds_band(0.95))   # too short (below 1.40x)
         self.assertFalse(elo.passes_odds_band(0.10))   # too long (above 5.0x)
+        # 1.40x entry floor: price 0.80 (1.25x payout) is now rejected; 0.70 (1.43x) passes.
+        self.assertFalse(elo.passes_odds_band(0.80))
+        self.assertTrue(elo.passes_odds_band(0.70))
 
     def test_kelly_positive_only_with_edge(self):
         self.assertGreater(elo.kelly_fraction(0.60, 0.50), 0.0)   # model > price -> bet
