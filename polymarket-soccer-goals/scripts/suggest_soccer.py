@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 import _bootstrap  # noqa: F401
 
 import dixon_coles as dc
+import forecast_soccer as fcs
 import leagues
 import soccer_market as sm
 import data_inputs
@@ -529,6 +530,7 @@ def run(args) -> dict:
                             "side": c["chosen"]["side"], "line": c["line"],
                             "edge": round(c["chosen"]["edge"], 4),
                             "lam_home": round(c["lam_h"], 3), "lam_away": round(c["lam_a"], 3),
+                            "forecast": c["stats"].get("forecast"),
                             "prediction_id": pred_id, "recommendation": c["rec"], "_text": c["text"]})
 
     # A re-run may pick a different best line per (game, market); void this game's
@@ -628,6 +630,7 @@ def _evaluate(market_type, slug, m, line, chosen, notes, lam_h, lam_a, used,
     desc = (f"{market_type} {chosen['side']}" + (f" {line}" if line is not None else "")
             + f" @ {price:.3f} (payout {odds:.2f}x) edge {chosen['edge']*100:+.1f}% "
             + ("Dixon-Coles" if used else "market-implied (fallback)"))
+    forecast = fcs.forecast_block(lam_h, lam_a, args.rho, line, market_type)
     stats = {
         "model": "dixon_coles", "market": market_type, "chosen_side": chosen["side"],
         "lam_home": round(lam_h, 4),
@@ -636,14 +639,19 @@ def _evaluate(market_type, slug, m, line, chosen, notes, lam_h, lam_a, used,
         "decimal_odds": round(odds, 4), "edge_after_fee": round(chosen["edge"], 4),
         "used_external": used, "book_sum": book_sum, "price_sane": price_sane,
         "kelly_fraction": round(kelly, 5), "size_pct": round(size_pct, 5),
-        "size_usd": round(size_usd, 2), "confidence": round(confidence, 3), "sides": notes,
+        "size_usd": round(size_usd, 2), "confidence": round(confidence, 3),
+        "forecast": forecast, "sides": notes,
     }
     rec = {"token_id": chosen["token"], "side": "YES", "action": "BUY",
            "size_pct": round(size_pct, 4), "price": round(price, 4),
            "confidence": round(confidence, 3), "reasoning": sanitize_text(desc),
            "strategy": STRATEGY, "fee_rate": args.fee_rate}
+    fc_line = (f"\nForecast: ~{forecast['mean_goals']} goals "
+               f"(80% PI {forecast['pi80'][0]}-{forecast['pi80'][1]}, "
+               f"entropy {forecast['entropy_bits']:.2f} bits, "
+               f"BTTS {forecast['p_btts']*100:.0f}%)")
     text = (f"Market: {sanitize_text(m.get('question',''))}  [{slug}]\n"
-            f"Edge type: news-driven (Dixon-Coles model)\n{desc}\n"
+            f"Edge type: news-driven (Dixon-Coles model)\n{desc}{fc_line}\n"
             f"Size: ${size_usd:,.2f} ({size_pct*100:.2f}%)  Confidence: {confidence:.2f}")
     return {"market_type": market_type, "slug": slug, "m": m, "line": line, "chosen": chosen,
             "notes": notes, "lam_h": lam_h, "lam_a": lam_a, "used": used, "confidence": confidence,
