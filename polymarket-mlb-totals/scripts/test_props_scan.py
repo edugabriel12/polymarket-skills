@@ -28,6 +28,19 @@ class TestStatOf(unittest.TestCase):
         self.assertEqual(ps.stat_of("Will Ohtani record a hit?"), "hits")
         self.assertIsNone(ps.stat_of("Will the Yankees beat the Red Sox?"))
 
+    def test_commodity_hit_is_not_a_prop(self):
+        # The bug from the first live run: "Will WTI hit $70" must NOT match 'hits'.
+        self.assertIsNone(ps.stat_of("Will WTI Crude Oil (WTI) hit (LOW) $70 Week of June 22 2026?"))
+        self.assertIsNone(ps.stat_of("Will Netflix (NFLX) hit (HIGH) $77.50?"))
+
+
+class TestIsMlb(unittest.TestCase):
+    def test_filters_to_mlb_prefix(self):
+        self.assertTrue(ps.is_mlb({"event_slug": "mlb-tor-chc-2026-06-21"}))
+        self.assertFalse(ps.is_mlb({"event_slug": "wta-lys-navarro-2026-06-21"}))   # tennis
+        self.assertFalse(ps.is_mlb({"slug": "will-wti-dip-to-70-by-june-22-2026"}))  # commodity
+        self.assertFalse(ps.is_mlb({"slug": "bitcoin-up-or-down-on-june-23-2026"}))
+
 
 class TestClassify(unittest.TestCase):
     def test_player_prop(self):
