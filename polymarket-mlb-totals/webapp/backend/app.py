@@ -86,6 +86,13 @@ MLB_DB = os.environ.get("PREDICTIONS_DB", pdb.DEFAULT_DB)
 SOCCER_DB = os.environ.get("SOCCER_PREDICTIONS_DB", spdb.DEFAULT_DB)
 SOCCER_RATINGS_CSV = os.environ.get("SOCCER_RATINGS_CSV")
 FOOTBALL_DATA_TOKEN = os.environ.get("FOOTBALL_DATA_TOKEN")
+# Soccer sharp anchor is OFF in the backend by DEFAULT: querying every active league (+ a
+# per-event BTTS call) can cost dozens of Odds-API calls per soccer recompute, which would
+# blow the free quota. Opt in with SOCCER_SHARP=1, and bound it with SOCCER_SHARP_LEAGUES
+# (e.g. "world_cup") and SOCCER_SHARP_BTTS=1. Standalone CLI runs are unaffected.
+SOCCER_SHARP = os.environ.get("SOCCER_SHARP", "0") not in ("0", "false", "False", "no", "")
+SOCCER_SHARP_LEAGUES = os.environ.get("SOCCER_SHARP_LEAGUES")
+SOCCER_SHARP_BTTS = os.environ.get("SOCCER_SHARP_BTTS", "0") not in ("0", "false", "False", "no", "")
 TENNIS_DB = os.environ.get("TENNIS_PREDICTIONS_DB", tdb.DEFAULT_DB)
 TENNIS_RATINGS_CSV = os.environ.get("TENNIS_RATINGS_CSV")
 TENNIS_TOUR = os.environ.get("TENNIS_TOUR", "atp")
@@ -294,6 +301,13 @@ def _run_soccer(date: str) -> dict:
            "--predictions-db", SOCCER_DB]  # best-line-only: one bet per game (avoids correlated lines)
     if SOCCER_RATINGS_CSV:
         cmd += ["--ratings-csv", SOCCER_RATINGS_CSV]
+    if SOCCER_SHARP:   # opt-in sharp anchor (bounded by SOCCER_SHARP_LEAGUES / _BTTS)
+        if SOCCER_SHARP_LEAGUES:
+            cmd += ["--sharp-leagues", SOCCER_SHARP_LEAGUES]
+        if not SOCCER_SHARP_BTTS:
+            cmd += ["--no-sharp-btts"]
+    else:              # default OFF -> predictive + edge-capped (protects the Odds-API quota)
+        cmd += ["--no-sharp"]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
     except Exception as e:  # noqa: BLE001
