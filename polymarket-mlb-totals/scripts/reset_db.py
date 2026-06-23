@@ -2,15 +2,15 @@
 """Reset the prediction database(s) — clear all recorded predictions (and the
 analysis cache), so you can start fresh after a model change.
 
-Pure stdlib, no skill imports (works for both the MLB and soccer stores). By
+Pure stdlib, no skill imports (works for the MLB, soccer, and tennis stores). By
 default it DELETEs the rows (keeps the file/schema); --delete-file removes the
 file entirely (it's recreated empty on the next run). Destructive: asks for
 confirmation unless --yes.
 
 Examples:
-  python reset_db.py                      # reset BOTH stores (asks to confirm)
-  python reset_db.py --sport mlb --yes    # reset only MLB, no prompt
-  python reset_db.py --delete-file --yes  # remove the .db files entirely
+  python reset_db.py                        # reset ALL stores (asks to confirm)
+  python reset_db.py --sport tennis --yes   # reset only tennis, no prompt
+  python reset_db.py --delete-file --yes    # remove the .db files entirely
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ import sys
 DEFAULT_DBS = {
     "mlb": os.path.expanduser("~/.polymarket-mlb-totals/predictions.db"),
     "soccer": os.path.expanduser("~/.polymarket-soccer/predictions.db"),
+    "tennis": os.path.expanduser("~/.polymarket-tennis/predictions.db"),
 }
 
 
@@ -62,7 +63,7 @@ def reset(db_path: str, *, delete_file: bool = False) -> dict:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Reset the prediction database(s).")
-    p.add_argument("--sport", choices=("mlb", "soccer", "all"), default="all")
+    p.add_argument("--sport", choices=("mlb", "soccer", "tennis", "all"), default="all")
     p.add_argument("--db", default=None, help="Override a single DB path (implies one target)")
     p.add_argument("--delete-file", action="store_true",
                    help="Remove the .db file entirely (default: just clear the rows)")
@@ -72,7 +73,7 @@ def main() -> None:
     if a.db:
         targets = [("custom", a.db)]
     else:
-        sports = ("mlb", "soccer") if a.sport == "all" else (a.sport,)
+        sports = ("mlb", "soccer", "tennis") if a.sport == "all" else (a.sport,)
         targets = [(s, DEFAULT_DBS[s]) for s in sports]
 
     print("About to reset:")
