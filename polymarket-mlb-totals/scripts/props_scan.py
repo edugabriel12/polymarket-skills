@@ -28,10 +28,12 @@ from category_common import (APIClient, CLOB_API, discover_markets, game_date,
                              resolve_category, to_float)
 
 # Player-stat keywords (question text) -> the prop is about an individual player.
+# Patterns require a BASEBALL context (not the bare verb "hit", which matches commodity
+# "Will WTI hit $70" markets); the mlb- prefix filter below is the primary guard.
 PLAYER_STATS = {
-    "strikeouts": r"strikeout|\bk'?s\b|\bks\b", "home_runs": r"home run|\bhr\b|homer",
-    "hits": r"\bhits?\b|record a hit|get a hit", "total_bases": r"total bases",
-    "rbis": r"\brbi", "stolen_bases": r"stolen base|steal a base",
+    "strikeouts": r"strikeout|\bstrikes? out\b", "home_runs": r"home run|homer|\bhr\b",
+    "hits": r"\bhits\b|record a hit|get a hit|base hit|collect a hit",
+    "total_bases": r"total bases", "rbis": r"\brbi", "stolen_bases": r"stolen base|steal a base",
     "runs": r"runs scored|score a run", "walks": r"\bwalks?\b|base on balls",
     "doubles": r"\bdoubles?\b", "outs_recorded": r"outs recorded|pitching outs",
     "earned_runs": r"earned runs", "pitcher_wins": r"record (?:the |a )?win|pitcher win",
@@ -111,16 +113,29 @@ def book_metrics(book: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def is_mlb(market: dict) -> bool:
+    """True only for a real MLB market — slug is league-prefixed `mlb-`.
+
+    The `mlb` Gamma tag is NOT honored: it returns the global volume-ranked mix (crypto,
+    politics, even other sports), so we hard-filter by the slug prefix exactly like the
+    main skill does, or commodity 'will X hit $Y' markets leak in as fake 'hits' props.
+    """
+    return (market.get("event_slug") or market.get("slug") or "").lower().startswith("mlb-")
+
+
 def run(api, target: str | None, top_n: int, min_liq: float, vlog) -> dict:
     cat, cands = resolve_category("baseball")
     cands = ["mlb"] + [c for c in cands if c != "mlb"]
     _tag, markets = discover_markets(api, cat, cands, min_volume=0.0, include_closed=False)
     on_day = [m for m in markets if (not target or game_date(m) == target)]
-    vlog(f"Discovery: tag '{_tag}' -> {len(markets)} markets; {len(on_day)} dated {target or 'any'}")
+    mlb = [m for m in on_day if is_mlb(m)]
+    vlog(f"Discovery: tag '{_tag}' -> {len(markets)} markets; {len(on_day)} dated "
+         f"{target or 'any'}; {len(mlb)} are MLB (mlb- prefix), "
+         f"{len(on_day) - len(mlb)} non-MLB dropped (tag returns the global mix)")
 
     by_kind: dict[str, list] = defaultdict(list)
     by_stat: dict[str, list] = defaultdict(list)
-    for m in on_day:
+    for m in mlb:
         kind, stat = classify(m)
         by_kind[kind].append(m)
         if kind == "player_prop":
@@ -151,8 +166,8 @@ def run(api, target: str | None, top_n: int, min_liq: float, vlog) -> dict:
                     "stat": classify(m)[1], "vol24h": round(vol(m), 2),
                     "liq": round(liq(m), 2), **bm})
 
-    return {"target": target, "tag": _tag, "discovered": len(markets), "on_day": len(on_day),
-            "by_kind": summary,
+    return {"target": target, "tag": _tag, "discovered": len(markets),
+            "on_day": len(on_day), "mlb": len(mlb), "by_kind": summary,
             "by_stat": {s: len(ms) for s, ms in sorted(by_stat.items(), key=lambda kv: -len(kv[1]))},
             "top_props": top,
             "samples": {k: [m.get("event_slug") or m.get("slug") for m in ms[:5]]
@@ -174,7 +189,8 @@ def verdict(rep: dict, min_liq: float, min_props: int) -> str:
 
 def format_report(rep: dict, min_liq: float, min_props: int) -> str:
     L = [f"=== MLB market feasibility on Polymarket ({rep['target'] or 'any day'}) ===",
-         f"Discovered {rep['discovered']} markets via tag '{rep['tag']}'; {rep['on_day']} on day.", "",
+         f"Discovered {rep['discovered']} via tag '{rep['tag']}'; {rep['on_day']} on day; "
+         f"{rep.get('mlb', 0)} are MLB (mlb- prefix; the rest is the tag's global mix).", "",
          f"{'kind':<13} {'n':>4} {'vol24h$':>10} {'liq$':>10} {'med_liq$':>9} {'#liquid':>8}"]
     for kind in ("moneyline", "game_total", "player_prop", "team_prop", "other"):
         b = rep["by_kind"].get(kind)
