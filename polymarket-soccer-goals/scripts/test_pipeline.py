@@ -257,6 +257,8 @@ class _NoNetAPI:
 class _Args:
     def __init__(self, **kw):
         d = dict(date="2026-06-14", min_volume=1000.0, min_edge=0.05, max_edge=1.0, min_hours=0.0,
+                 no_sharp=True, odds_api_key=None, sharp_btts=True, sharp_leagues=None,
+                 require_sharp=True,
                  odds_min=1.60, odds_max=3.00, rho=dc.DEFAULT_RHO, ratings_csv=None,
                  auto_ratings=False, home_first=True, best_line_only=True, fee_rate=0.0,
                  portfolio_value=10000.0, portfolio_db=None, record=False,

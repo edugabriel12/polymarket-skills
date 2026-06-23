@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from datetime import datetime, timedelta, timezone
@@ -24,6 +25,7 @@ import dixon_coles as dc
 import leagues
 import soccer_market as sm
 import data_inputs
+import sharp_odds_soccer as sosh
 import baselines_source as bsrc
 import soccer_predictions as spdb
 
@@ -44,6 +46,41 @@ MAX_PLAUSIBLE_EDGE = 0.15
 # A date-anchored game key: the slug up to and including YYYY-MM-DD. Collapses every
 # market type of a game (total/BTTS/spread/double-chance/correct-score/…) to one game.
 _GAME_DATE_RE = re.compile(r"^(.*?-\d{4}-\d{2}-\d{2})")
+
+
+def _load_sharp_lookup(args, target, vlog) -> dict:
+    """Load the sharp reference (Pinnacle totals + BTTS via The Odds API) for the day.
+
+    With it the model becomes a divergence detector (anchor to sharp; edge = Polymarket
+    vs sharp); without it the model stays predictive (Elo), protected only by the cap.
+    Lists the active soccer leagues, then queries each. Best-effort / {} offline.
+    """
+    if getattr(args, "no_sharp", False):
+        return {}
+    key = getattr(args, "odds_api_key", None) or os.environ.get("ODDS_API_KEY")
+    if not key:
+        vlog("  sharp source: none (no ODDS_API_KEY) -> predictive model (edge-capped)")
+        return {}
+    keys = sosh.fetch_active_soccer_keys(key, vlog=vlog)
+    only = getattr(args, "sharp_leagues", None)
+    if only:
+        wanted = {x.strip().lower() for x in only.split(",") if x.strip()}
+        keys = [k for k in keys if any(w in k.lower() for w in wanted)]
+        vlog(f"  sharp leagues filtered to {only!r}: {len(keys)} key(s)")
+    lookup = sosh.fetch_sharp_soccer(key, keys, date=target,
+                                     with_btts=getattr(args, "sharp_btts", True), vlog=vlog)
+    if lookup:
+        vlog(f"  sharp reference loaded: {len(lookup)} game(s) (divergence-detector mode)")
+    return lookup
+
+
+def _game_names(gmarkets) -> tuple[str, str] | None:
+    """Normalized (team_a, team_b) for a game, parsed from any of its market questions."""
+    for x in gmarkets or []:
+        t = sosh.extract_teams_from_question(x.get("question") or "")
+        if t:
+            return t
+    return None
 
 
 def now_utc() -> datetime:
@@ -331,6 +368,11 @@ def run(args) -> dict:
                 f"{p}={v:.2f}(was {leagues.LEAGUE_BASELINES.get(p, leagues.DEFAULT_BASELINE):.2f})"
                 for p, v in sorted(calibrated.items())))
 
+    # Sharp reference (Pinnacle totals + BTTS) -> divergence detector. Without it the model
+    # stays predictive (Elo), bounded by the implausible-edge cap.
+    sharp_lookup = _load_sharp_lookup(args, target, vlog)
+    require_sharp = bool(sharp_lookup) and getattr(args, "require_sharp", True)
+
     suggestions, skipped, cand_rows = [], [], []
 
     def _skip(slug, reason, **extra):
@@ -356,12 +398,25 @@ def run(args) -> dict:
         if not tmarkets:
             _skip(slug, "no total-goals market"); continue
         _inp, total, sup, used = _inputs_for(slug)  # game-level inputs: compute once
+        names = _game_names(gmarkets)
+        sharp_tot = (sosh.sharp_total_ref(sharp_lookup, target, names[0], names[1])
+                     if (sharp_lookup and names) else None)
+        if require_sharp and sharp_tot is None:
+            _skip(slug, "no sharp total reference (divergence mode bets only on a sharp anchor)")
+            continue
         for m in tmarkets:
             line = sm.parse_total_line(m)
             ou = sm.over_under_tokens(m)
             if line is None or not ou or ou["over_price"] is None or ou["under_price"] is None:
                 _skip(slug, "could not parse total line/tokens"); continue
-            if used:
+            if sharp_tot is not None:
+                # Pure divergence anchor: invert the sharp (line, P(over)) to an expected total
+                # (mu) at the SHARP line, re-split by Elo supremacy, then price the POLYMARKET
+                # line off that mu (robust to line drift between books).
+                s_line, s_over = sharp_tot
+                lh0, la0 = dc.market_implied_lambdas(s_line, s_over)
+                lam_h, lam_a = dc.lambdas_from_total_supremacy(lh0 + la0, sup if used else 0.0)
+            elif used:
                 lam_h, lam_a = dc.lambdas_from_total_supremacy(total, sup)
             else:
                 lam_h, lam_a = dc.market_implied_lambdas(line, ou["over_price"])
@@ -372,6 +427,8 @@ def run(args) -> dict:
                                       getattr(args, "max_edge", MAX_PLAUSIBLE_EDGE))
             vlog(f"  [{slug}] model(TOTAL {line}): λh={lam_h:.2f} λa={lam_a:.2f} ρ={args.rho} "
                  f"P(over)={probs['p_over_eff']:.3f} P(under)={probs['p_under_eff']:.3f} external={used}"
+                 + (f" sharp_over={sharp_tot[1]:.3f}@{sharp_tot[0]:g}" if sharp_tot
+                    else (" (no sharp ref)" if sharp_lookup else ""))
                  + (f" inputs={_inp}" if _inp else ""))
             vlog(f"  [{slug}] edges(TOTAL): " + "; ".join(
                 f"{n['side']} price={n['price']} p={n['p_model']} edge={n['edge']:+.3f} "
@@ -392,17 +449,27 @@ def run(args) -> dict:
         if not bt or bt["yes_price"] is None or bt["no_price"] is None:
             _skip(slug, "could not map BTTS tokens"); continue
         _inp, total, sup, used = _inputs_for(slug)
+        names = _game_names(gmarkets)
+        sharp_btts = (sosh.sharp_btts_ref(sharp_lookup, target, names[0], names[1])
+                      if (sharp_lookup and names) else None)
+        if require_sharp and sharp_btts is None:
+            _skip(slug, "no sharp BTTS reference (divergence mode bets only on a sharp anchor)")
+            continue
         if used:
             lam_h, lam_a = dc.lambdas_from_total_supremacy(total, sup)
         else:
             lam_h, lam_a = dc.market_implied_from_btts(bt["yes_price"])
         probs = dc.prob_btts(dc.score_matrix(lam_h, lam_a, args.rho))
+        if sharp_btts is not None:
+            probs = {"p_yes": sharp_btts, "p_no": 1.0 - sharp_btts}   # pure sharp anchor
         chosen, notes = pick_side([("YES", bt["yes_token"], bt["yes_price"], probs["p_yes"]),
                                    ("NO", bt["no_token"], bt["no_price"], probs["p_no"])],
                                   args.fee_rate, args.odds_min, args.odds_max,
                                   getattr(args, "max_edge", MAX_PLAUSIBLE_EDGE))
         vlog(f"  [{slug}] model(BTTS): λh={lam_h:.2f} λa={lam_a:.2f} ρ={args.rho} "
              f"P(yes)={probs['p_yes']:.3f} P(no)={probs['p_no']:.3f} external={used}"
+             + (f" sharp_yes={sharp_btts:.3f}" if sharp_btts is not None
+                else (" (no sharp ref)" if sharp_lookup else ""))
              + (f" inputs={_inp}" if _inp else ""))
         vlog(f"  [{slug}] edges(BTTS): " + "; ".join(
             f"{n['side']} price={n['price']} p={n['p_model']} edge={n['edge']:+.3f} "
@@ -619,6 +686,17 @@ def main() -> None:
                                       "(keep the static LEAGUE_BASELINES)")
     p.add_argument("--football-data-token", default=None,
                    help="football-data.org key for baseline calibration (default $FOOTBALL_DATA_TOKEN)")
+    p.add_argument("--odds-api-key", default=None,
+                   help="The Odds API key (or $ODDS_API_KEY) -> sharp anchor (divergence detector)")
+    p.add_argument("--no-sharp", action="store_true",
+                   help="Disable the sharp anchor entirely (predictive model, edge-capped)")
+    p.add_argument("--no-sharp-btts", dest="sharp_btts", action="store_false", default=True,
+                   help="Skip the per-event BTTS sharp fetch (cheaper; BTTS stays predictive)")
+    p.add_argument("--sharp-leagues", default=None,
+                   help="Comma substrings to limit sharp leagues (e.g. 'world_cup,epl'); default all active")
+    p.add_argument("--no-require-sharp", dest="require_sharp", action="store_false", default=True,
+                   help="With a sharp slate loaded, still model games with NO sharp match (default OFF: "
+                        "skip them — bet only on a sharp anchor)")
     p.add_argument("--home-first", dest="home_first", action="store_true", default=True,
                    help="Slug lists home team first (default)")
     p.add_argument("--away-first", dest="home_first", action="store_false",
