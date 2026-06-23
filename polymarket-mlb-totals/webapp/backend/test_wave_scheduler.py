@@ -58,6 +58,16 @@ class TestWavesFromCommences(unittest.TestCase):
         self.assertEqual(waves, [datetime(2026, 6, 23, 19, 50, tzinfo=UTC)])
 
 
+class TestNextWave(unittest.TestCase):
+    def test_picks_soonest_unfired_future(self):
+        now = datetime(2026, 6, 23, 16, 0, tzinfo=UTC)
+        w1 = datetime(2026, 6, 23, 16, 50, tzinfo=UTC)
+        w2 = datetime(2026, 6, 23, 22, 55, tzinfo=UTC)
+        self.assertEqual(wsch.next_wave([w1, w2], set(), now), w1)
+        self.assertEqual(wsch.next_wave([w1, w2], {w1}, now), w2)   # w1 fired -> w2
+        self.assertIsNone(wsch.next_wave([w1, w2], {w1, w2}, now))  # all fired
+
+
 class TestRunWaveLoop(unittest.TestCase):
     def test_fires_one_wave_when_due_then_stops(self):
         base = datetime(2026, 6, 23, 16, 0, tzinfo=UTC)

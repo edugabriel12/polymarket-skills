@@ -38,14 +38,22 @@ def waves_from_commences(commences, now=None, *, lead_min: int = 10,
     return waves
 
 
+def next_wave(waves, fired, now) -> datetime | None:
+    """The soonest scheduled wave that is still upcoming and unfired, or None."""
+    future = [w for w in waves if w > now and w not in fired]
+    return min(future) if future else None
+
+
 async def run_wave_loop(today_fn, get_commences, do_wave, vlog, *,
                         lead_min: int = 10, bucket_min: int = 10, poll_sec: int = 300,
-                        now_fn=None, sleep=asyncio.sleep) -> None:
+                        now_fn=None, sleep=asyncio.sleep, on_update=None) -> None:
     """Poll loop that fires one recompute wave as each game's lead window arrives.
 
     - `today_fn()` -> the current target date string (for logging/day rollover).
     - `get_commences()` -> awaitable list of upcoming UTC start times (refetched per day).
     - `do_wave()` -> awaitable that recomputes the slate (fetch + model + capture + cache).
+    - `on_update(info)` -> optional callback with the live schedule for the UI:
+      `{date, waves: [iso...], next_wave: iso|None}`, called each tick.
 
     Refetches the schedule when the day rolls over. Fires at most one wave per poll tick
     (a wave covers every pregame game), so missed triggers after a late start don't burst.
@@ -53,6 +61,15 @@ async def run_wave_loop(today_fn, get_commences, do_wave, vlog, *,
     """
     now_fn = now_fn or (lambda: datetime.now(timezone.utc))
     state = {"date": None, "waves": [], "fired": set()}
+
+    def _report(now):
+        if on_update is None:
+            return
+        nxt = next_wave(state["waves"], state["fired"], now)
+        on_update({"date": state["date"],
+                   "waves": [w.isoformat() for w in state["waves"]],
+                   "next_wave": nxt.isoformat() if nxt else None})
+
     while True:
         try:
             now, today = now_fn(), today_fn()
@@ -70,6 +87,7 @@ async def run_wave_loop(today_fn, get_commences, do_wave, vlog, *,
                     state["fired"].add(w)   # one wave covers all due games
                 vlog(f"[waves] firing recompute for {len(due)} due wave(s) at {now.strftime('%H:%MZ')}")
                 await do_wave()
+            _report(now)
         except Exception as e:  # noqa: BLE001 - the loop must survive any single failure
             vlog(f"[waves] loop error: {e}")
         await sleep(poll_sec)

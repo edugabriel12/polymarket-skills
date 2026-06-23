@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   RefreshCw,
-  Database,
+  Clock,
   CalendarDays,
   Inbox,
   BadgeInfo,
@@ -31,6 +31,17 @@ export function AnalysesTab({ sport }: { sport: Sport }) {
     staleTime: msUntilEndOfDay(),
     refetchOnWindowFocus: false,
   });
+
+  // Live schedule for the "next recalc" indicator (the loop reports next_wave to /api/health).
+  const { data: health } = useQuery({
+    queryKey: ["health"],
+    queryFn: () => api.health(),
+    refetchInterval: 60_000,
+    refetchOnWindowFocus: false,
+  });
+  const nextWave = health?.sharp_close?.next_wave;
+  const hhmm = (iso: string) =>
+    new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
   const items = data?.suggestions ?? [];
   const n = items.length;
@@ -64,25 +75,27 @@ export function AnalysesTab({ sport }: { sport: Sport }) {
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
           <CalendarDays className="h-4 w-4" />
           <span>Previsões de {data?.date ?? "—"}</span>
-          {data && (
-            <span className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs font-semibold">
-              <Database className="h-3 w-3" />
-              {data.cached ? "cache do dia" : "calculado agora"}
-            </span>
-          )}
           {n > 0 && (
             <span className="rounded-full bg-gradient-to-r from-sky-500/20 to-violet-500/20 px-2 py-0.5 text-xs font-bold">
               {n} {n === 1 ? "entrada" : "entradas"}
             </span>
           )}
         </div>
-        {data?.computed_at && (
-          <span className="inline-flex items-center gap-1 text-xs text-muted-foreground" title="Recalculado automaticamente ~10 min antes de cada jogo">
-            <RefreshCw className="h-3 w-3" />
-            auto ·{" "}
-            {new Date(data.computed_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+        <div className="flex items-center gap-3 text-xs text-muted-foreground">
+          {data?.computed_at && (
+            <span className="inline-flex items-center gap-1" title="Última atualização automática">
+              <RefreshCw className="h-3 w-3" />
+              auto · {hhmm(data.computed_at)}
+            </span>
+          )}
+          <span
+            className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 font-semibold"
+            title="O modelo recalcula automaticamente ~10 min antes de cada jogo"
+          >
+            <Clock className="h-3 w-3" />
+            {nextWave ? `próximo recálculo · ${hhmm(nextWave)}` : "sem mais recálculos hoje"}
           </span>
-        )}
+        </div>
       </div>
 
       {isLoading ? (

@@ -109,7 +109,14 @@ SHARP_CLOSE_CSV = os.environ.get(
 _capture_state: dict = {"runs": 0, "last_run": None, "last_suggestions": None,
                         "last_rows": 0, "total_rows": 0, "last_error": None,
                         "enabled": AUTO_RECALC, "has_key": bool(ODDS_API_KEY),
-                        "lead_min": WAVE_LEAD_MIN, "csv": SHARP_CLOSE_CSV, "started": False}
+                        "lead_min": WAVE_LEAD_MIN, "csv": SHARP_CLOSE_CSV, "started": False,
+                        "next_wave": None, "waves_today": []}
+
+
+def _on_wave_update(info: dict) -> None:
+    """Mirror the wave loop's live schedule into the health state (for the UI)."""
+    _capture_state.update(next_wave=info.get("next_wave"),
+                          waves_today=info.get("waves", []))
 
 
 def _sched_vlog(*a) -> None:
@@ -182,7 +189,8 @@ async def _start_auto_recalc() -> None:
           file=sys.stderr, flush=True)
     asyncio.create_task(wsch.run_wave_loop(
         _today, _get_commences, _do_wave, _sched_vlog,
-        lead_min=WAVE_LEAD_MIN, bucket_min=WAVE_BUCKET_MIN, poll_sec=WAVE_POLL_SEC))
+        lead_min=WAVE_LEAD_MIN, bucket_min=WAVE_BUCKET_MIN, poll_sec=WAVE_POLL_SEC,
+        on_update=_on_wave_update))
 
 
 def _today() -> str:
