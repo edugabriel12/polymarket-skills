@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+import types
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -70,6 +71,46 @@ class TestImplausibleEdgeCap(unittest.TestCase):
         chosen, _ = st.pick_side(sides, 0.58, 0.0, 1.50, 3.00)   # +8% edge, within cap
         self.assertIsNotNone(chosen)
         self.assertEqual(chosen["side"], "A")
+
+
+class TestLoadSharpLogging(unittest.TestCase):
+    """The loader's log must say whether the sharp slate loaded, is empty, or had no key."""
+
+    def _run(self, lookup, key="k", tours=("tennis_atp",)):
+        logs = []
+        vlog = lambda *a, **k: logs.append(" ".join(str(x) for x in a))  # noqa: E731
+        orig = (sot.fetch_active_tennis_keys, sot.fetch_sharp_tennis)
+        saved_env = os.environ.pop("ODDS_API_KEY", None)
+        try:
+            sot.fetch_active_tennis_keys = lambda *a, **k: list(tours)
+            sot.fetch_sharp_tennis = lambda *a, **k: lookup
+            args = types.SimpleNamespace(no_sharp=False, odds_api_key=key,
+                                         sharp_tours=None, sharp_min_reserve=0)
+            out = st._load_sharp_lookup(args, "2026-06-21", vlog)
+        finally:
+            sot.fetch_active_tennis_keys, sot.fetch_sharp_tennis = orig
+            if saved_env is not None:
+                os.environ["ODDS_API_KEY"] = saved_env
+        return out, "\n".join(logs)
+
+    def test_empty_with_key_logs_off(self):
+        out, log = self._run({})
+        self.assertEqual(out, {})
+        self.assertIn("divergence detector OFF", log)
+
+    def test_loaded_logs_dated_count(self):
+        lookup = {
+            sot._key("2026-06-21", "Carlos Alcaraz", "Novak Djokovic"): {"alcaraz": 0.6, "djokovic": 0.4},
+            sot._key("2026-06-22", "Player A", "Player B"): {"a": 0.5, "b": 0.5},
+        }
+        out, log = self._run(lookup)
+        self.assertEqual(len(out), 2)
+        self.assertIn("2 match(es) (1 dated 2026-06-21)", log)   # only one is today's slate
+
+    def test_no_key_logs_none(self):
+        out, log = self._run({}, key=None)
+        self.assertEqual(out, {})
+        self.assertIn("no ODDS_API_KEY", log)
 
 
 if __name__ == "__main__":
