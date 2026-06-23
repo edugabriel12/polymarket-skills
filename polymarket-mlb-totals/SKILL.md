@@ -233,22 +233,25 @@ ROI/CLV vs the devigged **closing** line are the real validation; `mean(μ − m
 Over/Under bias. Team factors are point-in-time from the results; per-start starter FIP is a documented
 extension (needs a probables history).
 
-### Sharp anchor — the divergence detector (`sharp_odds.py`)
-The deep research (`references/edge-pathways-deep-research.md`) is blunt: a predictive run-total model
-does **not** beat the MLB closing line — the **sharp close (Pinnacle, devigged) IS the efficient
-probability**. So with a sharp reference the model stops trying to out-predict and instead acts on
-**divergence**: `model_probabilities(..., sharp_over_price=...)` anchors fair value to the sharp price,
-so the edge (`p_model − Polymarket price`) measures how far Polymarket strays from the sharp line —
-bet a side only when Polymarket prices it cheaper than the sharp fair value. Without a sharp ref the
-model stays Polymarket-anchored (zero edge — anti-fabrication).
+### Model as the prediction engine + sharp edge-sign veto (`sharp_odds.py`)
+The **factor model is the prediction engine**: when team offense/pitching factors are present, μ comes
+from the model (`model_probabilities` → `adjust_mu`) and `p_over`/`p_under` are the model's own forecast.
+The **sharp reference is a separate edge-sign veto**, not an anchor: `p_over_sharp` (the devigged
+Pinnacle fair P(Over), evaluated at the Polymarket line) is compared to the price for the side the model
+chose. **A bet is suggested only if the sharp's edge for that side is strictly positive** — the model
+proposes, the sharp confirms it's +EV. If the sharp says the model's side is overpriced (sharp edge ≤ 0),
+the bet is vetoed (logged as `sharp edge … ≤ 0`).
 
-**Pure anchor in divergence mode.** When a sharp ref is present, μ is anchored *purely* to the sharp
-line — the factor model is **not** blended in (it has no proven predictive edge, so blending only adds
-noise and can mask a corrupt sharp line as a small "plausible" edge). With a pure anchor, bad sharp data
-instead yields an implausibly large edge that the cap rejects. Games with **no** sharp match are skipped,
-not bet via factors (`--no-require-sharp` to override). Consequence: because Polymarket MLB totals track
-the sharp closely, **most games show no edge and most sessions bet nothing** — that is the correct,
-honest result, not a bug.
+So a suggestion requires BOTH: the model's own edge ≥ `--min-edge` (its conviction floor, default 5%,
+and ≤ the 15% implausible cap) **and** a positive sharp edge. Set `--min-edge 0` to let the model propose
+at any positive model edge and rely on the sharp veto alone. `sharp_edge` is recorded in `stats_log` and
+returned per suggestion.
+
+**Fallbacks.** With a sharp ref but **no** factors, there's nothing to predict from → μ falls back to the
+sharp (degenerate). Without a sharp ref, the model runs Polymarket-anchored (factors shrunk toward the
+price; zero edge — anti-fabrication) and there's no veto. Games with no sharp match are skipped when
+`require_sharp` is on (`--no-require-sharp` to model them anyway, no veto). The forecast layer (§ above)
+predicts **every** game from the model regardless.
 ```bash
 # Live: The Odds API (includes Pinnacle).            Backtest/offline: a CSV.
 python polymarket-mlb-totals/scripts/suggest_totals.py --odds-api-key $ODDS_API_KEY

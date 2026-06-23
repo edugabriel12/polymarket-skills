@@ -92,65 +92,58 @@ def model_probabilities(line, over_price, park_factor, inputs, *,
                         league_baseline, dispersion, sharp_over_price=None, sharp_line=None):
     """Model the total-runs distribution and return the full math as a dict.
 
-    The FAIR-VALUE anchor is the SHARP reference when one is supplied
-    (`sharp_over_price`, the devigged Pinnacle/consensus P(Over)) — because the deep
-    research shows the sharp close, not our model, is the efficient probability. The
-    edge (computed later in pick_side as p_model − over_price) then measures how far the
-    POLYMARKET price diverges from the sharp fair value: a true mispricing detector.
+    The factor MODEL is the PREDICTION ENGINE: when external inputs exist, mu comes from the
+    model (`adjust_mu`), and `p_over`/`p_under` are the model's own forecast at the Polymarket
+    line. The SHARP reference is NOT used to anchor mu — instead it is a separate EDGE-SIGN
+    veto: `p_over_sharp` (the devigged Pinnacle/consensus fair P(Over), evaluated at the
+    Polymarket line) lets the caller suggest a bet only when the SHARP agrees the model's
+    chosen side is +EV (sharp fair − price > 0). The model proposes; the sharp confirms.
 
-    Crucially the sharp anchor is interpreted AT THE SHARP'S OWN LINE (`sharp_line`): we
-    invert the sharp prob to an expected total (mu) at the sharp line, then evaluate the
-    distribution at whatever Polymarket line is on offer. So a sharp main line of 8.5 can
-    correctly price a Polymarket alternate line of 7.5/11.5 — line drift no longer breaks
-    the anchor. When `sharp_line` is omitted the sharp prob is taken at the Polymarket line.
+    The sharp prob is inverted to an expected total at the SHARP'S OWN line (`sharp_line`),
+    then the distribution is evaluated at whatever Polymarket line is on offer — so a sharp
+    main line of 8.5 still prices a Polymarket alternate of 7.5/11.5 correctly.
 
-    In divergence mode mu is anchored PURELY to the sharp line — the factor model is NOT
-    blended in. The 10-season backtest showed the factor model has no predictive edge, so
-    nudging mu off the efficient sharp value with factors only adds noise AND masks bad
-    sharp data (a wrong sharp line, blended halfway to the factor mu, can slip past the
-    implausible-edge cap as a false signal). With a pure sharp anchor, a corrupt sharp line
-    instead produces an implausibly large edge that the cap correctly rejects. `model_mu`
-    is still computed and reported for transparency, but it does not move mu.
-
-    Without a sharp price, the anchor falls back to the Polymarket price itself, so the
-    model stays market-implied (edge ≈ 0 — anti-fabrication); only there do the factors
-    nudge mu (the legacy no-sharp path). `over_price` is always the Polymarket price we
-    trade against; both the sharp and Polymarket mu are reported.
+    Fallbacks (no model to drive the prediction):
+      - sharp present but NO factors → mu = the sharp mu (degenerate: the sharp is all we have);
+      - no sharp + factors          → mu = factors shrunk toward the Polymarket price
+                                        (`anchor_to_market`, the legacy bias-capped path);
+      - neither                     → mu = market-implied (edge ≈ 0, anti-fabrication).
     """
     poly_mu = rd.market_implied_mu(line, over_price, dispersion)
-    if sharp_over_price is not None:
-        anchor_price = sharp_over_price
-        anchor_line = sharp_line if sharp_line is not None else line
-    else:
-        anchor_price = over_price
-        anchor_line = line
-    anchor_mu = rd.market_implied_mu(anchor_line, anchor_price, dispersion)
     used_external = any(k in inputs for k in STRONG_INPUT_KEYS)
-    model_mu = None
-    if used_external:
-        base = rd.baseline_mu(park_factor, league_baseline)
-        model_mu = rd.adjust_mu(base, **inputs)
+    model_mu = rd.adjust_mu(rd.baseline_mu(park_factor, league_baseline), **inputs) if used_external else None
+    sharp_mu = None
     if sharp_over_price is not None:
-        mu = anchor_mu                                  # pure sharp anchor (divergence detector)
+        sharp_mu = rd.market_implied_mu(sharp_line if sharp_line is not None else line,
+                                        sharp_over_price, dispersion)
+
+    if sharp_over_price is not None:
+        mu = model_mu if used_external else sharp_mu     # MODEL drives; degenerate to sharp w/o factors
     elif used_external:
-        mu = rd.anchor_to_market(model_mu, anchor_mu)   # no sharp: factors nudge off poly anchor
+        mu = rd.anchor_to_market(model_mu, poly_mu)      # unchanged no-sharp path
     else:
-        mu = anchor_mu
+        mu = poly_mu
+
     var = rd.variance_from_mu(mu, dispersion)
     pmf = rd.negbin_total_runs_pmf(mu, var)
     probs = rd.prob_over(line, pmf)
     r, p = rd.negbin_params_from_moments(mu, var)
-    # Independent factor-model P(over) (NOT sharp-anchored) for the congruence check: does our
-    # own NegBin corroborate the sharp? None when there are no factors to form an independent view.
-    p_over_model = None
-    if model_mu is not None:
-        m_pmf = rd.negbin_total_runs_pmf(model_mu, rd.variance_from_mu(model_mu, dispersion))
-        p_over_model = rd.prob_over(line, m_pmf)["p_over_eff"]
+
+    # Sharp fair P(over) at the Polymarket line — the edge-sign reference for the veto.
+    p_over_sharp = None
+    if sharp_mu is not None:
+        sp = rd.negbin_total_runs_pmf(sharp_mu, rd.variance_from_mu(sharp_mu, dispersion))
+        p_over_sharp = rd.prob_over(line, sp)["p_over_eff"]
+    p_over_model = probs["p_over_eff"] if used_external else None
+
     return {
         "p_over": probs["p_over_eff"], "p_under": probs["p_under_eff"],
-        "mu": mu, "market_mu": anchor_mu, "model_mu": model_mu, "poly_mu": poly_mu,
-        "p_over_model": p_over_model,
-        "sharp_anchored": sharp_over_price is not None, "var": var,
+        "mu": mu, "market_mu": (sharp_mu if sharp_mu is not None else poly_mu),
+        "model_mu": model_mu, "poly_mu": poly_mu, "sharp_mu": sharp_mu,
+        "p_over_sharp": p_over_sharp, "p_over_model": p_over_model,
+        # sharp_anchored: True only in the degenerate fallback (sharp present, no factors).
+        "sharp_anchored": (sharp_over_price is not None) and (not used_external),
+        "sharp_gated": sharp_over_price is not None, "var": var,
         "used_external": used_external,
         "p_push": probs["p_push"], "need": probs["need"],
         "negbin_r": r, "negbin_p": p,
@@ -181,17 +174,18 @@ def forecast_block(m, line) -> dict:
 
 
 def _forecast_mu(line, over_price, sharp, inputs, park, dispersion, league_baseline):
-    """Best-available expected total for a FORECAST (not a trade): sharp → factors → market.
+    """Best-available expected total for a FORECAST (not a trade): factors → sharp → market.
 
-    Returns (mu, basis) or (None, None) when there's nothing to model from. Mirrors the trade
-    path's anchor priority, but never requires a Polymarket price — so a game with no totals
-    market can still be forecast from the sharp line or the team factors.
+    The factor MODEL is the prediction engine, so its mu comes first; the sharp and the
+    market price are only fallbacks when there are no team factors. Returns (mu, basis) or
+    (None, None) when there's nothing to model from — never requires a Polymarket price, so
+    a game with no totals market can still be forecast from the factors or the sharp line.
     """
     sharp_line, sharp_over = (sharp if sharp else (None, None))
-    if sharp_over is not None:
-        return rd.market_implied_mu(sharp_line, sharp_over, dispersion), "sharp"
     if any(k in inputs for k in STRONG_INPUT_KEYS):
         return rd.adjust_mu(rd.baseline_mu(park, league_baseline), **inputs), "factors"
+    if sharp_over is not None:
+        return rd.market_implied_mu(sharp_line, sharp_over, dispersion), "sharp"
     if over_price is not None:
         return rd.market_implied_mu(line, over_price, dispersion), "market"
     return None, None
@@ -402,6 +396,10 @@ def record_prediction_row(db_path, game_slug, game_date, totals, line, chosen, m
         "p_over_eff": round(m["p_over"], 4), "p_under_eff": round(m["p_under"], 4),
         "p_push": round(m["p_push"], 4),
         "p_over_model": round(m["p_over_model"], 4) if m.get("p_over_model") is not None else None,
+        "p_over_sharp": round(m["p_over_sharp"], 4) if m.get("p_over_sharp") is not None else None,
+        "sharp_mu": round(m["sharp_mu"], 4) if m.get("sharp_mu") is not None else None,
+        "sharp_edge": round(m["sharp_edge"], 4) if m.get("sharp_edge") is not None else None,
+        "sharp_gated": m.get("sharp_gated", False),
         "congruence": m.get("congruence"),
         "forecast": forecast,
         "chosen_side": chosen["side"], "entry_price": price,
@@ -650,7 +648,8 @@ def run(args) -> dict:
              f"P(over)={m['p_over']:.3f} P(under)={m['p_under']:.3f} "
              f"external_inputs={m['used_external']}"
              + (f" sharp_over={sharp_over:.3f}@line{sharp_line:g} "
-                f"(sharp_mu={m['market_mu']:.2f} vs poly_mu={m['poly_mu']:.2f})"
+                f"(model_mu={m['mu']:.2f} vs sharp_mu={m['market_mu']:.2f}; "
+                f"sharp P(over)@{line:g}={m['p_over_sharp']:.3f})"
                 if sharp_over is not None else " (no sharp ref)")
              + (f" inputs={inputs}" if inputs else ""))
 
@@ -672,6 +671,23 @@ def run(args) -> dict:
             _skip(event_slug, reason, line=line, sides=side_notes)
             continue
 
+        # Sharp edge-sign veto: the factor MODEL proposes the side (above); the SHARP only
+        # confirms the bet is +EV. Suggest ONLY if the sharp's fair edge for the chosen side
+        # is strictly positive (`p_over_sharp` is None when no sharp ref → no veto, model-only).
+        sharp_edge = None
+        if m.get("p_over_sharp") is not None:
+            p_sharp_side = (m["p_over_sharp"] if chosen["side"] == "OVER"
+                            else 1.0 - m["p_over_sharp"])
+            sharp_edge = p_sharp_side - chosen["price"]
+            vlog(f"  [{event_slug}] sharp veto: model picks {chosen['side']} "
+                 f"(model edge {chosen['edge']*100:+.1f}%); sharp edge {sharp_edge*100:+.1f}%")
+            if sharp_edge <= 0:
+                reason = (f"sharp edge {sharp_edge*100:+.1f}% ≤ 0 — sharp does not confirm the "
+                          f"model's {chosen['side']} as +EV")
+                _shadow_log_mlb(args, target, event_slug, line, side_notes, chosen, m, 0, reason, totals, ou)
+                _skip(event_slug, reason, line=line, side=chosen["side"])
+                continue
+
         passed, reason = decision_tree(chosen, totals, ou,
                                        min_volume=args.min_volume, min_edge=args.min_edge,
                                        min_hours=args.min_hours)
@@ -683,13 +699,7 @@ def run(args) -> dict:
         size_pct, size_usd, kelly = size_position(
             chosen["p_model"], chosen["price"], portfolio_value, first_trade,
             advisor_kelly_half())
-        # Congruence: shrink size when our independent NegBin disagrees with the sharp anchor
-        # (factor 0 → size 0 → tripped by the $10 minimum below). Never moves the edge.
-        cong = (cg.assess(m.get("p_over_model"), m["p_over"]) if m["sharp_anchored"]
-                else dict(cg.NEUTRAL))
-        if cong.get("applied") and not getattr(args, "no_congruence", False):
-            size_pct *= cong["factor"]
-            size_usd = portfolio_value * size_pct
+        cong = dict(cg.NEUTRAL)   # congruence sizing replaced by the sharp edge-sign veto above
         if kelly <= 0:
             _shadow_log_mlb(args, target, event_slug, line, side_notes, chosen, m, 0, "Kelly <= 0", totals, ou)
             _skip(event_slug, "Kelly <= 0", line=line, side=chosen["side"])
@@ -702,8 +712,6 @@ def run(args) -> dict:
 
         confidence = (max(0.5, min(0.5 + chosen["edge"], 0.65))
                       if m["used_external"] else 0.5)
-        if cong.get("applied") and not getattr(args, "no_congruence", False):
-            confidence = cg.apply_confidence(confidence, cong["factor"])
         rec, text = build_recommendation(event_slug, totals, line, chosen, m["mu"],
                                          m["used_external"], size_pct, size_usd,
                                          confidence, args.fee_rate, ou,
@@ -714,7 +722,7 @@ def run(args) -> dict:
             "inputs": inputs, "park_factor": park_factor, "m": m, "chosen": chosen,
             "side_notes": side_notes, "size_pct": size_pct, "size_usd": size_usd,
             "kelly": kelly, "confidence": confidence, "rec": rec, "text": text,
-            "cong": cong,
+            "cong": cong, "sharp_edge": sharp_edge,
         })
 
     # Best-line-per-game: record/score only the highest-edge line per matchup; the other
@@ -735,7 +743,8 @@ def run(args) -> dict:
 
     recorded_ids: dict[str, set] = {}
     for c in final:
-        c["m"]["congruence"] = c.get("cong")     # carried into the recorded stats_log
+        c["m"]["congruence"] = c.get("cong")        # carried into the recorded stats_log
+        c["m"]["sharp_edge"] = c.get("sharp_edge")  # the sharp's confirming edge for the bet side
         prediction_id = None
         if args.record:
             prediction_id = record_prediction_row(
@@ -748,8 +757,8 @@ def run(args) -> dict:
                         c["chosen"], c["m"], 1, None, c["totals"], c["ou"])
         suggestions.append({"game": c["event_slug"], "line": c["line"],
                             "mu": round(c["m"]["mu"], 3), "edge": round(c["chosen"]["edge"], 4),
+                            "sharp_edge": (round(c["sharp_edge"], 4) if c.get("sharp_edge") is not None else None),
                             "forecast": forecast_block(c["m"], c["line"]),
-                            "congruence": c.get("cong"),
                             "prediction_id": prediction_id, "recommendation": c["rec"],
                             "_text": c["text"]})
         vlog(f"  [{c['event_slug']}] >>> SUGGEST {c['chosen']['side']} {c['line']} "
