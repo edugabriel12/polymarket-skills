@@ -80,6 +80,7 @@ python polymarket-tennis/scripts/test_pipeline.py
 | `--blend F` | 0.50 | Overall/surface Elo blend weight |
 | `--odds-min / --odds-max` | 1.40 / 5.00 | Decimal payout band (entry floor 1.40x → price ≤ 0.714) |
 | `--min-edge F` | 0.05 | Min edge (P_model − price) |
+| `--min-hours F` | 0.0 | Min hours until match start (0 = pre-live only; a started match is skipped as live) |
 | `--fee-rate F` | 0.0 | Taker fee rate |
 | `--portfolio-value N` | 10000 | Portfolio size for sizing |
 | `--record / --no-record` | on | Record predictions to the tennis DB |
