@@ -106,20 +106,31 @@ class TestDiscoverFromSharp(unittest.TestCase):
             so._key("2026-06-23", "PHI", "WSH"): {"line": 8.5},
         }
         markets = sd.discover_from_sharp(api, lookup, "2026-06-23")
+        # event_slug is the total MARKET's own slug (encodes the line) so the downstream
+        # `-total-` filter keeps it.
         slugs = sorted(m["event_slug"] for m in markets)
         self.assertEqual(len(markets), 2)
-        self.assertIn("mlb-chc-nym-2026-06-23", slugs)
-        self.assertIn("mlb-wsh-phi-2026-06-23", slugs)
+        self.assertIn("mlb-chc-nym-2026-06-23-total-9", slugs)
+        self.assertIn("mlb-wsh-phi-2026-06-23-total-8pt5", slugs)
         # phi-wsh ordering was tried and missed, then wsh-phi tried and hit.
         self.assertIn("mlb-phi-wsh-2026-06-23", api.calls)
         self.assertIn("mlb-wsh-phi-2026-06-23", api.calls)
+
+    def test_total_market_slug_survives_run_total_filter(self):
+        # Regression: the event_slug must carry the -total-<line> suffix, or the run-total
+        # filter (-\d{4}-\d{2}-\d{2}-total-\d) drops every sharp-discovered total.
+        import re
+        events = {"mlb-bal-laa-2026-06-23": [_raw_total("mlb-bal-laa-2026-06-23", "8pt5")]}
+        lookup = {so._key("2026-06-23", "bal", "laa"): {"line": 8.5}}
+        m = sd.discover_from_sharp(_FakeAPI(events), lookup, "2026-06-23")[0]
+        self.assertRegex(m["event_slug"], r"-\d{4}-\d{2}-\d{2}-total-\d{1,2}(?:pt5)?$")
 
     def test_markets_are_parsed_shape(self):
         events = {"mlb-chc-nym-2026-06-23": [_raw_total("mlb-chc-nym-2026-06-23", "9")]}
         api = _FakeAPI(events)
         lookup = {so._key("2026-06-23", "chc", "nym"): {"line": 9.0}}
         m = sd.discover_from_sharp(api, lookup, "2026-06-23")[0]
-        self.assertEqual(m["event_slug"], "mlb-chc-nym-2026-06-23")
+        self.assertEqual(m["event_slug"], "mlb-chc-nym-2026-06-23-total-9")
         self.assertEqual(m["token_ids"], ["t1", "t2"])
         self.assertEqual(m["outcomes"], ["Over", "Under"])
         self.assertTrue(m["slug"].endswith("-total-9"))
