@@ -35,6 +35,12 @@ STRATEGY = "soccer-goals-dc"
 CAP_MODEL = 0.02
 CAP_FIRST_TRADE = 0.01
 
+# On a near-efficient goals market (e.g. a liquid World Cup total/BTTS), an edge this large
+# signals MODEL error — the Elo-derived λ over/under-shooting — not real value. Such a side
+# is flagged implausible and skipped, exactly like the MLB model's MAX_PLAUSIBLE_EDGE. This
+# is a blunt safety net until the model is anchored to a sharp reference (divergence detector).
+MAX_PLAUSIBLE_EDGE = 0.15
+
 # A date-anchored game key: the slug up to and including YYYY-MM-DD. Collapses every
 # market type of a game (total/BTTS/spread/double-chance/correct-score/…) to one game.
 _GAME_DATE_RE = re.compile(r"^(.*?-\d{4}-\d{2}-\d{2})")
@@ -175,17 +181,22 @@ def derive_total_supremacy(inputs: dict, baseline: float, neutral: bool):
     return total, supremacy, True
 
 
-def pick_side(sides, fee_rate, odds_min, odds_max):
-    """sides = [(name, token, price, p_model)]. Return (chosen|None, notes)."""
+def pick_side(sides, fee_rate, odds_min, odds_max, max_edge=MAX_PLAUSIBLE_EDGE):
+    """sides = [(name, token, price, p_model)]. Return (chosen|None, notes).
+
+    A side whose post-fee edge exceeds `max_edge` is flagged `implausible` and excluded —
+    on a near-efficient goals market a huge edge signals model error, not value.
+    """
     notes, candidates = [], []
     for name, token, price, p in sides:
         if price is None:
             continue
         edge = p - price - fee_for(price, fee_rate)
         in_band = dc.passes_odds_filter(price, odds_min, odds_max)
+        implausible = edge > max_edge
         notes.append({"side": name, "price": round(price, 4), "p_model": round(p, 4),
-                      "edge": round(edge, 4), "in_odds_band": in_band})
-        if edge > 0 and in_band:
+                      "edge": round(edge, 4), "in_odds_band": in_band, "implausible": implausible})
+        if edge > 0 and in_band and not implausible:
             candidates.append({"side": name, "token": token, "price": price, "p_model": p, "edge": edge})
     if not candidates:
         return None, notes
@@ -357,7 +368,8 @@ def run(args) -> dict:
             probs = dc.prob_over(line, dc.score_matrix(lam_h, lam_a, args.rho))
             chosen, notes = pick_side([("OVER", ou["over_token"], ou["over_price"], probs["p_over_eff"]),
                                        ("UNDER", ou["under_token"], ou["under_price"], probs["p_under_eff"])],
-                                      args.fee_rate, args.odds_min, args.odds_max)
+                                      args.fee_rate, args.odds_min, args.odds_max,
+                                      getattr(args, "max_edge", MAX_PLAUSIBLE_EDGE))
             vlog(f"  [{slug}] model(TOTAL {line}): λh={lam_h:.2f} λa={lam_a:.2f} ρ={args.rho} "
                  f"P(over)={probs['p_over_eff']:.3f} P(under)={probs['p_under_eff']:.3f} external={used}"
                  + (f" inputs={_inp}" if _inp else ""))
@@ -387,7 +399,8 @@ def run(args) -> dict:
         probs = dc.prob_btts(dc.score_matrix(lam_h, lam_a, args.rho))
         chosen, notes = pick_side([("YES", bt["yes_token"], bt["yes_price"], probs["p_yes"]),
                                    ("NO", bt["no_token"], bt["no_price"], probs["p_no"])],
-                                  args.fee_rate, args.odds_min, args.odds_max)
+                                  args.fee_rate, args.odds_min, args.odds_max,
+                                  getattr(args, "max_edge", MAX_PLAUSIBLE_EDGE))
         vlog(f"  [{slug}] model(BTTS): λh={lam_h:.2f} λa={lam_a:.2f} ρ={args.rho} "
              f"P(yes)={probs['p_yes']:.3f} P(no)={probs['p_no']:.3f} external={used}"
              + (f" inputs={_inp}" if _inp else ""))
@@ -497,7 +510,11 @@ def _evaluate(market_type, slug, m, line, chosen, notes, lam_h, lam_a, used,
                     target, bet, skip_reason, ref_token)
 
     if not chosen:
-        reason = f"no positive-edge side within {args.odds_min:.2f}x-{args.odds_max:.1f}x band"
+        impl = next((n for n in notes
+                     if n.get("implausible") and n["edge"] > 0 and n["in_odds_band"]), None)
+        reason = (f"edge {impl['edge']:.1%} implausibly large (> {MAX_PLAUSIBLE_EDGE:.0%} cap) "
+                  f"— likely model error, skipped" if impl else
+                  f"no positive-edge side within {args.odds_min:.2f}x-{args.odds_max:.1f}x band")
         _shadow(0, reason)
         _skip(slug, reason, market=market_type, sides=notes)
         return None
@@ -587,6 +604,9 @@ def main() -> None:
     p.add_argument("--date", default=None, help="Target day YYYY-MM-DD (default today UTC)")
     p.add_argument("--min-volume", type=float, default=1000.0)
     p.add_argument("--min-edge", type=float, default=0.05)
+    p.add_argument("--max-edge", type=float, default=MAX_PLAUSIBLE_EDGE,
+                   help=f"Reject a side whose edge exceeds this as likely model error "
+                        f"(default {MAX_PLAUSIBLE_EDGE})")
     p.add_argument("--min-hours", type=float, default=0.0, help="0 = pre-game only (not started)")
     p.add_argument("--odds-min", type=float, default=dc.ODDS_MIN_DEFAULT)
     p.add_argument("--odds-max", type=float, default=dc.ODDS_MAX_DEFAULT)
