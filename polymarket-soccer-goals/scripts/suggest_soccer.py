@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 
@@ -33,6 +34,10 @@ from category_common import (
 STRATEGY = "soccer-goals-dc"
 CAP_MODEL = 0.02
 CAP_FIRST_TRADE = 0.01
+
+# A date-anchored game key: the slug up to and including YYYY-MM-DD. Collapses every
+# market type of a game (total/BTTS/spread/double-chance/correct-score/…) to one game.
+_GAME_DATE_RE = re.compile(r"^(.*?-\d{4}-\d{2}-\d{2})")
 
 
 def now_utc() -> datetime:
@@ -269,11 +274,17 @@ def run(args) -> dict:
     # carry a total/BTTS market vs how many games appeared at all. Makes it visible whether
     # a day is genuinely one-competition (e.g. only `fifwc` during a World Cup) vs a league
     # present-but-without-goals-markets vs possible truncation (see the offset-cap note above).
+    # Use a DATE-ANCHORED game key (everything up to YYYY-MM-DD) so non-goals market types
+    # (-double-chance/-correct-score/-draw-no-bet/...) collapse to the same game instead of
+    # inflating the denominator (base_game_slug only strips total/BTTS/spread suffixes).
     from collections import Counter
+    def _game_key(slug):
+        m = _GAME_DATE_RE.match(slug or "")
+        return m.group(1) if m else (slug or "")
     def _comp(slug):
         return leagues.league_prefix(slug) or "?"
-    all_games = {leagues.base_game_slug(k) for k in games}
-    cls_games = {leagues.base_game_slug(k) for k in classified}
+    all_games = {_game_key(k) for k in games}
+    cls_games = {_game_key(k) for k in classified}
     all_by_comp, cls_by_comp = Counter(map(_comp, all_games)), Counter(map(_comp, cls_games))
     breakdown = ", ".join(f"{c}={cls_by_comp.get(c, 0)}/{n}"
                           for c, n in all_by_comp.most_common())
