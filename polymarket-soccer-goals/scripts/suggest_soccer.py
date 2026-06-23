@@ -265,6 +265,21 @@ def run(args) -> dict:
     vlog(f"  {len(total_evts)} total-goals + {len(btts_evts)} BTTS soccer markets "
          f"({filtered_non_soccer} other events dropped)")
 
+    # Competition coverage diagnostic: per league prefix, how many DISTINCT games today
+    # carry a total/BTTS market vs how many games appeared at all. Makes it visible whether
+    # a day is genuinely one-competition (e.g. only `fifwc` during a World Cup) vs a league
+    # present-but-without-goals-markets vs possible truncation (see the offset-cap note above).
+    from collections import Counter
+    def _comp(slug):
+        return leagues.league_prefix(slug) or "?"
+    all_games = {leagues.base_game_slug(k) for k in games}
+    cls_games = {leagues.base_game_slug(k) for k in classified}
+    all_by_comp, cls_by_comp = Counter(map(_comp, all_games)), Counter(map(_comp, cls_games))
+    breakdown = ", ".join(f"{c}={cls_by_comp.get(c, 0)}/{n}"
+                          for c, n in all_by_comp.most_common())
+    vlog(f"  competitions dated {target} ({len(cls_games)}/{len(all_games)} games with "
+         f"total|BTTS) -> {breakdown}")
+
     # Diagnostic: when nothing classifies, dump a sample of the real market shapes so
     # the slug/outcome format can be inspected from the logs (Gamma changes formats).
     if not classified and games:
