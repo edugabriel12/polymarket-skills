@@ -101,6 +101,37 @@ P(model), edge, sizing) and the Polymarket match link. Every modeled match is sh
   calibration/CLV read-out used by the other skills (Brier / log-loss / reliability + CLV vs the
   closing line). Validate with **~1,000+ settled matches** before any real capital.
 
+## Calibrated forecasting — the 4-layer architecture
+Beyond edge detection, the skill produces an **accurate win prediction with a validated confidence**
+(research write-up: `references/calibrated-forecasting-research.md`). The match-winner market is
+**binary**, so the layers collapse:
+1. **Distribution** — the outcome is Bernoulli(p); the forecast *is* the win probability.
+2. **Calibration** — reliability/ECE/Murphy + temperature/Platt via the shared `calibration_core` /
+   `calibration.py --sport tennis`.
+3. **Per-prediction confidence** — there is no interval (binary); confidence = the calibrated p, its
+   **predictive entropy** (max 1 bit at the p=0.5 toss-up) and a label (`forecast_tennis.forecast_block`,
+   wired into `stats_log.forecast` + the suggestion). A heat/wind `uncertainty_flag` *widens* the
+   stated confidence without moving the favourite.
+4. **Validation** — `backtest_tennis.py` walk-forward: point-in-time surface-Elo → **Brier + log-loss
+   + ECE + accuracy** (RPS = Brier for a binary), vs the devigged closing line.
+
+```bash
+python polymarket-tennis/scripts/backtest_tennis.py --games-csv matches.csv --test-hand --test-h2h
+```
+
+**Which features belong in the model** (deep-research verdict, with built-in ablations to test on your
+own data via `--test-hand` / `--test-h2h`, each reporting ΔBrier vs pure Elo):
+
+| Predictor | In the model? | Why |
+|---|---|---|
+| **Surface** (clay/grass/hard) | ✅ already in (`SURFACE_BLEND=0.5`) | surface-blended Elo beats overall-only by ~1.5–2.5pp; surface-*only* is worse (noise) — the value is the blend |
+| **Handedness** (L/R) | ⚠️ not as a main effect | lefty edge is small, declining, and already absorbed by Elo; only a lefty×righty interaction is non-redundant (~1–2%) |
+| **Head-to-head** | ❌ not raw | adds ≈0 beyond ratings (0–3 prior meetings → noise); if used, shrink toward the Elo-implied prob |
+| **Weather/conditions** | ❌ not a feature | no out-of-sample gain once surface ratings exist; altitude/indoor already in surface-Elo; heat/wind are variance modifiers → use the `uncertainty_flag`, don't move the favourite |
+
+Pure-stdlib cores, offline-tested (`test_forecast_tennis.py`, `test_backtest_tennis.py`). On synthetic
+data the ablations reproduce the verdicts (handedness ΔBrier ≈ 0, H2H ΔBrier > 0 → exclude).
+
 ## Honest limitations
 - **Market near-efficient at close.** Every peer-reviewed study (Kovalchik 2016, Wilkens 2021,
   Bunker 2024) puts the bookmaker on top (~69–72% accuracy / ~0.196 Brier); Elo reaches ~70% but

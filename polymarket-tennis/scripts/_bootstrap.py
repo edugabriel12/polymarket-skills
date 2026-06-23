@@ -3,6 +3,9 @@
 
 Reused (by import, never modified):
   - category_common  (polymarket-category-watcher) — market discovery
+  - scoring / calibration_core / forecast (polymarket-mlb-totals) — the shared
+    pure-stdlib calibrated-forecasting cores (CRPS/Brier/log-loss, ECE/reliability,
+    pmf entropy) reused across all sports.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
 
 _REUSED_SCRIPT_DIRS = (
     os.path.join(_REPO_ROOT, "polymarket-category-watcher", "scripts"),
+    os.path.join(_REPO_ROOT, "polymarket-mlb-totals", "scripts"),
 )
 
 # This skill's own scripts dir must win on name collisions, so put it FIRST and
