@@ -95,6 +95,7 @@ list_games_today (scanner)  →  find total-runs Over/Under market  →  NegBin 
 | `--min-hours F` | 0 | Min hours until game start (0 = pre-game only, not started) |
 | `--all-lines` | off | Suggest every qualifying line (default: best-edge line per game) |
 | `--min-edge F` | 0.05 | Min edge after fees (decision tree) |
+| `--min-sharp-edge F` | 0.01 | Min sharp confirming edge for the chosen side (sharp veto floor; 0 = any positive) |
 | `--odds-min / --odds-max` | 1.50 / 3.00 | Decimal payout band (→ price 0.667 … 0.333) |
 | `--dispersion F` | 2.0 | `variance = dispersion × mean` |
 | `--league-baseline F` | 8.5 | Neutral game total |
@@ -238,14 +239,17 @@ The **factor model is the prediction engine**: when team offense/pitching factor
 from the model (`model_probabilities` → `adjust_mu`) and `p_over`/`p_under` are the model's own forecast.
 The **sharp reference is a separate edge-sign veto**, not an anchor: `p_over_sharp` (the devigged
 Pinnacle fair P(Over), evaluated at the Polymarket line) is compared to the price for the side the model
-chose. **A bet is suggested only if the sharp's edge for that side is strictly positive** — the model
-proposes, the sharp confirms it's +EV. If the sharp says the model's side is overpriced (sharp edge ≤ 0),
-the bet is vetoed (logged as `sharp edge … ≤ 0`).
+chose. **A bet is suggested only if the sharp's edge for that side clears `--min-sharp-edge`** (default
+1%) — the model proposes, the sharp confirms it's +EV. If the sharp says the model's side is overpriced
+or barely endorses it (sharp edge < the minimum), the bet is vetoed (logged as `sharp edge … < N% min`).
+The threshold exists because a positive-but-tiny sharp edge is the sharp expressing **no opinion**, not
+confirmation — empirically those bets behaved like noise, so the minimum filters them out.
 
 So a suggestion requires BOTH: the model's own edge ≥ `--min-edge` (its conviction floor, default 5%,
-and ≤ the 15% implausible cap) **and** a positive sharp edge. Set `--min-edge 0` to let the model propose
-at any positive model edge and rely on the sharp veto alone. `sharp_edge` is recorded in `stats_log` and
-returned per suggestion.
+and ≤ the 15% implausible cap) **and** a sharp edge ≥ `--min-sharp-edge` (default 1%). Set `--min-edge 0`
+to let the model propose at any positive model edge and rely on the sharp veto alone; set
+`--min-sharp-edge 0` to revert to the old "any positive sharp edge confirms" behavior. `sharp_edge` is
+recorded in `stats_log` and returned per suggestion.
 
 **Fallbacks.** With a sharp ref but **no** factors, there's nothing to predict from → μ falls back to the
 sharp (degenerate). Without a sharp ref, the model runs Polymarket-anchored (factors shrunk toward the

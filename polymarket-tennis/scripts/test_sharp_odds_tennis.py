@@ -86,7 +86,7 @@ class TestLoadSharpLogging(unittest.TestCase):
             sot.fetch_sharp_tennis = lambda *a, **k: lookup
             args = types.SimpleNamespace(no_sharp=False, odds_api_key=key,
                                          sharp_tours=None, sharp_min_reserve=0)
-            out = st._load_sharp_lookup(args, "2026-06-21", vlog)
+            out = st._load_sharp_lookup(args, ["2026-06-21", "2026-06-22"], vlog)
         finally:
             sot.fetch_active_tennis_keys, sot.fetch_sharp_tennis = orig
             if saved_env is not None:
@@ -102,10 +102,12 @@ class TestLoadSharpLogging(unittest.TestCase):
         lookup = {
             sot._key("2026-06-21", "Carlos Alcaraz", "Novak Djokovic"): {"alcaraz": 0.6, "djokovic": 0.4},
             sot._key("2026-06-22", "Player A", "Player B"): {"a": 0.5, "b": 0.5},
+            sot._key("2026-06-30", "Out Side", "Of Window"): {"side": 0.5, "window": 0.5},
         }
         out, log = self._run(lookup)
-        self.assertEqual(len(out), 2)
-        self.assertIn("2 match(es) (1 dated 2026-06-21)", log)   # only one is today's slate
+        self.assertEqual(len(out), 3)
+        # Both 06-21 and 06-22 fall in the window; the 06-30 match does not.
+        self.assertIn("3 match(es) (2 dated within 2026-06-21…2026-06-22)", log)
 
     def test_no_key_logs_none(self):
         out, log = self._run({}, key=None)
