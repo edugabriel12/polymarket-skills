@@ -100,6 +100,59 @@ class TestSettlePending(unittest.TestCase):
             s = spdb.summary(db)
             self.assertEqual(s["acerto"], 2)
             self.assertEqual(s["pendente"], 0)
+            # Diagnostics: the match + the settle_game row count must be reported.
+            self.assertTrue(any("matched" in d and "jpn" in d for d in res["diagnostics"]))
+            self.assertTrue(any("updated 2 row(s)" in d for d in res["diagnostics"]))
+
+
+class TestSettleDiagnostics(unittest.TestCase):
+    """The diagnostics must pinpoint WHY a pending game didn't settle."""
+
+    def _seed_one(self, db, slug, date):
+        spdb.record_prediction({
+            "game_slug": slug, "game_date": date, "league": "fifwc", "market": "TOTAL",
+            "market_question": "q", "condition_id": "0x", "token_id": "t", "line": 2.5,
+            "side": "OVER", "entry_price": 0.5, "decimal_odds": 2.0, "model_prob": 0.6,
+            "edge": 0.1, "lam_home": 1.5, "lam_away": 1.1, "rho": -0.1, "confidence": 0.6,
+            "size_pct": 0.01, "size_usd": 100.0, "kelly_fraction": 0.2, "used_external": True,
+            "fee_rate": 0.0, "strategy": "soccer-goals-dc", "market_url": "u", "stats": {}}, db)
+
+    def test_no_token_diag_explains(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "p.db")
+            self._seed_one(db, "fifwc-nld-jpn-2026-06-14", "2026-06-14")
+            res = sr.settle_pending(db, token=None)
+            self.assertTrue(any("no FOOTBALL_DATA_TOKEN" in x for x in res["diagnostics"]))
+
+    def test_date_mismatch_flagged(self):
+        # Feed has the game FINISHED on 06-14, but the prediction is dated 06-13 (UTC
+        # rollover). The diagnostics must call out the date mismatch, not silently skip.
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "p.db")
+            self._seed_one(db, "fifwc-nld-jpn-2026-06-13", "2026-06-13")
+            orig = sr.fetch_finished
+            sr.fetch_finished = lambda *a, **k: sr.parse_finished(_PAYLOAD)
+            try:
+                res = sr.settle_pending(db, token="fake")
+            finally:
+                sr.fetch_finished = orig
+            self.assertEqual(res["settled"], [])
+            self.assertTrue(any("date mismatch" in x and "2026-06-14" in x
+                                for x in res["diagnostics"]))
+
+    def test_not_played_flagged(self):
+        # Team pair absent from the feed entirely -> "not FINISHED in feed".
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "p.db")
+            self._seed_one(db, "epl-liv-mci-2026-06-14", "2026-06-14")
+            orig = sr.fetch_finished
+            sr.fetch_finished = lambda *a, **k: sr.parse_finished(_PAYLOAD)
+            try:
+                res = sr.settle_pending(db, token="fake")
+            finally:
+                sr.fetch_finished = orig
+            self.assertEqual(res["settled"], [])
+            self.assertTrue(any("not FINISHED in feed" in x for x in res["diagnostics"]))
 
 
 if __name__ == "__main__":

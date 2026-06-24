@@ -485,7 +485,9 @@ def results(sport: str = Query("mlb")) -> dict:
     db = _db_for(sport)
     if sport == "soccer":
         try:
-            settled = soccer_results.settle_pending(db, token=FOOTBALL_DATA_TOKEN)
+            settled = soccer_results.settle_pending(
+                db, token=FOOTBALL_DATA_TOKEN,
+                vlog=lambda m: print(m, file=sys.stderr, flush=True))
         except Exception as e:  # noqa: BLE001
             settled = {"checked": 0, "settled": [], "error": str(e)}
         perf, series, recent = spdb.performance(db), spdb.pnl_by_day(db), spdb.get_predictions(db)
@@ -519,9 +521,13 @@ def results(sport: str = Query("mlb")) -> dict:
     print(f"[results] {sport} settlement: checked={settled.get('checked', 0)} "
           f"finals_found={settled.get('finals_found', '-')} "
           f"settled={len(settled.get('settled', []))} "
+          f"games_matched={settled.get('games_matched', '-')} "
           f"backfilled_urls={settled.get('backfilled_urls', 0)} close_captured={captured}"
           + (f" error={settled['error']}" if settled.get('error') else ""),
           file=sys.stderr, flush=True)
+    # Surface the per-game settlement diagnostics (why each PENDENTE did/didn't settle).
+    for line in settled.get("diagnostics", []):
+        print(f"[results] {sport}: {line}", file=sys.stderr, flush=True)
     return {"sport": sport, "settlement": settled, "performance": perf,
             "pnl_by_day": series, "recent": recent, "generated_at": _now()}
 
