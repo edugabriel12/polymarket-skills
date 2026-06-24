@@ -71,6 +71,25 @@ def _btts_event(home, away, date, yes_px=-110, no_px=-110):
                 {"name": "Yes", "price": yes_px}, {"name": "No", "price": no_px}]}]}]}
 
 
+class TestDateTolerance(unittest.TestCase):
+    def test_adjacent_dates(self):
+        self.assertEqual(so._adjacent_dates("2026-06-24"), ["2026-06-24", "2026-06-25"])
+        self.assertEqual(so._adjacent_dates("2026-06-30"), ["2026-06-30", "2026-07-01"])
+        self.assertEqual(so._adjacent_dates("bad"), ["bad"])
+
+    def test_late_kickoff_keyed_next_utc_day_still_matches(self):
+        # A World Cup game Polymarket lists for 06-24 but whose UTC commence is 06-25 (late
+        # kickoff) is keyed one day ahead — the ref must still attach (the gap the 2026-06-24
+        # log surfaced: rsa-kr / bih-qat / cze-mex fell to "no sharp total reference").
+        tot = so.parse_totals([_totals_event("South Africa", "Korea Republic", "2026-06-25", 2.5)])
+        bt = so.parse_btts([_btts_event("South Africa", "Korea Republic", "2026-06-25")])
+        self.assertIsNotNone(so.sharp_total_ref(tot, "2026-06-24", "South Africa", "Korea Republic"))
+        self.assertIsNotNone(so.sharp_btts_ref(bt, "2026-06-24", "South Africa", "Korea Republic"))
+        # +1 only, not +2, and a truly-absent game is still None.
+        self.assertIsNone(so.sharp_total_ref(tot, "2026-06-23", "South Africa", "Korea Republic"))
+        self.assertIsNone(so.sharp_total_ref(tot, "2026-06-24", "Bosnia", "Qatar"))
+
+
 class TestParse(unittest.TestCase):
     def test_parse_totals_devigs_main_line(self):
         events = [_totals_event("England", "Ghana", "2026-06-23", 2.5)]

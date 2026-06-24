@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import re
 import unicodedata
+from datetime import datetime, timedelta
 
 ODDS_API = "https://api.the-odds-api.com/v4"
 _APIKEY_RE = re.compile(r"(apiKey=)[^&\s]+", re.IGNORECASE)
@@ -109,6 +110,30 @@ def extract_teams_from_question(question: str) -> tuple[str, str] | None:
 
 def _key(date: str, a: str, b: str) -> tuple:
     return (date, frozenset((norm_name(a), norm_name(b))))
+
+
+def _adjacent_dates(date: str) -> list[str]:
+    """The target date AND the next UTC day.
+
+    A game listed on Polymarket for a US/Europe local date (e.g. a late kickoff) can have a
+    UTC commence_time on the FOLLOWING calendar day, so the sharp event is keyed one day ahead.
+    Matching both recovers those games instead of dropping them as "no sharp reference".
+    """
+    out = [date]
+    try:
+        out.append((datetime.strptime(date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d"))
+    except (ValueError, TypeError):
+        pass
+    return out
+
+
+def _find_rec(lookup: dict, date: str, a: str, b: str) -> dict | None:
+    """Look up a game's sharp record by team pair, trying `date` then the next UTC day."""
+    for d in _adjacent_dates(date):
+        rec = lookup.get(_key(d, a, b))
+        if rec:
+            return rec
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -197,16 +222,17 @@ def merge_lookup(totals: dict, btts: dict | None = None) -> dict:
 
 
 def sharp_total_ref(lookup: dict, date: str, a: str, b: str) -> tuple[float, float] | None:
-    """(total_line, fair P(over)) for a game, or None. Names are normalized internally."""
-    rec = lookup.get(_key(date, a, b))
+    """(total_line, fair P(over)) for a game, or None. Names are normalized internally;
+    the date matches `date` or the next UTC day (late kickoffs)."""
+    rec = _find_rec(lookup, date, a, b)
     if not rec or rec.get("over_fair") is None or rec.get("total_line") is None:
         return None
     return float(rec["total_line"]), float(rec["over_fair"])
 
 
 def sharp_btts_ref(lookup: dict, date: str, a: str, b: str) -> float | None:
-    """Fair P(BTTS yes) for a game, or None."""
-    rec = lookup.get(_key(date, a, b))
+    """Fair P(BTTS yes) for a game, or None (date matches `date` or the next UTC day)."""
+    rec = _find_rec(lookup, date, a, b)
     return float(rec["btts_yes_fair"]) if rec and rec.get("btts_yes_fair") is not None else None
 
 
