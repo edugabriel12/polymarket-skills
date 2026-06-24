@@ -21,13 +21,27 @@ import soccer_predictions as spdb
 
 FOOTBALL_DATA_API = "https://api.football-data.org/v4"
 
-# Results-feed three-letter codes (lowercased) -> our slug team code. National-team
-# TLAs differ from the ISO codes Polymarket uses (NED vs nld); clubs mostly match.
+# Results-feed three-letter codes (lowercased) -> our slug team code. football-data.org
+# tags national teams with FIFA-style TLAs (POR, CRO, …) while Polymarket slugs use ISO
+# 3166-1 alpha-3 (prt, hrv, …); this table reconciles the two where they differ. It is a
+# canonicalization applied to BOTH the feed side and the slug side (see `norm_code` /
+# `_pair_key`), so each mapping only needs to send the two spellings of one country to a
+# single token — adding correct entries can never break a pair that already matched (the
+# only hazard is mapping two different countries onto the same token, which none do here).
+# Codes not listed pass through unchanged (BRA, ESP, ITA, … already agree).
 TLA_TO_CODE: dict[str, str] = {
-    "ned": "nld", "ger": "deu", "sui": "che", "den": "dnk", "por": "por",
-    "rsa": "rsa", "kor": "kor", "uae": "are", "ksa": "sau", "iri": "irn",
-    "alg": "dza", "mar": "mar", "civ": "civ", "wal": "wal", "sco": "sct",
-    "ire": "irl", "cze": "cze", "uru": "uru", "par": "pry", "chi": "chl",
+    # --- UEFA ---
+    "ned": "nld", "ger": "deu", "sui": "che", "den": "dnk", "por": "prt",
+    "cro": "hrv", "gre": "grc", "bul": "bgr", "sco": "sct", "wal": "wal",
+    "ire": "irl", "cze": "cze",
+    # --- CONMEBOL ---
+    "par": "pry", "chi": "chl", "uru": "ury",
+    # --- CONCACAF ---
+    "crc": "cri", "hon": "hnd", "gua": "gtm", "hai": "hti", "tri": "tto",
+    # --- CAF ---
+    "rsa": "zaf", "alg": "dza", "mar": "mar", "civ": "civ", "zam": "zmb",
+    # --- AFC ---
+    "kor": "kor", "uae": "are", "ksa": "sau", "iri": "irn",
 }
 
 
