@@ -23,7 +23,6 @@ import _bootstrap  # noqa: F401  (adds category-watcher scripts to sys.path)
 
 import elo
 import forecast_tennis as fct
-import congruence as cg
 import ratings as ratings_mod
 import ratings_source
 import tennis_market as tm
@@ -276,34 +275,35 @@ def run(args) -> dict:
         p_a_elo, used, ea, eb = model_probability(label_a or pa_slug, label_b or pb_slug,
                                                   surface, rt, args.blend)
         p_a = p_a_elo
-        # Sharp anchor (divergence detector): when the sharp prices this match, use its fair
-        # P(win) directly — edge then measures Polymarket vs sharp, not Elo vs market.
+        # The Elo MODEL drives the prediction. The sharp is NOT an anchor — it's an edge-sign
+        # veto (below): the model picks the side, the sharp only confirms it's +EV. require_sharp
+        # still skips matches with no sharp to veto against.
         sharp_pa = (sot.sharp_win_ref(sharp_lookup, target, label_a or pa_slug, label_b or pb_slug)
                     if sharp_lookup else None)
-        cong = dict(cg.NEUTRAL)
-        if sharp_pa is not None:
-            # Congruence: does our independent Elo corroborate the sharp? (modulates size/confidence,
-            # never the edge). No-op when Elo had no ratings (p_a_elo None → factor 1.0).
-            cong = cg.assess(p_a_elo if used else None, sharp_pa)
-            p_a = sharp_pa
-        elif require_sharp:
-            _skip(slug, "no sharp reference (divergence mode bets only on a sharp anchor)",
+        if sharp_pa is None and require_sharp:
+            _skip(slug, "no sharp reference (bet only where the sharp can confirm the edge)",
                   price_sane=ms["price_sane"])
             continue
-        elif p_a is None:                     # anti-fabrication: devig -> ~0 edge
+        if p_a is None:                       # no Elo ratings -> market-implied (anti-fabrication)
             fair = elo.devig_two_way(ms["sides"][0]["price"], ms["sides"][1]["price"])
             p_a = fair[0] if fair else ms["sides"][0]["price"]
         chosen, notes = pick_side(ms["sides"], p_a, args.fee_rate, args.odds_min, args.odds_max,
                                   getattr(args, "max_edge", MAX_PLAUSIBLE_EDGE))
+        # Sharp edge-sign veto: the sharp's fair edge for the side the model chose.
+        sharp_edge = None
+        if chosen and sharp_pa is not None:
+            p_sharp_side = sharp_pa if chosen["side"] == label_a else (1.0 - sharp_pa)
+            sharp_edge = p_sharp_side - chosen["price"]
         vlog(f"  [{slug}] {label_a} vs {label_b} ({surface}): P({label_a})={p_a:.3f} "
              f"external={used}"
              + (f" sharp={sharp_pa:.3f}" if sharp_pa is not None else (" (no sharp ref)" if sharp_lookup else ""))
-             + (f" elo={ea:.0f}/{eb:.0f}" if used and sharp_pa is None else ""))
+             + (f" elo={ea:.0f}/{eb:.0f}" if used else "")
+             + (f" sharp_edge={sharp_edge*100:+.1f}%" if sharp_edge is not None else ""))
         ref = ms["sides"][0]
         cand = {"slug": slug, "surface": surface, "p_a": p_a, "used": used,
                 "elo_a": ea, "elo_b": eb, "sides": ms["sides"], "ou": ms, "m": m,
                 "chosen": chosen, "notes": notes, "ref_token": ref["token"],
-                "ref_label": label_a, "ref_price": ref["price"], "cong": cong}
+                "ref_label": label_a, "ref_price": ref["price"], "sharp_edge": sharp_edge}
         if not chosen:
             impl = next((n for n in notes
                          if n.get("implausible") and n["edge"] > 0 and n["in_odds_band"]), None)
@@ -313,8 +313,14 @@ def run(args) -> dict:
             cand_rows.append({**cand, "bet": 0, "skip_reason": reason})
             continue
         if chosen["edge"] < args.min_edge:
-            _skip(slug, f"edge {chosen['edge']*100:.1f}% < {args.min_edge*100:.0f}%")
-            cand_rows.append({**cand, "bet": 0, "skip_reason": "edge below threshold"})
+            _skip(slug, f"model edge {chosen['edge']*100:.1f}% < {args.min_edge*100:.0f}%")
+            cand_rows.append({**cand, "bet": 0, "skip_reason": "model edge below threshold"})
+            continue
+        if sharp_edge is not None and sharp_edge <= 0:
+            reason = (f"sharp edge {sharp_edge*100:+.1f}% ≤ 0 — sharp does not confirm "
+                      f"{chosen['side']} as +EV")
+            _skip(slug, reason)
+            cand_rows.append({**cand, "bet": 0, "skip_reason": reason})
             continue
         cand_rows.append({**cand, "bet": 1, "skip_reason": None})
 
@@ -326,16 +332,7 @@ def run(args) -> dict:
             continue
         ch = c["chosen"]
         size_pct, size_usd, kelly, conf = _size(ch, args, portfolio_value)
-        cong = c.get("cong") or dict(cg.NEUTRAL)
-        if cong.get("applied") and not getattr(args, "no_congruence", False):
-            if cong["factor"] == 0.0:          # model disagrees with sharp beyond the band -> skip
-                _skip(c["slug"], f"incongruent: Elo vs sharp gap {cong['gap']:.1%} "
-                      f"(model does not corroborate the sharp) — not bet")
-                continue
-            size_pct *= cong["factor"]
-            size_usd = round(size_pct * portfolio_value, 2)
-            conf = cg.apply_confidence(conf, cong["factor"])
-        rec_id = _record(c, ch, size_pct, size_usd, kelly, conf, args, target, cong)
+        rec_id = _record(c, ch, size_pct, size_usd, kelly, conf, args, target)
         if rec_id is not None:
             recorded_ids.setdefault(c["slug"], set()).add(rec_id)
         suggestions.append({"match": c["slug"], "surface": c["surface"],
@@ -343,11 +340,12 @@ def run(args) -> dict:
                             "price": ch["price"], "edge": round(ch["edge"], 4),
                             "p_model": round(ch["p_model"], 4),
                             "forecast": fct.forecast_block(ch["p_model"]),
-                            "congruence": cong,
+                            "sharp_edge": (round(c["sharp_edge"], 4) if c.get("sharp_edge") is not None else None),
                             "size_pct": round(size_pct, 5), "prediction_id": rec_id})
         vlog(f"  [{c['slug']}] >>> SUGGEST {ch['side']} @ {ch['price']:.3f} "
-             f"edge={ch['edge']*100:+.1f}% size={size_pct*100:.2f}% "
-             f"cong={cong['agreement']}(x{cong['factor']:.2f}) pred_id={rec_id}")
+             f"edge={ch['edge']*100:+.1f}% size={size_pct*100:.2f}%"
+             + (f" sharp_edge={c['sharp_edge']*100:+.1f}%" if c.get("sharp_edge") is not None else "")
+             + f" pred_id={rec_id}")
 
     superseded = 0
     if args.record:
@@ -374,7 +372,7 @@ def _size(chosen, args, portfolio_value):
     return size_pct, round(size_pct * portfolio_value, 2), kelly, conf
 
 
-def _record(c, chosen, size_pct, size_usd, kelly, conf, args, target, cong=None):
+def _record(c, chosen, size_pct, size_usd, kelly, conf, args, target):
     if not args.record:
         return None
     stats = {"model": "surface_elo", "surface": c["surface"], "elo_side": c["elo_a"]
@@ -382,7 +380,8 @@ def _record(c, chosen, size_pct, size_usd, kelly, conf, args, target, cong=None)
              "elo_opp": c["elo_b"] if chosen["side"] == c["ref_label"] else c["elo_a"],
              "p_model": round(chosen["p_model"], 4), "edge": round(chosen["edge"], 4),
              "forecast": fct.forecast_block(chosen["p_model"]),
-             "congruence": cong, "size_pct": round(size_pct, 5), "confidence": round(conf, 3),
+             "sharp_edge": (round(c["sharp_edge"], 4) if c.get("sharp_edge") is not None else None),
+             "size_pct": round(size_pct, 5), "confidence": round(conf, 3),
              "used_external": c["used"], "blend": args.blend, "notes": c["notes"]}
     try:
         return tdb.record_prediction({
@@ -435,9 +434,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-hours", type=float, default=0.0,
                    help="Min hours until match start (default 0 = pre-live only; a started match "
                         "is skipped as live)")
-    p.add_argument("--no-congruence", action="store_true",
-                   help="Disable model↔sharp congruence sizing (default on: shrink size/confidence "
-                        "when the Elo disagrees with the sharp; skip when the gap exceeds the cap)")
     p.add_argument("--ratings-csv", default=None, help="player,elo,hard,clay,grass CSV (overrides auto)")
     p.add_argument("--auto-ratings", dest="auto_ratings", action="store_true", default=True,
                    help="Auto-compute surface Elo from Sackmann data (default on)")

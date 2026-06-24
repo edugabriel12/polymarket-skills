@@ -64,8 +64,14 @@ python polymarket-tennis/scripts/test_pipeline.py
   - Players resolve by full name, surname, `C. Surname`, or a truncated slug token (`altmaie`).
 - **Anti-fabrication:** if a player has no rating, the model is **market-implied** (devigged price),
   so edge ≈ 0 and nothing is suggested. Real edge appears only when ratings move P(win) off the
-  market. The research is unambiguous: tennis moneyline markets are **near-efficient** — the edge is
-  in spotting **price divergence**, not out-predicting the consensus.
+  market. The research is unambiguous: tennis moneyline markets are **near-efficient**.
+- **Model drives + sharp veto** (when a sharp slate is loaded): the surface-Elo **model is the
+  prediction engine** — it picks the side and its model edge (P_win − price). The **sharp is an
+  edge-sign veto**: for the chosen side, `sharp_edge = P_sharp(side) − price`, and a bet is suggested
+  **only if `sharp_edge > 0`** (the sharp confirms the model's side is +EV); otherwise it's skipped
+  (`sharp edge … ≤ 0`). So a suggestion needs the **model edge ≥ `--min-edge`** AND a **positive sharp
+  edge**. With no sharp ref the model runs alone (no veto); `require_sharp` (default on) skips matches
+  with no sharp to veto against. `sharp_edge` is recorded in `stats_log` and returned per suggestion.
 - **Surface inference:** read from the tournament/tag in the slug (French Open → clay, Wimbledon →
   grass, default hard).
 - **Scope:** only tennis tags (`atp-`, `wta-`, slams, ...) and only the **moneyline** (2-player)
