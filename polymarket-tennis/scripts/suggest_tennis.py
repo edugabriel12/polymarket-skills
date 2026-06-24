@@ -17,7 +17,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import _bootstrap  # noqa: F401  (adds category-watcher scripts to sys.path)
 
@@ -47,6 +47,20 @@ HONORED_FRAC = 0.60        # >= this tennis fraction in the probe => honored tag
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def date_window(target: str, days_ahead: int) -> list[str]:
+    """[target, target+1, … target+days_ahead]. Tennis runs daily (incl. weekends), so the
+    look-ahead is the next CALENDAR day(s) — most of today's matches are already live by the
+    time the model runs, so the next day's card is where the pre-live entries are."""
+    out = [target]
+    try:
+        d = datetime.strptime(target, "%Y-%m-%d")
+        for i in range(1, max(0, days_ahead) + 1):
+            out.append((d + timedelta(days=i)).strftime("%Y-%m-%d"))
+    except (ValueError, TypeError):
+        pass
+    return out
 
 
 def pregame_status(market: dict, min_hours: float = 0.0,
@@ -186,11 +200,13 @@ def pick_side(sides, p_a, fee_rate, odds_min, odds_max, max_edge=MAX_PLAUSIBLE_E
     return cands[0], notes
 
 
-def _load_sharp_lookup(args, target, vlog) -> dict:
+def _load_sharp_lookup(args, dates, vlog) -> dict:
     """Load the sharp h2h reference (Pinnacle via The Odds API) -> divergence detector.
 
-    Lists active tennis tours, then queries each. Best-effort / {} offline. With it the
-    model anchors P(win) to the sharp; without it it stays Elo-predictive (edge-capped).
+    Lists active tennis tours, then queries each. Best-effort / {} offline. The lookup spans
+    ALL upcoming matches (no single-date filter), so it covers the whole `dates` window; each
+    Polymarket match is matched by its OWN date later. With it the model's edge is sharp-vetoed;
+    without it it stays Elo-only.
     """
     if getattr(args, "no_sharp", False):
         return {}
@@ -203,15 +219,16 @@ def _load_sharp_lookup(args, target, vlog) -> dict:
     if only:
         wanted = {x.strip().lower() for x in only.split(",") if x.strip()}
         keys = [k for k in keys if any(w in k.lower() for w in wanted)]
-    lookup = sot.fetch_sharp_tennis(key, keys, date=target,
+    lookup = sot.fetch_sharp_tennis(key, keys, date=None,
                                     min_quota_reserve=int(getattr(args, "sharp_min_reserve", 0) or 0),
                                     vlog=vlog)
     if lookup:
-        # k = (date, frozenset(surnames)); count how many are dated for today's slate so a
+        # k = (date, frozenset(surnames)); count how many fall in the analysis window so a
         # date-boundary mismatch (a night match crossing UTC midnight) is visible in the log.
-        dated = sum(1 for k in lookup if k[0] == target)
+        win = set(dates)
+        dated = sum(1 for k in lookup if k[0] in win)
         vlog(f"  sharp reference loaded: {len(lookup)} match(es) "
-             f"({dated} dated {target}) (divergence-detector mode)")
+             f"({dated} dated within {dates[0]}…{dates[-1]}) (divergence-detector mode)")
     else:
         vlog("  sharp reference EMPTY — divergence detector OFF "
              "(model stays Elo-predictive, edge-capped). Check the [odds-api] lines above: "
@@ -223,17 +240,19 @@ def run(args) -> dict:
     api = APIClient(rate_limit_ms=args.rate_limit, debug=args.debug)
     vlog = log if getattr(args, "verbose", True) else (lambda *a, **k: None)
     target = args.date or now_utc().date().isoformat()
-    vlog(f"=== Tennis match-winner analysis for {target} ===")
+    dates = date_window(target, int(getattr(args, "days_ahead", 1) or 0))
+    win = set(dates)
+    vlog(f"=== Tennis match-winner analysis for {dates[0]}…{dates[-1]} ===")
 
     try:
         markets = discover_tennis(api, vlog)
     except Exception as e:  # noqa: BLE001
         return {"date": target, "error": f"discovery failed: {e}", "suggestions": [], "skipped": []}
 
-    on_day = [m for m in markets if game_date(m) == target]
+    on_day = [m for m in markets if game_date(m) in win]
     matches = group_by_match(on_day)
     vlog(f"Discovery: {len(tm.TENNIS_TAGS)} tags -> {len(markets)} markets; "
-         f"{len(on_day)} dated {target}, {len(matches)} matches")
+         f"{len(on_day)} dated within {dates[0]}…{dates[-1]}, {len(matches)} matches")
 
     match_evts = {k: v for k, v in matches.items()
                   if is_tennis_slug(k) and any(tm.is_match_market(x) for x in v)}
@@ -250,7 +269,7 @@ def run(args) -> dict:
     else:
         rt = {}
     portfolio_value = float(args.portfolio_value)
-    sharp_lookup = _load_sharp_lookup(args, target, vlog)
+    sharp_lookup = _load_sharp_lookup(args, dates, vlog)
     require_sharp = bool(sharp_lookup) and getattr(args, "require_sharp", True)
     suggestions, skipped, cand_rows = [], [], []
 
@@ -268,6 +287,7 @@ def run(args) -> dict:
         live_ok, live_why = pregame_status(m, getattr(args, "min_hours", 0.0))
         if not live_ok:
             _skip(slug, live_why); continue
+        mdate = game_date(m) or target          # the match's own date (window spans >1 day)
         surface = args.surface or tm.surface_for(slug)
         pa_slug, pb_slug = tm.parse_players(slug)
         # Prefer the market's own outcome labels for rating resolution; fall back to slug.
@@ -278,7 +298,7 @@ def run(args) -> dict:
         # The Elo MODEL drives the prediction. The sharp is NOT an anchor — it's an edge-sign
         # veto (below): the model picks the side, the sharp only confirms it's +EV. require_sharp
         # still skips matches with no sharp to veto against.
-        sharp_pa = (sot.sharp_win_ref(sharp_lookup, target, label_a or pa_slug, label_b or pb_slug)
+        sharp_pa = (sot.sharp_win_ref(sharp_lookup, mdate, label_a or pa_slug, label_b or pb_slug)
                     if sharp_lookup else None)
         if sharp_pa is None and require_sharp:
             _skip(slug, "no sharp reference (bet only where the sharp can confirm the edge)",
@@ -300,7 +320,7 @@ def run(args) -> dict:
              + (f" elo={ea:.0f}/{eb:.0f}" if used else "")
              + (f" sharp_edge={sharp_edge*100:+.1f}%" if sharp_edge is not None else ""))
         ref = ms["sides"][0]
-        cand = {"slug": slug, "surface": surface, "p_a": p_a, "used": used,
+        cand = {"slug": slug, "surface": surface, "p_a": p_a, "used": used, "date": mdate,
                 "elo_a": ea, "elo_b": eb, "sides": ms["sides"], "ou": ms, "m": m,
                 "chosen": chosen, "notes": notes, "ref_token": ref["token"],
                 "ref_label": label_a, "ref_price": ref["price"], "sharp_edge": sharp_edge}
@@ -385,7 +405,7 @@ def _record(c, chosen, size_pct, size_usd, kelly, conf, args, target):
              "used_external": c["used"], "blend": args.blend, "notes": c["notes"]}
     try:
         return tdb.record_prediction({
-            "match_slug": c["slug"], "match_date": target,
+            "match_slug": c["slug"], "match_date": c.get("date") or target,
             "tour": (c["slug"].split("-")[0] if c["slug"] else None),
             "surface": c["surface"], "market_question": c["m"].get("question", ""),
             "condition_id": c["m"].get("condition_id"), "token_id": chosen["token"],
@@ -409,7 +429,7 @@ def _shadow_log(c, args, target):
     ch = c["chosen"]
     try:
         tdb.record_model_log({
-            "match_slug": c["slug"], "match_date": target,
+            "match_slug": c["slug"], "match_date": c.get("date") or target,
             "tour": (c["slug"].split("-")[0] if c["slug"] else None), "surface": c["surface"],
             "ref_side": c["ref_label"], "ref_prob": round(c["p_a"], 4),
             "ref_price": c["ref_price"], "ref_token": c["ref_token"],
@@ -434,6 +454,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-hours", type=float, default=0.0,
                    help="Min hours until match start (default 0 = pre-live only; a started match "
                         "is skipped as live)")
+    p.add_argument("--days-ahead", type=int, default=1,
+                   help="Also analyze the next N calendar days' matches (default 1 = today + "
+                        "tomorrow; 0 = today only). Most of today's card is live by run time.")
     p.add_argument("--ratings-csv", default=None, help="player,elo,hard,clay,grass CSV (overrides auto)")
     p.add_argument("--auto-ratings", dest="auto_ratings", action="store_true", default=True,
                    help="Auto-compute surface Elo from Sackmann data (default on)")

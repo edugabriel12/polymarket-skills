@@ -237,6 +237,18 @@ class TestEndToEnd(unittest.TestCase):
         # Devig fair price ~0.524 vs price 0.55 -> negative edge -> no suggestion.
         self.assertEqual(len(result["suggestions"]), 0)
 
+    def test_window_includes_next_day_excludes_beyond(self):
+        markets = [
+            _mk("atp-aa-bb-2026-06-20", ["AA", "BB"], [0.55, 0.50], ["a", "b"]),   # today
+            _mk("atp-cc-dd-2026-06-21", ["CC", "DD"], [0.55, 0.50], ["c", "d"]),   # tomorrow (in window)
+            _mk("atp-ee-ff-2026-06-25", ["EE", "FF"], [0.55, 0.50], ["e", "f"]),   # beyond the window
+        ]
+        st.discover_markets = lambda *a, **k: ("tennis", markets)
+        st.game_date = lambda m: "-".join(m["slug"].split("-")[-3:])
+        st.APIClient = _NoNetAPI
+        result = st.run(_Args(date="2026-06-20", days_ahead=1))
+        self.assertEqual(result["counts"]["matches"], 2)      # today + tomorrow, not 06-25
+
     def _veto_run(self, alcaraz_elo, djokovic_elo, sharp_alcaraz):
         """Run the pipeline: the Elo model drives the pick; the injected sharp is the veto."""
         markets = [_mk("atp-alcaraz-djokovic-2026-06-20",
