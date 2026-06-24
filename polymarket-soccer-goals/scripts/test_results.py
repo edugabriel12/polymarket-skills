@@ -105,6 +105,33 @@ class TestSettlePending(unittest.TestCase):
             self.assertTrue(any("updated 2 row(s)" in d for d in res["diagnostics"]))
 
 
+class TestFifaIsoCodeMap(unittest.TestCase):
+    """football-data FIFA TLAs (POR/CRO) must reconcile with ISO slug codes (prt/hrv)."""
+
+    def test_portugal_croatia_settle(self):
+        # Reproduces the live World Cup case: feed tags Portugal POR / Croatia CRO; the
+        # Polymarket slugs use ISO prt / hrv. Before the map fix these stayed PENDENTE.
+        payload = {"matches": [
+            {"status": "FINISHED", "utcDate": "2026-06-23T19:00:00Z",
+             "homeTeam": {"tla": "POR"}, "awayTeam": {"tla": "UZB"},
+             "score": {"fullTime": {"home": 3, "away": 1}}},  # total 4 > 3.5
+            {"status": "FINISHED", "utcDate": "2026-06-23T16:00:00Z",
+             "homeTeam": {"tla": "CRO"}, "awayTeam": {"tla": "PAN"},
+             "score": {"fullTime": {"home": 2, "away": 0}}},  # total 2 < 2.5
+        ]}
+        lk = sr.parse_finished(payload)
+        self.assertEqual(lk[("2026-06-23", "prt", "uzb")], (4.0, True))
+        self.assertEqual(lk[("2026-06-23", "hrv", "pan")], (2.0, False))
+        # Pending slugs use ISO codes; decide_settlements must match across the FIFA/ISO gap.
+        pending = [{"game_slug": "fifwc-prt-uzb-2026-06-23", "game_date": "2026-06-23",
+                    "home": "prt", "away": "uzb"},
+                   {"game_slug": "fifwc-pan-hrv-2026-06-23", "game_date": "2026-06-23",
+                    "home": "pan", "away": "hrv"}]
+        out = {i["game_slug"]: i for i in sr.decide_settlements(pending, lk)}
+        self.assertEqual(out["fifwc-prt-uzb-2026-06-23"]["actual_total"], 4.0)
+        self.assertEqual(out["fifwc-pan-hrv-2026-06-23"]["actual_total"], 2.0)
+
+
 class TestSettleDiagnostics(unittest.TestCase):
     """The diagnostics must pinpoint WHY a pending game didn't settle."""
 
