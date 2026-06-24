@@ -151,16 +151,38 @@ def capture_close_prices(db_path: str = spdb.DEFAULT_DB) -> int:
 
 
 def settle_pending(db_path: str = spdb.DEFAULT_DB, token: str | None = None,
-                   days_back: int = 4) -> dict:
-    """Settle eligible PENDENTE soccer predictions from the results feed."""
+                   days_back: int = 4, vlog=None) -> dict:
+    """Settle eligible PENDENTE soccer predictions from the results feed.
+
+    Emits step-by-step diagnostics (returned under ``diagnostics`` and echoed via
+    ``vlog``) so a stuck settlement can be debugged from the /results output: how
+    many rows are pending, which games failed team/date parsing, the feed window
+    queried, how many finished games came back, and — per pending game — whether
+    it matched, missed because the pair isn't FINISHED yet, or missed because the
+    feed dated it on a DIFFERENT day (UTC rollover) than the prediction.
+    """
+    diag: list[str] = []
+
+    def note(msg: str) -> None:
+        diag.append(msg)
+        if vlog:
+            vlog(f"[soccer-settle] {msg}")
+
     token = token or os.environ.get("FOOTBALL_DATA_TOKEN")
     pending = spdb.get_predictions(db_path, status="PENDENTE")
-    if not pending or not token:
-        return {"checked": len(pending), "settled": [],
-                "note": None if token else "set FOOTBALL_DATA_TOKEN to auto-settle soccer"}
+    note(f"pending PENDENTE rows: {len(pending)}")
+    if not token:
+        note("no FOOTBALL_DATA_TOKEN — cannot reach the results feed; rows stay PENDENTE")
+        return {"checked": len(pending), "settled": [], "finals_found": 0,
+                "games_matched": 0,
+                "note": "set FOOTBALL_DATA_TOKEN to auto-settle soccer", "diagnostics": diag}
+    if not pending:
+        return {"checked": 0, "settled": [], "finals_found": 0, "games_matched": 0,
+                "diagnostics": diag}
 
     # Distinct games + their teams (order-independent).
     games: dict[str, dict] = {}
+    unparsed: list[str] = []
     for r in pending:
         slug = r["game_slug"]
         if slug in games:
@@ -169,18 +191,55 @@ def settle_pending(db_path: str = spdb.DEFAULT_DB, token: str | None = None,
         if home and away and r.get("game_date"):
             games[slug] = {"game_slug": slug, "game_date": r["game_date"],
                            "home": home, "away": away}
+        else:
+            unparsed.append(slug)
+    note(f"distinct pending games: {len(games)} parsed, {len(unparsed)} unparsed/dateless")
+    if unparsed:
+        note("could not parse teams+date for: " + ", ".join(sorted(set(unparsed))[:10]))
 
     dates = sorted({g["game_date"] for g in games.values()})
     if not dates:
-        return {"checked": len(pending), "settled": []}
+        note("no parseable games with a date — nothing to query")
+        return {"checked": len(pending), "settled": [], "finals_found": 0,
+                "games_matched": 0, "diagnostics": diag}
     today = datetime.now(timezone.utc).date().isoformat()
     date_from = min(dates[0], (datetime.now(timezone.utc).date() - timedelta(days=days_back)).isoformat())
-    lookup = fetch_finished(date_from, max(dates[-1], today), token)
+    date_to = max(dates[-1], today)
+    note(f"querying results feed {date_from}…{date_to} for {len(games)} game(s)")
+    lookup = fetch_finished(date_from, date_to, token)
+    note(f"FINISHED games returned by feed: {len(lookup)}")
+    if not lookup:
+        note("feed returned 0 finished games — bad/expired token, rate-limit, network, "
+             "or no covered competition finished in the window")
+
+    instructions = []
+    for g in games.values():
+        key = _pair_key(g["game_date"], g["home"], g["away"])
+        res = lookup.get(key)
+        pair = tuple(sorted((norm_code(g["home"]), norm_code(g["away"]))))
+        if res is not None:
+            note(f"✓ {g['game_slug']}: matched {pair[0]}/{pair[1]} @ {g['game_date']} "
+                 f"→ total={res[0]}, btts={res[1]}")
+            instructions.append({"game_slug": g["game_slug"], "actual_total": res[0],
+                                 "actual_btts": res[1]})
+        else:
+            alt = sorted({k[0] for k in lookup if k[1:] == pair})
+            if alt:
+                note(f"✗ {g['game_slug']}: pair {pair[0]}/{pair[1]} is FINISHED in the feed "
+                     f"under {alt} but the prediction is dated {g['game_date']} "
+                     f"(date mismatch — likely UTC rollover)")
+            else:
+                note(f"✗ {g['game_slug']}: {pair[0]}/{pair[1]} @ {g['game_date']} not FINISHED "
+                     f"in feed (not played yet, or team code not mapped in TLA_TO_CODE)")
 
     settled = []
-    for ins in decide_settlements(list(games.values()), lookup):
+    for ins in instructions:
         rows = spdb.settle_game(ins["game_slug"], db_path,
                                 actual_total=ins["actual_total"], actual_btts=ins["actual_btts"])
+        note(f"settle_game({ins['game_slug']}): updated {len(rows)} row(s) "
+             + (", ".join(f"{r['side']}→{r['status']}" for r in rows) if rows else
+                "(0 — no PENDENTE rows under this base slug)"))
         settled.extend(rows)
-    return {"checked": len(pending), "settled": settled, "games_matched": len(set(
-        i["game_slug"] for i in decide_settlements(list(games.values()), lookup)))}
+    note(f"DONE: {len(instructions)} game(s) matched, {len(settled)} prediction row(s) settled")
+    return {"checked": len(pending), "settled": settled, "finals_found": len(lookup),
+            "games_matched": len(instructions), "diagnostics": diag}
