@@ -673,17 +673,21 @@ def run(args) -> dict:
 
         # Sharp edge-sign veto: the factor MODEL proposes the side (above); the SHARP only
         # confirms the bet is +EV. Suggest ONLY if the sharp's fair edge for the chosen side
-        # is strictly positive (`p_over_sharp` is None when no sharp ref → no veto, model-only).
+        # clears `--min-sharp-edge` (`p_over_sharp` is None when no sharp ref → no veto,
+        # model-only). A positive-but-tiny sharp edge is treated as "no opinion", not
+        # confirmation — the threshold filters out bets the sharp barely endorses.
         sharp_edge = None
+        min_sharp = getattr(args, "min_sharp_edge", 0.0)
         if m.get("p_over_sharp") is not None:
             p_sharp_side = (m["p_over_sharp"] if chosen["side"] == "OVER"
                             else 1.0 - m["p_over_sharp"])
             sharp_edge = p_sharp_side - chosen["price"]
             vlog(f"  [{event_slug}] sharp veto: model picks {chosen['side']} "
-                 f"(model edge {chosen['edge']*100:+.1f}%); sharp edge {sharp_edge*100:+.1f}%")
-            if sharp_edge <= 0:
-                reason = (f"sharp edge {sharp_edge*100:+.1f}% ≤ 0 — sharp does not confirm the "
-                          f"model's {chosen['side']} as +EV")
+                 f"(model edge {chosen['edge']*100:+.1f}%); sharp edge {sharp_edge*100:+.1f}% "
+                 f"(min {min_sharp*100:.1f}%)")
+            if sharp_edge < min_sharp:
+                reason = (f"sharp edge {sharp_edge*100:+.1f}% < {min_sharp*100:.1f}% min — sharp "
+                          f"does not confirm the model's {chosen['side']} as +EV")
                 _shadow_log_mlb(args, target, event_slug, line, side_notes, chosen, m, 0, reason, totals, ou)
                 _skip(event_slug, reason, line=line, side=chosen["side"])
                 continue
@@ -864,6 +868,10 @@ def main() -> None:
     p.add_argument("--all-lines", dest="best_line_only", action="store_false", default=True,
                    help="Suggest every qualifying line (default: best-edge line per game only)")
     p.add_argument("--min-edge", type=float, default=0.05, help="Min edge after fees (default 0.05)")
+    p.add_argument("--min-sharp-edge", type=float, default=0.01,
+                   help="Min sharp confirming edge for the chosen side (default 0.01 = 1%%); "
+                        "the sharp veto rejects bets the sharp endorses by less than this — "
+                        "a positive-but-tiny sharp edge is 'no opinion', not confirmation")
     p.add_argument("--odds-min", type=float, default=rd.ODDS_MIN_DEFAULT, help="Min decimal payout (default 1.50)")
     p.add_argument("--odds-max", type=float, default=rd.ODDS_MAX_DEFAULT, help="Max decimal payout (default 3.00)")
     p.add_argument("--dispersion", type=float, default=2.0, help="variance = dispersion*mean (default 2.0)")

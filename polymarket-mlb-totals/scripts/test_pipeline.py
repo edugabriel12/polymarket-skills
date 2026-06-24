@@ -421,8 +421,8 @@ class TestEndToEndRun(unittest.TestCase):
 class _Args:
     """Minimal args namespace with pipeline defaults overridable by kwargs."""
     def __init__(self, **kw):
-        defaults = dict(date=None, min_volume=1000.0, min_edge=0.05, min_hours=0.0,
-                        best_line_only=True,
+        defaults = dict(date=None, min_volume=1000.0, min_edge=0.05, min_sharp_edge=0.01,
+                        min_hours=0.0, best_line_only=True,
                         odds_min=1.60, odds_max=3.00, dispersion=2.0,
                         league_baseline=8.5, league_prefix="mlb-",
                         fee_rate=0.0, use_external=True,
@@ -475,7 +475,15 @@ class TestSharpVeto(unittest.TestCase):
         # though the model loves the Over.
         result = self._run(sharp_over=0.45)
         self.assertEqual(len(result["suggestions"]), 0)
-        self.assertTrue(any("sharp edge" in s["reason"] and "≤ 0" in s["reason"]
+        self.assertTrue(any("sharp edge" in s["reason"] and "< 1.0% min" in s["reason"]
+                            for s in result["skipped"]))
+
+    def test_sharp_vetoes_positive_but_subthreshold_skips(self):
+        # Sharp fair Over ~0.505 @ 8.5 -> sharp edge = +0.5%: positive, but below the 1% min,
+        # so the hardened veto treats it as "no opinion" and skips (the old > 0 gate passed it).
+        result = self._run(sharp_over=0.505)
+        self.assertEqual(len(result["suggestions"]), 0)
+        self.assertTrue(any("sharp edge" in s["reason"] and "< 1.0% min" in s["reason"]
                             for s in result["skipped"]))
 
 
