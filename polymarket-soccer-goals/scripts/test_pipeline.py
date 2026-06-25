@@ -337,6 +337,38 @@ class TestEndToEnd(unittest.TestCase):
             self.assertLessEqual(rec["size_pct"], 0.01)  # first-trade cap
             self.assertTrue(dc.passes_odds_filter(rec["price"]))
 
+    def test_analyses_cover_every_game_found(self):
+        # The output must carry a model read for EVERY discovered game-market (TOTAL+BTTS),
+        # with λ / P / best-side / edges — not just the bets and skip reasons.
+        markets = [
+            _rich("epl-ars-che-2026-06-14-total-2pt5", "Arsenal vs Chelsea: O/U 2.5",
+                  ["Over 2.5", "Under 2.5"], [0.50, 0.50], ["T_over", "T_under"]),
+            _rich("epl-ars-che-2026-06-14-btts", "Arsenal vs Chelsea: Both teams to score?",
+                  ["Yes", "No"], [0.50, 0.50], ["B_yes", "B_no"]),
+        ]
+        ss.discover_markets = lambda *a, **k: ("soccer", markets)
+        ss.game_date = lambda m: "2026-06-14"
+        ss.APIClient = _NoNetAPI
+
+        with tempfile.TemporaryDirectory() as d:
+            csv_path = os.path.join(d, "r.csv")
+            with open(csv_path, "w", encoding="utf-8") as fh:
+                fh.write("team,elo,att_factor,def_factor\nars,1850,1.25,1.25\nche,1550,1.2,1.2\n")
+            result = ss.run(_Args(ratings_csv=csv_path, predictions_db=os.path.join(d, "p.db")))
+
+        analyses = result["analyses"]
+        self.assertEqual(result["counts"]["analyzed"], len(analyses))
+        self.assertEqual({a["market"] for a in analyses}, {"TOTAL", "BTTS"})
+        total = next(a for a in analyses if a["market"] == "TOTAL")
+        self.assertEqual((total["home"], total["away"]), ("arsenal", "chelsea"))
+        self.assertEqual(total["line"], 2.5)
+        for key in ("lam_home", "lam_away", "p_over", "p_under", "best_side", "edges", "suggested"):
+            self.assertIn(key, total)
+        self.assertEqual({e["side"] for e in total["edges"]}, {"OVER", "UNDER"})
+        btts = next(a for a in analyses if a["market"] == "BTTS")
+        self.assertIn("p_yes", btts)
+        self.assertEqual({e["side"] for e in btts["edges"]}, {"YES", "NO"})
+
     def test_event_slug_grouping_classifies_markets(self):
         # Real Gamma shape: every market of a game shares one event_slug (the
         # game-level slug, no -total-/-btts suffix); the suffix lives on each

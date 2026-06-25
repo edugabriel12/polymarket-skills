@@ -402,7 +402,8 @@ def _payload(sport: str, target: str, result: dict) -> dict:
         "sport": sport, "date": target, "computed_at": _now(), "cached": False,
         "counts": result.get("counts", {}),
         "suggestions": _enrich(sport, result.get("suggestions", []), target),
-        "forecasts": result.get("forecasts", []),   # calibrated prediction for EVERY game
+        "forecasts": result.get("forecasts", []),   # calibrated prediction for EVERY game (MLB legacy)
+        "analyses": result.get("analyses", []),      # soccer: model read for EVERY game found
         "skipped": result.get("skipped", []),
         "disclaimer": result.get("disclaimer", ""),
         "error": result.get("error"),
