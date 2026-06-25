@@ -237,6 +237,27 @@ def source_order() -> list[str]:
     return list(_DEFAULT_SOURCE_ORDER)
 
 
+def fetch_matches(tour: str = "atp", years: list[int] | None = None, debug: bool = False) -> list:
+    """Match rows via the SOURCE CHAIN (source_order); first non-empty source wins, [] if all dry.
+
+    The single fetch entry point shared by ratings (auto_ratings) and settlement
+    (tennis_results) — so a Sackmann 404/egress block transparently falls through to
+    tennis-data.co.uk for both, not just ratings.
+    """
+    import sys
+    from datetime import datetime, timezone
+    if years is None:
+        y = datetime.now(timezone.utc).year
+        years = [y - 2, y - 1, y]
+    for src in source_order():
+        rows = _fetch_from_source(src, tour, years, debug)
+        if rows:
+            print(f"[ratings_source] {tour}: source '{src}' supplied {len(rows)} matches",
+                  file=sys.stderr, flush=True)
+            return rows
+    return []
+
+
 def auto_ratings(tour: str = "atp", years: list[int] | None = None,
                  cache_hours: float = 24.0, debug: bool = False) -> dict:
     """Load auto Elo ratings for a tour, computing from a match feed (cached to disk).
@@ -259,13 +280,7 @@ def auto_ratings(tour: str = "atp", years: list[int] | None = None,
                 return json.load(fh)
         except Exception:  # noqa: BLE001
             pass
-    matches: list[dict] = []
-    for src in source_order():
-        matches = _fetch_from_source(src, tour, years, debug)
-        if matches:
-            print(f"[ratings_source] {tour}: source '{src}' supplied {len(matches)} matches "
-                  f"-> computing surface Elo", file=sys.stderr, flush=True)
-            break
+    matches = fetch_matches(tour, years, debug)
     if not matches:
         # Each source already printed its concrete cause (SSL/proxy/404/egress block/...).
         print(f"[ratings_source] 0 matches for {tour} {years} from sources {source_order()} "
