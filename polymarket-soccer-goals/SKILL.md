@@ -104,6 +104,15 @@ python polymarket-soccer-goals/scripts/test_pipeline.py
   existence-probed (the 2.5 line / BTTS) before fetching all lines, so moneyline-only games cost ~2
   calls; logs `[goals-backfill] <slug>: +N goals/BTTS market(s)`. This is why the `mar1=0/1`-style
   "no goals market" reading is now recovered when the markets actually exist on Polymarket.
+- **Sharp book chain (`--sharp-book` / `SOCCER_SHARP_BOOK`):** the divergence anchor comes from a
+  PRIORITY chain of **sharp** books (default `pinnacle,betfair_ex_eu`) — for each market the first
+  one carrying it wins. **Pinnacle** is the primary; **Betfair Exchange** (a true sharp/efficient
+  source — a betting *exchange*, near-zero effective margin, no public shading) fills sharp markets
+  Pinnacle doesn't quote, e.g. **lower-league BTTS** (Pinnacle offers BTTS for only a handful of top
+  leagues, so Série B BTTS had no anchor). The log shows the split: `totals by book: pinnacle=48 |
+  BTTS by book: pinnacle=4, betfair_ex_eu=12`. ⚠️ Only add **sharp** books to the chain — soft/
+  recreational books (Bet365, etc.) carry high margins and public bias and would manufacture false
+  edges; they are deliberately NOT in the default.
 
 ## Script: suggest_soccer.py
 | Flag | Default | Purpose |
