@@ -74,24 +74,36 @@ def settle_pending(db_path: str = tdb.DEFAULT_DB, tour: str = "atp",
         return {"checked": 0, "settled": [], "diagnostics": ["0 PENDENTE rows — nothing to settle"]}
     if years is None:
         years = [datetime.now(timezone.utc).year]
-    diags: list[str] = [f"{len(pending)} PENDENTE row(s); querying {tour} results for {years}"]
 
-    matches = ratings_source.fetch_matches(tour, years)
-    diags.append(f"feed returned {len(matches)} finished match(es) for {tour} {years}")
-    if not matches:
+    # Predictions span BOTH tours (atp-… and wta-… slugs), so settle each against ITS OWN
+    # tour's feed — querying only the default tour leaves the other tour's bets stuck forever.
+    def _tour_of(slug: str) -> str:
+        return "wta" if (slug or "").split("-", 1)[0].lower() == "wta" else "atp"
+    tours = sorted({_tour_of(r["match_slug"]) for r in pending})
+    diags: list[str] = [f"{len(pending)} PENDENTE row(s) across tour(s) {tours}; results for {years}"]
+
+    lookups: dict = {}
+    feed_sur: dict = {}
+    finals_found = 0
+    for t in tours:
+        m = ratings_source.fetch_matches(t, years)
+        finals_found += len(m)
+        diags.append(f"feed[{t}] returned {len(m)} finished match(es) for {years}")
+        lookups[t] = build_winner_lookup(m)
+        feed_sur[t] = {_surname(nm) for mm in m for nm in (mm["winner"], mm["loser"])}
+    if not finals_found:
         diags.append("⚠ EMPTY feed — every source dry (offline/egress-blocked, or no source has "
                      "these matches yet). Rows stay PENDENTE. Check the [ratings_source] lines above.")
         return {"checked": len(pending), "settled": [], "finals_found": 0,
                 "games_matched": 0, "diagnostics": diags}
-
-    lookup = build_winner_lookup(matches)
-    feed_sur = {_surname(nm) for m in matches for nm in (m["winner"], m["loser"])}
 
     settled, seen = [], set()
     for r in pending:
         slug = r["match_slug"]
         if slug in seen:
             continue
+        t = _tour_of(slug)
+        lookup, fsur = lookups.get(t, {}), feed_sur.get(t, set())
         side, opp = r.get("side", "") or "", r.get("opponent", "") or ""
         s_sur, o_sur = _surname(side), _surname(opp)
         winner = lookup_winner(lookup, side, opp)
@@ -107,7 +119,7 @@ def settle_pending(db_path: str = tdb.DEFAULT_DB, tour: str = "atp",
                 diags.append(f"⚠ {slug}: found winner {winner} but 0 rows updated "
                              f"(already settled, or slug not in DB)")
         else:
-            present = [(p, sur) for p, sur in ((side, s_sur), (opp, o_sur)) if sur in feed_sur]
+            present = [(p, sur) for p, sur in ((side, s_sur), (opp, o_sur)) if sur in fsur]
             if not present:
                 why = "neither player is in the feed (match not played yet, or feed lacks this event)"
             elif len(present) == 1:
@@ -120,10 +132,11 @@ def settle_pending(db_path: str = tdb.DEFAULT_DB, tour: str = "atp",
                          f"[looked up surnames {s_sur!r}/{o_sur!r}]")
 
     if not settled:                              # help compare expected vs available names
-        diags.append("feed surname sample (first 25): "
-                     + ", ".join(sorted(feed_sur)[:25]))
+        for t in tours:                          # per tour, so each feed's names are visible
+            sample = sorted(feed_sur.get(t, set()))[:25]
+            diags.append(f"feed[{t}] surname sample (first 25): " + ", ".join(sample))
     diags.append(f"DONE: {len(settled)} row(s) settled across {len(seen)} match(es)")
-    return {"checked": len(pending), "settled": settled, "finals_found": len(matches),
+    return {"checked": len(pending), "settled": settled, "finals_found": finals_found,
             "games_matched": len(seen), "diagnostics": diags}
 
 
