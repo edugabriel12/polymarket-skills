@@ -85,9 +85,45 @@ class TestTableAndInputs(unittest.TestCase):
         self.assertAlmostEqual(2.0 * avg, 3.0)              # avg total goals/game
 
 
+class TestSerieBWiring(unittest.TestCase):
+    """The Série B (bra2) strength path is fully wired — only APIFOOTBALL_KEY is needed."""
+
+    def test_bra2_league_id_and_season(self):
+        self.assertEqual(apif.api_league_id("bra2"), 72)
+        self.assertEqual(apif.season_for("bra2", "2026-06-25"), 2026)   # calendar-year league
+
+    def test_cuiaba_londrina_resolve_to_inputs(self):
+        rows = apif.parse_standings(_standings([
+            ("Cuiabá", 14, 10, 12), ("Londrina", 9, 13, 12),
+            ("Goiás", 18, 8, 12), ("Novorizontino", 11, 11, 12)]))
+        table, avg = apif.table_from_rows(rows, min_played=1)
+        self.assertEqual(apif.match_team("cui", table.keys()), "Cuiabá")
+        self.assertEqual(apif.match_team("lon", table.keys()), "Londrina")
+        out = apif.compute_inputs(table, avg, "cui", "lon")
+        self.assertTrue(out)                                # external=True would fire
+        self.assertGreater(out["supremacy_xg"], 0)          # Cuiabá (home, better) favored
+
+
 class TestNoNetwork(unittest.TestCase):
     def test_team_inputs_no_key(self):
         self.assertEqual(apif.team_inputs("nov", "nau", "bra2", "2026-06-14", key=""), {})
+
+    def test_missing_key_warns_once_per_league(self):
+        import io, os, contextlib
+        env = os.environ.pop("APIFOOTBALL_KEY", None)
+        apif._KEY_WARNED.discard("bra2")
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                apif.team_inputs("cui", "lon", "bra2", "2026-06-25", key="")
+                apif.team_inputs("cui", "lon", "bra2", "2026-06-25", key="")   # 2nd: no repeat
+            log = buf.getvalue()
+            self.assertIn("APIFOOTBALL_KEY not set", log)
+            self.assertIn("bra2", log)
+            self.assertEqual(log.count("APIFOOTBALL_KEY not set"), 1)           # deduped
+        finally:
+            if env is not None:
+                os.environ["APIFOOTBALL_KEY"] = env
 
     def test_team_inputs_unknown_league(self):
         self.assertEqual(apif.team_inputs("aa", "bb", "cs2", "2026-06-14", key="x"), {})

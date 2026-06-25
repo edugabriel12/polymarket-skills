@@ -63,6 +63,14 @@ python polymarket-soccer-goals/scripts/test_pipeline.py
   e.g. **Brasileirão Série B**), **(4)** Elo — **national-team Elo for international games (World Cup)**
   and **Club Elo for club leagues**. No manual input needed for covered teams. **BTTS is asymmetric**
   — governed by the smaller λ (weak attack vs strong defense).
+  - **Strength keys (operator setup):** the source a club league uses depends on coverage —
+    **Club Elo (`clubelo.com`) is Europe-only**, so **non-European club leagues (e.g. Brasileirão
+    Série B, Argentina, MLS) need `APIFOOTBALL_KEY`** (free tier at api-football.com) to get a
+    strength model. The path is fully wired (league ids + team-name resolution); setting the env var
+    is the only step — no code change. When a covered club league is hit **without** the key, the log
+    warns once: `[apifootball] APIFOOTBALL_KEY not set — no strength model for 'bra2' (league 72)…`,
+    so an `external=False` / zero-edge club game is self-diagnosable. Verify a club name with
+    `curl http://api.clubelo.com/<Name> | head` (Club Elo) or the API-Football `/standings` endpoint.
 - **Anti-fabrication:** if no source covers a match, the model is **market-implied** (matches the
   Over and BTTS prices), so edge ≈ 0 and nothing is suggested. Real edge appears only when a rating
   source moves λ off the market.

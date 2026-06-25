@@ -20,12 +20,17 @@ Elo / market-implied (never fabricates an edge). Pure math is split out for test
 from __future__ import annotations
 
 import os
+import sys
 import unicodedata
 from datetime import datetime, timezone
 
 import leagues  # noqa: F401  (kept for symmetry / future league lookups)
 
 APIFOOTBALL_API = "https://v3.football.api-sports.io"
+
+# One-time diagnostic dedupe: warn once per league prefix when the key is missing so the
+# operator can see WHY a club league (e.g. Série B) has no strength model, without spam.
+_KEY_WARNED: set = set()
 
 # Home tilt: equal teams -> ~+0.25 goal home edge at a 2.5 total (f - 1/f ≈ 0.21).
 HOME_TILT_DEFAULT = 1.105
@@ -252,7 +257,17 @@ def _fetch_standings_rows(league_id: int, season: int, key: str, timeout: int = 
 def _resolve_table(prefix: str | None, date: str | None, key: str | None, timeout: int):
     key = key or os.environ.get("APIFOOTBALL_KEY")
     league_id = api_league_id(prefix)
-    if not key or not league_id:
+    if not league_id:
+        return None, None
+    if not key:
+        # A covered club league was requested but no key is set — the single config step
+        # that gives these games a strength model. Warn once per league so external=False
+        # is self-diagnosable from the log instead of silent.
+        p = (prefix or "").strip().lower()
+        if p and p not in _KEY_WARNED:
+            _KEY_WARNED.add(p)
+            print(f"  [apifootball] APIFOOTBALL_KEY not set — no strength model for "
+                  f"'{p}' (league {league_id}); set the env var to enable it", file=sys.stderr)
         return None, None
     rows = _fetch_standings_rows(league_id, season_for(prefix, date), key, timeout)
     return table_from_rows(rows)
