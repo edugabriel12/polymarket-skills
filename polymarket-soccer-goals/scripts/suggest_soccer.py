@@ -426,12 +426,26 @@ def run(args) -> dict:
         rec = {"game": slug, "reason": reason}; rec.update(extra)
         skipped.append(rec); vlog(f"  [{slug}] SKIP — {reason}")
 
-    def _inputs_for(slug):
+    def _inputs_for(slug, gmarkets):
         home, away = leagues.parse_teams(slug, home_first=args.home_first)
+        # Full club names (from the market question) resolve strength by name across leagues.
+        # Align each name to its slug abbr by prefix so home/away can't be swapped (sign-safe).
+        names = _game_names(gmarkets) or ()
+        def _pick(abbr):
+            a = (abbr or "").lower()
+            if not a:
+                return None
+            for nm in names:
+                if (nm or "").lower().replace(" ", "").startswith(a):
+                    return nm
+            return None
+        home_name = _pick(home) or (names[0] if len(names) > 0 else None)
+        away_name = _pick(away) or (names[1] if len(names) > 1 else None)
         inp = data_inputs.get_match_inputs(api, home, away, leagues.league_prefix(slug),
                                            ratings=ratings, auto=args.auto_ratings,
                                            international=leagues.is_international(slug),
-                                           date=target, debug=args.debug)
+                                           date=target, debug=args.debug,
+                                           home_name=home_name, away_name=away_name)
         total, sup, used = derive_total_supremacy(inp, bsrc.baseline_for(slug, calibrated),
                                                   leagues.is_neutral(slug))
         return inp, total, sup, used
@@ -444,7 +458,7 @@ def run(args) -> dict:
                     if sm.GAME_TOTAL_RE.search((x.get("slug") or "").lower()) and sm.is_total_market(x)]
         if not tmarkets:
             _skip(slug, "no total-goals market"); continue
-        _inp, total, sup, used = _inputs_for(slug)  # game-level inputs: compute once
+        _inp, total, sup, used = _inputs_for(slug, gmarkets)  # game-level inputs: compute once
         names = _game_names(gmarkets)
         sharp_tot = (sosh.sharp_total_ref(sharp_lookup, target, names[0], names[1])
                      if (sharp_lookup and names) else None)
@@ -509,7 +523,7 @@ def run(args) -> dict:
         bt = sm.btts_tokens(m)
         if not bt or bt["yes_price"] is None or bt["no_price"] is None:
             _skip(slug, "could not map BTTS tokens"); continue
-        _inp, total, sup, used = _inputs_for(slug)
+        _inp, total, sup, used = _inputs_for(slug, gmarkets)
         names = _game_names(gmarkets)
         sharp_btts = (sosh.sharp_btts_ref(sharp_lookup, target, names[0], names[1])
                       if (sharp_lookup and names) else None)

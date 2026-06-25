@@ -43,6 +43,34 @@ class TestMatchTeam(unittest.TestCase):
         self.assertIsNone(apif.match_team("", self.names))
 
 
+class TestMatchByFullName(unittest.TestCase):
+    """The full club name (from discovery) resolves strength across leagues, beating the code."""
+
+    def test_full_name_exact_beats_ambiguous_code(self):
+        names = ["Nautico", "Novorizontino"]
+        # The 3-letter code "n" is ambiguous (both start with n) -> None on code alone.
+        self.assertIsNone(apif.match_team("n", names))
+        # ...but the full name resolves exactly.
+        self.assertEqual(apif.match_team("n", names, name="Nautico"), "Nautico")
+
+    def test_full_name_accent_and_suffix_tolerant(self):
+        names = ["Cuiabá", "Londrina"]
+        # Discovery passes the club-suffix-normalized name ("cuiaba" from "Cuiabá EC").
+        self.assertEqual(apif.match_team("xyz", names, name="cuiaba"), "Cuiabá")
+
+    def test_falls_back_to_code_when_no_name(self):
+        names = ["Cuiabá", "Londrina"]
+        self.assertEqual(apif.match_team("cui", names), "Cuiabá")          # code prefix still works
+
+    def test_compute_inputs_uses_names(self):
+        rows = apif.parse_standings(_standings([
+            ("Cuiabá", 14, 10, 12), ("Londrina", 9, 13, 12), ("Goiás", 18, 8, 12)]))
+        table, avg = apif.table_from_rows(rows, min_played=1)
+        out = apif.compute_inputs(table, avg, "xxx", "yyy",
+                                  home_name="cuiaba", away_name="londrina")
+        self.assertEqual(out.get("_resolved"), ["Cuiabá", "Londrina"])
+
+
 class TestTableAndInputs(unittest.TestCase):
     def test_table_and_league_avg(self):
         rows = apif.parse_standings(_standings([
@@ -102,6 +130,48 @@ class TestSerieBWiring(unittest.TestCase):
         out = apif.compute_inputs(table, avg, "cui", "lon")
         self.assertTrue(out)                                # external=True would fire
         self.assertGreater(out["supremacy_xg"], 0)          # Cuiabá (home, better) favored
+
+
+class TestStrengthLogs(unittest.TestCase):
+    """The strength path logs key status, which leagues return a table, and per-game resolution."""
+
+    def setUp(self):
+        self._orig = apif._fetch_standings_rows
+        apif._KEY_WARNED.clear()
+        apif._LEAGUE_LOGGED.clear()
+        apif._KEY_OK_LOGGED[0] = False
+        apif._STANDINGS_CACHE.clear()
+
+    def tearDown(self):
+        apif._fetch_standings_rows = self._orig
+
+    def _run(self, *args, **kwargs):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            apif.team_inputs(*args, **kwargs)
+        return buf.getvalue()
+
+    def test_key_set_league_and_game_resolution_logged(self):
+        apif._fetch_standings_rows = lambda lid, season, key, timeout=8: apif.parse_standings(
+            _standings([("Cuiabá", 14, 10, 12), ("Londrina", 9, 13, 12), ("Goiás", 18, 8, 12)]))
+        log = self._run("cui", "lon", "bra2", "2026-06-25", key="K",
+                        home_name="cuiaba", away_name="londrina")
+        self.assertIn("APIFOOTBALL_KEY is set", log)
+        self.assertIn("bra2 (league 72, season 2026): 3 standings row(s)", log)
+        self.assertIn("Cuiabá vs Londrina", log)
+
+    def test_unresolved_game_logged(self):
+        apif._fetch_standings_rows = lambda lid, season, key, timeout=8: apif.parse_standings(
+            _standings([("Cuiabá", 14, 10, 12), ("Londrina", 9, 13, 12)]))
+        log = self._run("xxx", "yyy", "bra2", "2026-06-25", key="K",
+                        home_name="nobody", away_name="noone")
+        self.assertIn("UNRESOLVED", log)
+
+    def test_no_key_warns(self):
+        log = self._run("cui", "lon", "epl", "2026-06-25", key="")
+        self.assertIn("APIFOOTBALL_KEY not set", log)
+        self.assertIn("league 39", log)
 
 
 class TestNoNetwork(unittest.TestCase):

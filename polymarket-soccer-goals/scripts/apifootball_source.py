@@ -28,9 +28,15 @@ import leagues  # noqa: F401  (kept for symmetry / future league lookups)
 
 APIFOOTBALL_API = "https://v3.football.api-sports.io"
 
-# One-time diagnostic dedupe: warn once per league prefix when the key is missing so the
-# operator can see WHY a club league (e.g. Série B) has no strength model, without spam.
+# Diagnostic dedupe so the strength path is auditable without spam: warn once per league when
+# the key is missing, log the key-present state once, and log each league's standings result once.
 _KEY_WARNED: set = set()
+_KEY_OK_LOGGED: list = [False]
+_LEAGUE_LOGGED: set = set()
+
+
+def _log(msg: str) -> None:
+    print(f"  [apifootball] {msg}", file=sys.stderr, flush=True)
 
 # Home tilt: equal teams -> ~+0.25 goal home edge at a 2.5 total (f - 1/f ≈ 0.21).
 HOME_TILT_DEFAULT = 1.105
@@ -154,16 +160,29 @@ def _acronym(name: str) -> str:
     return _norm("".join(w[0] for w in (name or "").split() if w))
 
 
-def match_team(code: str | None, names) -> str | None:
-    """Resolve a Polymarket 3-letter code to a team name, or None if ambiguous.
+def match_team(code: str | None, names, name: str | None = None) -> str | None:
+    """Resolve a team to a standings name, or None if ambiguous.
 
-    Tries, in order: unique normalized-name prefix, unique acronym, unique
-    substring. Anything ambiguous returns None (caller falls back — no wrong data).
+    The full club `name` (from the market/sharp slate, already club-suffix-normalized) is the
+    most reliable signal and is tried FIRST — exact, then prefix-either-way, then substring,
+    each accepted only when unique. Falling back to the 3-letter `code` (unique prefix /
+    acronym / substring). Anything ambiguous returns None (caller falls back — no wrong data).
     """
+    names = list(names)
+    q = _norm(name)
+    if q:
+        exact = [n for n in names if _norm(n) == q]
+        if len(exact) == 1:
+            return exact[0]
+        pref = [n for n in names if _norm(n).startswith(q) or q.startswith(_norm(n))]
+        if len(pref) == 1:
+            return pref[0]
+        cont = [n for n in names if q in _norm(n) or _norm(n) in q]
+        if len(cont) == 1:
+            return cont[0]
     c = _norm(code)
     if not c:
         return None
-    names = list(names)
     pref = [n for n in names if _norm(n).startswith(c)]
     if len(pref) == 1:
         return pref[0]
@@ -217,9 +236,11 @@ def table_from_rows(rows: list[dict], min_played: int = MIN_PLAYED_DEFAULT):
 
 
 def compute_inputs(table: dict, league_avg: float, home: str | None, away: str | None,
-                   home_tilt: float = HOME_TILT_DEFAULT) -> dict:
+                   home_tilt: float = HOME_TILT_DEFAULT,
+                   home_name: str | None = None, away_name: str | None = None) -> dict:
     """Expected total + home supremacy from the league table, or {} if teams unresolved."""
-    hm, am = match_team(home, table.keys()), match_team(away, table.keys())
+    hm = match_team(home, table.keys(), home_name)
+    am = match_team(away, table.keys(), away_name)
     if not hm or not am or not league_avg:
         return {}
     h, a = table[hm], table[am]
@@ -266,21 +287,40 @@ def _resolve_table(prefix: str | None, date: str | None, key: str | None, timeou
         p = (prefix or "").strip().lower()
         if p and p not in _KEY_WARNED:
             _KEY_WARNED.add(p)
-            print(f"  [apifootball] APIFOOTBALL_KEY not set — no strength model for "
-                  f"'{p}' (league {league_id}); set the env var to enable it", file=sys.stderr)
+            _log(f"APIFOOTBALL_KEY not set — no strength model for '{p}' (league {league_id}); "
+                 f"set the env var to enable it")
         return None, None
-    rows = _fetch_standings_rows(league_id, season_for(prefix, date), key, timeout)
+    if not _KEY_OK_LOGGED[0]:                 # confirm once that the key is configured
+        _KEY_OK_LOGGED[0] = True
+        _log("APIFOOTBALL_KEY is set — strength model enabled")
+    season = season_for(prefix, date)
+    rows = _fetch_standings_rows(league_id, season, key, timeout)
+    lk = (league_id, season)
+    if lk not in _LEAGUE_LOGGED:              # which leagues return a table (and how big), once each
+        _LEAGUE_LOGGED.add(lk)
+        _log(f"{prefix} (league {league_id}, season {season}): {len(rows)} standings row(s)"
+             + ("" if rows else " — no data (off-season, or league/season not covered)"))
     return table_from_rows(rows)
 
 
 def team_inputs(home: str | None, away: str | None, prefix: str | None, date: str | None,
                 key: str | None = None, home_tilt: float = HOME_TILT_DEFAULT,
-                timeout: int = 8) -> dict:
+                timeout: int = 8, home_name: str | None = None,
+                away_name: str | None = None) -> dict:
     """Model inputs (total_xg, supremacy_xg) for a match from API-Football, or {}."""
     table, league_avg = _resolve_table(prefix, date, key, timeout)
     if not table:
         return {}
-    return compute_inputs(table, league_avg, home, away, home_tilt)
+    out = compute_inputs(table, league_avg, home, away, home_tilt, home_name, away_name)
+    # Which games resolve strength (and to which standings names) vs which don't.
+    if out.get("_resolved"):
+        h, a = out["_resolved"]
+        _log(f"{prefix}: {h} vs {a} -> total_xg={out['total_xg']:.2f} "
+             f"sup={out['supremacy_xg']:+.2f}")
+    else:
+        _log(f"{prefix}: UNRESOLVED {home_name or home!r} / {away_name or away!r} "
+             f"in the {len(table)}-team table -> no strength model")
+    return out
 
 
 def league_baseline(prefix: str | None, date: str | None, key: str | None = None,

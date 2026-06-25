@@ -82,8 +82,12 @@ def load_ratings(csv_path: str) -> dict[str, dict]:
 def get_match_inputs(api, home_abbr: str | None, away_abbr: str | None,
                      league_prefix: str | None, *, ratings: dict | None = None,
                      international: bool = False, auto: bool = True,
-                     date: str | None = None, debug: bool = False) -> dict:
+                     date: str | None = None, debug: bool = False,
+                     home_name: str | None = None, away_name: str | None = None) -> dict:
     """Return model inputs for a match, or {} to trigger the zero-edge fallback.
+
+    `home_name`/`away_name` are the FULL club names (from discovery), used to resolve strength
+    by name across leagues — far more reliable than the 3-letter slug code alone.
 
     Keys: home_elo, away_elo, att_home, def_home, att_away, def_away,
     total_xg, supremacy_xg.
@@ -116,9 +120,10 @@ def get_match_inputs(api, home_abbr: str | None, away_abbr: str | None,
             return xg
 
     # 2.5 API-Football season attack/defense (club leagues; covers e.g. Série B,
-    # which Club Elo lacks). Returns total_xg + supremacy_xg directly.
+    # which Club Elo lacks). Matched by full name when available. total_xg + supremacy_xg.
     if not international and home_abbr and away_abbr:
-        af = apif.team_inputs(home_abbr, away_abbr, league_prefix, date)
+        af = apif.team_inputs(home_abbr, away_abbr, league_prefix, date,
+                              home_name=home_name, away_name=away_name)
         if af:
             if not debug:
                 af.pop("_resolved", None)
@@ -128,7 +133,8 @@ def get_match_inputs(api, home_abbr: str | None, away_abbr: str | None,
     if international:
         eh, ea = rs.national_elo(home_abbr), rs.national_elo(away_abbr)
     else:
-        eh, ea = rs.fetch_club_elo(home_abbr), rs.fetch_club_elo(away_abbr)
+        eh = rs.fetch_club_elo(home_abbr, name=home_name)
+        ea = rs.fetch_club_elo(away_abbr, name=away_name)
     if eh is not None:
         inputs["home_elo"] = eh
     if ea is not None:

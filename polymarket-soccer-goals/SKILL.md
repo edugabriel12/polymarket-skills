@@ -63,6 +63,11 @@ python polymarket-soccer-goals/scripts/test_pipeline.py
   e.g. **Brasileirão Série B**), **(4)** Elo — **national-team Elo for international games (World Cup)**
   and **Club Elo for club leagues**. No manual input needed for covered teams. **BTTS is asymmetric**
   — governed by the smaller λ (weak attack vs strong defense).
+  - **Resolved by full club NAME, not just the 3-letter slug code.** The match's full team names
+    (from discovery, club-suffix-normalized) are threaded into the strength lookup, so API-Football
+    matches the standings name directly (covers all its ~40 mapped leagues far more reliably than a
+    code prefix), and Club Elo tries a name-derived endpoint when the curated alias map misses (so
+    more European clubs resolve without hand-adding each code). Wrong guesses fall back harmlessly.
   - **Strength keys (operator setup):** the source a club league uses depends on coverage —
     **Club Elo (`clubelo.com`) is Europe-only**, so **non-European club leagues (e.g. Brasileirão
     Série B, Argentina, MLS) need `APIFOOTBALL_KEY`** (free tier at api-football.com) to get a
