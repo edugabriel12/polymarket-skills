@@ -396,6 +396,77 @@ def _enrich(sport: str, suggestions: list[dict], date: str) -> list[dict]:
     return suggestions
 
 
+def _pending_suggestions(sport: str, target: str) -> list[dict]:
+    """Open PENDENTE predictions for the day, normalized to the Suggestion shape.
+
+    These are positions already recorded that a later recompute may no longer surface (the
+    game started, the edge faded, or it wasn't rediscovered). They must ALWAYS show in the
+    panel, so the operator never loses sight of an open position. Best-effort: returns [] on
+    any DB error rather than breaking the analyses response.
+    """
+    try:
+        if sport == "soccer":
+            rows = spdb.get_predictions(SOCCER_DB, status="PENDENTE", game_date=target)
+            slug_key, default_market = "game_slug", "TOTAL"
+        elif sport == "tennis":
+            rows = tdb.get_predictions(TENNIS_DB, status="PENDENTE", match_date=target)
+            slug_key, default_market = "match_slug", "MATCH"
+        else:
+            rows = pdb.get_predictions(MLB_DB, status="PENDENTE", game_date=target)
+            slug_key, default_market = "game_slug", "TOTAL"
+    except Exception as e:  # noqa: BLE001
+        print(f"[analyses] pending fetch failed ({sport}): {e}", file=sys.stderr, flush=True)
+        return []
+    out: list[dict] = []
+    for r in rows:
+        try:
+            stats = json.loads(r.get("stats_log") or "{}")
+        except Exception:  # noqa: BLE001
+            stats = {}
+        out.append({
+            "game": r.get(slug_key), "market": r.get("market") or default_market,
+            "side": r.get("side"), "line": r.get("line"), "edge": r.get("edge"),
+            "prediction_id": r.get("id"), "status": r.get("status") or "PENDENTE",
+            "market_url": r.get("market_url"), "question": r.get("market_question"),
+            "stats": stats,
+            "recommendation": {
+                "token_id": r.get("token_id") or "", "side": r.get("side") or "",
+                "size_pct": r.get("size_pct") or 0.0, "price": r.get("entry_price") or 0.0,
+                "confidence": r.get("confidence") or 0.0,
+                "reasoning": "Posição em aberto (PENDENTE), recuperada do registro.",
+                "strategy": r.get("strategy") or "", "fee_rate": r.get("fee_rate") or 0.0,
+            },
+        })
+    return out
+
+
+def _suggestion_key(s: dict):
+    return (s.get("game"), (s.get("market") or "").upper(),
+            (s.get("side") or "").upper(), s.get("line"))
+
+
+def _with_pending(payload: dict, sport: str, target: str) -> dict:
+    """A COPY of the payload with open PENDENTE positions merged into `suggestions`.
+
+    Deduped against what the recompute already surfaced (by game/market/side/line), so a
+    still-predicted position isn't doubled — only positions the recompute dropped are added
+    back. Applied at SERVE time (not cached) so the pending view is always current.
+    """
+    suggestions = list(payload.get("suggestions", []))
+    seen = {_suggestion_key(s) for s in suggestions}
+    added = 0
+    for p in _pending_suggestions(sport, target):
+        k = _suggestion_key(p)
+        if k not in seen:
+            seen.add(k)
+            suggestions.append(p)
+            added += 1
+    merged = dict(payload)
+    merged["suggestions"] = suggestions
+    merged["counts"] = {**(payload.get("counts") or {}), "pending_shown": added}
+    return merged
+
+
 def _payload(sport: str, target: str, result: dict) -> dict:
     """Build the /api/analyses response (and the cached payload) from a model result."""
     return {
@@ -471,13 +542,16 @@ def analyses(sport: str = Query("mlb"), date: str | None = Query(None),
     if not force:
         cached = _cache_get(sport, target)
         if cached is not None:
-            cached["cached"] = True
-            return cached
+            # Re-merge open PENDENTE at serve time so the pending view is always current
+            # (a position may have settled since the model payload was cached).
+            merged = _with_pending(cached, sport, target)
+            merged["cached"] = True
+            return merged
 
     result = ({"soccer": _run_soccer, "tennis": _run_tennis}.get(sport, _run_mlb))(target)
     payload = _payload(sport, target, result)
-    _cache_put(sport, target, payload)
-    return payload
+    _cache_put(sport, target, payload)        # cache the model-only payload (pending merged on serve)
+    return _with_pending(payload, sport, target)
 
 
 @app.get("/api/results")
