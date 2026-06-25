@@ -97,7 +97,7 @@ SOCCER_SHARP_BTTS = os.environ.get("SOCCER_SHARP_BTTS", "1") not in ("0", "false
 SOCCER_SHARP_RESERVE = int(os.environ.get("SOCCER_SHARP_RESERVE", "0") or 0)   # 0 = no reserve
 # Sharp bookmaker priority chain (both sharp): Pinnacle, then Betfair Exchange for markets
 # Pinnacle doesn't cover (e.g. lower-league BTTS). Bet365 etc. are NOT sharp — don't add them.
-SOCCER_SHARP_BOOK = os.environ.get("SOCCER_SHARP_BOOK", "pinnacle,betfair_ex_eu")
+SOCCER_SHARP_BOOK = os.environ.get("SOCCER_SHARP_BOOK", "pinnacle,betfair_ex_eu,matchbook")
 TENNIS_DB = os.environ.get("TENNIS_PREDICTIONS_DB", tdb.DEFAULT_DB)
 TENNIS_RATINGS_CSV = os.environ.get("TENNIS_RATINGS_CSV")
 TENNIS_TOUR = os.environ.get("TENNIS_TOUR", "atp")

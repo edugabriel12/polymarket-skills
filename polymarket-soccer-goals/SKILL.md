@@ -105,14 +105,16 @@ python polymarket-soccer-goals/scripts/test_pipeline.py
   calls; logs `[goals-backfill] <slug>: +N goals/BTTS market(s)`. This is why the `mar1=0/1`-style
   "no goals market" reading is now recovered when the markets actually exist on Polymarket.
 - **Sharp book chain (`--sharp-book` / `SOCCER_SHARP_BOOK`):** the divergence anchor comes from a
-  PRIORITY chain of **sharp** books (default `pinnacle,betfair_ex_eu`) — for each market the first
-  one carrying it wins. **Pinnacle** is the primary; **Betfair Exchange** (a true sharp/efficient
-  source — a betting *exchange*, near-zero effective margin, no public shading) fills sharp markets
-  Pinnacle doesn't quote, e.g. **lower-league BTTS** (Pinnacle offers BTTS for only a handful of top
-  leagues, so Série B BTTS had no anchor). The log shows the split: `totals by book: pinnacle=48 |
-  BTTS by book: pinnacle=4, betfair_ex_eu=12`. ⚠️ Only add **sharp** books to the chain — soft/
-  recreational books (Bet365, etc.) carry high margins and public bias and would manufacture false
-  edges; they are deliberately NOT in the default.
+  PRIORITY chain of **sharp** books (default `pinnacle,betfair_ex_eu,matchbook`) — for each market the
+  first one carrying it wins. **Pinnacle** is primary; **Betfair Exchange** and **Matchbook** (true
+  sharp *exchanges* — near-zero margin, no public shading) fill markets Pinnacle's Odds-API feed
+  doesn't expose — notably **lower-league BTTS**. (Pinnacle quotes Série B BTTS on its own site, but
+  The Odds API doesn't ingest it; Matchbook's exchange BTTS — ~2.7% margin — is carried and devigs to
+  the fair price.) The log shows the split: `totals by book: pinnacle=52 | BTTS by book: pinnacle=4,
+  matchbook=8`. ⚠️ Only add **sharp** books — soft/recreational books (Bet365, William Hill, 1xBet…)
+  carry 7–9% margins + public bias and would manufacture false edges; they're deliberately excluded.
+  (This matters: a Série B BTTS the model scored at +14.9% devigged to ~0 against Matchbook — the
+  model edge was spurious, and the sharp anchor correctly vetoes it.)
 
 ## Script: suggest_soccer.py
 | Flag | Default | Purpose |
