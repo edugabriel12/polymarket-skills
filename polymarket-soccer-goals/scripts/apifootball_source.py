@@ -20,6 +20,7 @@ Elo / market-implied (never fabricates an edge). Pure math is split out for test
 from __future__ import annotations
 
 import os
+import re
 import sys
 import unicodedata
 from datetime import datetime, timezone
@@ -160,6 +161,18 @@ def _acronym(name: str) -> str:
     return _norm("".join(w[0] for w in (name or "").split() if w))
 
 
+def _sig_tokens(name: str | None) -> set:
+    """Distinctive word tokens (≥4 chars, accent-stripped) of a club name.
+
+    Used to bridge abbreviation vs full-name forms that share the club's core word —
+    'IR Tanger' vs 'Ittihad Tanger' both yield {'tanger'}; 'RS Berkane' vs 'Renaissance
+    Berkane' both yield {'berkane'} (+others). Short connective tokens (rs, as, ir, fc) drop out.
+    """
+    s = unicodedata.normalize("NFKD", name or "")
+    s = "".join(c for c in s if not unicodedata.combining(c)).lower()
+    return {t for t in re.split(r"[^a-z0-9]+", s) if len(t) >= 4}
+
+
 def match_team(code: str | None, names, name: str | None = None) -> str | None:
     """Resolve a team to a standings name, or None if ambiguous.
 
@@ -194,6 +207,13 @@ def match_team(code: str | None, names, name: str | None = None) -> str | None:
     cont = [n for n in names if c in _norm(n)]
     if len(cont) == 1:
         return cont[0]
+    # Last resort: a shared distinctive word between the full name and a standings name
+    # (bridges 'IR Tanger' <-> 'Ittihad Tanger', 'RS Berkane' <-> 'Renaissance Berkane').
+    qsig = _sig_tokens(name)
+    if qsig:
+        shared = [n for n in names if qsig & _sig_tokens(n)]
+        if len(shared) == 1:
+            return shared[0]
     return None
 
 
