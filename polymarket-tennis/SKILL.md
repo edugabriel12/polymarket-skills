@@ -49,13 +49,19 @@ python polymarket-tennis/scripts/test_pipeline.py
   highest-value enhancement over plain Elo (Tennis Abstract). Ratings update with the
   **FiveThirtyEight dynamic K-factor** `K = 250/(n+5)^0.4`. See `references/deep-research.md`.
 - **Ratings (automatic, default):** with `--auto-ratings` (on by default) the surface Elo is computed
-  from Jeff Sackmann's match history (`tennis_atp`/`tennis_wta`), walked forward with the 538
-  K-factor and cached for 24h. The CSVs are fetched from **multiple mirror hosts** —
-  `raw.githubusercontent.com`, then **`cdn.jsdelivr.net`**, then **`cdn.statically.io`** — so if a
-  network blocks GitHub's raw host (a synthetic 404), the CDNs still serve the same files (no setup).
-  Offline/all-blocked, it logs the concrete cause and falls back to market-implied (zero edge).
-  - **If even the CDNs are blocked:** clone via git (`github.com` usually works) and set
-    **`TENNIS_DATA_DIR`** to the parent of the clones — `git clone --depth 1
+  from a match feed, walked forward with the 538 K-factor and cached for 24h. The feed comes from a
+  **source chain** (`--ratings-source`, or `$TENNIS_RATINGS_SOURCE`; default `sackmann,tennisdata`),
+  tried in order until one yields matches — so a block on one host transparently falls through:
+  - **`sackmann`** — Jeff Sackmann's `tennis_atp`/`tennis_wta` CSVs, fetched from **mirror hosts**
+    (`raw.githubusercontent.com`, then **`cdn.jsdelivr.net`**, then **`cdn.statically.io`**). All are
+    GitHub-hosted, so a network that blocks GitHub egress blocks every mirror.
+  - **`tennisdata`** — **tennis-data.co.uk** season workbooks (`.xlsx`, read with pure stdlib — no
+    openpyxl), a **wholly separate host** reachable where GitHub egress is blocked. ATP under
+    `/{year}/`, WTA under `/{year}w/`. Names arrive as `Surname I.`; surname aliasing keeps them
+    resolvable. ⚠️ The host must be on your **network egress allowlist** (add `www.tennis-data.co.uk`).
+  - Offline/all-blocked, it logs the concrete cause per source and falls back to market-implied (0 edge).
+  - **To skip straight to it:** `--ratings-source tennisdata` (or `TENNIS_RATINGS_SOURCE=tennisdata`).
+  - **Or clone via git** and set **`TENNIS_DATA_DIR`** to the parent of the clones — `git clone --depth 1
     https://github.com/JeffSackmann/tennis_atp.git` (and `tennis_wta`); the loader reads
     `{TENNIS_DATA_DIR}/tennis_atp|tennis_wta/{prefix}_matches_<year>.csv`.
   - **Or supply ratings directly:** `--ratings-csv player,elo,hard,clay,grass` overrides everything.

@@ -198,6 +198,16 @@ match CSVs, and for Elo directly:
 
 The skill tries raw → jsDelivr → statically automatically; `TENNIS_DATA_DIR` reads a local clone.
 
+**Different data source, non-GitHub host (implemented):**
+- **tennis-data.co.uk** — per-season workbooks (`.xlsx`) for ATP (`/{year}/{year}.zip`) and WTA
+  (`/{year}w/{year}.zip`), each row carrying a `Surface` column + Winner/Loser. A **wholly separate
+  host** (no GitHub dependency), so it works when *every* Sackmann mirror is egress-blocked. Wired as
+  the `tennisdata` source in `tennis_data_source.py` (pure-stdlib `.xlsx` reader — no openpyxl/pandas)
+  and chained after `sackmann` by default (`$TENNIS_RATINGS_SOURCE`). Caveats: ATP+WTA but **no
+  precomputed Elo** (we compute it), names are `Surname I.` (surname-aliased to stay resolvable),
+  `.xls` years (≤2012) are unsupported (recent-form window is `.xlsx`), and `www.tennis-data.co.uk`
+  must be on the network egress allowlist. Free for personal use; treat as non-commercial.
+
 **Elo directly (skip computing from matches):**
 - **wheeloratings.com** — `tennis_atp_ratings.html` / `tennis_wta_ratings.html`, overall + Hard/Clay/
   Grass Elo, CSV export on the stats pages.

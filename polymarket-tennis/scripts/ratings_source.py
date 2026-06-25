@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Automatic surface-aware Elo ratings, computed from Jeff Sackmann's match data.
+"""Automatic surface-aware Elo ratings, computed from public match data.
 
 The deterministic core — `build_elo_from_matches` — walks the match history forward
 in time and maintains an overall Elo plus per-surface Elo for every player, using the
 engine in elo.py (FiveThirtyEight dynamic K-factor). It is pure and offline-testable.
 
-The network layer fetches Sackmann's CSVs from GitHub (`tennis_atp`/`tennis_wta`,
-CC BY-NC-SA — non-commercial; see references/deep-research.md) with a lazy `requests`
-import; offline/blocked it returns empty and the pipeline falls back to market-implied.
+The match feed comes from a SOURCE CHAIN (`auto_ratings` -> `source_order()`), tried in
+order until one yields matches: 'sackmann' (Jeff Sackmann's CSVs on the GitHub mirrors,
+here) and 'tennisdata' (tennis-data.co.uk .xlsx in `tennis_data_source.py`, a wholly
+separate host reachable where GitHub egress is blocked). Each fetcher imports `requests`
+lazily; when every source is empty the pipeline falls back to market-implied.
 
-Result shape: {normalized_name: {"elo", "hard", "clay", "grass"}} — directly consumable
-by ratings.resolve / elo.blended_elo.
+Result shape: {normalized_name: {"elo", "hard", "clay", "grass"}}, plus unambiguous surname
+aliases (`index_by_surname`) — directly consumable by ratings.resolve / elo.blended_elo. Both
+feeds are non-commercial (CC BY-NC-SA / personal-use). See references/deep-research.md.
 """
 
 from __future__ import annotations
@@ -82,6 +85,44 @@ def build_elo_from_matches(matches: list[dict]) -> dict:
         for s in _elo.SURFACES:
             rating[s] = round(elo_surf[s][name], 1) if name in elo_surf[s] else None
         out[name] = rating
+    return out
+
+
+def _surname_key(normalized_name: str) -> str:
+    """The token the resolver matches on: the last surname token, dropping a trailing initial.
+
+    'rafael nadal' -> 'nadal'; 'alcaraz c' (tennis-data 'Surname I.') -> 'alcaraz';
+    'bautista agut r' -> 'agut'. Mirrors `ratings.resolve`, which keys full-name labels by
+    their last token, so both name styles land on the same surname key.
+    """
+    toks = [t for t in normalized_name.split(" ") if t]
+    if not toks:
+        return ""
+    if len(toks) >= 2 and len(toks[-1]) == 1:        # trailing single char = initial -> drop
+        toks = toks[:-1]
+    return toks[-1]
+
+
+def index_by_surname(ratings: dict) -> dict:
+    """Add unambiguous surname keys so surname slugs / full-name labels resolve.
+
+    `build_elo_from_matches` keys players by their FULL display name (e.g. 'rafael nadal' or
+    tennis-data's 'alcaraz c'), which a bare surname or 'Surname I.' query won't hit directly.
+    This adds a surname alias for every player whose surname maps to exactly ONE player — a
+    shared surname is left ambiguous (resolves to None -> market-implied), never guessed.
+    """
+    counts: dict[str, int] = {}
+    last_map: dict[str, dict] = {}
+    for name, rating in ratings.items():
+        sk = _surname_key(name)
+        if not sk:
+            continue
+        counts[sk] = counts.get(sk, 0) + 1
+        last_map[sk] = rating
+    out = dict(ratings)
+    for sk, n in counts.items():
+        if n == 1 and sk not in out:                 # unambiguous surname only
+            out[sk] = last_map[sk]
     return out
 
 
@@ -168,12 +209,44 @@ def fetch_sackmann_matches(tour: str, years: list[int], timeout: int = 10,
     return rows
 
 
+# Match-feed sources, tried in order until one returns matches. 'sackmann' = the GitHub-hosted
+# CSV mirrors; 'tennisdata' = tennis-data.co.uk .xlsx (a wholly separate host, reachable where
+# GitHub egress is blocked). Override the order with $TENNIS_RATINGS_SOURCE (comma-separated).
+_DEFAULT_SOURCE_ORDER = ("sackmann", "tennisdata")
+
+
+def _fetch_from_source(source: str, tour: str, years: list[int], debug: bool) -> list[dict]:
+    """Dispatch one named source to its fetcher. Unknown source -> []."""
+    if source == "sackmann":
+        return fetch_sackmann_matches(tour, years, debug=debug)
+    if source == "tennisdata":
+        import tennis_data_source as tds
+        return tds.fetch_tennisdata_matches(tour, years, debug=debug)
+    import sys
+    print(f"[ratings_source] unknown ratings source {source!r} (skipped)", file=sys.stderr)
+    return []
+
+
+def source_order() -> list[str]:
+    """Resolve the source chain from $TENNIS_RATINGS_SOURCE (else the default order)."""
+    env = (os.environ.get("TENNIS_RATINGS_SOURCE") or "").strip()
+    if env:
+        order = [s.strip().lower() for s in env.split(",") if s.strip()]
+        if order:
+            return order
+    return list(_DEFAULT_SOURCE_ORDER)
+
+
 def auto_ratings(tour: str = "atp", years: list[int] | None = None,
                  cache_hours: float = 24.0, debug: bool = False) -> dict:
-    """Load auto Elo ratings for a tour, computing from Sackmann data (cached to disk).
+    """Load auto Elo ratings for a tour, computing from a match feed (cached to disk).
 
-    Returns {} when offline/blocked (pipeline then falls back to market-implied).
+    Tries each source in `source_order()` (default Sackmann, then tennis-data.co.uk) until one
+    yields matches — so a network/egress block on one host transparently falls through to the
+    next. Surname aliases are added (`index_by_surname`) so surname slugs resolve. Returns {}
+    when every source is empty (pipeline then falls back to market-implied).
     """
+    import sys
     from datetime import datetime, timezone
     if years is None:
         y = datetime.now(timezone.utc).year
@@ -186,15 +259,21 @@ def auto_ratings(tour: str = "atp", years: list[int] | None = None,
                 return json.load(fh)
         except Exception:  # noqa: BLE001
             pass
-    matches = fetch_sackmann_matches(tour, years, debug=debug)
+    matches: list[dict] = []
+    for src in source_order():
+        matches = _fetch_from_source(src, tour, years, debug)
+        if matches:
+            if debug:
+                print(f"[ratings_source] source '{src}': {len(matches)} matches for {tour} {years}",
+                      file=sys.stderr)
+            break
     if not matches:
-        import sys
-        # fetch_sackmann_matches already printed the concrete cause (SSL/proxy/404/...).
-        print(f"[ratings_source] 0 matches for {tour} {years} -> market-implied (zero edge). "
-              f"Fix the cause above, or set TENNIS_DATA_DIR / pass --ratings-csv.",
-              file=sys.stderr)
+        # Each source already printed its concrete cause (SSL/proxy/404/egress block/...).
+        print(f"[ratings_source] 0 matches for {tour} {years} from sources {source_order()} "
+              f"-> market-implied (zero edge). Fix a cause above, set TENNIS_DATA_DIR, "
+              f"or pass --ratings-csv.", file=sys.stderr)
         return {}
-    ratings = build_elo_from_matches(matches)
+    ratings = index_by_surname(build_elo_from_matches(matches))
     try:
         with open(cache, "w", encoding="utf-8") as fh:
             json.dump(ratings, fh)
