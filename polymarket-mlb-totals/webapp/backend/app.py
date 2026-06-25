@@ -441,7 +441,17 @@ def _pending_suggestions(sport: str, target: str) -> list[dict]:
 
 
 def _suggestion_key(s: dict):
-    return (s.get("game"), (s.get("market") or "").upper(),
+    """Dedupe identity. prediction_id is the reliable one (a recorded suggestion and its
+    PENDENTE DB row share it); fall back to game/market/side/line only when it's absent.
+
+    The field tuple alone is NOT enough: MLB suggestions carry no top-level market/side
+    (they live in `recommendation`), so they'd never match the DB row's TOTAL/OVER and the
+    same position would show twice. prediction_id collapses them.
+    """
+    pid = s.get("prediction_id")
+    if pid is not None:
+        return ("id", pid)
+    return ("f", s.get("game"), (s.get("market") or "").upper(),
             (s.get("side") or "").upper(), s.get("line"))
 
 

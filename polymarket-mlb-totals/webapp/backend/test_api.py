@@ -92,6 +92,30 @@ class TestApi(unittest.TestCase):
         self.assertEqual(pend[0]["recommendation"]["price"], 0.55)   # PredictionCard needs this
         self.assertGreaterEqual(body["counts"]["pending_shown"], 1)
 
+    def test_pending_not_duplicated_when_recompute_surfaces_it(self):
+        # Regression: a suggestion the recompute DID surface must not be doubled by the
+        # pending merge. Dedupe is by prediction_id (MLB suggestions carry no top-level
+        # market/side, so the field tuple alone would mismatch the DB row -> 2 cards).
+        date = "2026-07-02"
+        pid = backend.spdb.record_prediction({
+            "game_slug": "epl-ars-che-2026-07-02-total-2pt5", "game_date": date, "league": "epl",
+            "market": "TOTAL", "line": 2.5, "side": "OVER", "entry_price": 0.5,
+            "decimal_odds": 2.0, "model_prob": 0.6, "edge": 0.1, "size_pct": 0.02,
+            "size_usd": 200.0, "confidence": 0.6, "kelly_fraction": 0.04, "used_external": 0,
+            "fee_rate": 0.0, "strategy": "x", "market_url": "u", "stats_log": "{}"},
+            backend.SOCCER_DB)
+        # The recompute surfaces the SAME prediction (by prediction_id), MLB-style shape
+        # (no top-level market/side — they're in `recommendation`).
+        model_sug = {"game": "epl-ars-che-2026-07-02-total-2pt5", "line": 2.5,
+                     "edge": 0.1, "prediction_id": pid,
+                     "recommendation": {"side": "OVER", "price": 0.5, "size_pct": 0.02}}
+        merged = backend._with_pending(
+            {"suggestions": [model_sug], "counts": {}}, "soccer", date)
+        same = [s for s in merged["suggestions"]
+                if s["game"] == "epl-ars-che-2026-07-02-total-2pt5"]
+        self.assertEqual(len(same), 1)                       # exactly one card, not two
+        self.assertEqual(merged["counts"]["pending_shown"], 0)
+
     def test_analyses_cache_per_sport(self):
         r1 = client.get("/api/analyses?sport=soccer&date=2026-06-14")
         self.assertEqual(r1.json()["sport"], "soccer")
