@@ -25,6 +25,7 @@ import dixon_coles as dc
 import forecast_soccer as fcs
 import congruence as cg
 import leagues
+import soccer_sharp_discovery
 import soccer_market as sm
 import data_inputs
 import sharp_odds_soccer as sosh
@@ -312,6 +313,25 @@ def run(args) -> dict:
     _tag = f"{len(SOCCER_TAGS)} league tags"
     vlog(f"Discovery: {_tag} -> {len(markets)} markets; {len(on_day)} dated {target}, {len(games)} events")
 
+    # The Gamma tags are volume-ranked and truncated (offset-2100 cap), so low-volume leagues
+    # never surface. Load the sharp slate now — it carries the FULL daily card — and fetch each
+    # game the tag missed directly by event slug, unioning it in (sharp-driven discovery). Also
+    # logs recovered-vs-not-found per game, distinguishing "truncated" from "not on Polymarket".
+    sharp_lookup = _load_sharp_lookup(args, target, vlog)
+    require_sharp = bool(sharp_lookup) and getattr(args, "require_sharp", True)
+    if sharp_lookup and getattr(args, "sharp_discovery", True):
+        existing_sets = {frozenset(t) for v in games.values() if (t := _game_names(v))}
+        extra = soccer_sharp_discovery.discover_from_sharp(
+            api, sharp_lookup, target, existing_sets, vlog=vlog)
+        existing_slugs = {m.get("slug") for m in markets if m.get("slug")}
+        added = [m for m in extra if m.get("slug") and m.get("slug") not in existing_slugs]
+        if added:
+            markets = markets + added
+            on_day = [m for m in markets if game_date(m) == target]
+            games = group_by_event(on_day)
+            vlog(f"  sharp-driven discovery added {len(added)} market(s) the tag missed "
+                 f"(total now {len(markets)}, {len(games)} events dated {target})")
+
     # Keep only soccer total-goals and BTTS markets. Gamma groups every market of a
     # game under one event_slug (no -total-/-btts suffix), so classify by the per-MARKET
     # slugs inside each event, not the event key — and stay goals-specific (the suffix
@@ -380,10 +400,6 @@ def run(args) -> dict:
                 f"{p}={v:.2f}(was {leagues.LEAGUE_BASELINES.get(p, leagues.DEFAULT_BASELINE):.2f})"
                 for p, v in sorted(calibrated.items())))
 
-    # Sharp reference (Pinnacle totals + BTTS) -> divergence detector. Without it the model
-    # stays predictive (Elo), bounded by the implausible-edge cap.
-    sharp_lookup = _load_sharp_lookup(args, target, vlog)
-    require_sharp = bool(sharp_lookup) and getattr(args, "require_sharp", True)
 
     # Cross-check the sharp slate against ALL discovered Polymarket events (not just goals
     # markets): tells whether the sharp's other-league games are on Polymarket without a
@@ -836,6 +852,9 @@ def main() -> None:
     p.add_argument("--no-require-sharp", dest="require_sharp", action="store_false", default=True,
                    help="With a sharp slate loaded, still model games with NO sharp match (default OFF: "
                         "skip them — bet only on a sharp anchor)")
+    p.add_argument("--no-sharp-discovery", dest="sharp_discovery", action="store_false", default=True,
+                   help="Disable sharp-driven discovery (fetching games the volume-ranked Gamma "
+                        "tag truncated directly by event slug). On by default when a sharp slate loads.")
     p.add_argument("--home-first", dest="home_first", action="store_true", default=True,
                    help="Slug lists home team first (default)")
     p.add_argument("--away-first", dest="home_first", action="store_false",

@@ -179,7 +179,7 @@ def parse_totals(events: list, book: str = "pinnacle") -> dict:
         if fair:
             out[_key(date, home, away)] = {"total_line": main[0], "over_fair": fair[0],
                                            "under_fair": fair[1], "home": norm_name(home),
-                                           "away": norm_name(away)}
+                                           "away": norm_name(away), "league": ev.get("_league")}
     return out
 
 
@@ -204,7 +204,8 @@ def parse_btts(events: list, book: str = "pinnacle") -> dict:
                 no = american_to_implied(o.get("price"))
         fair = devig(yes, no)
         if fair:
-            out[_key(date, home, away)] = {"btts_yes_fair": fair[0], "btts_no_fair": fair[1]}
+            out[_key(date, home, away)] = {"btts_yes_fair": fair[0], "btts_no_fair": fair[1],
+                                           "league": ev.get("_league")}
     return out
 
 
@@ -315,6 +316,9 @@ def fetch_sharp_soccer(api_key: str | None, keys: list[str], *, date: str | None
             continue
         if date:
             events = [e for e in events if (e.get("commence_time") or "")[:10] == date] or events
+        for e in events:                       # thread the league for sharp-driven discovery
+            if isinstance(e, dict):
+                e["_league"] = key
         totals_all += events
         vlog(f"  [odds-api] {key}: {len(events)} game(s) (quota used={used} remaining={remaining})")
         if with_btts:
@@ -329,7 +333,10 @@ def fetch_sharp_soccer(api_key: str | None, keys: list[str], *, date: str | None
                                       params={**base, "markets": "btts"}, timeout=timeout)
                     remaining = _rem_int(rb) if _rem_int(rb) is not None else remaining
                     rb.raise_for_status()
-                    btts_all.append(rb.json())
+                    bev = rb.json()
+                    if isinstance(bev, dict):
+                        bev["_league"] = key       # thread the league (sharp-driven discovery)
+                    btts_all.append(bev)
                 except Exception as e:  # noqa: BLE001
                     vlog(f"  [odds-api] {key}/{eid} btts failed: {_redact(e)}")
             if _reserve_hit():
