@@ -264,8 +264,10 @@ def run(args) -> dict:
     if args.ratings_csv:
         rt = ratings_mod.load_ratings(args.ratings_csv)
     elif args.auto_ratings:
+        if getattr(args, "ratings_source", None):     # CLI override of the source chain
+            os.environ["TENNIS_RATINGS_SOURCE"] = args.ratings_source
         rt = ratings_source.auto_ratings(tour=args.tour, debug=args.debug)
-        vlog(f"  auto ratings ({args.tour}): {len(rt)} players")
+        vlog(f"  auto ratings ({args.tour}) via {ratings_source.source_order()}: {len(rt)} players")
     else:
         rt = {}
     portfolio_value = float(args.portfolio_value)
@@ -469,6 +471,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Auto-compute surface Elo from Sackmann data (default on)")
     p.add_argument("--no-auto-ratings", dest="auto_ratings", action="store_false")
     p.add_argument("--tour", choices=("atp", "wta"), default="atp", help="Tour for auto ratings")
+    p.add_argument("--ratings-source", default=None,
+                   help="Auto-ratings match feed chain, comma-separated (e.g. 'tennisdata' or "
+                        "'sackmann,tennisdata'); overrides $TENNIS_RATINGS_SOURCE. "
+                        "Sources: sackmann (GitHub mirrors), tennisdata (tennis-data.co.uk .xlsx)")
     p.add_argument("--surface", choices=("hard", "clay", "grass"), default=None,
                    help="Override surface (else inferred from the slug/tournament)")
     p.add_argument("--blend", type=float, default=elo.SURFACE_BLEND, help="overall/surface Elo blend")
