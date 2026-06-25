@@ -173,16 +173,29 @@ def _sig_tokens(name: str | None) -> set:
     return {t for t in re.split(r"[^a-z0-9]+", s) if len(t) >= 4}
 
 
+# Explicit Polymarket-name -> API-Football-name aliases for clubs the heuristics can't bridge:
+# acronyms with no distinctive >=4-char token (AS FAR), or wholly different names. Keyed by the
+# space-stripped normalized Polymarket name. Extend as UNRESOLVED lines surface in the log.
+CLUB_NAME_ALIASES: dict[str, str] = {
+    "asfar": "FAR Rabat",                 # AS FAR (Forces Armées Royales) — "FAR" is only 3 chars
+    "rsberkane": "Renaissance Berkane",   # RS Berkane (safety net; also matches via shared "berkane")
+}
+
+
 def match_team(code: str | None, names, name: str | None = None) -> str | None:
     """Resolve a team to a standings name, or None if ambiguous.
 
-    The full club `name` (from the market/sharp slate, already club-suffix-normalized) is the
-    most reliable signal and is tried FIRST — exact, then prefix-either-way, then substring,
-    each accepted only when unique. Falling back to the 3-letter `code` (unique prefix /
-    acronym / substring). Anything ambiguous returns None (caller falls back — no wrong data).
+    Tries, in order: an explicit alias (for acronyms the heuristics can't bridge); then the full
+    club `name` (exact -> prefix-either-way -> substring -> shared distinctive word), each unique
+    only; then the 3-letter `code`. Anything ambiguous returns None (caller falls back).
     """
     names = list(names)
     q = _norm(name)
+    target = CLUB_NAME_ALIASES.get(q)
+    if target:
+        hit = [n for n in names if _norm(n) == _norm(target)]
+        if len(hit) == 1:
+            return hit[0]
     if q:
         exact = [n for n in names if _norm(n) == q]
         if len(exact) == 1:
