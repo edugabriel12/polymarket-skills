@@ -174,12 +174,22 @@ def _main_totals(market: dict) -> tuple[float, float, float] | None:
     return float(pt), complete[pt]["over"], complete[pt]["under"]
 
 
-def _chosen_book(ev: dict, book: str):
+def _chosen_book(ev: dict, book) -> dict | None:
+    """Pick the bookmaker by PRIORITY: `book` is a comma-list / list of sharp keys (e.g.
+    'pinnacle,betfair_ex_eu'). Returns the first one present on the event, so a market
+    Pinnacle doesn't cover (e.g. Série B BTTS) falls back to the next sharp source."""
     books = ev.get("bookmakers") or []
-    return next((b for b in books if b.get("key") == book), None) or (books[0] if books else None)
+    if not books:
+        return None
+    prefs = [p.strip() for p in (book.split(",") if isinstance(book, str) else book) if p.strip()]
+    by_key = {b.get("key"): b for b in books}
+    for p in prefs:
+        if p in by_key:
+            return by_key[p]
+    return books[0]                 # the API already filtered to our sharp books
 
 
-def parse_totals(events: list, book: str = "pinnacle") -> dict:
+def parse_totals(events: list, book="pinnacle") -> dict:
     """{(date,{teams}): {total_line, over_fair, under_fair, home, away}} from a totals response."""
     out: dict = {}
     for ev in events or []:
@@ -194,11 +204,12 @@ def parse_totals(events: list, book: str = "pinnacle") -> dict:
         if fair:
             out[_key(date, home, away)] = {"total_line": main[0], "over_fair": fair[0],
                                            "under_fair": fair[1], "home": norm_name(home),
-                                           "away": norm_name(away), "league": ev.get("_league")}
+                                           "away": norm_name(away), "league": ev.get("_league"),
+                                           "totals_book": (chosen or {}).get("key")}
     return out
 
 
-def parse_btts(events: list, book: str = "pinnacle") -> dict:
+def parse_btts(events: list, book="pinnacle") -> dict:
     """{(date,{teams}): {btts_yes_fair, btts_no_fair}} from a btts (per-event) response."""
     out: dict = {}
     for ev in events or []:
@@ -220,7 +231,8 @@ def parse_btts(events: list, book: str = "pinnacle") -> dict:
         fair = devig(yes, no)
         if fair:
             out[_key(date, home, away)] = {"btts_yes_fair": fair[0], "btts_no_fair": fair[1],
-                                           "league": ev.get("_league")}
+                                           "league": ev.get("_league"),
+                                           "btts_book": (chosen or {}).get("key")}
     return out
 
 
@@ -287,7 +299,8 @@ def _rem_int(resp) -> int | None:
 
 
 def fetch_sharp_soccer(api_key: str | None, keys: list[str], *, date: str | None = None,
-                       with_btts: bool = True, book: str = "pinnacle", regions: str = "eu",
+                       with_btts: bool = True, book: str = "pinnacle,betfair_ex_eu",
+                       regions: str = "eu",
                        timeout: int = 10, vlog=None, min_quota_reserve: int = 0) -> dict:
     """Sharp totals (+ optional BTTS) across the given leagues -> merged lookup. {} offline.
 
@@ -357,6 +370,15 @@ def fetch_sharp_soccer(api_key: str | None, keys: list[str], *, date: str | None
             if _reserve_hit():
                 break
     lookup = merge_lookup(parse_totals(totals_all, book), parse_btts(btts_all, book))
-    vlog(f"  [odds-api] sharp soccer lookup: {len(lookup)} game(s) "
-         f"({sum('btts_yes_fair' in v for v in lookup.values())} with BTTS)")
+    n_btts = sum("btts_yes_fair" in v for v in lookup.values())
+    # Per-book breakdown so the fallback is visible (e.g. Pinnacle for totals, Betfair for the
+    # BTTS that Pinnacle doesn't cover).
+    from collections import Counter
+    tbk = Counter(v.get("totals_book") for v in lookup.values() if v.get("totals_book"))
+    bbk = Counter(v.get("btts_book") for v in lookup.values() if v.get("btts_book"))
+    def _fmt(c):
+        return ", ".join(f"{k}={n}" for k, n in c.most_common()) or "none"
+    vlog(f"  [odds-api] sharp soccer lookup: {len(lookup)} game(s) ({n_btts} with BTTS) "
+         f"[books {book}]")
+    vlog(f"  [odds-api]   totals by book: {_fmt(tbk)} | BTTS by book: {_fmt(bbk)}")
     return lookup

@@ -107,6 +107,31 @@ class TestDateTolerance(unittest.TestCase):
         self.assertIsNone(so.sharp_total_ref(tot, "2026-06-24", "Bosnia", "Qatar"))
 
 
+class TestSharpBookChain(unittest.TestCase):
+    """Sharp book priority: Pinnacle first, then Betfair Exchange for markets Pinnacle lacks."""
+
+    def test_priority_picks_pinnacle_when_present(self):
+        ev = {"bookmakers": [{"key": "betfair_ex_eu"}, {"key": "pinnacle"}]}
+        self.assertEqual(so._chosen_book(ev, "pinnacle,betfair_ex_eu")["key"], "pinnacle")
+
+    def test_falls_back_to_betfair_when_pinnacle_absent(self):
+        # The btts response only carries books that OFFER btts — Pinnacle absent -> Betfair used.
+        ev = {"bookmakers": [{"key": "betfair_ex_eu"}]}
+        self.assertEqual(so._chosen_book(ev, "pinnacle,betfair_ex_eu")["key"], "betfair_ex_eu")
+
+    def test_btts_resolves_from_betfair_when_pinnacle_lacks_it(self):
+        # Série B BTTS: Pinnacle doesn't offer it, Betfair does -> the game still gets a BTTS anchor.
+        ev = {"home_team": "Cuiaba", "away_team": "Londrina",
+              "commence_time": "2026-06-25T18:00:00Z",
+              "bookmakers": [{"key": "betfair_ex_eu", "markets": [{"key": "btts", "outcomes": [
+                  {"name": "Yes", "price": -110}, {"name": "No", "price": -110}]}]}]}
+        bt = so.parse_btts([ev], book="pinnacle,betfair_ex_eu")
+        ref = so.sharp_btts_ref(bt, "2026-06-25", "cuiaba", "londrina")
+        self.assertIsNotNone(ref)
+        rec = bt[so._key("2026-06-25", "Cuiaba", "Londrina")]
+        self.assertEqual(rec["btts_book"], "betfair_ex_eu")
+
+
 class TestParse(unittest.TestCase):
     def test_parse_totals_devigs_main_line(self):
         events = [_totals_event("England", "Ghana", "2026-06-23", 2.5)]

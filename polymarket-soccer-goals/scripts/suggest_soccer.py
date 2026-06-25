@@ -72,6 +72,7 @@ def _load_sharp_lookup(args, target, vlog) -> dict:
         vlog(f"  sharp leagues filtered to {only!r}: {len(keys)} key(s)")
     lookup = sosh.fetch_sharp_soccer(key, keys, date=target,
                                      with_btts=getattr(args, "sharp_btts", True),
+                                     book=getattr(args, "sharp_book", None) or "pinnacle,betfair_ex_eu",
                                      min_quota_reserve=int(getattr(args, "sharp_min_reserve", 0) or 0),
                                      vlog=vlog)
     if lookup:
@@ -880,6 +881,10 @@ def main() -> None:
                    help="The Odds API key (or $ODDS_API_KEY) -> sharp anchor (divergence detector)")
     p.add_argument("--no-sharp", action="store_true",
                    help="Disable the sharp anchor entirely (predictive model, edge-capped)")
+    p.add_argument("--sharp-book", default=None,
+                   help="Sharp bookmaker priority chain (comma-separated Odds-API keys), first "
+                        "with the market wins. Default 'pinnacle,betfair_ex_eu' — Betfair Exchange "
+                        "fills sharp markets Pinnacle lacks (e.g. lower-league BTTS). Both are sharp.")
     p.add_argument("--no-sharp-btts", dest="sharp_btts", action="store_false", default=True,
                    help="Skip the per-event BTTS sharp fetch (cheaper; BTTS stays predictive)")
     p.add_argument("--sharp-leagues", default=None,

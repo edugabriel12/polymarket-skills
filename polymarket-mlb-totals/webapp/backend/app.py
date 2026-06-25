@@ -95,6 +95,9 @@ SOCCER_SHARP = os.environ.get("SOCCER_SHARP", "1") not in ("0", "false", "False"
 SOCCER_SHARP_LEAGUES = os.environ.get("SOCCER_SHARP_LEAGUES")   # default unset = all active
 SOCCER_SHARP_BTTS = os.environ.get("SOCCER_SHARP_BTTS", "1") not in ("0", "false", "False", "no", "")
 SOCCER_SHARP_RESERVE = int(os.environ.get("SOCCER_SHARP_RESERVE", "0") or 0)   # 0 = no reserve
+# Sharp bookmaker priority chain (both sharp): Pinnacle, then Betfair Exchange for markets
+# Pinnacle doesn't cover (e.g. lower-league BTTS). Bet365 etc. are NOT sharp — don't add them.
+SOCCER_SHARP_BOOK = os.environ.get("SOCCER_SHARP_BOOK", "pinnacle,betfair_ex_eu")
 TENNIS_DB = os.environ.get("TENNIS_PREDICTIONS_DB", tdb.DEFAULT_DB)
 TENNIS_RATINGS_CSV = os.environ.get("TENNIS_RATINGS_CSV")
 TENNIS_TOUR = os.environ.get("TENNIS_TOUR", "atp")
@@ -314,6 +317,8 @@ def _run_soccer(date: str) -> dict:
         cmd += ["--ratings-csv", SOCCER_RATINGS_CSV]
     if SOCCER_SHARP:   # sharp anchor (all leagues + BTTS by default); reserve 0 = no quota limit
         cmd += ["--sharp-min-reserve", str(SOCCER_SHARP_RESERVE)]
+        if SOCCER_SHARP_BOOK:
+            cmd += ["--sharp-book", SOCCER_SHARP_BOOK]
         if SOCCER_SHARP_LEAGUES:
             cmd += ["--sharp-leagues", SOCCER_SHARP_LEAGUES]
         if not SOCCER_SHARP_BTTS:
