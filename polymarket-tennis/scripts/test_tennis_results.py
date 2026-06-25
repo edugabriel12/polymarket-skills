@@ -164,23 +164,33 @@ class TestSettlePendingChain(unittest.TestCase):
 
 
 class _FakeGamma:
-    """Serves Gamma /markets?condition_ids= from a {condition_id: market_dict} map."""
+    """Serves Gamma /markets by condition_ids OR slug from {condition_id|slug: market_dict}."""
 
-    def __init__(self, by_cid):
-        self.by_cid = by_cid
+    def __init__(self, by_cid=None, by_slug=None):
+        self.by_cid = by_cid or {}
+        self.by_slug = by_slug or {}
         self.calls = 0
+        self.slug_calls = 0
 
     def get(self, url, params=None):
         self.calls += 1
-        ids = (params or {}).get("condition_ids")
+        params = params or {}
+        if "slug" in params:
+            self.slug_calls += 1
+            m = self.by_slug.get(params["slug"])
+            return [m] if m else []
+        ids = params.get("condition_ids")
         ids = ids if isinstance(ids, list) else [ids]
         return [self.by_cid[c] for c in ids if c in self.by_cid]
 
 
-def _resolved_market(cid, tokens, outcomes, prices):
-    return {"conditionId": cid, "closed": True, "umaResolutionStatus": "resolved",
-            "clobTokenIds": json.dumps(tokens), "outcomes": json.dumps(outcomes),
-            "outcomePrices": json.dumps(prices)}
+def _resolved_market(cid, tokens, outcomes, prices, slug=None):
+    m = {"conditionId": cid, "closed": True, "umaResolutionStatus": "resolved",
+         "clobTokenIds": json.dumps(tokens), "outcomes": json.dumps(outcomes),
+         "outcomePrices": json.dumps(prices)}
+    if slug:
+        m["slug"] = slug
+    return m
 
 
 class TestWinnerFromMarket(unittest.TestCase):
@@ -285,6 +295,36 @@ class TestSettleFromMarket(unittest.TestCase):
             self.assertEqual(len(out["settled"]), 1)                 # settled via the feed
             self.assertEqual(out["settled"][0]["status"], "ACERTO")
             self.assertEqual(len(tdb.get_predictions(db, status="PENDENTE")), 0)
+
+    def test_settles_by_slug_when_condition_query_returns_nothing(self):
+        # The live failure: the condition_ids query indexed 0 markets. The bet must still
+        # settle via its slug (match_slug is the real Polymarket market slug).
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "t.db")
+            self._seed(db)
+            api = _FakeGamma(by_cid={}, by_slug={"wta-you-jeanjea-2026-06-23": _resolved_market(
+                "c_you", ["tok_you", "tok_jean"], ["Xiaodi You", "Leolia Jeanjean"], ["1", "0"],
+                slug="wta-you-jeanjea-2026-06-23")})
+            out = tr.settle_pending_from_market(api, db)
+            self.assertEqual(len(out["settled"]), 1)
+            self.assertEqual(out["settled"][0]["status"], "ACERTO")
+            self.assertGreaterEqual(api.slug_calls, 1)                  # used the slug fallback
+            self.assertTrue(any("found by slug fallback" in x for x in out["diagnostics"]))
+
+    def test_found_but_open_market_stays_pending_with_note(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "t.db")
+            self._seed(db)
+            open_m = {"conditionId": "c_you", "slug": "wta-you-jeanjea-2026-06-23",
+                      "closed": False, "umaResolutionStatus": "",
+                      "clobTokenIds": json.dumps(["tok_you", "tok_jean"]),
+                      "outcomes": json.dumps(["Xiaodi You", "Leolia Jeanjean"]),
+                      "outcomePrices": json.dumps(["0.7", "0.3"])}
+            api = _FakeGamma(by_cid={"c_you": open_m})
+            out = tr.settle_pending_from_market(api, db)
+            self.assertEqual(out["settled"], [])
+            self.assertEqual(len(tdb.get_predictions(db, status="PENDENTE")), 1)
+            self.assertTrue(any("still open" in x for x in out["diagnostics"]))
 
     def test_offline_market_noop_keeps_pending(self):
         with tempfile.TemporaryDirectory() as d:
