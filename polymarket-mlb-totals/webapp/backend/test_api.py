@@ -73,6 +73,25 @@ class TestApi(unittest.TestCase):
         self.assertTrue(any(r["market"] == "BTTS" for r in soccer_recent))
         self.assertTrue(any(r["side"] in ("YES", "NO", "OVER", "UNDER") for r in soccer_recent))
 
+    def test_analyses_always_shows_pending_predictions(self):
+        # An open PENDENTE position the (stubbed, empty) recompute does NOT surface must
+        # still appear in the panel — for every sport.
+        date = "2026-07-01"
+        backend.spdb.record_prediction({
+            "game_slug": "bra2-cui-lon-2026-07-01-total-1pt5", "game_date": date, "league": "bra2",
+            "market": "TOTAL", "line": 1.5, "side": "OVER", "entry_price": 0.55,
+            "decimal_odds": 1.82, "model_prob": 0.63, "edge": 0.08, "size_pct": 0.02,
+            "size_usd": 200.0, "confidence": 0.6, "kelly_fraction": 0.04, "used_external": 0,
+            "fee_rate": 0.0, "strategy": "divergence",
+            "market_url": "https://polymarket.com/event/bra2-cui-lon-2026-07-01",
+            "stats_log": "{}"}, backend.SOCCER_DB)
+        body = client.get(f"/api/analyses?sport=soccer&date={date}&force=true").json()
+        pend = [s for s in body["suggestions"] if s.get("status") == "PENDENTE"]
+        self.assertEqual(len(pend), 1)
+        self.assertEqual(pend[0]["game"], "bra2-cui-lon-2026-07-01-total-1pt5")
+        self.assertEqual(pend[0]["recommendation"]["price"], 0.55)   # PredictionCard needs this
+        self.assertGreaterEqual(body["counts"]["pending_shown"], 1)
+
     def test_analyses_cache_per_sport(self):
         r1 = client.get("/api/analyses?sport=soccer&date=2026-06-14")
         self.assertEqual(r1.json()["sport"], "soccer")
