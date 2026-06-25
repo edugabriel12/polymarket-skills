@@ -81,11 +81,26 @@ NAME_ALIASES: dict[str, str] = {
 }
 
 
+# Club-type abbreviation tokens (Esporte Clube, Futebol Clube, Sport Club, Clube de Regatas,
+# Unión/Sociedad Deportiva, Fudbalski/Sportski Klub, ...). Polymarket writes them into club names
+# ("Cuiabá EC", "Londrina EC") while the odds-api / Elo sources don't ("Cuiabá"), so the same club
+# fails to match across sources. We drop these tokens in norm_name. National teams have none, so
+# it's a no-op there; the strip never empties a name (at least one token always remains).
+CLUB_TYPE_TOKENS = frozenset({
+    "ec", "fc", "sc", "ac", "cf", "se", "cr", "aa", "ad", "ud", "sd",
+    "afc", "cfc", "fk", "sk", "if", "ff", "bk",
+})
+
+
 def norm_name(s: str) -> str:
-    """Lowercase, strip accents/punctuation, collapse spaces, apply the alias map."""
+    """Lowercase, strip accents/punctuation, drop club-type tokens, collapse, apply alias map."""
     s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode()
     s = re.sub(r"[^a-z0-9 ]", " ", s.lower())
     s = re.sub(r"\s+", " ", s).strip()
+    toks = s.split(" ")
+    stripped = [t for t in toks if t not in CLUB_TYPE_TOKENS]
+    if stripped and len(stripped) < len(toks):    # drop club tokens, never empty the name
+        s = " ".join(stripped)
     return NAME_ALIASES.get(s, s)
 
 
