@@ -119,7 +119,44 @@ class TestSettlePendingChain(unittest.TestCase):
             joined = " ".join(out["diagnostics"])
             self.assertIn("UNSETTLED", joined)
             self.assertIn("neither player is in the feed", joined)
-            self.assertIn("feed surname sample", joined)
+            self.assertIn("feed[atp] surname sample", joined)
+
+    def test_each_prediction_settles_against_its_own_tour_feed(self):
+        # The live bug: settlement queried only the ATP feed, so WTA predictions never settled.
+        # Each prediction must settle against the feed of ITS OWN tour (atp-… vs wta-… slug).
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "t.db")
+            tdb.record_prediction({
+                "match_slug": "atp-alcaraz-sinner-2026-06-25", "match_date": "2026-06-25",
+                "tour": "atp", "surface": "clay", "side": "Carlos Alcaraz",
+                "opponent": "Jannik Sinner", "entry_price": 0.5, "decimal_odds": 2.0,
+                "model_prob": 0.6, "edge": 0.1, "confidence": 0.6, "size_pct": 0.02,
+                "size_usd": 200.0, "kelly_fraction": 0.04, "used_external": 1, "fee_rate": 0.0,
+                "strategy": "x", "market_url": "u"}, db)
+            tdb.record_prediction({
+                "match_slug": "wta-swiatek-sabalenka-2026-06-25", "match_date": "2026-06-25",
+                "tour": "wta", "surface": "clay", "side": "Iga Swiatek",
+                "opponent": "Aryna Sabalenka", "entry_price": 0.5, "decimal_odds": 2.0,
+                "model_prob": 0.6, "edge": 0.1, "confidence": 0.6, "size_pct": 0.02,
+                "size_usd": 200.0, "kelly_fraction": 0.04, "used_external": 1, "fee_rate": 0.0,
+                "strategy": "x", "market_url": "u"}, db)
+
+            # Each tour's feed carries ONLY its own match — settlement must query both.
+            feeds = {
+                "atp": [{"date": "20260625", "surface": "clay", "winner": "Alcaraz C.",
+                         "loser": "Sinner J."}],
+                "wta": [{"date": "20260625", "surface": "clay", "winner": "Swiatek I.",
+                         "loser": "Sabalenka A."}],
+            }
+            ratings_source.fetch_matches = lambda tour, years=None, debug=False: feeds[tour]
+            out = tr.settle_pending(db)
+
+            self.assertEqual(out["checked"], 2)
+            self.assertEqual(out["games_matched"], 2)            # both tours settled
+            self.assertEqual(len(out["settled"]), 2)
+            self.assertEqual(len(tdb.get_predictions(db, status="PENDENTE")), 0)
+            joined = " ".join(out["diagnostics"])
+            self.assertIn("tour(s) ['atp', 'wta']", joined)
 
 
 if __name__ == "__main__":
