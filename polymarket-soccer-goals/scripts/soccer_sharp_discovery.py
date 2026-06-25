@@ -206,6 +206,40 @@ def fetch_markets_by_slug(api, market_slug: str, category_key: str = "soccer") -
     return _parse_rows(rows, market_slug, category_key)
 
 
+def backfill_goals_markets(api, base_slugs, *, vlog=None, max_games: int = 40) -> list[dict]:
+    """Fetch total-goals/BTTS markets by slug for DISCOVERED games missing them.
+
+    A game's moneyline can surface via the volume-ranked tag while its total/BTTS markets
+    (separate, lower-volume slugs) get truncated past the offset cap. Unlike `discover_from_sharp`
+    (driven by the sharp slate), this is driven by the games already discovered — so it recovers
+    goals markets for ANY league, including ones the sharp feed doesn't cover (e.g. Morocco
+    Botola). Each game is cheaply existence-probed (the 2.5 line or BTTS) before fetching all
+    lines, so moneyline-only games cost ~2 calls. Returns parsed goals markets; [] if none.
+    """
+    vlog = vlog or (lambda *a, **k: None)
+    bases = list(dict.fromkeys(s for s in base_slugs if s))
+    if not bases:
+        return []
+    capped = bases[:max_games]
+    markets: list[dict] = []
+    recovered = 0
+    for base in capped:
+        probe = (fetch_markets_by_slug(api, f"{base}-total-2pt5")
+                 or fetch_markets_by_slug(api, f"{base}-btts"))
+        if not probe:                        # no goals market on Polymarket (or wrong base)
+            continue
+        found = [m for gs in goals_market_slugs(base)
+                 for m in fetch_markets_by_slug(api, gs) if _is_goals_market(m)]
+        if found:
+            recovered += 1
+            markets.extend(found)
+            vlog(f"  [goals-backfill] {base}: +{len(found)} goals/BTTS market(s)")
+    note = f" ({len(bases) - len(capped)} more not probed, cap {max_games})" if len(bases) > max_games else ""
+    vlog(f"  [goals-backfill] probed {len(capped)} game(s) missing goals markets, "
+         f"recovered {recovered}{note}")
+    return markets
+
+
 def _games_from_lookup(sharp_lookup: dict, target: str):
     """Yield (teams_frozenset, sorted_team_list, league_key) for each sharp game dated target."""
     for key, rec in sharp_lookup.items():

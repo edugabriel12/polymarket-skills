@@ -96,8 +96,14 @@ python polymarket-soccer-goals/scripts/test_pipeline.py
   NO goals/BTTS market`** (Polymarket lists the game but only moneyline-type markets — the goals model
   can't price it), or **`NOT FOUND (prefix=…, tried N)`** (absent, or our abbreviation guess missed →
   hard-code that league's tokens). On by default with a sharp slate; `--no-sharp-discovery` disables.
-  ⚠️ Lower leagues (e.g. Brazilian Série B) frequently have **no goals/BTTS market on Polymarket at
-  all** — confirmed by the second log line — so there is nothing for the goals model to price.
+- **Goals-market backfill (any league):** sharp-driven discovery only covers the sharp slate. A game
+  the tag *did* surface (its moneyline) but whose total/BTTS markets were truncated by the volume cap
+  is recovered too: for each discovered game dated today **with an event but no goals market**, the
+  goals/BTTS slugs are fetched directly (`backfill_goals_markets`) — so leagues outside the sharp feed
+  (e.g. **Morocco Botola**) get their `…-total-Xpt5` / `…-btts` markets back. Each game is cheaply
+  existence-probed (the 2.5 line / BTTS) before fetching all lines, so moneyline-only games cost ~2
+  calls; logs `[goals-backfill] <slug>: +N goals/BTTS market(s)`. This is why the `mar1=0/1`-style
+  "no goals market" reading is now recovered when the markets actually exist on Polymarket.
 
 ## Script: suggest_soccer.py
 | Flag | Default | Purpose |

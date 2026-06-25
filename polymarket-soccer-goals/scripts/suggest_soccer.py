@@ -339,6 +339,30 @@ def run(args) -> dict:
     def _has_market(gmarkets, slug_re) -> bool:
         return any(slug_re.search((x.get("slug") or "").lower()) for x in gmarkets)
 
+    # Goals-market backfill (any league): a game's moneyline can surface while its total/BTTS
+    # markets are truncated by the volume cap. For each soccer game dated today with an event but
+    # NO goals market, fetch the goals slugs directly — recovers leagues OUTSIDE the sharp slate
+    # (e.g. Morocco Botola), which sharp-driven discovery never probes.
+    if getattr(args, "sharp_discovery", True):
+        def _gk(slug):
+            m = _GAME_DATE_RE.match(slug or "")
+            return m.group(1) if m else (slug or "")
+        soccer_games = {_gk(k): k for k in games if leagues.is_soccer_slug(k)}
+        with_goals = {_gk(k) for k in games if leagues.is_soccer_slug(k)
+                      and (_has_market(games[k], sm.GAME_TOTAL_RE)
+                           or _has_market(games[k], sm.GAME_BTTS_RE))}
+        missing = sorted(g for g in soccer_games if g not in with_goals)
+        if missing:
+            existing_slugs = {m.get("slug") for m in markets if m.get("slug")}
+            bf = soccer_sharp_discovery.backfill_goals_markets(api, missing, vlog=vlog)
+            added2 = [m for m in bf if m.get("slug") and m.get("slug") not in existing_slugs]
+            if added2:
+                markets = markets + added2
+                on_day = [m for m in markets if game_date(m) == target]
+                games = group_by_event(on_day)
+                vlog(f"  goals-backfill added {len(added2)} market(s) (total now {len(markets)}, "
+                     f"{len(games)} events dated {target})")
+
     total_evts = {k: v for k, v in games.items()
                   if leagues.is_soccer_slug(k) and _has_market(v, sm.GAME_TOTAL_RE)}
     btts_evts = {k: v for k, v in games.items()
