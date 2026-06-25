@@ -34,6 +34,23 @@ class TestNameNormalization(unittest.TestCase):
         self.assertEqual(so.norm_name("DR Congo"), "congo dr")
         self.assertEqual(so.norm_name("South Korea"), "korea republic")
 
+    def test_strips_club_type_tokens(self):
+        # Polymarket "Cuiabá EC" vs odds-api "Cuiabá" must converge (the Série B blocker).
+        self.assertEqual(so.norm_name("Cuiabá EC"), "cuiaba")
+        self.assertEqual(so.norm_name("Londrina EC"), "londrina")
+        self.assertEqual(so.norm_name("SE Palmeiras"), "palmeiras")     # leading token
+        self.assertEqual(so.norm_name("CR Flamengo"), "flamengo")
+        # No over-strip: a name made only of a club token keeps it; real words survive.
+        self.assertEqual(so.norm_name("Sport Recife"), "sport recife")
+        self.assertEqual(so.norm_name("EC"), "ec")
+
+    def test_club_suffix_key_matches_across_sources(self):
+        # Sharp side ("Cuiabá"/"Londrina") and Polymarket question ("Cuiabá EC"/"Londrina EC").
+        self.assertEqual(so._key("2026-06-25", "Cuiabá", "Londrina"),
+                         so._key("2026-06-25", "Cuiabá EC", "Londrina EC"))
+        self.assertEqual(so.extract_teams_from_question("Cuiabá EC vs Londrina EC: O/U 1.5"),
+                         ("cuiaba", "londrina"))
+
     def test_key_matches_across_spellings(self):
         # The sharp source ("DR Congo") and the Polymarket question ("Congo DR") must key alike.
         self.assertEqual(so._key("2026-06-23", "Colombia", "DR Congo"),
