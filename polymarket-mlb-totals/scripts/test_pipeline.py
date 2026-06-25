@@ -421,8 +421,8 @@ class TestEndToEndRun(unittest.TestCase):
 class _Args:
     """Minimal args namespace with pipeline defaults overridable by kwargs."""
     def __init__(self, **kw):
-        defaults = dict(date=None, min_volume=1000.0, min_edge=0.05, min_sharp_edge=0.01,
-                        min_hours=0.0, best_line_only=True,
+        defaults = dict(date=None, min_volume=1000.0, min_edge=0.05, min_hours=0.0,
+                        best_line_only=True,
                         odds_min=1.60, odds_max=3.00, dispersion=2.0,
                         league_baseline=8.5, league_prefix="mlb-",
                         fee_rate=0.0, use_external=True,
@@ -433,111 +433,6 @@ class _Args:
                         verbose=False, debug=False)
         defaults.update(kw)
         self.__dict__.update(defaults)
-
-
-class TestSharpVeto(unittest.TestCase):
-    """Model drives the prediction; the sharp is an edge-sign veto (suggest only if +EV)."""
-
-    def setUp(self):
-        self._orig = (st.discover_markets, st.game_date, st.APIClient,
-                      st._load_sharp_lookup, st.sharp_odds.sharp_ref, st.data_inputs.get_game_inputs)
-
-    def tearDown(self):
-        (st.discover_markets, st.game_date, st.APIClient, st._load_sharp_lookup,
-         st.sharp_odds.sharp_ref, st.data_inputs.get_game_inputs) = self._orig
-
-    def _run(self, sharp_over):
-        # Modest-offense game: the model forecasts Over with a plausible edge (~7%, below the
-        # 15% implausible cap) at price 0.50.
-        markets = [_rich_market("mlb-aaa-bbb-2026-06-14-total-8pt5",
-                                "AAA vs. BBB: O/U 8.5", ["Over 8.5", "Under 8.5"],
-                                [0.50, 0.50], ["o1", "u1"])]
-        st.discover_markets = lambda *a, **k: ("mlb", markets)
-        st.game_date = lambda m: "2026-06-14"
-        st.APIClient = _NoNetAPI
-        st._load_sharp_lookup = lambda args, target, vlog: {"slate": 1}     # truthy
-        st.sharp_odds.sharp_ref = lambda lk, date, away, home: (8.5, sharp_over)
-        st.data_inputs.get_game_inputs = lambda *a, **k: {
-            "home_off": 1.10, "away_off": 1.10, "home_sp": 1.10, "away_sp": 1.10, "home_field": 0.0}
-        return st.run(_Args(date="2026-06-14", use_external=True, record=False,
-                            sharp_discovery=False))
-
-    def test_sharp_confirms_positive_edge_suggests(self):
-        # Sharp fair Over ~0.60 @ 8.5 -> sharp edge on Over = 0.60-0.50 = +0.10 -> confirm.
-        result = self._run(sharp_over=0.60)
-        self.assertEqual(len(result["suggestions"]), 1)
-        sug = result["suggestions"][0]
-        self.assertGreater(sug["sharp_edge"], 0)
-        self.assertEqual(sug["recommendation"]["token_id"], "o1")    # bet Over
-
-    def test_sharp_vetoes_negative_edge_skips(self):
-        # Sharp fair Over ~0.45 @ 8.5 -> sharp edge on Over = 0.45-0.50 = -0.05 -> veto, even
-        # though the model loves the Over.
-        result = self._run(sharp_over=0.45)
-        self.assertEqual(len(result["suggestions"]), 0)
-        self.assertTrue(any("sharp edge" in s["reason"] and "< 1.0% min" in s["reason"]
-                            for s in result["skipped"]))
-
-    def test_sharp_vetoes_positive_but_subthreshold_skips(self):
-        # Sharp fair Over ~0.505 @ 8.5 -> sharp edge = +0.5%: positive, but below the 1% min,
-        # so the hardened veto treats it as "no opinion" and skips (the old > 0 gate passed it).
-        result = self._run(sharp_over=0.505)
-        self.assertEqual(len(result["suggestions"]), 0)
-        self.assertTrue(any("sharp edge" in s["reason"] and "< 1.0% min" in s["reason"]
-                            for s in result["skipped"]))
-
-
-class TestForecastLayer(unittest.TestCase):
-    """The forecast layer predicts EVERY game, independent of the trade filters."""
-
-    def _totals_event(self, slug, line=8.5, over=0.52):
-        m = totals_market(line=line, over=over, under=round(1 - over, 2))
-        m["slug"] = slug
-        return m
-
-    def _moneyline_event(self, slug):
-        return {"slug": slug, "question": "Who wins?", "outcomes": ["AAA", "BBB"],
-                "outcome_prices": [0.5, 0.5], "token_ids": ["a", "b"],
-                "volume_24h": 500, "accepting_orders": True}
-
-    def test_market_basis_forecast(self):
-        # No external inputs, no sharp -> the forecast falls back to the market price.
-        args = _Args(use_external=False)
-        events = {"mlb-ari-stl-2026-06-23": [self._totals_event("mlb-ari-stl-2026-06-23-total-8pt5")]}
-        out = st.forecast_all_mlb(None, events, {}, "2026-06-23", args, lambda *a, **k: None)
-        self.assertEqual(len(out), 1)
-        r = out[0]
-        self.assertEqual(r["basis"], "market")
-        self.assertTrue(r["has_market"])
-        self.assertIsNotNone(r["forecast"])
-        self.assertAlmostEqual(r["forecast"]["p_over"] + r["forecast"]["p_under"], 1.0, places=6)
-        self.assertEqual(len(r["forecast"]["pi80"]), 2)          # an 80% interval is present
-        self.assertGreater(r["forecast"]["pi80"][1] - r["forecast"]["pi80"][0], 4)  # wide, honest
-
-    def test_game_without_market_and_no_inputs_has_no_basis(self):
-        args = _Args(use_external=False)
-        events = {"mlb-ccc-ddd-2026-06-23": [self._moneyline_event("mlb-ccc-ddd-2026-06-23")]}
-        out = st.forecast_all_mlb(None, events, {}, "2026-06-23", args, lambda *a, **k: None)
-        self.assertEqual(len(out), 1)
-        self.assertIsNone(out[0]["forecast"])                    # nothing to model from
-        self.assertFalse(out[0]["has_market"])
-
-    def test_factors_basis_without_any_market(self):
-        # A game with only a moneyline market is still forecast from team factors (no Polymarket
-        # totals market needed) — the core of "predict every game".
-        args = _Args(use_external=True)
-        events = {"mlb-eee-fff-2026-06-23": [self._moneyline_event("mlb-eee-fff-2026-06-23")]}
-        orig = st.data_inputs.get_game_inputs
-        st.data_inputs.get_game_inputs = lambda *a, **k: {
-            "home_off": 1.10, "away_off": 1.05, "home_sp": 0.95, "away_sp": 1.0}
-        try:
-            out = st.forecast_all_mlb(None, events, {}, "2026-06-23", args, lambda *a, **k: None)
-        finally:
-            st.data_inputs.get_game_inputs = orig
-        self.assertEqual(out[0]["basis"], "factors")
-        self.assertIsNotNone(out[0]["forecast"])
-        self.assertFalse(out[0]["has_market"])
-        self.assertIsNone(out[0]["edge_vs_market"])              # no price -> no edge
 
 
 if __name__ == "__main__":

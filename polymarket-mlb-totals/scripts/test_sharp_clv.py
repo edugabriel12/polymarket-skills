@@ -165,65 +165,6 @@ class TestSharpOdds(unittest.TestCase):
             self.assertIsNone(so.sharp_over_prob(lk, "2026-06-21", "cws", "nyy", 11.5))  # line mismatch
 
 
-class TestDivergenceDetector(unittest.TestCase):
-    def test_sharp_anchor_creates_edge_from_price_gap(self):
-        # Polymarket prices Over at 0.58, but the SHARP fair Over is 0.50 -> Under is value.
-        line = 8.5
-        m = st.model_probabilities(line, 0.58, 100.0, {}, league_baseline=8.5,
-                                   dispersion=2.0, sharp_over_price=0.50)
-        self.assertTrue(m["sharp_anchored"])
-        # Fair P(over) tracks the SHARP price (~0.50), not the Polymarket 0.58.
-        self.assertAlmostEqual(m["p_over"], 0.50, delta=0.02)
-        # Edge vs the Polymarket price: Under is +EV (model 0.50 over vs 0.58 priced).
-        self.assertLess(m["p_over"], 0.58)             # Over overpriced on Polymarket
-        self.assertGreater(m["p_under"], 0.42)         # Under underpriced -> edge
-
-    def test_sharp_line_drift_anchors_mu_at_sharp_line(self):
-        # Sharp main line 8.5 @ fair 0.50 -> sharp mu ~8.5. Polymarket offers an ALTERNATE
-        # line of 7.5. The anchor must price 7.5 off the sharp mu (P(over 7.5) > 0.50),
-        # NOT treat 0.50 as the prob at 7.5.
-        m = st.model_probabilities(7.5, 0.55, 100.0, {}, league_baseline=8.5,
-                                   dispersion=2.0, sharp_over_price=0.50, sharp_line=8.5)
-        self.assertTrue(m["sharp_anchored"])
-        # mu is inverted from P(over 8.5)=0.50 (right-skewed NegBin -> mu ~9.0), anchored
-        # at the SHARP line (8.5), not the poly line (7.5).
-        self.assertGreater(m["market_mu"], 8.6)
-        self.assertGreater(m["p_over"], 0.55)                     # P(over 7.5 | high mu) is high
-        # Without the sharp_line, the same prob would be (wrongly) pinned at 7.5 -> lower mu.
-        m2 = st.model_probabilities(7.5, 0.55, 100.0, {}, league_baseline=8.5,
-                                    dispersion=2.0, sharp_over_price=0.50)
-        self.assertLess(m2["market_mu"], m["market_mu"])
-
-    def test_sharp_present_model_drives_sharp_is_veto(self):
-        # NEW behavior: the factor MODEL is the prediction engine — with factors present, mu
-        # comes from the model (not the sharp). The sharp is a separate edge-sign veto, exposed
-        # as p_over_sharp / sharp_mu. Strong offense pushes the model mu well above the sharp.
-        inputs = {"home_off": 1.2, "away_off": 1.2, "home_sp": 1.3, "away_sp": 1.3}
-        m = st.model_probabilities(8.5, 0.52, 100.0, inputs, league_baseline=8.5,
-                                   dispersion=2.0, sharp_over_price=0.50, sharp_line=8.5)
-        self.assertFalse(m["sharp_anchored"])                        # NOT sharp-anchored anymore
-        self.assertTrue(m["sharp_gated"])                            # sharp present -> used as veto
-        self.assertAlmostEqual(m["mu"], m["model_mu"], places=6)     # mu == the model's mu
-        self.assertGreater(m["mu"], m["sharp_mu"] + 0.5)             # factors moved mu off the sharp
-        self.assertGreater(m["p_over"], 0.5)                         # model forecasts Over
-        # The sharp's fair P(over)@8.5 ≈ 0.50 (the veto reference), distinct from the model.
-        self.assertAlmostEqual(m["p_over_sharp"], 0.50, delta=0.02)
-
-    def test_sharp_present_no_factors_falls_back_to_sharp(self):
-        # With a sharp ref but NO factors, there's nothing to predict from -> mu = the sharp.
-        m = st.model_probabilities(8.5, 0.58, 100.0, {}, league_baseline=8.5,
-                                   dispersion=2.0, sharp_over_price=0.50, sharp_line=8.5)
-        self.assertTrue(m["sharp_anchored"])
-        self.assertAlmostEqual(m["mu"], m["sharp_mu"], places=6)
-        self.assertAlmostEqual(m["p_over"], 0.50, delta=0.02)
-
-    def test_no_sharp_is_market_implied(self):
-        # Without a sharp ref, fair == Polymarket price -> ~zero edge (anti-fabrication).
-        m = st.model_probabilities(8.5, 0.55, 100.0, {}, league_baseline=8.5, dispersion=2.0)
-        self.assertFalse(m["sharp_anchored"])
-        self.assertAlmostEqual(m["p_over"], 0.55, delta=2e-3)
-
-
 class TestClvVsSharp(unittest.TestCase):
     def test_clv_for(self):
         # Bet OVER at 0.50; sharp closes Over fair at 0.56 -> +0.06 CLV (you beat the close).

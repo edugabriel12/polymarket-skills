@@ -301,8 +301,15 @@ def run(args) -> dict:
         sharp_pa = (sot.sharp_win_ref(sharp_lookup, mdate, label_a or pa_slug, label_b or pb_slug)
                     if sharp_lookup else None)
         if sharp_pa is None and require_sharp:
-            _skip(slug, "no sharp reference (bet only where the sharp can confirm the edge)",
-                  price_sane=ms["price_sane"])
+            # Pinpoint WHY no sharp matched: name/date mismatch (surname is in the slate but
+            # not paired on mdate±1) vs tournament not covered by the feed (surname absent).
+            na, nb = sot.norm_player(label_a or pa_slug), sot.norm_player(label_b or pb_slug)
+            da = sorted({k[0] for k in sharp_lookup if na in k[1]})
+            db = sorted({k[0] for k in sharp_lookup if nb in k[1]})
+            why = (f"surname(s) in sharp slate but not paired @ {mdate}±1 "
+                   f"[{na}:{da or '—'}, {nb}:{db or '—'}]" if (da or db)
+                   else f"neither surname ({na}/{nb}) in the sharp slate — tour not in the feed")
+            _skip(slug, f"no sharp reference — {why}", price_sane=ms["price_sane"])
             continue
         if p_a is None:                       # no Elo ratings -> market-implied (anti-fabrication)
             fair = elo.devig_two_way(ms["sides"][0]["price"], ms["sides"][1]["price"])

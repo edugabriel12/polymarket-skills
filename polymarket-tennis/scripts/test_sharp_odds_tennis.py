@@ -53,6 +53,16 @@ class TestParse(unittest.TestCase):
     def test_missing_ref(self):
         self.assertIsNone(sot.sharp_win_ref({}, "2026-06-21", "a", "b"))
 
+    def test_date_tolerance_plus_minus_one_day(self):
+        # The Odds API keyed this match on 06-22 (late UTC commence); a Polymarket match
+        # dated 06-21 must still resolve via the ±1-day tolerance.
+        d = sot.parse_h2h([_h2h_event("Carlos Alcaraz", "Novak Djokovic", "2026-06-22",
+                                      a_px=-200, b_px=+170)])
+        self.assertIsNotNone(sot.sharp_win_ref(d, "2026-06-21", "Alcaraz", "Djokovic"))
+        self.assertIsNotNone(sot.sharp_win_ref(d, "2026-06-23", "Alcaraz", "Djokovic"))
+        # Two days off is still rejected (no false positives).
+        self.assertIsNone(sot.sharp_win_ref(d, "2026-06-24", "Alcaraz", "Djokovic"))
+
 
 class TestImplausibleEdgeCap(unittest.TestCase):
     def test_large_edge_capped(self):

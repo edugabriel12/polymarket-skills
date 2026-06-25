@@ -67,6 +67,17 @@ def _key(date: str, a: str, b: str) -> tuple:
     return (date, frozenset((norm_player(a), norm_player(b))))
 
 
+def _adjacent_dates(date: str) -> list[str]:
+    """[date-1, date, date+1] (ISO). A late match whose UTC commence rolls to the next
+    day is keyed one day off between Polymarket and the Odds API; tolerate ±1 day."""
+    from datetime import datetime, timedelta
+    try:
+        d = datetime.strptime(date, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return [date]
+    return [(d + timedelta(days=k)).strftime("%Y-%m-%d") for k in (-1, 0, 1)]
+
+
 def parse_h2h(events: list, book: str = "pinnacle") -> dict:
     """{(date,{surnames}): {surname: fair_p, ...}} from a tennis h2h /odds response."""
     out: dict = {}
@@ -94,11 +105,15 @@ def parse_h2h(events: list, book: str = "pinnacle") -> dict:
 
 
 def sharp_win_ref(lookup: dict, date: str, player: str, opponent: str) -> float | None:
-    """Sharp fair P(`player` beats `opponent`) for the match, or None."""
-    rec = lookup.get(_key(date, player, opponent))
-    if not rec:
-        return None
-    return rec.get(norm_player(player))
+    """Sharp fair P(`player` beats `opponent`) for the match, or None.
+
+    Matches the surname pair on the target date OR ±1 day (UTC-rollover tolerance),
+    mirroring the MLB/soccer sharp lookups."""
+    for d in _adjacent_dates(date):
+        rec = lookup.get(_key(d, player, opponent))
+        if rec:
+            return rec.get(norm_player(player))
+    return None
 
 
 # ---------------------------------------------------------------------------
