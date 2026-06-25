@@ -66,7 +66,7 @@ ODDSAPI_TO_PREFIX = {
     "soccer_uefa_europa_league": "uel",
     "soccer_uefa_europa_conference_league": "uecl",
     "soccer_epl": "epl",
-    "soccer_england_efl_champ": "elc",
+    "soccer_efl_champ": "elc",                    # real Odds-API key (was wrongly england_efl_champ)
     "soccer_england_league1": "eng1",
     "soccer_england_league2": "eng2",
     "soccer_spain_la_liga": "laliga",
@@ -88,14 +88,24 @@ ODDSAPI_TO_PREFIX = {
     "soccer_china_superleague": "csl",
     "soccer_japan_j_league": "j-league",
     "soccer_korea_kleague1": "k-league",
-    "soccer_spl": "saudi",
+    "soccer_spl": "scotland",                     # Scottish Premiership (was wrongly mapped to saudi)
+    "soccer_saudi_arabia_pro_league": "saudi",
     "soccer_sweden_allsvenskan": "allsvenskan",
     "soccer_sweden_superettan": "superettan",
     "soccer_norway_eliteserien": "eliteserien",
     "soccer_turkey_super_league": "super-lig",
     "soccer_finland_veikkausliiga": "veikkausliiga",
     "soccer_league_of_ireland": "ireland",
+    "soccer_denmark_superliga": "denmark",
+    "soccer_belgium_first_div": "belgium",
+    "soccer_greece_super_league": "greece",
+    "soccer_switzerland_superleague": "swiss",
+    "soccer_russia_premier_league": "russia",
+    "soccer_austria_bundesliga": "austria",
+    "soccer_germany_liga3": "ger3",
 }
+# NOTE: Morocco Botola is NOT on The Odds API (no soccer_morocco_* key exists), so its games
+# are inherently no-sharp — strength resolves via API-Football, but there's no sharp anchor.
 
 _MAX_TOKENS = 3        # token forms tried per team
 _MAX_CANDIDATES = 14   # hard cap on slugs fetched per game (bounds API calls)
