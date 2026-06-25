@@ -119,6 +119,35 @@ class TestFetchEventMarkets(unittest.TestCase):
         self.assertEqual(sd.fetch_markets_by_slug(_FakeAPI({}), "nope"), [])
 
 
+class TestBackfillGoalsMarkets(unittest.TestCase):
+    """Recover goals/BTTS markets the volume cap truncated, driven by discovered games (any league)."""
+
+    def test_recovers_truncated_goals_markets(self):
+        base = "mar1-old-irt-2026-06-25"   # Morocco Botola — not in the sharp slate
+        api = _FakeAPI(markets_by_slug={
+            f"{base}-total-2pt5": [_market(f"{base}-total-2pt5", ["Over 2.5", "Under 2.5"], ["0.39", "0.62"])],
+            f"{base}-total-1pt5": [_market(f"{base}-total-1pt5", ["Over 1.5", "Under 1.5"], ["0.65", "0.38"])],
+            f"{base}-btts": [_market(f"{base}-btts", ["Yes", "No"], ["0.5", "0.5"])]})
+        out = sd.backfill_goals_markets(api, [base])
+        slugs = {m["slug"] for m in out}
+        self.assertIn(f"{base}-total-2pt5", slugs)
+        self.assertIn(f"{base}-btts", slugs)
+
+    def test_moneyline_only_game_is_cheap_and_empty(self):
+        # No goals market on Polymarket -> the existence probe fails, nothing fetched.
+        api = _FakeAPI(markets_by_slug={})
+        out = sd.backfill_goals_markets(api, ["epl-foo-bar-2026-06-25"])
+        self.assertEqual(out, [])
+        # Only the 2 cheap probes (total-2pt5 + btts), not all ~9 line slugs.
+        self.assertEqual(len(api.slugs_queried), 2)
+
+    def test_cap_bounds_probes(self):
+        api = _FakeAPI(markets_by_slug={})
+        bases = [f"epl-a{i}-b{i}-2026-06-25" for i in range(60)]
+        sd.backfill_goals_markets(api, bases, max_games=10)
+        self.assertEqual(len(api.slugs_queried), 20)        # 10 games x 2 probes
+
+
 class TestDiscoverFromSharp(unittest.TestCase):
     def _lookup(self):
         # One Série B game in the sharp slate, carrying its odds-api league key.
