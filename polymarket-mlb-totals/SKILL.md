@@ -95,7 +95,6 @@ list_games_today (scanner)  →  find total-runs Over/Under market  →  NegBin 
 | `--min-hours F` | 0 | Min hours until game start (0 = pre-game only, not started) |
 | `--all-lines` | off | Suggest every qualifying line (default: best-edge line per game) |
 | `--min-edge F` | 0.05 | Min edge after fees (decision tree) |
-| `--min-sharp-edge F` | 0.01 | Min sharp confirming edge for the chosen side (sharp veto floor; 0 = any positive) |
 | `--odds-min / --odds-max` | 1.50 / 3.00 | Decimal payout band (→ price 0.667 … 0.333) |
 | `--dispersion F` | 2.0 | `variance = dispersion × mean` |
 | `--league-baseline F` | 8.5 | Neutral game total |
@@ -182,19 +181,6 @@ measure**, built in four layers (full write-up in `references/calibrated-forecas
 Pure-stdlib cores, offline-tested by `test_forecast.py` / `test_calibration_core.py` /
 `test_scoring.py`.
 
-**Forecast layer — predict EVERY game** (`forecast_all_mlb`, on by default; `--no-forecast-all`):
-beyond the tradeable `suggestions` (which still respect edge/odds-band/volume), the run also emits
-a `forecasts` array with a calibrated run-total prediction for **every** discovered MLB game —
-including games Polymarket lists **without** a totals market, or with no actionable edge. Each
-forecast picks the best basis (**sharp → factors → market price**), reports the full distribution
-(mean/median/mode, 50%/80% intervals, entropy, P(over) at the game's line) plus `edge_vs_market`
-when a price exists. This is prediction, not a trade signal — the dashboard shows it under
-"Previsão de todos os jogos". Games with no basis are listed with `forecast: null`.
-
-**Sharp date tolerance**: the sharp lookup matches a game's teams on the target date **and the next
-UTC day**, so late West-coast games (whose UTC commence rolls past midnight) keep their sharp anchor
-instead of falling to "no sharp reference".
-
 ### Calibration report (`calibration.py`)
 Settles the shadow log (a game's actual outcome is propagated to **all** its lines, bet or not) and
 scores the model. Pure stdlib; `--sport mlb|soccer`.
@@ -234,51 +220,23 @@ ROI/CLV vs the devigged **closing** line are the real validation; `mean(μ − m
 Over/Under bias. Team factors are point-in-time from the results; per-start starter FIP is a documented
 extension (needs a probables history).
 
-### Model as the prediction engine + sharp edge-sign veto (`sharp_odds.py`)
-The **factor model is the prediction engine**: when team offense/pitching factors are present, μ comes
-from the model (`model_probabilities` → `adjust_mu`) and `p_over`/`p_under` are the model's own forecast.
-The **sharp reference is a separate edge-sign veto**, not an anchor: `p_over_sharp` (the devigged
-Pinnacle fair P(Over), evaluated at the Polymarket line) is compared to the price for the side the model
-chose. **A bet is suggested only if the sharp's edge for that side clears `--min-sharp-edge`** (default
-1%) — the model proposes, the sharp confirms it's +EV. If the sharp says the model's side is overpriced
-or barely endorses it (sharp edge < the minimum), the bet is vetoed (logged as `sharp edge … < N% min`).
-The threshold exists because a positive-but-tiny sharp edge is the sharp expressing **no opinion**, not
-confirmation — empirically those bets behaved like noise, so the minimum filters them out.
+### Prediction model — factor μ anchored to the market
+The model is the **market-anchored factor model** (restored to the PR #36 contract). When team
+offense/pitching factors are present, μ starts from the factor model (`adjust_mu`) and is then
+**shrunk toward the market-implied μ and capped** (`anchor_to_market`, weight `0.6`, deviation cap
+`±0.75` runs) — the backtested fix for the raw factors sitting ~0.66 runs UNDER the market. With no
+strong factors, μ = market-implied (edge ≈ 0, anti-fabrication). The decision is purely model-vs-price:
+`pick_side` → `MAX_PLAUSIBLE_EDGE` (15%) guard → `decision_tree` (volume / `--min-edge` / pre-game) →
+half-Kelly sizing. **There is no sharp anchor or sharp veto in the bet decision** — the sharp lives only
+in the standalone CLV validation below.
 
-So a suggestion requires BOTH: the model's own edge ≥ `--min-edge` (its conviction floor, default 5%,
-and ≤ the 15% implausible cap) **and** a sharp edge ≥ `--min-sharp-edge` (default 1%). Set `--min-edge 0`
-to let the model propose at any positive model edge and rely on the sharp veto alone; set
-`--min-sharp-edge 0` to revert to the old "any positive sharp edge confirms" behavior. `sharp_edge` is
-recorded in `stats_log` and returned per suggestion.
+> The sharp/CLV tooling (`sharp_odds.py`, `capture_close.py`, `clv_vs_sharp.py`) remains available as a
+> **standalone** way to measure closing-line value; it is no longer wired into `model_probabilities` or
+> game discovery. Note this also restores the #36 discovery path (the `mlb` Gamma tag), which is
+> volume-ranked and can truncate low-volume games — re-enable sharp-driven discovery separately if you
+> need the full daily card surfaced.
 
-**Fallbacks.** With a sharp ref but **no** factors, there's nothing to predict from → μ falls back to the
-sharp (degenerate). Without a sharp ref, the model runs Polymarket-anchored (factors shrunk toward the
-price; zero edge — anti-fabrication) and there's no veto. Games with no sharp match are skipped when
-`require_sharp` is on (`--no-require-sharp` to model them anyway, no veto). The forecast layer (§ above)
-predicts **every** game from the model regardless.
-```bash
-# Live: The Odds API (includes Pinnacle).            Backtest/offline: a CSV.
-python polymarket-mlb-totals/scripts/suggest_totals.py --odds-api-key $ODDS_API_KEY
-python polymarket-mlb-totals/scripts/suggest_totals.py --sharp-odds-csv sharp.csv
-```
-
-### Sharp-driven discovery (`sharp_discovery.py`)
-The `mlb` Gamma tag is **not honored** — it returns the global volume-ranked mix and pagination caps
-at offset ~2100 (HTTP 422), so low-volume MLB games are truncated (only ~2 of the day's ~11 surface).
-When a sharp slate is loaded it carries the **full daily card**, so it becomes the **authoritative game
-list**: for each sharp game we fetch its Polymarket markets directly by event slug (`mlb-<away>-<home>-
-<date>`, both orderings tried) and **union** them into discovery. This fixes coverage (every game found
-regardless of volume rank) **and** matching — every added game already has its sharp reference, because
-team identifiers from any source (abbrev `CHC` or full name `Chicago Cubs`) are normalized to the
-Polymarket slug abbreviation (`sharp_odds.normalize_team`). On by default when a sharp reference is
-present; disable with `--no-sharp-discovery`. Each game's total markets are grouped by their
-line-encoding slug (`...-total-8pt5`) so the run-total filter keeps them. The sharp anchor is then
-interpreted **at the sharp's own line** (`sharp_ref` returns line + fair P(over)): the model inverts it
-to an expected total (μ) at the sharp line and prices whatever Polymarket line is on offer off that μ,
-so a sharp main line of 8.5 correctly prices a Polymarket alternate of 7.5/11.5 — line drift between
-the books no longer drops the reference.
-
-### CLV vs the sharp close (`clv_vs_sharp.py`) — the validated edge metric
+### CLV vs the sharp close (`clv_vs_sharp.py`) — standalone validation metric
 `CLV(side) = sharp_close_fair_prob(side) − entry_price`. Beating the sharp close is the only proxy that
 confirms a real edge (in ~50 bets, vs thousands for raw P&L). The close prob is taken **at the bet's own
 line** even when the sharp closed at a different line (same μ-inversion as the model anchor — alternate-line

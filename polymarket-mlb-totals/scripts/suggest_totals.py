@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -24,14 +23,10 @@ from datetime import datetime, timezone
 import _bootstrap  # noqa: F401  (wires sys.path for the reused skills)
 
 import run_distribution as rd
-import forecast as fc
-import congruence as cg
 import park_factors as pf
 import totals_market as tm
 import data_inputs
 import predictions_db
-import sharp_odds
-import sharp_discovery
 
 from category_common import (
     APIClient,
@@ -89,159 +84,37 @@ STRONG_INPUT_KEYS = ("home_off", "away_off", "home_sp", "away_sp")
 
 
 def model_probabilities(line, over_price, park_factor, inputs, *,
-                        league_baseline, dispersion, sharp_over_price=None, sharp_line=None):
+                        league_baseline, dispersion):
     """Model the total-runs distribution and return the full math as a dict.
 
-    The factor MODEL is the PREDICTION ENGINE: when external inputs exist, mu comes from the
-    model (`adjust_mu`), and `p_over`/`p_under` are the model's own forecast at the Polymarket
-    line. The SHARP reference is NOT used to anchor mu — instead it is a separate EDGE-SIGN
-    veto: `p_over_sharp` (the devigged Pinnacle/consensus fair P(Over), evaluated at the
-    Polymarket line) lets the caller suggest a bet only when the SHARP agrees the model's
-    chosen side is +EV (sharp fair − price > 0). The model proposes; the sharp confirms.
-
-    The sharp prob is inverted to an expected total at the SHARP'S OWN line (`sharp_line`),
-    then the distribution is evaluated at whatever Polymarket line is on offer — so a sharp
-    main line of 8.5 still prices a Polymarket alternate of 7.5/11.5 correctly.
-
-    Fallbacks (no model to drive the prediction):
-      - sharp present but NO factors → mu = the sharp mu (degenerate: the sharp is all we have);
-      - no sharp + factors          → mu = factors shrunk toward the Polymarket price
-                                        (`anchor_to_market`, the legacy bias-capped path);
-      - neither                     → mu = market-implied (edge ≈ 0, anti-fabrication).
+    mu is anchored to the **market-implied total** unless we have a STRONG input
+    (team offense / pitching factors); weather/park alone keep mu at the market
+    (edge ~ 0 — never fabricated). The market-implied mu is always reported for
+    transparency. Returns p_over/p_under (effective), mu, market_mu, var,
+    used_external, p_push, need, and the NegBin params (r, p).
     """
-    poly_mu = rd.market_implied_mu(line, over_price, dispersion)
+    market_mu = rd.market_implied_mu(line, over_price, dispersion)
     used_external = any(k in inputs for k in STRONG_INPUT_KEYS)
-    model_mu = rd.adjust_mu(rd.baseline_mu(park_factor, league_baseline), **inputs) if used_external else None
-    sharp_mu = None
-    if sharp_over_price is not None:
-        sharp_mu = rd.market_implied_mu(sharp_line if sharp_line is not None else line,
-                                        sharp_over_price, dispersion)
-
-    if sharp_over_price is not None:
-        mu = model_mu if used_external else sharp_mu     # MODEL drives; degenerate to sharp w/o factors
-    elif used_external:
-        mu = rd.anchor_to_market(model_mu, poly_mu)      # unchanged no-sharp path
+    model_mu = None
+    if used_external:
+        base = rd.baseline_mu(park_factor, league_baseline)
+        model_mu = rd.adjust_mu(base, **inputs)
+        # Anchor the factor-based mu to the efficient market (shrink + cap the deviation):
+        # the raw factors backtested ~0.66 runs UNDER the market and lost.
+        mu = rd.anchor_to_market(model_mu, market_mu)
     else:
-        mu = poly_mu
-
+        mu = market_mu
     var = rd.variance_from_mu(mu, dispersion)
     pmf = rd.negbin_total_runs_pmf(mu, var)
     probs = rd.prob_over(line, pmf)
     r, p = rd.negbin_params_from_moments(mu, var)
-
-    # Sharp fair P(over) at the Polymarket line — the edge-sign reference for the veto.
-    p_over_sharp = None
-    if sharp_mu is not None:
-        sp = rd.negbin_total_runs_pmf(sharp_mu, rd.variance_from_mu(sharp_mu, dispersion))
-        p_over_sharp = rd.prob_over(line, sp)["p_over_eff"]
-    p_over_model = probs["p_over_eff"] if used_external else None
-
     return {
         "p_over": probs["p_over_eff"], "p_under": probs["p_under_eff"],
-        "mu": mu, "market_mu": (sharp_mu if sharp_mu is not None else poly_mu),
-        "model_mu": model_mu, "poly_mu": poly_mu, "sharp_mu": sharp_mu,
-        "p_over_sharp": p_over_sharp, "p_over_model": p_over_model,
-        # sharp_anchored: True only in the degenerate fallback (sharp present, no factors).
-        "sharp_anchored": (sharp_over_price is not None) and (not used_external),
-        "sharp_gated": sharp_over_price is not None, "var": var,
+        "mu": mu, "market_mu": market_mu, "model_mu": model_mu, "var": var,
         "used_external": used_external,
         "p_push": probs["p_push"], "need": probs["need"],
         "negbin_r": r, "negbin_p": p,
     }
-
-
-def forecast_block(m, line) -> dict:
-    """Layer 1 + 3 per-prediction confidence: the full distribution summarized.
-
-    From the game's (mu, var) NegBin distribution: the expected total + most-likely
-    total, the 50% / 80% PREDICTION INTERVALS (the honest range the total will land in
-    — wide, because a single MLB game is irreducibly uncertain), and the predictive
-    entropy (spread). This turns "P(Over)=0.62" into a forecast with stated confidence.
-    The heavy pmf is dropped; only the human-readable summary is stored.
-    """
-    s = fc.forecast_summary(m["mu"], m["var"], line)
-    return {
-        "mean_total": round(s["mean"], 2),
-        "median_total": s["median"],
-        "most_likely_total": s["mode"],
-        "pi50": list(s["pi50"]),
-        "pi80": list(s["pi80"]),
-        "pi80_mass": round(s["pi80_mass"], 4),
-        "entropy_bits": round(s["entropy_bits"], 3),
-        "p_over": round(s["p_over"], 4),
-        "p_under": round(s["p_under"], 4),
-    }
-
-
-def _forecast_mu(line, over_price, sharp, inputs, park, dispersion, league_baseline):
-    """Best-available expected total for a FORECAST (not a trade): factors → sharp → market.
-
-    The factor MODEL is the prediction engine, so its mu comes first; the sharp and the
-    market price are only fallbacks when there are no team factors. Returns (mu, basis) or
-    (None, None) when there's nothing to model from — never requires a Polymarket price, so
-    a game with no totals market can still be forecast from the factors or the sharp line.
-    """
-    sharp_line, sharp_over = (sharp if sharp else (None, None))
-    if any(k in inputs for k in STRONG_INPUT_KEYS):
-        return rd.adjust_mu(rd.baseline_mu(park, league_baseline), **inputs), "factors"
-    if sharp_over is not None:
-        return rd.market_implied_mu(sharp_line, sharp_over, dispersion), "sharp"
-    if over_price is not None:
-        return rd.market_implied_mu(line, over_price, dispersion), "market"
-    return None, None
-
-
-def forecast_all_mlb(api, mlb_events, sharp_lookup, target, args, vlog):
-    """One run-total forecast per MLB game — independent of the trade filters.
-
-    Every game with a model basis (sharp → factors → market price) gets the full distribution
-    (mean/median/mode, 50%/80% intervals, entropy, P(over) at its main line), even when it has
-    no Polymarket totals market or no actionable edge. This is PREDICTION, not a trade signal:
-    no edge/odds-band/volume gating. Games with no basis are reported with forecast=None.
-    """
-    out = []
-    for event_slug, gmarkets in sorted(mlb_events.items()):
-        totals = tm.find_totals_market({"markets": gmarkets})
-        line = tm.parse_total_line(totals) if totals else None
-        ou = tm.over_under_tokens(totals) if totals else None
-        over_price = ou["over_price"] if (ou and ou.get("over_price") is not None) else None
-        park = pf.park_factor_for_slug(event_slug)
-        inputs = {}
-        if args.use_external:
-            try:
-                inputs = data_inputs.get_game_inputs(
-                    api, event_slug, target, projections_csv=args.projections_csv,
-                    debug=args.debug) or {}
-            except Exception:  # noqa: BLE001 - a forecast must never crash the run
-                inputs = {}
-        away, home = pf.parse_slug_teams(event_slug)
-        sharp = sharp_odds.sharp_ref(sharp_lookup, target, away, home) if sharp_lookup else None
-        eval_line = line if line is not None else (sharp[0] if sharp else 8.5)
-        mu, basis = _forecast_mu(eval_line, over_price, sharp, inputs, park,
-                                 args.dispersion, args.league_baseline)
-        if mu is None:
-            out.append({"game": event_slug, "line": eval_line, "has_market": totals is not None,
-                        "basis": None, "forecast": None,
-                        "reason": "no model basis (no sharp, no factors, no market price)"})
-            continue
-        s = fc.forecast_summary(mu, rd.variance_from_mu(mu, args.dispersion), eval_line)
-        rec = {
-            "game": event_slug, "line": eval_line, "has_market": totals is not None, "basis": basis,
-            "mu": round(mu, 3),
-            "forecast": {
-                "mean_total": round(s["mean"], 2), "median_total": s["median"],
-                "most_likely_total": s["mode"], "pi50": list(s["pi50"]), "pi80": list(s["pi80"]),
-                "pi80_mass": round(s["pi80_mass"], 4), "entropy_bits": round(s["entropy_bits"], 3),
-                "p_over": round(s["p_over"], 4), "p_under": round(s["p_under"], 4),
-            },
-            "over_price": over_price,
-            "edge_vs_market": (round(s["p_over"] - over_price, 4) if over_price is not None else None),
-        }
-        out.append(rec)
-    n_fc = sum(1 for r in out if r["forecast"] is not None)
-    vlog(f"  forecast layer: {n_fc}/{len(out)} MLB game(s) forecast "
-         f"({sum(1 for r in out if not r['has_market'])} without a Polymarket totals market)")
-    return out
 
 
 def pick_side(line, ou, p_over, p_under, fee_rate, odds_min, odds_max,
@@ -328,7 +201,7 @@ def size_position(p_model, price, portfolio_value, first_trade, kelly_half):
 
 
 def build_recommendation(game_slug, totals, line, chosen, mu, used_external,
-                         size_pct, size_usd, confidence, fee_rate, ou, forecast=None):
+                         size_pct, size_usd, confidence, fee_rate, ou):
     """Assemble the execute_paper-compatible recommendation + a human text block."""
     side_word = chosen["side"].capitalize()
     price = chosen["price"]
@@ -357,10 +230,7 @@ def build_recommendation(game_slug, totals, line, chosen, mu, used_external,
         f"(payout {rd.decimal_odds(price):.2f}x)\n"
         f"Size: ${size_usd:,.2f} ({size_pct*100:.2f}% of portfolio)\n"
         f"Confidence: {confidence:.2f}\n"
-        + (f"Forecast: ~{forecast['mean_total']} runs "
-           f"(80% PI {forecast['pi80'][0]}-{forecast['pi80'][1]}, "
-           f"entropy {forecast['entropy_bits']:.2f} bits)\n" if forecast else "")
-        + f"Edge: {chosen['edge']*100:+.1f}% after fees\n"
+        f"Edge: {chosen['edge']*100:+.1f}% after fees\n"
         f"Reasoning: {sanitize_text(reasoning)}"
     )
     return rec, text
@@ -376,7 +246,6 @@ def record_prediction_row(db_path, game_slug, game_date, totals, line, chosen, m
     """
     price = chosen["price"]
     odds = rd.decimal_odds(price)
-    forecast = forecast_block(m, line)
     # Link to the game event, not the specific total line (strip "-total-9pt5").
     event = predictions_db.model_log_base(game_slug or totals.get("slug") or "")
     market_url = (f"https://polymarket.com/event/{event}" if event
@@ -385,8 +254,6 @@ def record_prediction_row(db_path, game_slug, game_date, totals, line, chosen, m
         "model": "negative_binomial",
         "mu": round(m["mu"], 4), "market_mu": round(m["market_mu"], 4),
         "model_mu": round(m["model_mu"], 4) if m.get("model_mu") is not None else None,
-        "poly_mu": round(m["poly_mu"], 4) if m.get("poly_mu") is not None else None,
-        "sharp_anchored": m.get("sharp_anchored", False),
         "variance": round(m["var"], 4),
         "dispersion": args.dispersion,
         "negbin_r": round(m["negbin_r"], 4), "negbin_p": round(m["negbin_p"], 4),
@@ -395,13 +262,6 @@ def record_prediction_row(db_path, game_slug, game_date, totals, line, chosen, m
         "line": line, "need": m["need"],
         "p_over_eff": round(m["p_over"], 4), "p_under_eff": round(m["p_under"], 4),
         "p_push": round(m["p_push"], 4),
-        "p_over_model": round(m["p_over_model"], 4) if m.get("p_over_model") is not None else None,
-        "p_over_sharp": round(m["p_over_sharp"], 4) if m.get("p_over_sharp") is not None else None,
-        "sharp_mu": round(m["sharp_mu"], 4) if m.get("sharp_mu") is not None else None,
-        "sharp_edge": round(m["sharp_edge"], 4) if m.get("sharp_edge") is not None else None,
-        "sharp_gated": m.get("sharp_gated", False),
-        "congruence": m.get("congruence"),
-        "forecast": forecast,
         "chosen_side": chosen["side"], "entry_price": price,
         "decimal_odds": round(odds, 4), "model_prob": round(chosen["p_model"], 4),
         "fee_rate": args.fee_rate, "fee_applied": round(fee_for(price, args.fee_rate), 5),
@@ -463,38 +323,6 @@ def _shadow_log_mlb(args, target, slug, line, side_notes, chosen, m, bet, skip_r
             print(f"[model_log] failed: {e}", file=sys.stderr)
 
 
-def _load_sharp_lookup(args, target, vlog) -> dict:
-    """Load the sharp reference (Pinnacle/consensus, devigged) -> the fair-value anchor.
-
-    CSV first, then The Odds API. With it the model is a divergence detector (edge =
-    Polymarket price vs sharp fair); without it the model stays Polymarket-anchored
-    (zero edge). It also doubles as the authoritative game list for sharp-driven
-    discovery, so it is loaded BEFORE market discovery.
-    """
-    sharp_lookup: dict = {}
-    if getattr(args, "sharp_odds_csv", None):
-        vlog(f"  sharp source: CSV {args.sharp_odds_csv}")
-        try:
-            sharp_lookup = sharp_odds.load_sharp_csv(args.sharp_odds_csv)
-        except OSError as e:
-            vlog(f"  sharp CSV load failed: {e}")
-    elif getattr(args, "odds_api_key", None) or os.environ.get("ODDS_API_KEY"):
-        vlog("  sharp source: The Odds API (live)")
-        sharp_lookup = sharp_odds.fetch_sharp(
-            getattr(args, "odds_api_key", None), target, vlog=vlog)
-    else:
-        vlog("  sharp source: NONE (no --sharp-odds-csv and no --odds-api-key/$ODDS_API_KEY) "
-             "-> Polymarket-anchored, zero-edge fallback")
-    if sharp_lookup:
-        dated = sum(1 for k in sharp_lookup if k[0] == target)
-        vlog(f"  sharp reference loaded: {len(sharp_lookup)} game(s) "
-             f"({dated} dated {target}) (divergence-detector mode)")
-    else:
-        vlog("  sharp reference EMPTY — divergence detector OFF "
-             "(model stays Polymarket-anchored, zero edge)")
-    return sharp_lookup
-
-
 def run(args) -> dict:
     api = APIClient(rate_limit_ms=args.rate_limit, debug=args.debug)
     # Robust terminal logging (stderr -> shows in the uvicorn console). On unless --quiet.
@@ -513,42 +341,7 @@ def run(args) -> dict:
         return {"date": target, "error": f"discovery failed: {e}",
                 "suggestions": [], "skipped": []}
 
-    # Coverage diagnostics: the `mlb` tag is NOT honored by Gamma — it returns the
-    # global volume-ranked mix (crypto/politics/other sports), and pagination is capped
-    # (HTTP 422 past offset ~2100). So low-volume MLB games can fall past the cut and be
-    # invisible. Surface the MLB-vs-mix split + a truncation flag so this is auditable.
-    # The truncation check uses DATED MLB GAMES (distinct events on the target day), not
-    # the raw count of mlb- markets — a fat backlog of future/other-day games masks the
-    # fact that today's low-volume games were cut.
-    def _is_mlb(m):
-        return (m.get("event_slug") or m.get("slug") or "").lower().startswith("mlb-")
-    mlb_all = [m for m in markets if _is_mlb(m)]
-    mlb_events_today = {(m.get("event_slug") or m.get("slug"))
-                        for m in mlb_all if game_date(m) == target}
-    vlog(f"Discovery: tag '{_tag}' -> {len(markets)} active market(s); "
-         f"{len(mlb_all)} are MLB (mlb- prefix), {len(mlb_events_today)} MLB event(s) "
-         f"dated {target}; {len(markets) - len(mlb_all)} other (the tag's global mix)")
-    if len(markets) >= 2000 and len(mlb_events_today) < 6:
-        vlog(f"  ⚠️ COVERAGE WARNING: only {len(mlb_events_today)} MLB game(s) dated "
-             f"{target} surfaced in the top {len(markets)} by volume — low-volume games "
-             f"are being cut by the offset cap. Sharp-driven discovery will recover them.")
-
-    # Load the sharp reference EARLY: it doubles as the authoritative game list.
-    sharp_lookup = _load_sharp_lookup(args, target, vlog)
-
-    # Sharp-source-driven discovery: the sharp slate carries the FULL daily card, so we
-    # fetch each sharp game's Polymarket markets by event slug and UNION them in. This
-    # fixes coverage (every game found regardless of volume rank) AND matching (every
-    # added game already has a sharp ref). On by default when a sharp slate is loaded.
-    if sharp_lookup and getattr(args, "sharp_discovery", True):
-        existing = {m.get("slug") for m in markets if m.get("slug")}
-        extra = sharp_discovery.discover_from_sharp(api, sharp_lookup, target, vlog=vlog)
-        added = [m for m in extra if m.get("slug") and m.get("slug") not in existing]
-        if added:
-            markets = markets + added
-            vlog(f"  sharp-driven discovery added {len(added)} market(s) the tag missed "
-                 f"(total now {len(markets)})")
-
+    vlog(f"Discovery: tag '{_tag}' -> {len(markets)} active market(s)")
     on_day = [m for m in markets if game_date(m) == target]
     games = group_by_event(on_day)
     vlog(f"  {len(on_day)} market(s) dated {target} across {len(games)} event(s)")
@@ -563,12 +356,7 @@ def run(args) -> dict:
         games = {k: v for k, v in games.items() if k.lower().startswith(prefix)}
         filtered_non_league = before - len(games)
         vlog(f"  filtered out {filtered_non_league} non-'{prefix}' event(s); "
-             f"{len(games)} MLB event(s) dated {target}: "
-             + (", ".join(sorted(games)) if games else "(none)"))
-
-    # Snapshot ALL MLB events (pre-totals-filter) so the forecast layer can predict every
-    # game — including those Polymarket lists without a run-total market.
-    all_mlb_events = dict(games)
+             f"{len(games)} MLB event(s)")
 
     # Keep only full-GAME total-runs markets (drop moneyline/spread/F5/K-prop/NRFI).
     before_total = len(games)
@@ -626,31 +414,12 @@ def run(args) -> dict:
                 api, event_slug, target, projections_csv=args.projections_csv,
                 debug=args.debug) or {}
 
-        away, home = pf.parse_slug_teams(event_slug)
-        sharp = sharp_odds.sharp_ref(sharp_lookup, target, away, home) if sharp_lookup else None
-        sharp_line, sharp_over = (sharp if sharp else (None, None))
-        # Divergence mode: with a sharp slate loaded, bet ONLY on a sharp anchor. A game
-        # with no sharp match must be skipped, not fall back to the factor model (which the
-        # backtest proved is -EV) — otherwise the loophole reintroduces factor-noise bets.
-        if sharp_lookup and sharp is None:
-            vlog(f"  [{event_slug}] ⚠️ no sharp match for parsed teams "
-                 f"away={away} home={home} — not in the {len(sharp_lookup)}-game sharp slate "
-                 f"(check team-abbrev mapping)")
-            if getattr(args, "require_sharp", True):
-                _skip(event_slug, "no sharp reference (divergence mode bets only on a sharp anchor)",
-                      line=line)
-                continue
         m = model_probabilities(
             line, ou["over_price"], park_factor, inputs,
-            league_baseline=args.league_baseline, dispersion=args.dispersion,
-            sharp_over_price=sharp_over, sharp_line=sharp_line)
+            league_baseline=args.league_baseline, dispersion=args.dispersion)
         vlog(f"  [{event_slug}] model: park={park_factor} mu={m['mu']:.2f} "
              f"P(over)={m['p_over']:.3f} P(under)={m['p_under']:.3f} "
              f"external_inputs={m['used_external']}"
-             + (f" sharp_over={sharp_over:.3f}@line{sharp_line:g} "
-                f"(model_mu={m['mu']:.2f} vs sharp_mu={m['market_mu']:.2f}; "
-                f"sharp P(over)@{line:g}={m['p_over_sharp']:.3f})"
-                if sharp_over is not None else " (no sharp ref)")
              + (f" inputs={inputs}" if inputs else ""))
 
         chosen, side_notes = pick_side(line, ou, m["p_over"], m["p_under"],
@@ -671,27 +440,6 @@ def run(args) -> dict:
             _skip(event_slug, reason, line=line, sides=side_notes)
             continue
 
-        # Sharp edge-sign veto: the factor MODEL proposes the side (above); the SHARP only
-        # confirms the bet is +EV. Suggest ONLY if the sharp's fair edge for the chosen side
-        # clears `--min-sharp-edge` (`p_over_sharp` is None when no sharp ref → no veto,
-        # model-only). A positive-but-tiny sharp edge is treated as "no opinion", not
-        # confirmation — the threshold filters out bets the sharp barely endorses.
-        sharp_edge = None
-        min_sharp = getattr(args, "min_sharp_edge", 0.0)
-        if m.get("p_over_sharp") is not None:
-            p_sharp_side = (m["p_over_sharp"] if chosen["side"] == "OVER"
-                            else 1.0 - m["p_over_sharp"])
-            sharp_edge = p_sharp_side - chosen["price"]
-            vlog(f"  [{event_slug}] sharp veto: model picks {chosen['side']} "
-                 f"(model edge {chosen['edge']*100:+.1f}%); sharp edge {sharp_edge*100:+.1f}% "
-                 f"(min {min_sharp*100:.1f}%)")
-            if sharp_edge < min_sharp:
-                reason = (f"sharp edge {sharp_edge*100:+.1f}% < {min_sharp*100:.1f}% min — sharp "
-                          f"does not confirm the model's {chosen['side']} as +EV")
-                _shadow_log_mlb(args, target, event_slug, line, side_notes, chosen, m, 0, reason, totals, ou)
-                _skip(event_slug, reason, line=line, side=chosen["side"])
-                continue
-
         passed, reason = decision_tree(chosen, totals, ou,
                                        min_volume=args.min_volume, min_edge=args.min_edge,
                                        min_hours=args.min_hours)
@@ -703,7 +451,6 @@ def run(args) -> dict:
         size_pct, size_usd, kelly = size_position(
             chosen["p_model"], chosen["price"], portfolio_value, first_trade,
             advisor_kelly_half())
-        cong = dict(cg.NEUTRAL)   # congruence sizing replaced by the sharp edge-sign veto above
         if kelly <= 0:
             _shadow_log_mlb(args, target, event_slug, line, side_notes, chosen, m, 0, "Kelly <= 0", totals, ou)
             _skip(event_slug, "Kelly <= 0", line=line, side=chosen["side"])
@@ -718,15 +465,13 @@ def run(args) -> dict:
                       if m["used_external"] else 0.5)
         rec, text = build_recommendation(event_slug, totals, line, chosen, m["mu"],
                                          m["used_external"], size_pct, size_usd,
-                                         confidence, args.fee_rate, ou,
-                                         forecast_block(m, line))
+                                         confidence, args.fee_rate, ou)
         # Defer recording until best-line selection (avoids correlated multi-line bets).
         candidates.append({
             "event_slug": event_slug, "line": line, "totals": totals, "ou": ou,
             "inputs": inputs, "park_factor": park_factor, "m": m, "chosen": chosen,
             "side_notes": side_notes, "size_pct": size_pct, "size_usd": size_usd,
             "kelly": kelly, "confidence": confidence, "rec": rec, "text": text,
-            "cong": cong, "sharp_edge": sharp_edge,
         })
 
     # Best-line-per-game: record/score only the highest-edge line per matchup; the other
@@ -747,8 +492,6 @@ def run(args) -> dict:
 
     recorded_ids: dict[str, set] = {}
     for c in final:
-        c["m"]["congruence"] = c.get("cong")        # carried into the recorded stats_log
-        c["m"]["sharp_edge"] = c.get("sharp_edge")  # the sharp's confirming edge for the bet side
         prediction_id = None
         if args.record:
             prediction_id = record_prediction_row(
@@ -761,8 +504,6 @@ def run(args) -> dict:
                         c["chosen"], c["m"], 1, None, c["totals"], c["ou"])
         suggestions.append({"game": c["event_slug"], "line": c["line"],
                             "mu": round(c["m"]["mu"], 3), "edge": round(c["chosen"]["edge"], 4),
-                            "sharp_edge": (round(c["sharp_edge"], 4) if c.get("sharp_edge") is not None else None),
-                            "forecast": forecast_block(c["m"], c["line"]),
                             "prediction_id": prediction_id, "recommendation": c["rec"],
                             "_text": c["text"]})
         vlog(f"  [{c['event_slug']}] >>> SUGGEST {c['chosen']['side']} {c['line']} "
@@ -780,15 +521,8 @@ def run(args) -> dict:
                 vlog(f"  [{game_slug}] superseded {n} stale PENDENTE entry(ies) from an earlier run")
     suggestions.sort(key=lambda s: s["edge"], reverse=True)
 
-    # Forecast layer: a calibrated prediction for EVERY MLB game, independent of the trade
-    # filters (so a no-edge / no-market game still shows its run distribution).
-    forecasts = []
-    if getattr(args, "forecast_all", True):
-        forecasts = forecast_all_mlb(api, all_mlb_events, sharp_lookup, target, args, vlog)
-
     texts = [s.pop("_text") for s in suggestions]
     vlog(f"=== Done: {len(suggestions)} suggestion(s), {len(skipped)} skipped, "
-         f"{len(forecasts)} forecast(s), "
          f"{filtered_non_league} non-MLB + {filtered_non_total} non-run-total filtered ===")
 
     result = {
@@ -796,12 +530,11 @@ def run(args) -> dict:
         "portfolio_value": portfolio_value,
         "first_trade_strategy": first_trade,
         "counts": {"games": len(games), "suggestions": len(suggestions),
-                   "skipped": len(skipped), "forecasts": len(forecasts),
+                   "skipped": len(skipped),
                    "filtered_non_mlb": filtered_non_league,
                    "filtered_non_total": filtered_non_total,
                    "superseded": superseded},
         "suggestions": suggestions,
-        "forecasts": forecasts,
         "skipped": skipped,
         "disclaimer": "Paper-trading simulation — not financial advice. Real "
                       "trading involves risk of loss. Edge is reconstructed from a "
@@ -854,24 +587,13 @@ def render_text(result: dict) -> str:
 def main() -> None:
     p = argparse.ArgumentParser(description="Suggest MLB total-runs entries on Polymarket.")
     p.add_argument("--date", default=None, help="Target day YYYY-MM-DD (default today UTC)")
-    p.add_argument("--min-volume", type=float, default=0.0,
-                   help="Min 24h volume to consider a game (default 0 = no volume filter; "
-                        "pass a value to re-enable)")
-    p.add_argument("--no-congruence", action="store_true",
-                   help="Disable model↔sharp congruence sizing (default on: shrink size/confidence "
-                        "when the NegBin disagrees with the sharp anchor)")
-    p.add_argument("--no-forecast-all", dest="forecast_all", action="store_false", default=True,
-                   help="Disable the forecast layer (default on: a calibrated run-total prediction "
-                        "for every MLB game, independent of edge/volume/market filters)")
+    p.add_argument("--min-volume", type=float, default=1000.0,
+                   help="Min 24h volume (default 1000; lower than the generic 10k for MLB totals)")
     p.add_argument("--min-hours", type=float, default=0.0,
                    help="Min hours until game start (default 0 = pre-game only, not started)")
     p.add_argument("--all-lines", dest="best_line_only", action="store_false", default=True,
                    help="Suggest every qualifying line (default: best-edge line per game only)")
     p.add_argument("--min-edge", type=float, default=0.05, help="Min edge after fees (default 0.05)")
-    p.add_argument("--min-sharp-edge", type=float, default=0.01,
-                   help="Min sharp confirming edge for the chosen side (default 0.01 = 1%%); "
-                        "the sharp veto rejects bets the sharp endorses by less than this — "
-                        "a positive-but-tiny sharp edge is 'no opinion', not confirmation")
     p.add_argument("--odds-min", type=float, default=rd.ODDS_MIN_DEFAULT, help="Min decimal payout (default 1.50)")
     p.add_argument("--odds-max", type=float, default=rd.ODDS_MAX_DEFAULT, help="Max decimal payout (default 3.00)")
     p.add_argument("--dispersion", type=float, default=2.0, help="variance = dispersion*mean (default 2.0)")
@@ -884,21 +606,6 @@ def main() -> None:
     p.add_argument("--no-external", dest="use_external", action="store_false",
                    help="Disable external inputs -> market-implied (zero-edge) model")
     p.add_argument("--projections-csv", default=None, help="Path to a projections CSV (ToS-clean run-rate source)")
-    p.add_argument("--sharp-odds-csv", default=None,
-                   help="Sharp reference odds CSV (date,away,home,total_line,over_odds,under_odds) "
-                        "-> fair-value anchor; turns the model into a divergence detector")
-    p.add_argument("--odds-api-key", default=None,
-                   help="The Odds API key (or $ODDS_API_KEY) for live Pinnacle/consensus totals")
-    p.add_argument("--no-sharp-discovery", dest="sharp_discovery", action="store_false",
-                   default=True,
-                   help="Disable using the sharp slate as the authoritative game list "
-                        "(default on when a sharp reference is loaded; recovers low-volume "
-                        "games the volume-truncated tag misses)")
-    p.add_argument("--no-require-sharp", dest="require_sharp", action="store_false",
-                   default=True,
-                   help="In divergence mode (sharp slate loaded), also evaluate games with NO "
-                        "sharp match via the factor model (default OFF: skip them — the factor "
-                        "model has no proven edge, so bet only on a sharp anchor)")
     p.add_argument("--refresh-prices", action="store_true", help="Refresh prices via CLOB midpoint")
     p.add_argument("--portfolio-value", type=float, default=10000.0, help="Portfolio USD for sizing")
     p.add_argument("--portfolio-db", default=None, help="Paper portfolio DB (to detect first trade)")
