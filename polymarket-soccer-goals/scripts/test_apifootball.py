@@ -58,6 +58,19 @@ class TestMatchByFullName(unittest.TestCase):
         # Discovery passes the club-suffix-normalized name ("cuiaba" from "Cuiabá EC").
         self.assertEqual(apif.match_team("xyz", names, name="cuiaba"), "Cuiabá")
 
+    def test_shared_distinctive_token_bridges_abbrev_vs_fullname(self):
+        # Polymarket abbreviates; API-Football uses the full name — they share the core word.
+        names = ["Ittihad Tanger", "Olympic Dcheira", "Renaissance Berkane", "AS FAR Rabat",
+                 "Wydad Casablanca", "Raja Casablanca"]
+        self.assertEqual(apif.match_team("xxx", names, name="ir tanger"), "Ittihad Tanger")
+        self.assertEqual(apif.match_team("xxx", names, name="rs berkane"), "Renaissance Berkane")
+        self.assertEqual(apif.match_team("xxx", names, name="as far"), "AS FAR Rabat")
+
+    def test_shared_token_ambiguous_returns_none(self):
+        # Two clubs share "Casablanca" -> the shared-token tier must NOT guess.
+        names = ["Wydad Casablanca", "Raja Casablanca"]
+        self.assertIsNone(apif.match_team("xxx", names, name="casablanca"))
+
     def test_falls_back_to_code_when_no_name(self):
         names = ["Cuiabá", "Londrina"]
         self.assertEqual(apif.match_team("cui", names), "Cuiabá")          # code prefix still works
