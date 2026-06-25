@@ -123,6 +123,21 @@ class TestDiscoverFromSharp(unittest.TestCase):
         self.assertEqual(out, [])
         self.assertEqual(api.slugs_queried, [])            # never probed
 
+    def test_event_found_but_no_goals_market_is_flagged(self):
+        # Real Série B case: the Polymarket event EXISTS but lists only moneyline-type markets
+        # (no -total-/-btts slug), so the goals model can't price it — log must say so.
+        api = _FakeAPI({"bra2-cui-lon-2026-06-25":
+                        [_market("bra2-cui-lon-2026-06-25", ["Cuiaba", "Londrina"], ["0.6", "0.4"])]})
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            out = sd.discover_from_sharp(api, self._lookup(), "2026-06-25",
+                                         existing_team_sets=set(),
+                                         vlog=lambda m: print(m, file=sys.stderr))
+        log = buf.getvalue()
+        self.assertIn("NO goals/BTTS market", log)
+        self.assertIn("event(s) found, 0 with a goals/BTTS market", log)
+        self.assertEqual(len(out), 1)            # still returned (filtered later by classification)
+
     def test_not_found_is_logged(self):
         api = _FakeAPI({})                                  # Polymarket has nothing
         buf = io.StringIO()

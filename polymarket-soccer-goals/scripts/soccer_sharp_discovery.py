@@ -22,8 +22,15 @@ from __future__ import annotations
 import _bootstrap  # noqa: F401  (wires sys.path for the reused category-watcher module)
 
 import leagues
+import soccer_market as sm
 from category_common import GAMMA_API, parse_market
 from sharp_odds_soccer import norm_name
+
+
+def _is_goals_market(market: dict) -> bool:
+    """True if a recovered market is a total-goals or BTTS market (what the model prices)."""
+    slug = (market.get("slug") or "").lower()
+    return bool(sm.GAME_TOTAL_RE.search(slug) or sm.GAME_BTTS_RE.search(slug))
 
 # National-team -> Polymarket/FIFA 3-letter code. Polymarket writes World Cup / international
 # slugs with these codes (fifwc-ecu-ger-…), which are NOT simple truncations of the name
@@ -198,7 +205,8 @@ def discover_from_sharp(api, sharp_lookup: dict, target: str,
     vlog(f"  [sharp-discovery] probing {len(games)} sharp game(s) the tag missed ...")
     markets: list[dict] = []
     seen_slugs: set[str] = set()
-    recovered = 0
+    found_event = 0          # event exists on Polymarket
+    with_goals = 0           # ...and it actually carries a total-goals/BTTS market
     for _teams, (a, b), league in games:
         prefix = prefix_for_league(league)
         cands = candidate_event_slugs(prefix, a, b, target)
@@ -213,8 +221,8 @@ def discover_from_sharp(api, sharp_lookup: dict, target: str,
             tried = f" (prefix={prefix or '?'}, tried {len(cands)})" if cands else " (no prefix)"
             vlog(f"  [sharp-discovery] {a} v {b}: NOT FOUND on Polymarket{tried}")
             continue
-        recovered += 1
-        new = 0
+        found_event += 1
+        new = goals = 0
         for m in ev_markets:
             slug = m.get("slug") or ""
             if slug and slug in seen_slugs:
@@ -223,7 +231,17 @@ def discover_from_sharp(api, sharp_lookup: dict, target: str,
                 seen_slugs.add(slug)
             markets.append(m)
             new += 1
-        vlog(f"  [sharp-discovery] {a} v {b}: RECOVERED {new} market(s) via {hit}")
-    vlog(f"  [sharp-discovery] recovered {recovered}/{len(games)} truncated game(s) "
-         f"({len(markets)} market(s) added)")
+            if _is_goals_market(m):
+                goals += 1
+        if goals:
+            with_goals += 1
+            vlog(f"  [sharp-discovery] {a} v {b}: RECOVERED {goals} goals/BTTS market(s) "
+                 f"(+{new - goals} other) via {hit}")
+        else:
+            # The event exists but Polymarket lists NO goals/BTTS market for it (typically
+            # moneyline-only on lower leagues) — the goals model has nothing to price here.
+            vlog(f"  [sharp-discovery] {a} v {b}: event found ({hit}) but has NO goals/BTTS "
+                 f"market — Polymarket lists only {new} other market(s); goals model can't price it")
+    vlog(f"  [sharp-discovery] {found_event}/{len(games)} event(s) found, {with_goals} with a "
+         f"goals/BTTS market ({len(markets)} market(s) added)")
     return markets

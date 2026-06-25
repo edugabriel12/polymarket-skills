@@ -76,11 +76,13 @@ python polymarket-soccer-goals/scripts/test_pipeline.py
   the full daily card) is used as the **authoritative game list**: any game the tag missed is fetched
   **directly by event slug** (`soccer_sharp_discovery.py`), bypassing the volume rank. Slugs are built
   from a league→prefix map + FIFA codes for national teams / short prefixes for clubs, trying both
-  team orderings. Each probe **logs `RECOVERED <slug>` or `NOT FOUND (prefix=…, tried N)`**, so the
-  output distinguishes *truncated by the cap* from *Polymarket doesn't list it* (or our abbreviation
-  guess missed — then hard-code that league's tokens). On by default with a sharp slate;
-  `--no-sharp-discovery` disables. ⚠️ Polymarket simply may not offer goals/BTTS markets for some
-  lower leagues — then there is nothing to recover and the model can't price that game.
+  team orderings. Each probe logs one of three outcomes, so coverage is fully auditable:
+  **`RECOVERED N goals/BTTS market(s)`** (truncated by the cap — now fixed), **`event found … but has
+  NO goals/BTTS market`** (Polymarket lists the game but only moneyline-type markets — the goals model
+  can't price it), or **`NOT FOUND (prefix=…, tried N)`** (absent, or our abbreviation guess missed →
+  hard-code that league's tokens). On by default with a sharp slate; `--no-sharp-discovery` disables.
+  ⚠️ Lower leagues (e.g. Brazilian Série B) frequently have **no goals/BTTS market on Polymarket at
+  all** — confirmed by the second log line — so there is nothing for the goals model to price.
 
 ## Script: suggest_soccer.py
 | Flag | Default | Purpose |
