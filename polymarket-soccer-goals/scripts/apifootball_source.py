@@ -28,9 +28,15 @@ import leagues  # noqa: F401  (kept for symmetry / future league lookups)
 
 APIFOOTBALL_API = "https://v3.football.api-sports.io"
 
-# One-time diagnostic dedupe: warn once per league prefix when the key is missing so the
-# operator can see WHY a club league (e.g. Série B) has no strength model, without spam.
+# Diagnostic dedupe so the strength path is auditable without spam: warn once per league when
+# the key is missing, log the key-present state once, and log each league's standings result once.
 _KEY_WARNED: set = set()
+_KEY_OK_LOGGED: list = [False]
+_LEAGUE_LOGGED: set = set()
+
+
+def _log(msg: str) -> None:
+    print(f"  [apifootball] {msg}", file=sys.stderr, flush=True)
 
 # Home tilt: equal teams -> ~+0.25 goal home edge at a 2.5 total (f - 1/f ≈ 0.21).
 HOME_TILT_DEFAULT = 1.105
@@ -281,10 +287,19 @@ def _resolve_table(prefix: str | None, date: str | None, key: str | None, timeou
         p = (prefix or "").strip().lower()
         if p and p not in _KEY_WARNED:
             _KEY_WARNED.add(p)
-            print(f"  [apifootball] APIFOOTBALL_KEY not set — no strength model for "
-                  f"'{p}' (league {league_id}); set the env var to enable it", file=sys.stderr)
+            _log(f"APIFOOTBALL_KEY not set — no strength model for '{p}' (league {league_id}); "
+                 f"set the env var to enable it")
         return None, None
-    rows = _fetch_standings_rows(league_id, season_for(prefix, date), key, timeout)
+    if not _KEY_OK_LOGGED[0]:                 # confirm once that the key is configured
+        _KEY_OK_LOGGED[0] = True
+        _log("APIFOOTBALL_KEY is set — strength model enabled")
+    season = season_for(prefix, date)
+    rows = _fetch_standings_rows(league_id, season, key, timeout)
+    lk = (league_id, season)
+    if lk not in _LEAGUE_LOGGED:              # which leagues return a table (and how big), once each
+        _LEAGUE_LOGGED.add(lk)
+        _log(f"{prefix} (league {league_id}, season {season}): {len(rows)} standings row(s)"
+             + ("" if rows else " — no data (off-season, or league/season not covered)"))
     return table_from_rows(rows)
 
 
@@ -296,7 +311,16 @@ def team_inputs(home: str | None, away: str | None, prefix: str | None, date: st
     table, league_avg = _resolve_table(prefix, date, key, timeout)
     if not table:
         return {}
-    return compute_inputs(table, league_avg, home, away, home_tilt, home_name, away_name)
+    out = compute_inputs(table, league_avg, home, away, home_tilt, home_name, away_name)
+    # Which games resolve strength (and to which standings names) vs which don't.
+    if out.get("_resolved"):
+        h, a = out["_resolved"]
+        _log(f"{prefix}: {h} vs {a} -> total_xg={out['total_xg']:.2f} "
+             f"sup={out['supremacy_xg']:+.2f}")
+    else:
+        _log(f"{prefix}: UNRESOLVED {home_name or home!r} / {away_name or away!r} "
+             f"in the {len(table)}-team table -> no strength model")
+    return out
 
 
 def league_baseline(prefix: str | None, date: str | None, key: str | None = None,

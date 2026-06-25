@@ -132,6 +132,48 @@ class TestSerieBWiring(unittest.TestCase):
         self.assertGreater(out["supremacy_xg"], 0)          # Cuiabá (home, better) favored
 
 
+class TestStrengthLogs(unittest.TestCase):
+    """The strength path logs key status, which leagues return a table, and per-game resolution."""
+
+    def setUp(self):
+        self._orig = apif._fetch_standings_rows
+        apif._KEY_WARNED.clear()
+        apif._LEAGUE_LOGGED.clear()
+        apif._KEY_OK_LOGGED[0] = False
+        apif._STANDINGS_CACHE.clear()
+
+    def tearDown(self):
+        apif._fetch_standings_rows = self._orig
+
+    def _run(self, *args, **kwargs):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            apif.team_inputs(*args, **kwargs)
+        return buf.getvalue()
+
+    def test_key_set_league_and_game_resolution_logged(self):
+        apif._fetch_standings_rows = lambda lid, season, key, timeout=8: apif.parse_standings(
+            _standings([("Cuiabá", 14, 10, 12), ("Londrina", 9, 13, 12), ("Goiás", 18, 8, 12)]))
+        log = self._run("cui", "lon", "bra2", "2026-06-25", key="K",
+                        home_name="cuiaba", away_name="londrina")
+        self.assertIn("APIFOOTBALL_KEY is set", log)
+        self.assertIn("bra2 (league 72, season 2026): 3 standings row(s)", log)
+        self.assertIn("Cuiabá vs Londrina", log)
+
+    def test_unresolved_game_logged(self):
+        apif._fetch_standings_rows = lambda lid, season, key, timeout=8: apif.parse_standings(
+            _standings([("Cuiabá", 14, 10, 12), ("Londrina", 9, 13, 12)]))
+        log = self._run("xxx", "yyy", "bra2", "2026-06-25", key="K",
+                        home_name="nobody", away_name="noone")
+        self.assertIn("UNRESOLVED", log)
+
+    def test_no_key_warns(self):
+        log = self._run("cui", "lon", "epl", "2026-06-25", key="")
+        self.assertIn("APIFOOTBALL_KEY not set", log)
+        self.assertIn("league 39", log)
+
+
 class TestNoNetwork(unittest.TestCase):
     def test_team_inputs_no_key(self):
         self.assertEqual(apif.team_inputs("nov", "nau", "bra2", "2026-06-14", key=""), {})
