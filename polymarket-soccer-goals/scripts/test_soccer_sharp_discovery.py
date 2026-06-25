@@ -57,6 +57,13 @@ class TestPrefixForLeague(unittest.TestCase):
         self.assertEqual(sd.prefix_for_league("soccer_fifa_world_cup"), "fifwc")
         self.assertEqual(sd.prefix_for_league("soccer_epl"), "epl")
 
+    def test_real_oddsapi_keys_corrected(self):
+        # Verified against the live Odds-API /sports list.
+        self.assertEqual(sd.prefix_for_league("soccer_spl"), "scotland")          # NOT saudi
+        self.assertEqual(sd.prefix_for_league("soccer_saudi_arabia_pro_league"), "saudi")
+        self.assertEqual(sd.prefix_for_league("soccer_efl_champ"), "elc")         # NOT england_efl_champ
+        self.assertEqual(sd.prefix_for_league("soccer_denmark_superliga"), "denmark")
+
     def test_unmapped_falls_back_to_slugified_tail(self):
         self.assertEqual(sd.prefix_for_league("soccer_narnia_premier"), "narnia-premier")
         self.assertIsNone(sd.prefix_for_league(None))
