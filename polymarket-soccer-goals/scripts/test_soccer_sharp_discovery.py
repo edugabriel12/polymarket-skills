@@ -33,16 +33,19 @@ def _market(slug, outcomes, prices):
 
 
 class _FakeAPI:
-    """Serves a fixed {event_slug: [Gamma market rows]} map via Gamma /events?slug=."""
+    """Serves Gamma /events?slug= (nested markets) and /markets?slug= (exact market) maps."""
 
-    def __init__(self, events_by_slug):
-        self.events_by_slug = events_by_slug
+    def __init__(self, events_by_slug=None, markets_by_slug=None):
+        self.events_by_slug = events_by_slug or {}
+        self.markets_by_slug = markets_by_slug or {}
         self.slugs_queried = []
 
     def get(self, url, params=None):
         slug = (params or {}).get("slug")
         self.slugs_queried.append(slug)
-        markets = self.events_by_slug.get(slug)
+        if url.endswith("/markets"):
+            return self.markets_by_slug.get(slug, [])
+        markets = self.events_by_slug.get(slug)            # /events
         if markets is None:
             return []
         return [{"slug": slug, "markets": markets}]
@@ -86,19 +89,34 @@ class TestCandidateSlugs(unittest.TestCase):
         self.assertEqual(sd.candidate_event_slugs("", "a", "b", "2026-06-25"), [])
 
 
+class TestGoalsMarketSlugs(unittest.TestCase):
+    def test_enumerates_total_lines_and_btts(self):
+        slugs = sd.goals_market_slugs("bra2-cui-lon-2026-06-25")
+        self.assertIn("bra2-cui-lon-2026-06-25-total-1pt5", slugs)
+        self.assertIn("bra2-cui-lon-2026-06-25-total-2pt5", slugs)
+        self.assertIn("bra2-cui-lon-2026-06-25-btts", slugs)
+
+
 class TestFetchEventMarkets(unittest.TestCase):
     def test_parses_and_sets_event_slug(self):
-        api = _FakeAPI({"bra2-cui-lon-2026-06-25-total-2pt5":
-                        [_market("bra2-cui-lon-2026-06-25-total-2pt5",
-                                 ["Over 2.5", "Under 2.5"], ["0.5", "0.5"])]})
-        out = sd.fetch_event_markets(api, "bra2-cui-lon-2026-06-25-total-2pt5")
+        api = _FakeAPI({"bra2-cui-lon-2026-06-25":
+                        [_market("bra2-cui-lon-2026-06-25", ["Cuiaba", "Londrina"], ["0.5", "0.5"])]})
+        out = sd.fetch_event_markets(api, "bra2-cui-lon-2026-06-25")
         self.assertEqual(len(out), 1)
-        self.assertEqual(out[0]["slug"], "bra2-cui-lon-2026-06-25-total-2pt5")
-        self.assertEqual(out[0]["event_slug"], "bra2-cui-lon-2026-06-25-total-2pt5")
+        self.assertEqual(out[0]["slug"], "bra2-cui-lon-2026-06-25")
         self.assertEqual(out[0]["token_ids"], ["t1", "t2"])
+
+    def test_fetch_markets_by_slug(self):
+        api = _FakeAPI(markets_by_slug={"bra2-cui-lon-2026-06-25-total-1pt5":
+                                        [_market("bra2-cui-lon-2026-06-25-total-1pt5",
+                                                 ["Over 1.5", "Under 1.5"], ["0.63", "0.38"])]})
+        out = sd.fetch_markets_by_slug(api, "bra2-cui-lon-2026-06-25-total-1pt5")
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["slug"], "bra2-cui-lon-2026-06-25-total-1pt5")
 
     def test_miss_returns_empty(self):
         self.assertEqual(sd.fetch_event_markets(_FakeAPI({}), "nope"), [])
+        self.assertEqual(sd.fetch_markets_by_slug(_FakeAPI({}), "nope"), [])
 
 
 class TestDiscoverFromSharp(unittest.TestCase):
@@ -109,12 +127,20 @@ class TestDiscoverFromSharp(unittest.TestCase):
                  "home": "cuiaba", "away": "londrina", "league": "soccer_brazil_serie_b"}}
 
     def test_recovers_truncated_game(self):
-        api = _FakeAPI({"bra2-cui-lon-2026-06-25":
-                        [_market("bra2-cui-lon-2026-06-25-total-2pt5",
-                                 ["Over 2.5", "Under 2.5"], ["0.55", "0.45"])]})
+        # Base event nests only moneyline; the goals markets are separate slugs fetched
+        # explicitly via /markets — exactly the live Cuiabá×Londrina structure.
+        api = _FakeAPI(
+            events_by_slug={"bra2-cui-lon-2026-06-25":
+                            [_market("bra2-cui-lon-2026-06-25", ["Cuiaba", "Londrina"], ["0.55", "0.3"])]},
+            markets_by_slug={
+                "bra2-cui-lon-2026-06-25-total-1pt5":
+                    [_market("bra2-cui-lon-2026-06-25-total-1pt5", ["Over 1.5", "Under 1.5"], ["0.63", "0.38"])],
+                "bra2-cui-lon-2026-06-25-btts":
+                    [_market("bra2-cui-lon-2026-06-25-btts", ["Yes", "No"], ["0.41", "0.61"])]})
         out = sd.discover_from_sharp(api, self._lookup(), "2026-06-25", existing_team_sets=set())
-        self.assertEqual(len(out), 1)
-        self.assertTrue(out[0]["slug"].startswith("bra2-cui-lon-2026-06-25-total"))
+        slugs = {m["slug"] for m in out}
+        self.assertIn("bra2-cui-lon-2026-06-25-total-1pt5", slugs)
+        self.assertIn("bra2-cui-lon-2026-06-25-btts", slugs)
 
     def test_skips_already_discovered_game(self):
         api = _FakeAPI({"bra2-cui-lon-2026-06-25": [_market("x", ["Over"], ["0.5"])]})

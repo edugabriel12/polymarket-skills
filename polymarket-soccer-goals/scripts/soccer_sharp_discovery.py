@@ -150,6 +150,31 @@ def candidate_event_slugs(prefix: str, a: str, b: str, date: str) -> list[str]:
     return list(dict.fromkeys(slugs))[:_MAX_CANDIDATES]
 
 
+# Standard soccer goals/BTTS market slug suffixes hung off a base game slug. Polymarket
+# splits these out as their OWN markets (NOT always nested under the base event's markets
+# array), so they must be fetched by explicit slug. Totals use half-lines (…-total-2pt5).
+_TOTAL_LINE_SUFFIXES = tuple(f"total-{i}pt5" for i in range(0, 7))   # 0.5 … 6.5
+_BTTS_SUFFIXES = ("btts", "both-teams-to-score")
+
+
+def goals_market_slugs(base_slug: str) -> list[str]:
+    """Explicit total-goals + BTTS market slugs for a base game slug (…-total-Xpt5 / …-btts)."""
+    return ([f"{base_slug}-{s}" for s in _TOTAL_LINE_SUFFIXES]
+            + [f"{base_slug}-{s}" for s in _BTTS_SUFFIXES])
+
+
+def _parse_rows(rows, fallback_slug: str, category_key: str) -> list[dict]:
+    out: list[dict] = []
+    for m in (rows or []):
+        if not isinstance(m, dict):
+            continue
+        # Group each market by its OWN slug — a total/BTTS market slug encodes the type
+        # (…-total-2pt5 / …-btts) that downstream classification keys off.
+        m["eventSlug"] = m.get("slug") or fallback_slug
+        out.append(parse_market(m, category_key))
+    return out
+
+
 def fetch_event_markets(api, event_slug: str, category_key: str = "soccer") -> list[dict]:
     """Parsed markets nested under a Polymarket event slug via Gamma /events. [] on miss."""
     try:
@@ -162,15 +187,23 @@ def fetch_event_markets(api, event_slug: str, category_key: str = "soccer") -> l
     for ev in events:
         if not isinstance(ev, dict):
             continue
-        for m in (ev.get("markets") or []):
-            if not isinstance(m, dict):
-                continue
-            # Group each market by its OWN slug — a total/BTTS market slug encodes the type
-            # (…-total-2pt5 / …-btts) that downstream classification keys off. Forcing the
-            # base event slug would strip that suffix and drop the goals markets.
-            m["eventSlug"] = m.get("slug") or ev.get("slug") or event_slug
-            out.append(parse_market(m, category_key))
+        out += _parse_rows(ev.get("markets"), ev.get("slug") or event_slug, category_key)
     return out
+
+
+def fetch_markets_by_slug(api, market_slug: str, category_key: str = "soccer") -> list[dict]:
+    """Parsed market(s) for an exact market slug via Gamma /markets?slug=. [] on miss.
+
+    The base event often nests only moneyline/spreads, so the goals/BTTS markets — separate
+    Polymarket markets keyed by their own slug — must be fetched this way.
+    """
+    try:
+        rows = api.get(f"{GAMMA_API}/markets", params={"slug": market_slug})
+    except Exception:  # noqa: BLE001 - discovery is best-effort
+        return []
+    if not isinstance(rows, list):
+        return []
+    return _parse_rows(rows, market_slug, category_key)
 
 
 def _games_from_lookup(sharp_lookup: dict, target: str):
@@ -217,11 +250,15 @@ def discover_from_sharp(api, sharp_lookup: dict, target: str,
             if ev_markets:
                 hit = slug
                 break
-        if not ev_markets:
+        if not hit:
             tried = f" (prefix={prefix or '?'}, tried {len(cands)})" if cands else " (no prefix)"
             vlog(f"  [sharp-discovery] {a} v {b}: NOT FOUND on Polymarket{tried}")
             continue
         found_event += 1
+        # The base event usually nests only moneyline/spreads — fetch the goals/BTTS markets
+        # explicitly by their own slugs (…-total-Xpt5 / …-btts), or they'd be missed.
+        ev_markets = ev_markets + [m for gs in goals_market_slugs(hit)
+                                   for m in fetch_markets_by_slug(api, gs)]
         new = goals = 0
         for m in ev_markets:
             slug = m.get("slug") or ""
