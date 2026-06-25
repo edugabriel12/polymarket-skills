@@ -116,55 +116,105 @@ def winner_from_market(pred: dict, market: dict) -> str | None:
     return None
 
 
+def _absorb_markets(rows, out: dict) -> None:
+    """Index Gamma rows by BOTH conditionId and slug, so either key can find a market."""
+    for m in rows if isinstance(rows, list) else []:
+        if not isinstance(m, dict):
+            continue
+        cid = m.get("conditionId") or m.get("condition_id")
+        if cid:
+            out[str(cid)] = m
+        if m.get("slug"):
+            out[str(m["slug"])] = m
+
+
 def _fetch_markets_by_condition(api, condition_ids: list[str]) -> dict:
-    """{conditionId: market_dict} from Gamma /markets?condition_ids=. Best-effort, {} offline."""
+    """{conditionId|slug: market_dict} from Gamma /markets?condition_ids=. Best-effort, {} offline."""
     ids = [c for c in dict.fromkeys(condition_ids) if c]
     if not ids:
         return {}
     out: dict[str, dict] = {}
-
-    def absorb(rows):
-        for m in rows if isinstance(rows, list) else []:
-            cid = m.get("conditionId") or m.get("condition_id")
-            if cid:
-                out[cid] = m
-
     try:
-        absorb(api.get(f"{GAMMA_API}/markets", params={"condition_ids": ids}))
+        _absorb_markets(api.get(f"{GAMMA_API}/markets", params={"condition_ids": ids}), out)
     except Exception:  # noqa: BLE001 - batch failed (offline/forbidden): give up
         return out
     for cid in ids:                              # per-id fallback for any the batch missed
         if cid in out:
             continue
         try:
-            absorb(api.get(f"{GAMMA_API}/markets", params={"condition_ids": cid}))
+            _absorb_markets(api.get(f"{GAMMA_API}/markets", params={"condition_ids": cid}), out)
         except Exception:  # noqa: BLE001
             continue
     return out
+
+
+def _fetch_market_by_slug(api, slug: str) -> dict | None:
+    """The Polymarket market for an exact slug via Gamma /markets?slug=. None offline/missing.
+
+    match_slug is the real Polymarket market slug (discovery read it from Gamma), so this
+    finds the market even when the condition_ids query doesn't return a resolved/closed one.
+    """
+    if not slug:
+        return None
+    try:
+        rows = api.get(f"{GAMMA_API}/markets", params={"slug": slug})
+    except Exception:  # noqa: BLE001
+        return None
+    for m in rows if isinstance(rows, list) else []:
+        if isinstance(m, dict) and str(m.get("slug", "")) == slug:
+            return m
+    return rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else None
+
+
+def _unresolved_note(market: dict) -> str:
+    """Why a found market didn't settle — open vs closed-but-non-definitive (e.g. a void)."""
+    resolved = bool(market.get("closed")) or \
+        str(market.get("umaResolutionStatus", "")).lower() == "resolved"
+    prices = _as_list(market.get("outcomePrices"))
+    try:
+        mx = max(float(p) for p in prices) if prices else 0.0
+    except (TypeError, ValueError):
+        mx = 0.0
+    if not resolved:
+        return f"market still open on Polymarket (not closed/resolved; top price {mx:.2f})"
+    return f"market closed but no definitive 1/0 outcome yet (top price {mx:.2f})"
 
 
 def settle_pending_from_market(api, db_path: str = tdb.DEFAULT_DB) -> dict:
     """Settle PENDENTE rows from their Polymarket market resolution (condition_id/token_id).
 
     The authoritative settlement source — independent of any tour results feed, so it
-    settles qualifying/ITF/Challenger matches the feeds don't cover. Best-effort; offline
-    it settles nothing.
+    settles qualifying/ITF/Challenger matches the feeds don't cover. Each row's market is
+    found by its condition_id OR its slug (match_slug is the real Polymarket slug), so a
+    missing/empty condition_id no longer blocks settlement. Best-effort; offline it settles
+    nothing. Diagnostics explain, per row, why a market didn't settle (not found / still
+    open / closed-but-not-definitive).
     """
     pending = tdb.get_predictions(db_path, status="PENDENTE")
     if not pending:
         return {"checked": 0, "settled": [], "games_matched": 0, "diagnostics": []}
-    markets = _fetch_markets_by_condition(api, [p.get("condition_id") for p in pending])
-    diags = [f"[market] {len(pending)} PENDENTE row(s); Gamma returned {len(markets)} market(s)"]
+    cids = [p.get("condition_id") for p in pending]
+    n_cids = sum(1 for c in cids if c)
+    markets = _fetch_markets_by_condition(api, cids)
+    diags = [f"[market] {len(pending)} PENDENTE row(s) ({n_cids} with a condition_id); "
+             f"condition query indexed {len(markets)} market(s)"]
     settled, seen = [], set()
+    fetched_by_slug = 0
     for r in pending:
         slug = r["match_slug"]
         if slug in seen:
             continue
-        m = markets.get(r.get("condition_id"))
+        m = markets.get(str(r.get("condition_id") or "")) or markets.get(str(slug))
+        if not m:                                # condition query missed it -> fetch by slug
+            m = _fetch_market_by_slug(api, slug)
+            if m:
+                fetched_by_slug += 1
         if not m:
+            diags.append(f"[market] ✗ {slug}: no Polymarket market found (by condition_id or slug)")
             continue
         winner = winner_from_market(r, m)
         if not winner:
+            diags.append(f"[market] · {slug}: {_unresolved_note(m)} — staying PENDENTE")
             continue
         seen.add(slug)
         rows = tdb.settle_match(slug, winner, db_path)
@@ -173,6 +223,9 @@ def settle_pending_from_market(api, db_path: str = tdb.DEFAULT_DB) -> dict:
             res = "ACERTO" if _surname(winner) == _surname(r.get("side", "")) else "ERRO"
             diags.append(f"[market] ✓ {slug}: resolved -> winner {winner} "
                          f"({res}, {len(rows)} row(s))")
+    if fetched_by_slug:
+        diags.append(f"[market] {fetched_by_slug} market(s) found by slug fallback "
+                     f"(condition query didn't return them)")
     if settled:
         diags.append(f"[market] settled {len(settled)} row(s) across {len(seen)} match(es)")
     return {"checked": len(pending), "settled": settled,
