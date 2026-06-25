@@ -107,6 +107,9 @@ list_games_today (scanner)  →  find total-runs Over/Under market  →  NegBin 
 | `--portfolio-db PATH` | — | Paper DB (detects first trade → 1% cap) |
 | `--record / --no-record` | on | Record each prediction (+ stats log) to the predictions DB |
 | `--predictions-db PATH` | `~/.polymarket-mlb-totals/predictions.db` | Predictions store path |
+| `--sharp-odds-csv PATH` | — | Sharp slate used **only** as the day's game list (coverage), not pricing |
+| `--odds-api-key KEY` | `$ODDS_API_KEY` | The Odds API key — fetches the daily game list for discovery |
+| `--no-sharp-discovery` | off | Disable slate-driven discovery (volume-ranked tag only) |
 | `--paper` / `--paper-execute` | off | Pipe to paper trader (dry-run unless `--paper-execute`) |
 | `--output json\|text` | json | Output format |
 | `--rate-limit MS` / `--debug` | 100 / off | API pacing / logging |
@@ -231,10 +234,16 @@ half-Kelly sizing. **There is no sharp anchor or sharp veto in the bet decision*
 in the standalone CLV validation below.
 
 > The sharp/CLV tooling (`sharp_odds.py`, `capture_close.py`, `clv_vs_sharp.py`) remains available as a
-> **standalone** way to measure closing-line value; it is no longer wired into `model_probabilities` or
-> game discovery. Note this also restores the #36 discovery path (the `mlb` Gamma tag), which is
-> volume-ranked and can truncate low-volume games — re-enable sharp-driven discovery separately if you
-> need the full daily card surfaced.
+> **standalone** way to measure closing-line value; it is no longer wired into `model_probabilities`.
+
+### Coverage-only sharp discovery (`sharp_discovery.py`)
+The `mlb` Gamma tag is volume-ranked and pagination-capped (~offset 2100, HTTP 422), so low-volume
+games never surface — on a ~11-game day only ~2 may appear. To recover the full daily card, the sharp
+slate (CSV or The Odds API) is used **purely as the day's authoritative game list**: each slate game's
+Polymarket markets are fetched by event slug and unioned into discovery. **This is coverage only — the
+slate never prices or vetoes anything; μ stays the market-anchored #36 model.** On by default when a
+slate is available (`$ODDS_API_KEY` or `--sharp-odds-csv`); `--no-sharp-discovery` falls back to the
+tag-only path. With no slate configured, discovery is tag-only and low-volume games may be truncated.
 
 ### CLV vs the sharp close (`clv_vs_sharp.py`) — standalone validation metric
 `CLV(side) = sharp_close_fair_prob(side) − entry_price`. Beating the sharp close is the only proxy that

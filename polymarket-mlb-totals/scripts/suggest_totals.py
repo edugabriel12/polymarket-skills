@@ -22,11 +22,15 @@ from datetime import datetime, timezone
 
 import _bootstrap  # noqa: F401  (wires sys.path for the reused skills)
 
+import os
+
 import run_distribution as rd
 import park_factors as pf
 import totals_market as tm
 import data_inputs
 import predictions_db
+import sharp_odds          # only the daily game list is used (discovery); NOT the model
+import sharp_discovery
 
 from category_common import (
     APIClient,
@@ -323,6 +327,31 @@ def _shadow_log_mlb(args, target, slug, line, side_notes, chosen, m, bet, skip_r
             print(f"[model_log] failed: {e}", file=sys.stderr)
 
 
+def _load_sharp_slate(args, target, vlog) -> dict:
+    """Load the sharp slate ONLY as the authoritative daily game list (discovery).
+
+    The Polymarket `mlb` Gamma tag is volume-ranked and pagination-capped, so low-volume
+    games never surface. The sharp feed (Pinnacle/consensus, via CSV or The Odds API)
+    carries the FULL daily card, so we use it to recover those games. This is the ONLY
+    use of the sharp here — it does NOT price or veto anything; the model stays the
+    market-anchored #36 model. Returns {} (full coverage degrades to the tag) when no
+    sharp source is configured.
+    """
+    if getattr(args, "sharp_odds_csv", None):
+        vlog(f"  discovery slate: CSV {args.sharp_odds_csv}")
+        try:
+            return sharp_odds.load_sharp_csv(args.sharp_odds_csv)
+        except OSError as e:
+            vlog(f"  discovery slate CSV load failed: {e}")
+            return {}
+    if getattr(args, "odds_api_key", None) or os.environ.get("ODDS_API_KEY"):
+        vlog("  discovery slate: The Odds API (live)")
+        return sharp_odds.fetch_sharp(getattr(args, "odds_api_key", None), target, vlog=vlog)
+    vlog("  discovery slate: NONE (no --sharp-odds-csv / $ODDS_API_KEY) -> tag-only "
+         "discovery; low-volume games may be truncated")
+    return {}
+
+
 def run(args) -> dict:
     api = APIClient(rate_limit_ms=args.rate_limit, debug=args.debug)
     # Robust terminal logging (stderr -> shows in the uvicorn console). On unless --quiet.
@@ -342,6 +371,23 @@ def run(args) -> dict:
                 "suggestions": [], "skipped": []}
 
     vlog(f"Discovery: tag '{_tag}' -> {len(markets)} active market(s)")
+
+    # Sharp-slate-driven discovery (coverage ONLY — not pricing). The `mlb` tag is
+    # volume-ranked and truncated, so we union in every game from the sharp slate by
+    # fetching its Polymarket markets directly by event slug. The model itself stays the
+    # market-anchored #36 model; the slate is used purely as the day's authoritative
+    # game list. On by default when a slate is loaded; disable with --no-sharp-discovery.
+    if getattr(args, "sharp_discovery", True):
+        slate = _load_sharp_slate(args, target, vlog)
+        if slate:
+            existing = {m.get("slug") for m in markets if m.get("slug")}
+            extra = sharp_discovery.discover_from_sharp(api, slate, target, vlog=vlog)
+            added = [m for m in extra if m.get("slug") and m.get("slug") not in existing]
+            if added:
+                markets = markets + added
+                vlog(f"  sharp-driven discovery added {len(added)} market(s) the tag "
+                     f"missed (total now {len(markets)})")
+
     on_day = [m for m in markets if game_date(m) == target]
     games = group_by_event(on_day)
     vlog(f"  {len(on_day)} market(s) dated {target} across {len(games)} event(s)")
@@ -619,6 +665,15 @@ def main() -> None:
     p.add_argument("--paper-execute", action="store_true", help="Actually place paper trades (default dry-run)")
     p.add_argument("--output", choices=["json", "text"], default="json")
     p.add_argument("--rate-limit", type=int, default=100, help="Min ms between API calls")
+    # Coverage-only sharp discovery: use the sharp slate as the authoritative daily game
+    # list so low-volume games the volume-ranked Gamma tag truncates still surface. The
+    # slate is NOT used to price or veto — the model is the market-anchored #36 model.
+    p.add_argument("--sharp-odds-csv", default=None,
+                   help="Sharp totals CSV — used ONLY as the day's game list (discovery), not pricing")
+    p.add_argument("--odds-api-key", default=None,
+                   help="The Odds API key (or $ODDS_API_KEY) — fetches the daily game list for discovery")
+    p.add_argument("--no-sharp-discovery", dest="sharp_discovery", action="store_false", default=True,
+                   help="Disable sharp-slate-driven discovery (fall back to the volume-ranked tag only)")
     p.add_argument("--quiet", dest="verbose", action="store_false", default=True,
                    help="Suppress the per-game analysis logs (stderr)")
     p.add_argument("--debug", action="store_true", help="Also log every API call")

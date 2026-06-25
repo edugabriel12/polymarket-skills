@@ -166,5 +166,36 @@ class TestEndToEndMatch(unittest.TestCase):
         self.assertAlmostEqual(sharp_over, 0.5, places=6)
 
 
+class TestDiscoverySlateLoader(unittest.TestCase):
+    """`_load_sharp_slate` loads the slate for COVERAGE only; no source -> {} (tag-only)."""
+
+    def setUp(self):
+        import suggest_totals as st
+        self.st = st
+        self._orig = st.sharp_odds.load_sharp_csv
+        self._env = os.environ.pop("ODDS_API_KEY", None)
+
+    def tearDown(self):
+        self.st.sharp_odds.load_sharp_csv = self._orig
+        if self._env is not None:
+            os.environ["ODDS_API_KEY"] = self._env
+
+    def _args(self, **kw):
+        import types
+        base = dict(sharp_odds_csv=None, odds_api_key=None, sharp_discovery=True)
+        base.update(kw)
+        return types.SimpleNamespace(**base)
+
+    def test_csv_path_used_as_game_list(self):
+        self.st.sharp_odds.load_sharp_csv = lambda p: {"_slate": p}
+        out = self.st._load_sharp_slate(self._args(sharp_odds_csv="games.csv"), "2026-06-25",
+                                        lambda *a, **k: None)
+        self.assertEqual(out, {"_slate": "games.csv"})
+
+    def test_no_source_returns_empty(self):
+        out = self.st._load_sharp_slate(self._args(), "2026-06-25", lambda *a, **k: None)
+        self.assertEqual(out, {})  # tag-only discovery; nothing recovered
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
