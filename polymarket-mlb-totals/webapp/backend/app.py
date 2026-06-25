@@ -87,23 +87,23 @@ SOCCER_DB = os.environ.get("SOCCER_PREDICTIONS_DB", spdb.DEFAULT_DB)
 SOCCER_RATINGS_CSV = os.environ.get("SOCCER_RATINGS_CSV")
 FOOTBALL_DATA_TOKEN = os.environ.get("FOOTBALL_DATA_TOKEN")
 # Soccer sharp anchor — operator opted into ALL active leagues + BTTS (SOCCER_SHARP/_BTTS
-# default ON). That is quota-heavy (a per-event BTTS call across every league can cost
-# hundreds of credits/day and exhaust a free Odds-API plan in days), so SOCCER_SHARP_RESERVE
-# guards it: the soccer fetch STOPS once remaining quota hits the floor, preserving credits
-# for the MLB divergence detector (which would otherwise fall back to factor-noise). Set
-# SOCCER_SHARP=0 to disable, SOCCER_SHARP_LEAGUES to bound the leagues.
+# default ON). SOCCER_SHARP_RESERVE optionally stops the fetch once remaining Odds-API quota
+# hits a floor (to leave credits for other sports), but defaults to 0 = NO RESERVE (fetch all).
+# Set it to a positive floor to re-enable rationing; SOCCER_SHARP=0 disables the anchor,
+# SOCCER_SHARP_LEAGUES bounds the leagues.
 SOCCER_SHARP = os.environ.get("SOCCER_SHARP", "1") not in ("0", "false", "False", "no", "")
 SOCCER_SHARP_LEAGUES = os.environ.get("SOCCER_SHARP_LEAGUES")   # default unset = all active
 SOCCER_SHARP_BTTS = os.environ.get("SOCCER_SHARP_BTTS", "1") not in ("0", "false", "False", "no", "")
-SOCCER_SHARP_RESERVE = int(os.environ.get("SOCCER_SHARP_RESERVE", "200") or 0)
+SOCCER_SHARP_RESERVE = int(os.environ.get("SOCCER_SHARP_RESERVE", "0") or 0)   # 0 = no reserve
 TENNIS_DB = os.environ.get("TENNIS_PREDICTIONS_DB", tdb.DEFAULT_DB)
 TENNIS_RATINGS_CSV = os.environ.get("TENNIS_RATINGS_CSV")
 TENNIS_TOUR = os.environ.get("TENNIS_TOUR", "atp")
-# Tennis sharp anchor: cheap (h2h only, a couple of tour keys), so ON by default with a quota
-# reserve for MLB. TENNIS_SHARP=0 disables; TENNIS_SHARP_TOURS bounds the tours.
+# Tennis sharp anchor: cheap (h2h only, a couple of tour keys), ON by default. TENNIS_SHARP_RESERVE
+# defaults to 0 = NO RESERVE (fetch all tours); set a positive floor to ration quota. TENNIS_SHARP=0
+# disables; TENNIS_SHARP_TOURS bounds the tours.
 TENNIS_SHARP = os.environ.get("TENNIS_SHARP", "1") not in ("0", "false", "False", "no", "")
 TENNIS_SHARP_TOURS = os.environ.get("TENNIS_SHARP_TOURS")
-TENNIS_SHARP_RESERVE = int(os.environ.get("TENNIS_SHARP_RESERVE", "200") or 0)
+TENNIS_SHARP_RESERVE = int(os.environ.get("TENNIS_SHARP_RESERVE", "0") or 0)   # 0 = no reserve
 
 SPORTS = ("mlb", "soccer", "tennis")
 
@@ -312,7 +312,7 @@ def _run_soccer(date: str) -> dict:
            "--predictions-db", SOCCER_DB]  # best-line-only: one bet per game (avoids correlated lines)
     if SOCCER_RATINGS_CSV:
         cmd += ["--ratings-csv", SOCCER_RATINGS_CSV]
-    if SOCCER_SHARP:   # sharp anchor (all leagues + BTTS by default), quota-reserved for MLB
+    if SOCCER_SHARP:   # sharp anchor (all leagues + BTTS by default); reserve 0 = no quota limit
         cmd += ["--sharp-min-reserve", str(SOCCER_SHARP_RESERVE)]
         if SOCCER_SHARP_LEAGUES:
             cmd += ["--sharp-leagues", SOCCER_SHARP_LEAGUES]
@@ -341,7 +341,7 @@ def _run_tennis(date: str) -> dict:
            "--predictions-db", TENNIS_DB, "--tour", TENNIS_TOUR]
     if TENNIS_RATINGS_CSV:
         cmd += ["--ratings-csv", TENNIS_RATINGS_CSV]
-    if TENNIS_SHARP:   # sharp anchor (h2h), quota-reserved for MLB
+    if TENNIS_SHARP:   # sharp anchor (h2h); reserve 0 = no quota limit
         cmd += ["--sharp-min-reserve", str(TENNIS_SHARP_RESERVE)]
         if TENNIS_SHARP_TOURS:
             cmd += ["--sharp-tours", TENNIS_SHARP_TOURS]
