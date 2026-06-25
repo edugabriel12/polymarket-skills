@@ -72,7 +72,7 @@ def _load_sharp_lookup(args, target, vlog) -> dict:
         vlog(f"  sharp leagues filtered to {only!r}: {len(keys)} key(s)")
     lookup = sosh.fetch_sharp_soccer(key, keys, date=target,
                                      with_btts=getattr(args, "sharp_btts", True),
-                                     book=getattr(args, "sharp_book", None) or "pinnacle,betfair_ex_eu",
+                                     book=getattr(args, "sharp_book", None) or "pinnacle,betfair_ex_eu,matchbook",
                                      min_quota_reserve=int(getattr(args, "sharp_min_reserve", 0) or 0),
                                      vlog=vlog)
     if lookup:
@@ -883,8 +883,9 @@ def main() -> None:
                    help="Disable the sharp anchor entirely (predictive model, edge-capped)")
     p.add_argument("--sharp-book", default=None,
                    help="Sharp bookmaker priority chain (comma-separated Odds-API keys), first "
-                        "with the market wins. Default 'pinnacle,betfair_ex_eu' — Betfair Exchange "
-                        "fills sharp markets Pinnacle lacks (e.g. lower-league BTTS). Both are sharp.")
+                        "with the market wins. Default 'pinnacle,betfair_ex_eu,matchbook' — Betfair & "
+                        "Matchbook (sharp exchanges) fill markets Pinnacle's feed lacks, e.g. "
+                        "lower-league BTTS. ONLY add sharp books — soft books shade lines.")
     p.add_argument("--no-sharp-btts", dest="sharp_btts", action="store_false", default=True,
                    help="Skip the per-event BTTS sharp fetch (cheaper; BTTS stays predictive)")
     p.add_argument("--sharp-leagues", default=None,

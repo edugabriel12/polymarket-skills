@@ -299,8 +299,8 @@ def _rem_int(resp) -> int | None:
 
 
 def fetch_sharp_soccer(api_key: str | None, keys: list[str], *, date: str | None = None,
-                       with_btts: bool = True, book: str = "pinnacle,betfair_ex_eu",
-                       regions: str = "eu",
+                       with_btts: bool = True, book: str = "pinnacle,betfair_ex_eu,matchbook",
+                       regions: str = "eu,uk",   # uk reaches Matchbook; bookmakers filter still applies
                        timeout: int = 10, vlog=None, min_quota_reserve: int = 0) -> dict:
     """Sharp totals (+ optional BTTS) across the given leagues -> merged lookup. {} offline.
 
