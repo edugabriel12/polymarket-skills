@@ -71,7 +71,10 @@ python polymarket-tennis/scripts/test_pipeline.py
   **only if `sharp_edge > 0`** (the sharp confirms the model's side is +EV); otherwise it's skipped
   (`sharp edge … ≤ 0`). So a suggestion needs the **model edge ≥ `--min-edge`** AND a **positive sharp
   edge**. With no sharp ref the model runs alone (no veto); `require_sharp` (default on) skips matches
-  with no sharp to veto against. `sharp_edge` is recorded in `stats_log` and returned per suggestion.
+  with no sharp to veto against. The sharp is matched by surname pair on the match date **or ±1 day**
+  (UTC-rollover tolerance, as in MLB/soccer); a `no sharp reference` skip now states whether the surname
+  is absent from the slate (tour not in the feed) or present but unpaired on that date (name/date
+  mismatch). `sharp_edge` is recorded in `stats_log` and returned per suggestion.
 - **Surface inference:** read from the tournament/tag in the slug (French Open → clay, Wimbledon →
   grass, default hard).
 - **Scope:** only tennis tags (`atp-`, `wta-`, slams, ...) and only the **moneyline** (2-player)
