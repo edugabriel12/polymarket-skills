@@ -69,6 +69,18 @@ python polymarket-soccer-goals/scripts/test_pipeline.py
 - **Scope:** only soccer leagues (slug prefixes like `epl-`, `laliga-`, `fifwc-`, ...) and only the
   full-game **total-goals** (`...-total-<line>`) and **BTTS** (`...-btts`) markets — moneyline,
   spreads, etc. are dropped. **Pre-game only** (`--min-hours 0`), $1,000 volume floor (configurable).
+- **Discovery + sharp-driven recovery:** the Gamma league tags are **not honored** — they return the
+  global mix **ranked by volume**, and pagination is **capped at offset ~2100 (HTTP 422)**. So on a
+  busy slate (e.g. a World Cup), high-volume games fill the top and **low-volume leagues (Brazilian
+  Série B, etc.) fall past the cut and never surface**. To fix coverage, the sharp slate (which carries
+  the full daily card) is used as the **authoritative game list**: any game the tag missed is fetched
+  **directly by event slug** (`soccer_sharp_discovery.py`), bypassing the volume rank. Slugs are built
+  from a league→prefix map + FIFA codes for national teams / short prefixes for clubs, trying both
+  team orderings. Each probe **logs `RECOVERED <slug>` or `NOT FOUND (prefix=…, tried N)`**, so the
+  output distinguishes *truncated by the cap* from *Polymarket doesn't list it* (or our abbreviation
+  guess missed — then hard-code that league's tokens). On by default with a sharp slate;
+  `--no-sharp-discovery` disables. ⚠️ Polymarket simply may not offer goals/BTTS markets for some
+  lower leagues — then there is nothing to recover and the model can't price that game.
 
 ## Script: suggest_soccer.py
 | Flag | Default | Purpose |
