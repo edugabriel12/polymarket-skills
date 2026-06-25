@@ -66,6 +66,16 @@ class TestMatchByFullName(unittest.TestCase):
         self.assertEqual(apif.match_team("xxx", names, name="rs berkane"), "Renaissance Berkane")
         self.assertEqual(apif.match_team("xxx", names, name="as far"), "AS FAR Rabat")
 
+    def test_explicit_alias_resolves_acronym(self):
+        # "AS FAR" has no distinctive >=4 token; an explicit alias bridges it to the real
+        # API-Football name. Verified against the actual 16-team Botola table.
+        names = ["FAR Rabat", "Renaissance Berkane", "Ittihad Tanger", "Olympique Dcheïra",
+                 "Raja Casablanca", "Wydad AC", "FUS Rabat"]
+        self.assertEqual(apif.match_team("xxx", names, name="as far"), "FAR Rabat")
+        self.assertEqual(apif.match_team("xxx", names, name="rs berkane"), "Renaissance Berkane")
+        self.assertEqual(apif.match_team("xxx", names, name="ir tanger"), "Ittihad Tanger")
+        self.assertEqual(apif.match_team("xxx", names, name="olympic dcheira"), "Olympique Dcheïra")
+
     def test_shared_token_ambiguous_returns_none(self):
         # Two clubs share "Casablanca" -> the shared-token tier must NOT guess.
         names = ["Wydad Casablanca", "Raja Casablanca"]
