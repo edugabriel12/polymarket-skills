@@ -43,6 +43,34 @@ class TestMatchTeam(unittest.TestCase):
         self.assertIsNone(apif.match_team("", self.names))
 
 
+class TestMatchByFullName(unittest.TestCase):
+    """The full club name (from discovery) resolves strength across leagues, beating the code."""
+
+    def test_full_name_exact_beats_ambiguous_code(self):
+        names = ["Nautico", "Novorizontino"]
+        # The 3-letter code "n" is ambiguous (both start with n) -> None on code alone.
+        self.assertIsNone(apif.match_team("n", names))
+        # ...but the full name resolves exactly.
+        self.assertEqual(apif.match_team("n", names, name="Nautico"), "Nautico")
+
+    def test_full_name_accent_and_suffix_tolerant(self):
+        names = ["Cuiabá", "Londrina"]
+        # Discovery passes the club-suffix-normalized name ("cuiaba" from "Cuiabá EC").
+        self.assertEqual(apif.match_team("xyz", names, name="cuiaba"), "Cuiabá")
+
+    def test_falls_back_to_code_when_no_name(self):
+        names = ["Cuiabá", "Londrina"]
+        self.assertEqual(apif.match_team("cui", names), "Cuiabá")          # code prefix still works
+
+    def test_compute_inputs_uses_names(self):
+        rows = apif.parse_standings(_standings([
+            ("Cuiabá", 14, 10, 12), ("Londrina", 9, 13, 12), ("Goiás", 18, 8, 12)]))
+        table, avg = apif.table_from_rows(rows, min_played=1)
+        out = apif.compute_inputs(table, avg, "xxx", "yyy",
+                                  home_name="cuiaba", away_name="londrina")
+        self.assertEqual(out.get("_resolved"), ["Cuiabá", "Londrina"])
+
+
 class TestTableAndInputs(unittest.TestCase):
     def test_table_and_league_avg(self):
         rows = apif.parse_standings(_standings([

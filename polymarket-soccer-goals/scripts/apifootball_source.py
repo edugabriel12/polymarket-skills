@@ -154,16 +154,29 @@ def _acronym(name: str) -> str:
     return _norm("".join(w[0] for w in (name or "").split() if w))
 
 
-def match_team(code: str | None, names) -> str | None:
-    """Resolve a Polymarket 3-letter code to a team name, or None if ambiguous.
+def match_team(code: str | None, names, name: str | None = None) -> str | None:
+    """Resolve a team to a standings name, or None if ambiguous.
 
-    Tries, in order: unique normalized-name prefix, unique acronym, unique
-    substring. Anything ambiguous returns None (caller falls back — no wrong data).
+    The full club `name` (from the market/sharp slate, already club-suffix-normalized) is the
+    most reliable signal and is tried FIRST — exact, then prefix-either-way, then substring,
+    each accepted only when unique. Falling back to the 3-letter `code` (unique prefix /
+    acronym / substring). Anything ambiguous returns None (caller falls back — no wrong data).
     """
+    names = list(names)
+    q = _norm(name)
+    if q:
+        exact = [n for n in names if _norm(n) == q]
+        if len(exact) == 1:
+            return exact[0]
+        pref = [n for n in names if _norm(n).startswith(q) or q.startswith(_norm(n))]
+        if len(pref) == 1:
+            return pref[0]
+        cont = [n for n in names if q in _norm(n) or _norm(n) in q]
+        if len(cont) == 1:
+            return cont[0]
     c = _norm(code)
     if not c:
         return None
-    names = list(names)
     pref = [n for n in names if _norm(n).startswith(c)]
     if len(pref) == 1:
         return pref[0]
@@ -217,9 +230,11 @@ def table_from_rows(rows: list[dict], min_played: int = MIN_PLAYED_DEFAULT):
 
 
 def compute_inputs(table: dict, league_avg: float, home: str | None, away: str | None,
-                   home_tilt: float = HOME_TILT_DEFAULT) -> dict:
+                   home_tilt: float = HOME_TILT_DEFAULT,
+                   home_name: str | None = None, away_name: str | None = None) -> dict:
     """Expected total + home supremacy from the league table, or {} if teams unresolved."""
-    hm, am = match_team(home, table.keys()), match_team(away, table.keys())
+    hm = match_team(home, table.keys(), home_name)
+    am = match_team(away, table.keys(), away_name)
     if not hm or not am or not league_avg:
         return {}
     h, a = table[hm], table[am]
@@ -275,12 +290,13 @@ def _resolve_table(prefix: str | None, date: str | None, key: str | None, timeou
 
 def team_inputs(home: str | None, away: str | None, prefix: str | None, date: str | None,
                 key: str | None = None, home_tilt: float = HOME_TILT_DEFAULT,
-                timeout: int = 8) -> dict:
+                timeout: int = 8, home_name: str | None = None,
+                away_name: str | None = None) -> dict:
     """Model inputs (total_xg, supremacy_xg) for a match from API-Football, or {}."""
     table, league_avg = _resolve_table(prefix, date, key, timeout)
     if not table:
         return {}
-    return compute_inputs(table, league_avg, home, away, home_tilt)
+    return compute_inputs(table, league_avg, home, away, home_tilt, home_name, away_name)
 
 
 def league_baseline(prefix: str | None, date: str | None, key: str | None = None,

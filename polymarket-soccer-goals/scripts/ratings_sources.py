@@ -104,23 +104,52 @@ def club_elo_name(abbr: str | None) -> str | None:
     return CLUB_ELO_ALIASES.get((abbr or "").strip().lower())
 
 
-def fetch_club_elo(abbr: str | None, timeout: int = 8) -> float | None:
-    """Latest Club Elo for a Polymarket club abbreviation (None on failure)."""
-    name = club_elo_name(abbr)
-    if not name:
+def clubelo_name_candidates(abbr: str | None, full_name: str | None) -> list[str]:
+    """Club Elo endpoint names to try: the curated alias first, then a name-derived guess.
+
+    Club Elo's per-club endpoint keys off a spaceless CamelCase name (e.g. 'Augsburg',
+    'RealMadrid'). The alias map is authoritative; when it misses we derive a best-effort
+    name from the FULL club name (now available from discovery) — capitalized, spaces removed —
+    which resolves many single/compact European club names the map doesn't list yet. A wrong
+    guess just 404s and falls back (no harm). Returns [] when neither yields a candidate.
+    """
+    out: list[str] = []
+    alias = club_elo_name(abbr)
+    if alias:
+        out.append(alias)
+    if full_name:
+        compact = "".join(w.capitalize() for w in str(full_name).split())
+        if compact and compact not in out:
+            out.append(compact)
+    return out
+
+
+def fetch_club_elo(abbr: str | None, timeout: int = 8, name: str | None = None) -> float | None:
+    """Latest Club Elo for a club (None on failure).
+
+    Resolves via the curated abbreviation alias, then a name-derived Club Elo endpoint guess
+    (so European clubs outside the alias map can still resolve from their full name).
+    """
+    candidates = clubelo_name_candidates(abbr, name)
+    if not candidates:
         return None
     try:
         import requests  # lazy
-        resp = requests.get(f"{CLUBELO_API}/{name}", timeout=timeout)
-        resp.raise_for_status()
-        lines = [ln for ln in resp.text.strip().splitlines() if ln]
-        if len(lines) < 2:
-            return None
-        header = lines[0].split(",")
-        idx = header.index("Elo") if "Elo" in header else 4
-        return float(lines[-1].split(",")[idx])
     except Exception:  # noqa: BLE001
         return None
+    for cand in candidates:
+        try:
+            resp = requests.get(f"{CLUBELO_API}/{cand}", timeout=timeout)
+            resp.raise_for_status()
+            lines = [ln for ln in resp.text.strip().splitlines() if ln]
+            if len(lines) < 2:
+                continue
+            header = lines[0].split(",")
+            idx = header.index("Elo") if "Elo" in header else 4
+            return float(lines[-1].split(",")[idx])
+        except Exception:  # noqa: BLE001
+            continue
+    return None
 
 
 # ---------------------------------------------------------------------------
