@@ -583,7 +583,7 @@ def results(sport: str = Query("mlb")) -> dict:
         perf, series, recent = spdb.performance(db), spdb.pnl_by_day(db), spdb.get_predictions(db)
     elif sport == "tennis":
         try:
-            settled = tennis_results.settle_pending(db, tour=TENNIS_TOUR)
+            settled = tennis_results.settle_pending(db, tour=TENNIS_TOUR, api=_QuickAPI())
         except Exception as e:  # noqa: BLE001
             settled = {"checked": 0, "settled": [], "error": str(e)}
         perf, series = tdb.performance(db), tdb.pnl_by_day(db)

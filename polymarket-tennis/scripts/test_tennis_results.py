@@ -11,6 +11,7 @@ Run: python polymarket-tennis/scripts/test_tennis_results.py
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -80,6 +81,9 @@ class TestSettlePendingChain(unittest.TestCase):
             self.assertEqual(out["checked"], 1)
             self.assertEqual(len(out["settled"]), 1)
             self.assertEqual(out["games_matched"], 1)
+            # The feed labels the winner "Alcaraz C." but the bet was on "Carlos Alcaraz" —
+            # settlement must resolve to ACERTO, not ANULADO (exact-match would have voided it).
+            self.assertEqual(out["settled"][0]["status"], "ACERTO")
             self.assertEqual(len(tdb.get_predictions(db, status="PENDENTE")), 0)   # no longer pending
 
     def test_no_feed_keeps_pending(self):
@@ -157,6 +161,142 @@ class TestSettlePendingChain(unittest.TestCase):
             self.assertEqual(len(tdb.get_predictions(db, status="PENDENTE")), 0)
             joined = " ".join(out["diagnostics"])
             self.assertIn("tour(s) ['atp', 'wta']", joined)
+
+
+class _FakeGamma:
+    """Serves Gamma /markets?condition_ids= from a {condition_id: market_dict} map."""
+
+    def __init__(self, by_cid):
+        self.by_cid = by_cid
+        self.calls = 0
+
+    def get(self, url, params=None):
+        self.calls += 1
+        ids = (params or {}).get("condition_ids")
+        ids = ids if isinstance(ids, list) else [ids]
+        return [self.by_cid[c] for c in ids if c in self.by_cid]
+
+
+def _resolved_market(cid, tokens, outcomes, prices):
+    return {"conditionId": cid, "closed": True, "umaResolutionStatus": "resolved",
+            "clobTokenIds": json.dumps(tokens), "outcomes": json.dumps(outcomes),
+            "outcomePrices": json.dumps(prices)}
+
+
+class TestWinnerFromMarket(unittest.TestCase):
+    def test_our_token_won(self):
+        pred = {"side": "Xiaodi You", "opponent": "Leolia Jeanjean", "token_id": "tok_you"}
+        m = _resolved_market("c1", ["tok_you", "tok_jean"],
+                             ["Xiaodi You", "Leolia Jeanjean"], ["1", "0"])
+        self.assertEqual(tr.winner_from_market(pred, m), "Xiaodi You")
+
+    def test_our_token_lost(self):
+        pred = {"side": "Xiaodi You", "opponent": "Leolia Jeanjean", "token_id": "tok_you"}
+        m = _resolved_market("c1", ["tok_you", "tok_jean"],
+                             ["Xiaodi You", "Leolia Jeanjean"], ["0", "1"])
+        self.assertEqual(tr.winner_from_market(pred, m), "Leolia Jeanjean")
+
+    def test_open_market_returns_none(self):
+        pred = {"side": "A", "opponent": "B", "token_id": "ta"}
+        m = {"conditionId": "c", "closed": False, "umaResolutionStatus": "",
+             "clobTokenIds": json.dumps(["ta", "tb"]), "outcomes": json.dumps(["A", "B"]),
+             "outcomePrices": json.dumps(["0.6", "0.4"])}
+        self.assertIsNone(tr.winner_from_market(pred, m))
+
+    def test_resolved_but_nondefinitive_returns_none(self):
+        # Closed but ~0.5/0.5 (e.g. a void) -> don't guess a winner.
+        pred = {"side": "A", "opponent": "B", "token_id": "ta"}
+        m = _resolved_market("c", ["ta", "tb"], ["A", "B"], ["0.5", "0.5"])
+        self.assertIsNone(tr.winner_from_market(pred, m))
+
+    def test_token_missing_falls_back_to_outcome_surname(self):
+        # No usable token -> map the winning outcome name to side/opponent by surname.
+        pred = {"side": "Xiaodi You", "opponent": "Leolia Jeanjean", "token_id": ""}
+        m = _resolved_market("c", [], ["You X.", "Jeanjean L."], ["1", "0"])
+        self.assertEqual(tr.winner_from_market(pred, m), "Xiaodi You")
+
+
+class TestSettleFromMarket(unittest.TestCase):
+    def _seed(self, db):
+        # A WTA qualifying match no tour feed carries — only the market can settle it.
+        tdb.record_prediction({
+            "match_slug": "wta-you-jeanjea-2026-06-23", "match_date": "2026-06-23",
+            "tour": "wta", "surface": "grass", "side": "Xiaodi You",
+            "opponent": "Leolia Jeanjean", "condition_id": "c_you", "token_id": "tok_you",
+            "entry_price": 0.45, "decimal_odds": 2.2, "model_prob": 0.55, "edge": 0.1,
+            "confidence": 0.6, "size_pct": 0.02, "size_usd": 200.0, "kelly_fraction": 0.04,
+            "used_external": 1, "fee_rate": 0.0, "strategy": "divergence",
+            "market_url": "https://polymarket.com/x"}, db)
+
+    def test_settles_qualifying_match_from_market(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "t.db")
+            self._seed(db)
+            api = _FakeGamma({"c_you": _resolved_market(
+                "c_you", ["tok_you", "tok_jean"], ["Xiaodi You", "Leolia Jeanjean"], ["1", "0"])})
+            out = tr.settle_pending_from_market(api, db)
+            self.assertEqual(len(out["settled"]), 1)
+            self.assertEqual(out["settled"][0]["status"], "ACERTO")
+            self.assertEqual(len(tdb.get_predictions(db, status="PENDENTE")), 0)
+
+    def test_settle_pending_uses_market_then_skips_feed(self):
+        # With the market path resolving everything, the (expensive) feed must NOT be fetched.
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "t.db")
+            self._seed(db)
+            api = _FakeGamma({"c_you": _resolved_market(
+                "c_you", ["tok_you", "tok_jean"], ["Xiaodi You", "Leolia Jeanjean"], ["0", "1"])})
+            calls = {"n": 0}
+            orig = ratings_source.fetch_matches
+            ratings_source.fetch_matches = lambda *a, **k: calls.__setitem__("n", calls["n"] + 1) or []
+            try:
+                out = tr.settle_pending(db, api=api)
+            finally:
+                ratings_source.fetch_matches = orig
+            self.assertEqual(len(out["settled"]), 1)
+            self.assertEqual(out["settled"][0]["status"], "ERRO")    # opponent won
+            self.assertEqual(calls["n"], 0)                          # feed never fetched
+            self.assertEqual(len(tdb.get_predictions(db, status="PENDENTE")), 0)
+
+    def test_market_unresolved_falls_through_to_feed(self):
+        # Market still open -> market path settles nothing, feed path takes over.
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "t.db")
+            tdb.record_prediction({
+                "match_slug": "atp-alcaraz-sinner-2026-06-25", "match_date": "2026-06-25",
+                "tour": "atp", "surface": "clay", "side": "Carlos Alcaraz",
+                "opponent": "Jannik Sinner", "condition_id": "c_acs", "token_id": "tok_alc",
+                "entry_price": 0.5, "decimal_odds": 2.0, "model_prob": 0.6, "edge": 0.1,
+                "confidence": 0.6, "size_pct": 0.02, "size_usd": 200.0, "kelly_fraction": 0.04,
+                "used_external": 1, "fee_rate": 0.0, "strategy": "x", "market_url": "u"}, db)
+            api = _FakeGamma({"c_acs": {  # open market, no definitive price
+                "conditionId": "c_acs", "closed": False, "umaResolutionStatus": "",
+                "clobTokenIds": json.dumps(["tok_alc", "tok_sin"]),
+                "outcomes": json.dumps(["Carlos Alcaraz", "Jannik Sinner"]),
+                "outcomePrices": json.dumps(["0.55", "0.45"])}})
+            orig = ratings_source.fetch_matches
+            ratings_source.fetch_matches = lambda tour, years=None, debug=False: [
+                {"date": "20260625", "surface": "clay", "winner": "Alcaraz C.",
+                 "loser": "Sinner J."}]
+            try:
+                out = tr.settle_pending(db, api=api)
+            finally:
+                ratings_source.fetch_matches = orig
+            self.assertEqual(len(out["settled"]), 1)                 # settled via the feed
+            self.assertEqual(out["settled"][0]["status"], "ACERTO")
+            self.assertEqual(len(tdb.get_predictions(db, status="PENDENTE")), 0)
+
+    def test_offline_market_noop_keeps_pending(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "t.db")
+            self._seed(db)
+
+            class _Dead:
+                def get(self, *a, **k):
+                    raise RuntimeError("offline")
+            out = tr.settle_pending_from_market(_Dead(), db)
+            self.assertEqual(out["settled"], [])
+            self.assertEqual(len(tdb.get_predictions(db, status="PENDENTE")), 1)
 
 
 if __name__ == "__main__":
