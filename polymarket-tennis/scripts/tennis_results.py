@@ -63,28 +63,68 @@ def lookup_winner(lookup: dict, side: str, opponent: str) -> str | None:
 
 def settle_pending(db_path: str = tdb.DEFAULT_DB, tour: str = "atp",
                    years: list[int] | None = None) -> dict:
-    """Settle eligible PENDENTE predictions from Sackmann season results. Best-effort."""
+    """Settle eligible PENDENTE predictions from the results feed. Best-effort.
+
+    Emits a `diagnostics` list (the backend forwards it to the terminal) that explains, per
+    pending bet, exactly why it did or didn't settle — feed size, name resolution, and the
+    concrete reason a pair wasn't found (not played yet / opponent absent / name mismatch).
+    """
     pending = tdb.get_predictions(db_path, status="PENDENTE")
     if not pending:
-        return {"checked": 0, "settled": []}
+        return {"checked": 0, "settled": [], "diagnostics": ["0 PENDENTE rows — nothing to settle"]}
     if years is None:
         years = [datetime.now(timezone.utc).year]
+    diags: list[str] = [f"{len(pending)} PENDENTE row(s); querying {tour} results for {years}"]
+
     matches = ratings_source.fetch_matches(tour, years)
+    diags.append(f"feed returned {len(matches)} finished match(es) for {tour} {years}")
     if not matches:
-        return {"checked": len(pending), "settled": [],
-                "note": "no results feed (offline, or no source has the matches yet)"}
+        diags.append("⚠ EMPTY feed — every source dry (offline/egress-blocked, or no source has "
+                     "these matches yet). Rows stay PENDENTE. Check the [ratings_source] lines above.")
+        return {"checked": len(pending), "settled": [], "finals_found": 0,
+                "games_matched": 0, "diagnostics": diags}
+
     lookup = build_winner_lookup(matches)
+    feed_sur = {_surname(nm) for m in matches for nm in (m["winner"], m["loser"])}
 
     settled, seen = [], set()
     for r in pending:
         slug = r["match_slug"]
         if slug in seen:
             continue
-        winner = lookup_winner(lookup, r.get("side", ""), r.get("opponent", ""))
+        side, opp = r.get("side", "") or "", r.get("opponent", "") or ""
+        s_sur, o_sur = _surname(side), _surname(opp)
+        winner = lookup_winner(lookup, side, opp)
         if winner:
             seen.add(slug)
-            settled.extend(tdb.settle_match(slug, winner, db_path))
-    return {"checked": len(pending), "settled": settled, "games_matched": len(seen)}
+            rows = tdb.settle_match(slug, winner, db_path)
+            settled.extend(rows)
+            if rows:
+                result = "ACERTO" if _surname(winner) == s_sur else "ERRO"
+                diags.append(f"✓ {slug}: {side} vs {opp} -> winner {winner} "
+                             f"({result}, {len(rows)} row(s) updated)")
+            else:
+                diags.append(f"⚠ {slug}: found winner {winner} but 0 rows updated "
+                             f"(already settled, or slug not in DB)")
+        else:
+            present = [(p, sur) for p, sur in ((side, s_sur), (opp, o_sur)) if sur in feed_sur]
+            if not present:
+                why = "neither player is in the feed (match not played yet, or feed lacks this event)"
+            elif len(present) == 1:
+                why = (f"only {present[0][0]!r} (surname {present[0][1]!r}) is in the feed — the "
+                       f"opponent is absent (different event, or name didn't normalize the same)")
+            else:
+                why = ("both players ARE in the feed but not paired together — they played "
+                       "different opponents, or a name-format mismatch broke the pairing")
+            diags.append(f"✗ {slug}: {side} vs {opp} — UNSETTLED: {why} "
+                         f"[looked up surnames {s_sur!r}/{o_sur!r}]")
+
+    if not settled:                              # help compare expected vs available names
+        diags.append("feed surname sample (first 25): "
+                     + ", ".join(sorted(feed_sur)[:25]))
+    diags.append(f"DONE: {len(settled)} row(s) settled across {len(seen)} match(es)")
+    return {"checked": len(pending), "settled": settled, "finals_found": len(matches),
+            "games_matched": len(seen), "diagnostics": diags}
 
 
 def capture_close_prices(db_path: str = tdb.DEFAULT_DB) -> int:

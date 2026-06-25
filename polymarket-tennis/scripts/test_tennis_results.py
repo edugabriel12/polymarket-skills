@@ -95,8 +95,31 @@ class TestSettlePendingChain(unittest.TestCase):
             out = tr.settle_pending(db, tour="atp")
             self.assertEqual(out["checked"], 1)
             self.assertEqual(out["settled"], [])
-            self.assertIn("note", out)
+            self.assertEqual(out["finals_found"], 0)
+            self.assertTrue(any("EMPTY feed" in d for d in out["diagnostics"]))
             self.assertEqual(len(tdb.get_predictions(db, status="PENDENTE")), 1)   # stays pending
+
+    def test_unsettled_diagnostic_explains_why(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "t.db")
+            tdb.record_prediction({
+                "match_slug": "atp-alcaraz-sinner-2026-06-25", "match_date": "2026-06-25",
+                "tour": "atp", "surface": "clay", "side": "Carlos Alcaraz",
+                "opponent": "Jannik Sinner", "entry_price": 0.5, "decimal_odds": 2.0,
+                "model_prob": 0.6, "edge": 0.1, "confidence": 0.6, "size_pct": 0.02,
+                "size_usd": 200.0, "kelly_fraction": 0.04, "used_external": 1, "fee_rate": 0.0,
+                "strategy": "x", "market_url": "u"}, db)
+            # Feed has OTHER matches (neither player) -> must explain "neither player in the feed".
+            ratings_source.fetch_matches = lambda tour, years=None, debug=False: [
+                {"date": "20260625", "surface": "clay", "winner": "Rafael Nadal",
+                 "loser": "Novak Djokovic"}]
+            out = tr.settle_pending(db, tour="atp")
+            self.assertEqual(out["settled"], [])
+            self.assertEqual(out["finals_found"], 1)
+            joined = " ".join(out["diagnostics"])
+            self.assertIn("UNSETTLED", joined)
+            self.assertIn("neither player is in the feed", joined)
+            self.assertIn("feed surname sample", joined)
 
 
 if __name__ == "__main__":
