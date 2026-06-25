@@ -12,11 +12,14 @@ CLV: `capture_close_prices` snapshots each shadow row's reference-side CLOB midp
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 import ratings_source
 import tennis_predictions as tdb
 from ratings import normalize
+
+GAMMA_API = "https://gamma-api.polymarket.com"
 
 
 def _pair(a: str, b: str) -> frozenset:
@@ -61,9 +64,131 @@ def lookup_winner(lookup: dict, side: str, opponent: str) -> str | None:
     return lookup.get(_pair(side, opponent)) or lookup.get(_surname_pair(side, opponent))
 
 
+def _as_list(v):
+    """Gamma returns these fields as either a JSON-encoded string or a real list."""
+    if isinstance(v, list):
+        return v
+    if isinstance(v, str):
+        try:
+            return json.loads(v or "[]")
+        except (ValueError, TypeError):
+            return []
+    return []
+
+
+def winner_from_market(pred: dict, market: dict) -> str | None:
+    """Winner label for a moneyline bet from its RESOLVED Polymarket market, else None.
+
+    Authoritative and feed-independent: a match-winner market resolves to 1/0, so the
+    bet settles even for qualifying/ITF matches that the tour-level results feeds
+    (Sackmann, tennis-data.co.uk) never carry. Requires the market to be closed/resolved
+    AND to carry a definitive (≈1/0) outcome — an open market (live mid prices) is left
+    PENDENTE so nothing settles early.
+    """
+    resolved = bool(market.get("closed")) or \
+        str(market.get("umaResolutionStatus", "")).lower() == "resolved"
+    if not resolved:
+        return None
+    prices = _as_list(market.get("outcomePrices"))
+    try:
+        prices = [float(p) for p in prices]
+    except (TypeError, ValueError):
+        return None
+    if not prices or max(prices) < 0.99:        # not resolved to a definitive winner (e.g. void)
+        return None
+
+    side, opp = pred.get("side") or "", pred.get("opponent") or ""
+    tok = str(pred.get("token_id") or "")
+    tokens = [str(t) for t in _as_list(market.get("clobTokenIds"))]
+    if tok and tok in tokens and len(tokens) == len(prices):
+        return side if prices[tokens.index(tok)] >= 0.5 else opp   # our token won -> our side
+
+    # Fallback when the token isn't matchable: take the winning outcome name and map it to
+    # side/opponent by surname (handles "Surname F." vs full-name storage).
+    outcomes = _as_list(market.get("outcomes"))
+    if outcomes and len(outcomes) == len(prices):
+        win_name = outcomes[max(range(len(prices)), key=lambda i: prices[i])] or ""
+        wsur = _surname(win_name)
+        if wsur and wsur == _surname(side):
+            return side
+        if wsur and wsur == _surname(opp):
+            return opp
+    return None
+
+
+def _fetch_markets_by_condition(api, condition_ids: list[str]) -> dict:
+    """{conditionId: market_dict} from Gamma /markets?condition_ids=. Best-effort, {} offline."""
+    ids = [c for c in dict.fromkeys(condition_ids) if c]
+    if not ids:
+        return {}
+    out: dict[str, dict] = {}
+
+    def absorb(rows):
+        for m in rows if isinstance(rows, list) else []:
+            cid = m.get("conditionId") or m.get("condition_id")
+            if cid:
+                out[cid] = m
+
+    try:
+        absorb(api.get(f"{GAMMA_API}/markets", params={"condition_ids": ids}))
+    except Exception:  # noqa: BLE001 - batch failed (offline/forbidden): give up
+        return out
+    for cid in ids:                              # per-id fallback for any the batch missed
+        if cid in out:
+            continue
+        try:
+            absorb(api.get(f"{GAMMA_API}/markets", params={"condition_ids": cid}))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def settle_pending_from_market(api, db_path: str = tdb.DEFAULT_DB) -> dict:
+    """Settle PENDENTE rows from their Polymarket market resolution (condition_id/token_id).
+
+    The authoritative settlement source — independent of any tour results feed, so it
+    settles qualifying/ITF/Challenger matches the feeds don't cover. Best-effort; offline
+    it settles nothing.
+    """
+    pending = tdb.get_predictions(db_path, status="PENDENTE")
+    if not pending:
+        return {"checked": 0, "settled": [], "games_matched": 0, "diagnostics": []}
+    markets = _fetch_markets_by_condition(api, [p.get("condition_id") for p in pending])
+    diags = [f"[market] {len(pending)} PENDENTE row(s); Gamma returned {len(markets)} market(s)"]
+    settled, seen = [], set()
+    for r in pending:
+        slug = r["match_slug"]
+        if slug in seen:
+            continue
+        m = markets.get(r.get("condition_id"))
+        if not m:
+            continue
+        winner = winner_from_market(r, m)
+        if not winner:
+            continue
+        seen.add(slug)
+        rows = tdb.settle_match(slug, winner, db_path)
+        settled.extend(rows)
+        if rows:
+            res = "ACERTO" if _surname(winner) == _surname(r.get("side", "")) else "ERRO"
+            diags.append(f"[market] ✓ {slug}: resolved -> winner {winner} "
+                         f"({res}, {len(rows)} row(s))")
+    if settled:
+        diags.append(f"[market] settled {len(settled)} row(s) across {len(seen)} match(es)")
+    return {"checked": len(pending), "settled": settled,
+            "games_matched": len(seen), "diagnostics": diags}
+
+
 def settle_pending(db_path: str = tdb.DEFAULT_DB, tour: str = "atp",
-                   years: list[int] | None = None) -> dict:
-    """Settle eligible PENDENTE predictions from the results feed. Best-effort.
+                   years: list[int] | None = None, api=None) -> dict:
+    """Settle eligible PENDENTE predictions. Best-effort.
+
+    Two settlement sources, in order of authority:
+      1. The Polymarket market resolution (when `api` is supplied) — authoritative and
+         feed-independent, so it settles qualifying/ITF/Challenger matches the tour-level
+         results feeds never carry.
+      2. The results feed (Sackmann -> tennis-data.co.uk) for whatever the market path
+         couldn't resolve (e.g. the market hasn't closed yet).
 
     Emits a `diagnostics` list (the backend forwards it to the terminal) that explains, per
     pending bet, exactly why it did or didn't settle — feed size, name resolution, and the
@@ -75,12 +200,28 @@ def settle_pending(db_path: str = tdb.DEFAULT_DB, tour: str = "atp",
     if years is None:
         years = [datetime.now(timezone.utc).year]
 
-    # Predictions span BOTH tours (atp-… and wta-… slugs), so settle each against ITS OWN
+    # 1) Polymarket market resolution first — authoritative, and covers matches no feed lists.
+    market_settled: list = []
+    market_diags: list = []
+    if api is not None:
+        ms = settle_pending_from_market(api, db_path)
+        market_settled = ms.get("settled", [])
+        market_diags = ms.get("diagnostics", [])
+        pending = tdb.get_predictions(db_path, status="PENDENTE")    # drop the just-settled rows
+        if not pending:                                             # all settled -> skip feed fetch
+            return {"checked": len(market_settled), "settled": market_settled, "finals_found": 0,
+                    "games_matched": ms.get("games_matched", 0),
+                    "diagnostics": market_diags + [
+                        f"DONE: {len(market_settled)} row(s) settled via market resolution; "
+                        f"no PENDENTE rows left, results feed not fetched"]}
+
+    # 2) Predictions span BOTH tours (atp-… and wta-… slugs), so settle each against ITS OWN
     # tour's feed — querying only the default tour leaves the other tour's bets stuck forever.
     def _tour_of(slug: str) -> str:
         return "wta" if (slug or "").split("-", 1)[0].lower() == "wta" else "atp"
     tours = sorted({_tour_of(r["match_slug"]) for r in pending})
-    diags: list[str] = [f"{len(pending)} PENDENTE row(s) across tour(s) {tours}; results for {years}"]
+    diags: list[str] = list(market_diags)
+    diags.append(f"{len(pending)} PENDENTE row(s) across tour(s) {tours}; results for {years}")
 
     lookups: dict = {}
     feed_sur: dict = {}
@@ -94,8 +235,9 @@ def settle_pending(db_path: str = tdb.DEFAULT_DB, tour: str = "atp",
     if not finals_found:
         diags.append("⚠ EMPTY feed — every source dry (offline/egress-blocked, or no source has "
                      "these matches yet). Rows stay PENDENTE. Check the [ratings_source] lines above.")
-        return {"checked": len(pending), "settled": [], "finals_found": 0,
-                "games_matched": 0, "diagnostics": diags}
+        return {"checked": len(pending) + len(market_settled), "settled": market_settled,
+                "finals_found": 0, "games_matched": len(market_settled),
+                "diagnostics": diags}
 
     settled, seen = [], set()
     for r in pending:
@@ -109,10 +251,15 @@ def settle_pending(db_path: str = tdb.DEFAULT_DB, tour: str = "atp",
         winner = lookup_winner(lookup, side, opp)
         if winner:
             seen.add(slug)
-            rows = tdb.settle_match(slug, winner, db_path)
+            # The feed labels the winner as e.g. "Alcaraz C.", which won't string-match the
+            # prediction's "Carlos Alcaraz" — settle_match's compute_status is exact, so map the
+            # feed winner back to this row's own side/opponent label (by surname) or it'd ANULAR.
+            w_sur = _surname(winner)
+            winner_label = side if w_sur == s_sur else (opp if w_sur == o_sur else winner)
+            rows = tdb.settle_match(slug, winner_label, db_path)
             settled.extend(rows)
             if rows:
-                result = "ACERTO" if _surname(winner) == s_sur else "ERRO"
+                result = "ACERTO" if w_sur == s_sur else "ERRO"
                 diags.append(f"✓ {slug}: {side} vs {opp} -> winner {winner} "
                              f"({result}, {len(rows)} row(s) updated)")
             else:
@@ -135,9 +282,13 @@ def settle_pending(db_path: str = tdb.DEFAULT_DB, tour: str = "atp",
         for t in tours:                          # per tour, so each feed's names are visible
             sample = sorted(feed_sur.get(t, set()))[:25]
             diags.append(f"feed[{t}] surname sample (first 25): " + ", ".join(sample))
-    diags.append(f"DONE: {len(settled)} row(s) settled across {len(seen)} match(es)")
-    return {"checked": len(pending), "settled": settled, "finals_found": finals_found,
-            "games_matched": len(seen), "diagnostics": diags}
+    all_settled = market_settled + settled
+    diags.append(f"DONE: {len(all_settled)} row(s) settled "
+                 f"({len(market_settled)} via market, {len(settled)} via feed) "
+                 f"across {len(market_settled) + len(seen)} match(es)")
+    return {"checked": len(pending) + len(market_settled), "settled": all_settled,
+            "finals_found": finals_found,
+            "games_matched": len(market_settled) + len(seen), "diagnostics": diags}
 
 
 def capture_close_prices(db_path: str = tdb.DEFAULT_DB) -> int:
