@@ -208,42 +208,60 @@ def _season_url_candidates(tour: str, year: int) -> list[str]:
 
 def fetch_tennisdata_matches(tour: str, years: list[int], timeout: int = 15,
                              debug: bool = False) -> list[dict]:
-    """Fetch + parse tennis-data.co.uk season workbooks for the given years. [] on failure."""
+    """Fetch + parse tennis-data.co.uk season workbooks for the given years. [] on failure.
+
+    Emits ALWAYS-ON access logs (stderr) so reachability of www.tennis-data.co.uk is
+    verifiable from the terminal: one line per season with the HTTP status, host, payload
+    size and parsed-match count (or the concrete failure), plus a final summary. `debug`
+    adds a trace of every individual URL attempt.
+    """
+    def _log(msg: str) -> None:
+        print(f"[tennis_data_source] {msg}", file=sys.stderr, flush=True)
+
     try:
         import requests  # lazy, like the Sackmann path
     except Exception as e:  # noqa: BLE001
-        print(f"[tennis_data_source] 'requests' not importable: {e}", file=sys.stderr)
+        _log(f"'requests' not importable: {e}")
         return []
+
+    host = _BASE.split("/")[2]
+    _log(f"{tour}: fetching {len(years)} season(s) {years} from {host} ...")
     rows_out: list[dict] = []
     errors: list[str] = []
+    ok_seasons = 0
     for y in years:
         got = False
         last = "no response"
         for url in _season_url_candidates(tour, y):
-            host = url.split("/")[2]
             try:
                 resp = requests.get(url, timeout=timeout)
+                size = len(resp.content or b"")
+                if debug:
+                    _log(f"  GET {url} -> HTTP {resp.status_code} ({size/1024:.0f} KB)")
                 if resp.status_code == 200 and resp.content:
                     parsed = rows_to_matches(read_xlsx(resp.content))
                     if parsed:
                         rows_out.extend(parsed)
+                        ok_seasons += 1
                         got = True
-                        if debug:
-                            print(f"[tennis_data_source] {tour} {y}: +{len(parsed)} matches "
-                                  f"({url})", file=sys.stderr)
+                        _log(f"  {tour} {y}: HTTP 200 @ {host} ({size/1024:.0f} KB) "
+                             f"-> {len(parsed)} matches  [{url.rsplit('/', 1)[-1]}]")
                         break
-                    last = f"unparseable workbook @ {host}"
+                    last = f"HTTP 200 but unparseable workbook ({size/1024:.0f} KB) @ {host}"
                 else:
                     last = f"HTTP {resp.status_code} @ {host}"
             except Exception as e:  # noqa: BLE001
                 last = f"{type(e).__name__} @ {host}"
         if not got:
             errors.append(f"{y}: {last}")
-            if debug:
-                print(f"[tennis_data_source] {tour} {y}: {last}", file=sys.stderr)
-    if not rows_out and errors:
-        print(f"[tennis_data_source] {tour} fetch failed -> {'; '.join(errors)}", file=sys.stderr)
+            _log(f"  {tour} {y}: UNREACHABLE -> {last}")
     rows_out.sort(key=lambda m: m["date"])           # chronological -> no look-ahead
+    if rows_out:
+        _log(f"{tour}: OK — {len(rows_out)} matches from {ok_seasons}/{len(years)} season(s) "
+             f"@ {host}")
+    else:
+        _log(f"{tour}: FAILED — 0 matches from {host} -> {'; '.join(errors) or 'no seasons tried'}. "
+             f"Is {host} on the network egress allowlist?")
     return rows_out
 
 

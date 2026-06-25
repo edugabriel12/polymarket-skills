@@ -59,6 +59,10 @@ python polymarket-tennis/scripts/test_pipeline.py
     openpyxl), a **wholly separate host** reachable where GitHub egress is blocked. ATP under
     `/{year}/`, WTA under `/{year}w/`. Names arrive as `Surname I.`; surname aliasing keeps them
     resolvable. ⚠️ The host must be on your **network egress allowlist** (add `www.tennis-data.co.uk`).
+    Emits **always-on access logs** to stderr so you can validate reachability — one line per season
+    (`HTTP 200 @ www.tennis-data.co.uk (… KB) -> N matches`) and a summary (`OK — N matches …` or
+    `FAILED … Is www.tennis-data.co.uk on the network egress allowlist?`); add `--debug` to trace
+    every URL attempt.
   - Offline/all-blocked, it logs the concrete cause per source and falls back to market-implied (0 edge).
   - **To skip straight to it:** `--ratings-source tennisdata` (or `TENNIS_RATINGS_SOURCE=tennisdata`).
   - **Or clone via git** and set **`TENNIS_DATA_DIR`** to the parent of the clones — `git clone --depth 1

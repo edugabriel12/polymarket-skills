@@ -175,5 +175,53 @@ class TestEndToEndResolve(unittest.TestCase):
         self.assertIsNone(by_label["grass"])              # never played grass
 
 
+class TestFetchLogging(unittest.TestCase):
+    """The network fetcher must emit always-on access logs so reachability is verifiable."""
+
+    def setUp(self):
+        self._saved = sys.modules.get("requests")
+
+    def tearDown(self):
+        if self._saved is not None:
+            sys.modules["requests"] = self._saved
+        else:
+            sys.modules.pop("requests", None)
+
+    def _install_fake_requests(self, status, content):
+        import types
+        fake = types.ModuleType("requests")
+
+        class _Resp:
+            def __init__(self):
+                self.status_code = status
+                self.content = content
+        fake.get = lambda url, timeout=15: _Resp()
+        sys.modules["requests"] = fake
+
+    def _run_capturing_stderr(self, *args, **kwargs):
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            out = tds.fetch_tennisdata_matches(*args, **kwargs)
+        return out, buf.getvalue()
+
+    def test_success_logs_status_size_and_count(self):
+        xlsx = _make_xlsx([_HEADER, _row("07/06/2024", "Clay", "Alcaraz C.", "Sinner J.")])
+        self._install_fake_requests(200, xlsx)
+        matches, log = self._run_capturing_stderr("atp", [2024])
+        self.assertEqual(len(matches), 1)
+        self.assertIn("HTTP 200 @ www.tennis-data.co.uk", log)
+        self.assertIn("1 matches", log)
+        self.assertIn("OK — 1 matches from 1/1 season(s)", log)
+
+    def test_failure_logs_unreachable_and_egress_hint(self):
+        self._install_fake_requests(403, b"Host not in allowlist")
+        matches, log = self._run_capturing_stderr("atp", [2024])
+        self.assertEqual(matches, [])
+        self.assertIn("UNREACHABLE -> HTTP 403 @ www.tennis-data.co.uk", log)
+        self.assertIn("FAILED", log)
+        self.assertIn("egress allowlist", log)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -263,9 +263,8 @@ def auto_ratings(tour: str = "atp", years: list[int] | None = None,
     for src in source_order():
         matches = _fetch_from_source(src, tour, years, debug)
         if matches:
-            if debug:
-                print(f"[ratings_source] source '{src}': {len(matches)} matches for {tour} {years}",
-                      file=sys.stderr)
+            print(f"[ratings_source] {tour}: source '{src}' supplied {len(matches)} matches "
+                  f"-> computing surface Elo", file=sys.stderr, flush=True)
             break
     if not matches:
         # Each source already printed its concrete cause (SSL/proxy/404/egress block/...).
