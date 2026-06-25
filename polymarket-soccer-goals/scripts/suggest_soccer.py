@@ -404,7 +404,7 @@ def run(args) -> dict:
             sample = "; ".join(" v ".join(sorted(t)) for t in list(not_on_poly)[:10])
             vlog(f"    not on Polymarket (sample): {sample}")
 
-    suggestions, skipped, cand_rows = [], [], []
+    suggestions, skipped, cand_rows, analyses = [], [], [], []
 
     def _skip(slug, reason, **extra):
         rec = {"game": slug, "reason": reason}; rec.update(extra)
@@ -432,14 +432,18 @@ def run(args) -> dict:
         names = _game_names(gmarkets)
         sharp_tot = (sosh.sharp_total_ref(sharp_lookup, target, names[0], names[1])
                      if (sharp_lookup and names) else None)
-        if require_sharp and sharp_tot is None:
+        # In divergence mode a missing sharp ref BLOCKS the bet — but we still model the
+        # game so the analysis output covers it (the model read, not just a skip reason).
+        bet_blocked = require_sharp and sharp_tot is None
+        if bet_blocked:
             _skip(slug, "no sharp total reference (divergence mode bets only on a sharp anchor)")
-            continue
         for m in tmarkets:
             line = sm.parse_total_line(m)
             ou = sm.over_under_tokens(m)
             if line is None or not ou or ou["over_price"] is None or ou["under_price"] is None:
-                _skip(slug, "could not parse total line/tokens"); continue
+                if not bet_blocked:
+                    _skip(slug, "could not parse total line/tokens")
+                continue
             if sharp_tot is not None:
                 # Pure divergence anchor: invert the sharp (line, P(over)) to an expected total
                 # (mu) at the SHARP line, re-split by Elo supremacy, then price the POLYMARKET
@@ -470,6 +474,10 @@ def run(args) -> dict:
             vlog(f"  [{slug}] edges(TOTAL): " + "; ".join(
                 f"{n['side']} price={n['price']} p={n['p_model']} edge={n['edge']:+.3f} "
                 f"band={n['in_odds_band']}" for n in notes))
+            analyses.append(_analysis_row("TOTAL", slug, names, line, lam_h, lam_a, used,
+                                          probs, notes, sharp_tot, bet_blocked))
+            if bet_blocked:
+                continue   # analysis recorded; bet skipped (one skip per game logged above)
             c = _evaluate("TOTAL", slug, m, line, chosen, notes, lam_h, lam_a, used,
                           ou["book_sum"], ou["price_sane"], args, portfolio_value, first_trade, kh,
                           _skip, target, ref_token=ou.get("over_token"), cong=cong)
@@ -489,9 +497,10 @@ def run(args) -> dict:
         names = _game_names(gmarkets)
         sharp_btts = (sosh.sharp_btts_ref(sharp_lookup, target, names[0], names[1])
                       if (sharp_lookup and names) else None)
-        if require_sharp and sharp_btts is None:
+        # Missing sharp ref blocks the BTTS bet, but we still model it for the analysis output.
+        bet_blocked = require_sharp and sharp_btts is None
+        if bet_blocked:
             _skip(slug, "no sharp BTTS reference (divergence mode bets only on a sharp anchor)")
-            continue
         if used:
             lam_h, lam_a = dc.lambdas_from_total_supremacy(total, sup)
         else:
@@ -514,6 +523,10 @@ def run(args) -> dict:
         vlog(f"  [{slug}] edges(BTTS): " + "; ".join(
             f"{n['side']} price={n['price']} p={n['p_model']} edge={n['edge']:+.3f} "
             f"band={n['in_odds_band']}" for n in notes))
+        analyses.append(_analysis_row("BTTS", slug, names, None, lam_h, lam_a, used,
+                                      probs, notes, sharp_btts, bet_blocked))
+        if bet_blocked:
+            continue   # analysis recorded; bet skipped (one skip per game logged above)
         c = _evaluate("BTTS", slug, m, None, chosen, notes, lam_h, lam_a, used,
                       bt["book_sum"], bt["price_sane"], args, portfolio_value, first_trade, kh,
                       _skip, target, ref_token=bt.get("yes_token"), cong=cong)
@@ -564,20 +577,82 @@ def run(args) -> dict:
                 vlog(f"  [{game_slug}] superseded {n} stale PENDENTE entry(ies) from an earlier run")
     suggestions.sort(key=lambda s: s["edge"], reverse=True)
 
+    # Mark which analyses became live suggestions (best-line winners) so the output makes the
+    # bet/no-bet outcome explicit per game, alongside the model read for EVERY game found.
+    bet_keys = {(s["game"], s["market"], s["line"]) for s in suggestions}
+    for a in analyses:
+        a["suggested"] = (a["slug"], a["market"], a["line"]) in bet_keys
+    analyses.sort(key=lambda a: (a["best_edge"] is None, -(a["best_edge"] or 0)))
+
     texts = [s.pop("_text") for s in suggestions]
-    vlog(f"=== Done: {len(suggestions)} suggestion(s), {len(skipped)} skipped ===")
+
+    # Full-slate analysis log: EVERY game found + its model read (not just bets/skips).
+    vlog(f"=== Analysis of all {len(analyses)} game-market(s) found ===")
+    for a in analyses:
+        head = f"  [{a['game']}] {a['market']}" + (f" {a['line']:g}" if a["line"] is not None else "")
+        teams = f"{a['home']} v {a['away']}" if a["home"] else "?"
+        prob = (f"P(over)={a['p_over']:.3f}" if a["market"] == "TOTAL"
+                else f"P(yes)={a['p_yes']:.3f}")
+        sharp = (f" sharp={a['sharp_over']:.3f}@{a['sharp_line']:g}"
+                 if a["market"] == "TOTAL" and a.get("sharp_over") is not None
+                 else f" sharp_yes={a['sharp_yes']:.3f}"
+                 if a["market"] == "BTTS" and a.get("sharp_yes") is not None else "")
+        outcome = ("SUGGEST" if a["suggested"] else
+                   "no-sharp" if a["bet_blocked_no_sharp"] else "no-bet")
+        vlog(f"{head}: {teams} λ={a['lam_home']:g}/{a['lam_away']:g} {prob}{sharp} "
+             f"best={a['best_side'] or '—'} edge={(a['best_edge'] or 0)*100:+.1f}% "
+             f"ext={a['used_external']} -> {outcome}")
+    vlog(f"=== Done: {len(analyses)} analyzed, {len(suggestions)} suggestion(s), "
+         f"{len(skipped)} skipped ===")
 
     result = {
         "date": target,
         "counts": {"total_markets": len(total_evts), "btts_markets": len(btts_evts),
+                   "analyzed": len(analyses),
                    "suggestions": len(suggestions), "skipped": len(skipped),
                    "superseded": superseded},
-        "suggestions": suggestions, "skipped": skipped,
+        "suggestions": suggestions, "skipped": skipped, "analyses": analyses,
         "disclaimer": "Paper-trading simulation — not financial advice. Without live "
                       "inputs the Dixon-Coles engine returns zero edge (market-implied).",
         "_texts": texts,
     }
     return result
+
+
+def _analysis_row(market_type, slug, names, line, lam_h, lam_a, used, probs, notes, sharp,
+                  bet_blocked):
+    """One structured analysis record for a modeled game-market (bet or not).
+
+    Returned in the result's `analyses` array so the output carries EVERY discovered
+    game with its full model read — λ, P(over)/P(BTTS), per-side edges, sharp ref — not
+    just the bets and skip reasons.
+    """
+    best = max((n for n in notes), key=lambda n: n["edge"], default=None)
+    row = {
+        "game": spdb.model_log_base(slug), "slug": slug,
+        "home": names[0] if names else None, "away": names[1] if names else None,
+        "competition": leagues.league_prefix(slug),
+        "market": market_type, "line": line,
+        "lam_home": round(lam_h, 3), "lam_away": round(lam_a, 3),
+        "used_external": used,
+        "best_side": best["side"] if best else None,
+        "best_edge": round(best["edge"], 4) if best else None,
+        "in_odds_band": bool(best and best["in_odds_band"]),
+        "bet_blocked_no_sharp": bet_blocked,
+        "edges": [{"side": n["side"], "price": n["price"],
+                   "p_model": round(n["p_model"], 4), "edge": round(n["edge"], 4),
+                   "in_odds_band": n["in_odds_band"]} for n in notes],
+    }
+    if market_type == "TOTAL":
+        row["p_over"] = round(probs["p_over_eff"], 4)
+        row["p_under"] = round(probs["p_under_eff"], 4)
+        row["sharp_over"] = round(sharp[1], 4) if sharp else None
+        row["sharp_line"] = sharp[0] if sharp else None
+    else:
+        row["p_yes"] = round(probs["p_yes"], 4)
+        row["p_no"] = round(probs["p_no"], 4)
+        row["sharp_yes"] = round(sharp, 4) if sharp is not None else None
+    return row
 
 
 def _shadow_log(market_type, slug, line, notes, chosen, lam_h, lam_a, used, args, target,

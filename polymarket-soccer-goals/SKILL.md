@@ -92,6 +92,16 @@ python polymarket-soccer-goals/scripts/test_pipeline.py
 Records each suggestion (status PENDENTE) with the full Dixon-Coles audit (λ_home, λ_away, ρ,
 P(model), edge, sizing) and the Polymarket market link, for later calibration/win-rate analysis.
 
+**Full-slate analysis output:** the result carries an **`analyses`** array with the model read for
+**every** discovered game-market — TOTAL and BTTS — not just the bets and skip reasons. Each entry
+has the game + teams + competition, λ_home/λ_away, P(over)/P(under) (or P(yes)/P(no)), the per-side
+edges and odds-band flags, the sharp reference when present, the best side/edge, and `suggested`
+(became a live bet) / `bet_blocked_no_sharp` (modeled but not bet because no sharp ref in divergence
+mode). The run also logs an `=== Analysis of all N game-market(s) found ===` block summarizing every
+game's read, so a verbose run shows the complete slate at a glance (`counts.analyzed` totals it).
+Games that fall in divergence mode without a sharp anchor are now still **modeled** for this output
+(previously they were skipped before the model ran).
+
 **Full math audit:** dump the complete `stats_log` (λ_home/λ_away, ρ, P(model), edge, sizing) for
 every soccer prediction with the shared `audit_log.py`:
 ```bash
