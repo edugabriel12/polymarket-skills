@@ -32,6 +32,8 @@ NATIONAL_ELO: dict[str, float] = {
     "aus": 1730, "irn": 1760, "sau": 1690, "qat": 1670, "can": 1760, "crc": 1700,
     "sct": 1760, "irl": 1720, "srb": 1800, "cze": 1760, "hun": 1750, "grc": 1745,
     "cmr": 1700, "rsa": 1690, "nzl": 1640, "pan": 1680, "jam": 1690,
+    # World Football Elo snapshot (~early 2026); refresh/override via --ratings-csv if stale.
+    "irq": 1600, "cpv": 1630,
 }
 
 _COUNTRY_ALIASES: dict[str, str] = {
@@ -41,6 +43,8 @@ _COUNTRY_ALIASES: dict[str, str] = {
     "wls": "wal", "sco": "sct", "ire": "irl", "uae": "are", "ksa": "sau",
     "iri": "irn", "alg": "dza", "mor": "mar", "cmr_": "cmr", "civ_": "civ",
     "por_": "por", "bra_": "bra", "arg_": "arg",
+    # Polymarket slug codes -> table keys: Uruguay (slug 'ury' -> 'uru'), Cape Verde ('cvi' -> 'cpv').
+    "ury": "uru", "cvi": "cpv",
 }
 
 

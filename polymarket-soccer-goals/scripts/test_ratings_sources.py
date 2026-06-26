@@ -37,6 +37,14 @@ class TestNationalElo(unittest.TestCase):
         self.assertIsNone(rs.national_elo("zzz"))
         self.assertIsNone(rs.national_elo(None))
 
+    def test_slug_code_coverage(self):
+        # Polymarket slug codes that previously returned None -> ext=False (edge-zero) games.
+        self.assertEqual(rs.national_elo("ury"), rs.national_elo("uru"))   # Uruguay alias -> uru
+        self.assertEqual(rs.national_elo("ury"), 1865)
+        self.assertEqual(rs.national_elo("irq"), 1600)                     # Iraq added
+        self.assertEqual(rs.national_elo("cvi"), rs.national_elo("cpv"))   # Cape Verde alias -> cpv
+        self.assertEqual(rs.national_elo("cvi"), 1630)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
