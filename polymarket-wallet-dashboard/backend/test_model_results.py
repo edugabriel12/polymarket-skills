@@ -42,5 +42,22 @@ class TestAggregate(unittest.TestCase):
         self.assertIsNone(out["by_confidence"])   # Modelo has no confidence axis
 
 
+class TestModelBets(unittest.TestCase):
+    def test_row_to_bet_maps_status_and_subcategory(self):
+        b = mr._row_to_bet(
+            {"game_slug": "epl-ars-che-2026-06-25-total-2pt5", "side": "OVER",
+             "entry_price": 0.56, "decimal_odds": 1.79, "status": "ACERTO",
+             "settled_at": "2026-06-25", "market_url": "u"}, "Futebol", "Soccer")
+        self.assertEqual(b["status"], "WON")
+        self.assertEqual(b["subcategory"], "Over/Under gols")
+        self.assertEqual(b["event"], "ARS vs CHE")
+        self.assertEqual(b["unit"], 1.0)
+        self.assertAlmostEqual(b["odds"], 1.79)
+
+    def test_model_bets_unknown_category_empty(self):
+        out = mr.model_bets("Basketball", 0, 20)   # model only does Futebol/Tênis
+        self.assertEqual(out, {"total": 0, "bets": []})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

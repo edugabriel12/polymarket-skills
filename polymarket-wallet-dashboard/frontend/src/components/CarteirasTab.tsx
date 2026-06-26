@@ -7,6 +7,7 @@ import { KpiCards } from "@/components/KpiCards";
 import { ConfidenceBreakdown } from "@/components/ConfidenceBreakdown";
 import { CategoryBreakdown } from "@/components/CategoryBreakdown";
 import { Charts } from "@/components/Charts";
+import { DashBetList } from "@/components/DashBetList";
 import { wallets, type WalletRecord } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -54,7 +55,12 @@ function WalletAnalysis({ rec }: { rec: WalletRecord }) {
           <KpiCards overall={a.overall} nMarkets={a.n_markets} nTrades={a.n_trades} />
           {a.by_confidence && a.by_confidence.length > 0 && <ConfidenceBreakdown buckets={a.by_confidence} />}
           <Charts categories={a.by_category} />
-          <CategoryBreakdown categories={a.by_category} />
+          <CategoryBreakdown
+            categories={a.by_category}
+            renderBets={(cat) => (
+              <DashBetList fetchKey={["wallet-bets", rec.id, cat]} fetcher={(p) => wallets.bets(rec.id, cat, p)} />
+            )}
+          />
         </>
       ) : (
         <Card className="p-6 text-center text-sm text-muted-foreground">

@@ -70,3 +70,54 @@ def model_results() -> dict:
 
     by_category.sort(key=lambda c: c["total_pnl"], reverse=True)
     return {"entity": "Modelo", "by_category": by_category, "by_confidence": None}
+
+
+_STATUS_MAP = {"ACERTO": "WON", "ERRO": "LOST", "ANULADO": "VOID"}
+import re as _re  # noqa: E402
+_PRETTY = _re.compile(r"^[a-z0-9]+-([a-z0-9]+)-([a-z0-9]+)-", _re.I)
+
+
+def _pretty(slug: str) -> str:
+    m = _PRETTY.match(slug or "")
+    return f"{m.group(1).upper()} vs {m.group(2).upper()}" if m else (slug or "")
+
+
+def _store_for(category: str):
+    if category == "Futebol":
+        import soccer_predictions as s
+        return s, os.environ.get("SOCCER_PREDICTIONS_DB", s.DEFAULT_DB), "Soccer"
+    if category == "Tênis":
+        import tennis_predictions as t
+        return t, os.environ.get("TENNIS_PREDICTIONS_DB", t.DEFAULT_DB), "Tennis"
+    return None, None, None
+
+
+def _row_to_bet(r: dict, category: str, cat_en: str) -> dict:
+    import subcategory as sc
+    slug = r.get("game_slug") or r.get("match_slug") or ""
+    ep = _f(r.get("entry_price"))
+    odds = _f(r.get("decimal_odds")) or ((1.0 / ep) if ep > 0 else 0.0)
+    title = r.get("market_question") or _pretty(slug)
+    return {
+        "key": f"model-{slug}-{r.get('side','')}", "event": title, "category": category,
+        "subcategory": sc.classify(cat_en, title, slug, ""), "side": r.get("side") or "",
+        "odds": round(odds, 4), "entry_price": round(ep, 4), "unit": 1.0, "confidence": "Alta",
+        "live": "PRÉ-LIVE", "market_url": r.get("market_url"),
+        "status": _STATUS_MAP.get(r.get("status"), "VOID"), "pnl": None,
+        "updated_at": r.get("settled_at") or r.get("updated_at"),
+    }
+
+
+def model_bets(category: str, offset: int, limit: int) -> dict:
+    """Paginated settled model predictions of a category (Futebol/Tênis)."""
+    store, db, cat_en = _store_for(category)
+    if not store:
+        return {"total": 0, "bets": []}
+    try:
+        rows = [r for r in store.get_predictions(db) if r.get("status") in _STATUS_MAP]
+    except Exception as e:  # noqa: BLE001
+        print(f"[model-bets] {category} skipped: {e}", file=sys.stderr, flush=True)
+        return {"total": 0, "bets": []}
+    rows.sort(key=lambda r: (r.get("settled_at") or ""), reverse=True)
+    page = rows[offset:offset + limit]
+    return {"total": len(rows), "bets": [_row_to_bet(r, category, cat_en) for r in page]}

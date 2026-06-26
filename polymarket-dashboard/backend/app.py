@@ -128,3 +128,12 @@ def entries(category: str | None = Query(None)) -> dict:
 def results() -> dict:
     """Combined settled results (model + wallets together) in Unidade Sugerida."""
     return rc.combined(es.list_settled())
+
+
+@app.get("/api/results/bets")
+def results_bets(category: str | None = Query(None), page: int = Query(1, ge=1),
+                 page_size: int = Query(20, ge=1, le=100)) -> dict:
+    """Paginated list of the settled bets of a category (the drill-down detail)."""
+    offset = (page - 1) * page_size
+    return {"total": es.count_settled(category), "page": page, "page_size": page_size,
+            "bets": es.list_settled_page(category, offset, page_size)}

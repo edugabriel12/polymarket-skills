@@ -84,6 +84,7 @@ def persist_bets(wallet: dict, positions: list, db_path: str = ws.DEFAULT_DB) ->
         pnl = wa.to_float(pos.get("cashPnl")) if resolved else None
         status = (("WON" if pnl > 0 else "LOST" if pnl < 0 else "VOID") if resolved else "OPEN")
         ws.upsert_bet(wallet["id"], cond, {
+            "event": f["title"], "market_url": f["url"],
             "category": f["category"], "subcategory": f["subcategory"],
             "confidence": tier["confidence"], "side": f["side"],
             "total_position": _total_position(pos), "entry_price": f["price"],
