@@ -97,6 +97,16 @@ def _game_names(gmarkets) -> tuple[str, str] | None:
     return None
 
 
+def _event_label(names, slug: str) -> str:
+    """Human-readable 'Team A vs Team B' from the full team names (e.g. 'Cape Verde vs
+    Saudi Arabia'), falling back to the slug's team codes ('CVI vs KSA') when names are
+    unavailable. Title-cased for display."""
+    if names and len(names) == 2 and names[0] and names[1]:
+        return f"{str(names[0]).title()} vs {str(names[1]).title()}"
+    m = re.match(r"^[a-z0-9]+-([a-z0-9]+)-([a-z0-9]+)-", (slug or ""), re.I)
+    return f"{m.group(1).upper()} vs {m.group(2).upper()}" if m else (slug or "")
+
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -561,6 +571,7 @@ def run(args) -> dict:
                           ou["book_sum"], ou["price_sane"], args, portfolio_value, first_trade, kh,
                           _skip, target, ref_token=ou.get("over_token"), cong=cong)
             if c:
+                c["names"] = names          # full team names for a readable event label
                 cand_rows.append(c)
 
     # --- BTTS markets ---
@@ -613,6 +624,7 @@ def run(args) -> dict:
                       bt["book_sum"], bt["price_sane"], args, portfolio_value, first_trade, kh,
                       _skip, target, ref_token=bt.get("yes_token"), cong=cong)
         if c:
+            c["names"] = names              # full team names for a readable event label
             cand_rows.append(c)
 
     # Best-line-per-game: record/score only the highest-edge line per (game, market); the
@@ -639,7 +651,8 @@ def run(args) -> dict:
             recorded_ids.setdefault(c["slug"], set()).add(pred_id)
         _shadow_log(c["market_type"], c["slug"], c["line"], c["notes"], c["chosen"],
                     c["lam_h"], c["lam_a"], c["used"], args, target, 1, None, c["ref_token"])
-        suggestions.append({"game": c["slug"], "market": c["market_type"],
+        suggestions.append({"game": c["slug"], "event": _event_label(c.get("names"), c["slug"]),
+                            "market": c["market_type"], "market_url": c.get("market_url"),
                             "side": c["chosen"]["side"], "line": c["line"],
                             "edge": round(c["chosen"]["edge"], 4),
                             "lam_home": round(c["lam_h"], 3), "lam_away": round(c["lam_a"], 3),

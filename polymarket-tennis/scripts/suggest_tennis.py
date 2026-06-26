@@ -365,6 +365,8 @@ def run(args) -> dict:
         if rec_id is not None:
             recorded_ids.setdefault(c["slug"], set()).add(rec_id)
         suggestions.append({"match": c["slug"], "surface": c["surface"],
+                            "event": f"{ch['side']} vs {ch['opponent']}",
+                            "market_url": _match_url(c["slug"]),
                             "side": ch["side"], "opponent": ch["opponent"],
                             "price": ch["price"], "edge": round(ch["edge"], 4),
                             "p_model": round(ch["p_model"], 4),

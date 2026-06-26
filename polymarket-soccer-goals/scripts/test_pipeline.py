@@ -509,5 +509,18 @@ class TestPregameStatus(unittest.TestCase):
         self.assertTrue(ok)
 
 
+class TestEventLabel(unittest.TestCase):
+    """Readable 'Team A vs Team B' for the storefront, instead of raw slug codes (CVI)."""
+
+    def test_full_names_titlecased(self):
+        self.assertEqual(
+            ss._event_label(("cape verde", "saudi arabia"), "fifwc-cvi-ksa-2026-06-26-total-2pt5"),
+            "Cape Verde vs Saudi Arabia")
+
+    def test_falls_back_to_slug_codes(self):
+        self.assertEqual(
+            ss._event_label(None, "fifwc-cvi-ksa-2026-06-26-total-2pt5"), "CVI vs KSA")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
