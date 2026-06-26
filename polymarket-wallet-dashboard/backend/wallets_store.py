@@ -29,6 +29,22 @@ CREATE TABLE IF NOT EXISTS wallets (
     analysis     TEXT NOT NULL,     -- JSON: rollup_csv report (by category + confidence)
     thresholds   TEXT NOT NULL      -- JSON: confidence_model.derive_thresholds
 );
+-- The watcher's dedup state: ONE row per (wallet, market) holding the highest
+-- confidence tier already alerted (a tier UPGRADE re-pushes the same entry), plus
+-- one row per market already pushed as settled.
+CREATE TABLE IF NOT EXISTS seen_alerts (
+    wallet_id    INTEGER NOT NULL,
+    condition_id TEXT NOT NULL,
+    confidence   TEXT NOT NULL,
+    at           TEXT NOT NULL,
+    PRIMARY KEY (wallet_id, condition_id)
+);
+CREATE TABLE IF NOT EXISTS settled_markets (
+    wallet_id    INTEGER NOT NULL,
+    condition_id TEXT NOT NULL,
+    at           TEXT NOT NULL,
+    PRIMARY KEY (wallet_id, condition_id)
+);
 """
 
 
@@ -113,7 +129,53 @@ def delete_wallet(wallet_id: int, db_path: str = DEFAULT_DB) -> bool:
     con = connect(db_path)
     try:
         with con:
+            con.execute("DELETE FROM seen_alerts WHERE wallet_id=?", (wallet_id,))
+            con.execute("DELETE FROM settled_markets WHERE wallet_id=?", (wallet_id,))
             cur = con.execute("DELETE FROM wallets WHERE id=?", (wallet_id,))
             return cur.rowcount > 0
+    finally:
+        con.close()
+
+
+# --- watcher dedup state ---------------------------------------------------
+def seen_confidences(wallet_id: int, db_path: str = DEFAULT_DB) -> dict:
+    """{condition_id: highest confidence tier already alerted} for a wallet."""
+    con = connect(db_path)
+    try:
+        return {r["condition_id"]: r["confidence"] for r in con.execute(
+            "SELECT condition_id, confidence FROM seen_alerts WHERE wallet_id=?", (wallet_id,))}
+    finally:
+        con.close()
+
+
+def set_seen_confidence(wallet_id: int, condition_id: str, confidence: str,
+                        db_path: str = DEFAULT_DB) -> None:
+    """Upsert the highest tier alerted for (wallet, market)."""
+    con = connect(db_path)
+    try:
+        with con:
+            con.execute(
+                "INSERT INTO seen_alerts(wallet_id, condition_id, confidence, at) VALUES(?,?,?,?) "
+                "ON CONFLICT(wallet_id, condition_id) DO UPDATE SET confidence=excluded.confidence, "
+                "at=excluded.at", (wallet_id, condition_id, confidence, _now()))
+    finally:
+        con.close()
+
+
+def settled_keys(wallet_id: int, db_path: str = DEFAULT_DB) -> set:
+    con = connect(db_path)
+    try:
+        return {r["condition_id"] for r in con.execute(
+            "SELECT condition_id FROM settled_markets WHERE wallet_id=?", (wallet_id,))}
+    finally:
+        con.close()
+
+
+def mark_settled(wallet_id: int, condition_id: str, db_path: str = DEFAULT_DB) -> None:
+    con = connect(db_path)
+    try:
+        with con:
+            con.execute("INSERT OR IGNORE INTO settled_markets(wallet_id, condition_id, at) "
+                        "VALUES(?,?,?)", (wallet_id, condition_id, _now()))
     finally:
         con.close()
