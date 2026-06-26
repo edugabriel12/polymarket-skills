@@ -22,8 +22,10 @@ Two tabs:
 
 - **Análises** — the day's entry suggestions, rendered as cards with the full model math (soccer:
   λ_home/λ_away, P(Over)/P(Under)/P(BTTS), edge, payout, Kelly size; tennis: surface-Elo win prob,
-  edge, price). The heavy model calc runs **once per day** and is cached (a dedicated
-  `analysis_cache` table in the dashboard cache DB) until the next UTC day.
+  edge, price). An in-process scheduler recomputes **every sport at the top of each UTC hour**
+  (01:00, 02:00, …) and refreshes the cache (a dedicated `analysis_cache` table in the dashboard
+  cache DB), so the panel always shows the latest run — no manual recompute button. Disable the
+  loop with `AUTO_RECALC=0`.
 - **Resultados** — ROI, P&L, win rate for **diário / semanal / mensal**, with charts and a
   recent-predictions table linking to each Polymarket market. **Every visit triggers settlement**,
   moving PENDENTE rows to ACERTO/ERRO. Soccer settles from the football-data.org results feed;
@@ -90,7 +92,9 @@ curl -X POST "http://localhost:8000/api/seed-demo?sport=soccer&reset=true"
 | `POST /api/seed-demo?sport=&reset=` | Seed sample predictions (soccer demo) |
 | `GET /api/health` | Liveness |
 
-### Clear the cache / recompute
+### Recompute / clear the cache
+The backend recomputes every sport at the top of each UTC hour automatically (`AUTO_RECALC=1`,
+the default). The endpoints below still allow a manual one-off if needed:
 ```bash
 # Recompute today and overwrite the cache (one shot):
 curl "http://localhost:8000/api/analyses?sport=soccer&force=true"
@@ -101,8 +105,7 @@ curl -X POST "http://localhost:8000/api/cache/clear"
 # Delete just one sport/day:
 curl -X POST "http://localhost:8000/api/cache/clear?sport=soccer&date=2026-06-14"
 ```
-In the UI, the **Recalcular** button on the Análises tab does the force-recompute. (On Windows
-PowerShell use `curl.exe`.)
+(On Windows PowerShell use `curl.exe`.)
 
 ## Tests
 - Backend: `cd backend && . .venv/bin/activate && python test_api.py`

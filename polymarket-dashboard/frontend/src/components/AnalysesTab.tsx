@@ -1,8 +1,7 @@
 import { useEffect, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { AnimatePresence, motion } from "framer-motion";
 import {
-  RefreshCw,
   CalendarDays,
   Inbox,
   BadgeInfo,
@@ -10,39 +9,21 @@ import {
   ChevronRight,
 } from "lucide-react";
 import { api, type Sport } from "@/lib/api";
-import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { PredictionCard } from "@/components/PredictionCard";
 import { cn } from "@/lib/utils";
 
-// Until next UTC midnight — matches the backend's once-per-day cache.
-function msUntilEndOfDay() {
-  const now = new Date();
-  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
-  return end.getTime() - now.getTime();
-}
-
 export function AnalysesTab({ sport }: { sport: Sport }) {
-  const qc = useQueryClient();
-  const [recalculating, setRecalculating] = useState(false);
-  const { data, isLoading, isFetching } = useQuery({
+  // The backend recomputes every sport at the top of each UTC hour and refreshes its cache,
+  // so the panel just reads the cache — no manual recompute control. Refetch hourly to pick
+  // up the freshest server-side recompute.
+  const { data, isLoading } = useQuery({
     queryKey: ["analyses", sport],
     queryFn: () => api.analyses(sport),
-    staleTime: msUntilEndOfDay(),
+    staleTime: 60 * 60 * 1000,        // 1h — matches the server's hourly refresh
+    refetchInterval: 60 * 60 * 1000,
     refetchOnWindowFocus: false,
   });
-
-  // Manual recompute: force=true recomputes the model and overwrites the day cache.
-  const recalc = async () => {
-    setRecalculating(true);
-    try {
-      await api.analyses(sport, undefined, true);
-      await qc.invalidateQueries({ queryKey: ["analyses", sport] });
-    } finally {
-      setRecalculating(false);
-    }
-  };
-  const busy = isFetching || recalculating;
 
   const items = data?.suggestions ?? [];
   const n = items.length;
@@ -72,7 +53,7 @@ export function AnalysesTab({ sport }: { sport: Sport }) {
 
   return (
     <div className="space-y-5">
-      <div className="flex flex-wrap items-center justify-between gap-3">
+      <div className="flex flex-wrap items-center gap-3">
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
           <CalendarDays className="h-4 w-4" />
           <span>Previsões de {data?.date ?? "—"}</span>
@@ -82,11 +63,6 @@ export function AnalysesTab({ sport }: { sport: Sport }) {
             </span>
           )}
         </div>
-        <Button variant="outline" size="sm" onClick={recalc} disabled={busy}
-          title="Recalcula o modelo e atualiza o cache do dia">
-          <RefreshCw className={busy ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
-          Recalcular
-        </Button>
       </div>
 
       {isLoading ? (

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """FastAPI backend for the Polymarket sports dashboard (Soccer + Tennis).
 
-The Analises tab runs the heavy model calc once/day (cached per sport+date); the
-Resultados tab settles pending predictions then returns ROI/P&L/win-rate analytics.
-Read/analysis only — it never places live trades.
+The Analises tab serves a per-sport+date cache that an in-process scheduler refreshes
+at the top of every UTC hour (01:00, 02:00, …); the Resultados tab settles pending
+predictions then returns ROI/P&L/win-rate analytics. Read/analysis only — it never
+places live trades.
 
 Both sports run their model via subprocess (each skill defines its own `data_inputs`
 module, so importing them in one process would collide); the stdlib-only prediction
@@ -13,12 +14,13 @@ results/seed/pending paths.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -105,6 +107,10 @@ SPORTS = ("soccer", "tennis")
 # tied to any one sport's predictions DB. Override with DASHBOARD_CACHE_DB.
 CACHE_DB = os.environ.get("DASHBOARD_CACHE_DB") or \
     os.path.join(os.path.dirname(SOCCER_DB) or ".", "dashboard_cache.db")
+
+# Hourly auto-recalc: at the top of every UTC hour (01:00, 02:00, …) every sport's model is
+# recomputed for the current day and its cache refreshed. ON by default; AUTO_RECALC=0 disables.
+AUTO_RECALC = os.environ.get("AUTO_RECALC", "1") not in ("0", "false", "False", "no", "")
 
 
 class _QuickAPI:
@@ -535,3 +541,54 @@ def seed_demo_route(sport: str = Query("soccer"), reset: bool = Query(False)) ->
         con.execute("DELETE FROM analysis_cache WHERE sport=?", (sport,))
     con.close()
     return {"sport": sport, "seeded": n, "db": _db_for(sport)}
+
+
+# ---------------------------------------------------------------------------
+# Hourly auto-recalc scheduler (top of each UTC hour)
+# ---------------------------------------------------------------------------
+
+_RUNNERS = {"soccer": _run_soccer, "tennis": _run_tennis}
+
+
+def _recalc_sport(sport: str, target: str) -> int:
+    """Recompute one sport for `target` and refresh its day-cache. Returns suggestion count."""
+    result = _RUNNERS[sport](target)
+    payload = _payload(sport, target, result)
+    _cache_put(sport, target, payload)
+    return len(payload.get("suggestions", []))
+
+
+async def _recalc_all() -> None:
+    """Recompute every sport for today and refresh the cache (each in a worker thread)."""
+    target = _today()
+    for sport in SPORTS:
+        try:
+            n = await asyncio.to_thread(_recalc_sport, sport, target)
+            print(f"[recalc] {sport} {target}: cached {n} suggestion(s)",
+                  file=sys.stderr, flush=True)
+        except Exception as e:  # noqa: BLE001 - one sport failing must not stop the loop
+            print(f"[recalc] {sport} {target}: FAILED — {e}", file=sys.stderr, flush=True)
+
+
+def _seconds_to_next_hour() -> float:
+    """Seconds from now until the next top-of-hour (UTC). Always >= 1."""
+    now = datetime.now(timezone.utc)
+    nxt = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    return max(1.0, (nxt - now).total_seconds())
+
+
+async def _hourly_loop() -> None:
+    while True:
+        await asyncio.sleep(_seconds_to_next_hour())
+        await _recalc_all()
+
+
+@app.on_event("startup")
+async def _start_hourly_recalc() -> None:
+    """Launch the top-of-hour recompute loop for soccer + tennis (no-op if disabled)."""
+    if not AUTO_RECALC:
+        print("[recalc] auto-recalc disabled (AUTO_RECALC=0)", file=sys.stderr, flush=True)
+        return
+    print(f"[recalc] hourly auto-recalc ON (top of each UTC hour) for {', '.join(SPORTS)}; "
+          f"first run in {_seconds_to_next_hour() / 60:.1f} min", file=sys.stderr, flush=True)
+    asyncio.create_task(_hourly_loop())

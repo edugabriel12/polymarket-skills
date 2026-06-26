@@ -16,6 +16,7 @@ _TMP = tempfile.mkdtemp()
 os.environ["SOCCER_PREDICTIONS_DB"] = os.path.join(_TMP, "soccer.db")
 os.environ["TENNIS_PREDICTIONS_DB"] = os.path.join(_TMP, "tennis.db")
 os.environ["DASHBOARD_CACHE_DB"] = os.path.join(_TMP, "cache.db")
+os.environ["AUTO_RECALC"] = "0"   # don't start the hourly loop during tests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fastapi.testclient import TestClient  # noqa: E402
@@ -119,6 +120,19 @@ class TestApi(unittest.TestCase):
                 if s["game"] == "epl-ars-che-2026-07-02-total-2pt5"]
         self.assertEqual(len(same), 1)                       # exactly one card, not two
         self.assertEqual(merged["counts"]["pending_shown"], 0)
+
+    def test_hourly_scheduler_recomputes_and_caches(self):
+        # The top-of-hour scheduler refreshes the cache for both sports. Bound the sleep
+        # interval and verify _recalc_all writes a fresh payload (stubbed runners).
+        import asyncio
+        self.assertTrue(0 < backend._seconds_to_next_hour() <= 3600)
+        backend._RUNNERS["soccer"] = lambda d: {"counts": {}, "suggestions": [{"game": "g"}],
+                                                 "skipped": []}
+        backend._RUNNERS["tennis"] = lambda d: {"counts": {}, "suggestions": [], "skipped": []}
+        asyncio.run(backend._recalc_all())
+        today = backend._today()
+        self.assertIsNotNone(backend._cache_get("soccer", today))
+        self.assertIsNotNone(backend._cache_get("tennis", today))
 
     def test_analyses_cache_per_sport(self):
         r1 = client.get("/api/analyses?sport=soccer&date=2026-06-14")
