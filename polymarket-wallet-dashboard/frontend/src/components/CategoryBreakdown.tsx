@@ -49,7 +49,7 @@ function SubRow({ s }: { s: SubCategory }) {
   );
 }
 
-function CategoryItem({ c }: { c: Category }) {
+function CategoryItem({ c, renderBets }: { c: Category; renderBets?: (category: string) => React.ReactNode }) {
   const [open, setOpen] = useState(false);
   return (
     <Card className="overflow-hidden">
@@ -109,6 +109,7 @@ function CategoryItem({ c }: { c: Category }) {
                   ))}
                 </div>
               </div>
+              {renderBets && renderBets(c.category)}
             </div>
           </motion.div>
         )}
@@ -117,14 +118,20 @@ function CategoryItem({ c }: { c: Category }) {
   );
 }
 
-export function CategoryBreakdown({ categories }: { categories: Category[] }) {
+export function CategoryBreakdown({
+  categories,
+  renderBets,
+}: {
+  categories: Category[];
+  renderBets?: (category: string) => React.ReactNode;
+}) {
   return (
     <div className="space-y-2.5">
       <h2 className="text-sm font-bold uppercase tracking-wider text-muted-foreground">
-        Por categoria · clique para abrir as sub-categorias
+        Por categoria · clique para abrir as sub-categorias e apostas
       </h2>
       {categories.map((c) => (
-        <CategoryItem key={c.category} c={c} />
+        <CategoryItem key={c.category} c={c} renderBets={renderBets} />
       ))}
     </div>
   );

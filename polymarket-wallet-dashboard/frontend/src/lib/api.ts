@@ -123,10 +123,43 @@ async function jget<T>(url: string): Promise<T> {
   return r.json() as Promise<T>;
 }
 
+export interface DashBet {
+  key?: string;
+  event: string;
+  category: string;
+  subcategory: string;
+  side: string;
+  odds: number;
+  entry_price: number;
+  unit?: number;
+  confidence?: string | null;
+  total_position?: number;
+  status: string;
+  pnl?: number | null;
+  live?: string;
+  market_url?: string | null;
+  updated_at?: string;
+}
+
+export interface DashBetsPage {
+  total: number;
+  page: number;
+  page_size: number;
+  bets: DashBet[];
+}
+
 export const wallets = {
   list: () => jget<{ wallets: WalletSummary[] }>("/api/wallets").then((x) => x.wallets),
   get: (id: number) => jget<WalletRecord>(`/api/wallets/${id}`),
   modelResults: () => jget<ModelResults>("/api/model-results"),
+  bets: (id: number, category: string, page: number, pageSize = 20) =>
+    jget<DashBetsPage>(
+      `/api/wallets/${id}/bets?category=${encodeURIComponent(category)}&page=${page}&page_size=${pageSize}`
+    ),
+  modelBets: (category: string, page: number, pageSize = 20) =>
+    jget<DashBetsPage>(
+      `/api/model-bets?category=${encodeURIComponent(category)}&page=${page}&page_size=${pageSize}`
+    ),
   add: async (name: string, address: string, file: File) => {
     const fd = new FormData();
     fd.append("name", name);

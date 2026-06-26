@@ -167,6 +167,23 @@ class TestPersistBets(unittest.TestCase):
             w.persist_bets(wallet, [_pos("c2", 300)], db)
             self.assertEqual(len(ws.list_bets(wallet["id"], db)), 1)
 
+    def test_settled_bets_pagination_and_fields(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "w.db")
+            ws.add_wallet(WALLET["name"], WALLET["address"], {"n_markets": 0},
+                          WALLET["thresholds"], db_path=db)
+            wallet = ws.get_wallet(ws.list_wallets(db)[0]["id"], db)
+            wid = wallet["id"]
+            # 3 settled soccer + 1 open
+            for i in range(3):
+                w.persist_bets(wallet, [_pos(f"c{i}", 45000, redeemable=True, cashPnl=10.0)], db)
+            w.persist_bets(wallet, [_pos("open", 45000)], db)   # OPEN -> not in settled
+            self.assertEqual(ws.count_settled_bets(wid, "Soccer", db), 3)
+            self.assertEqual(ws.count_settled_bets(wid, None, db), 3)
+            page = ws.list_settled_bets(wid, "Soccer", 0, 2, db)
+            self.assertEqual(len(page), 2)
+            self.assertTrue(all(b["event"] and b["market_url"] for b in page))   # event/url stored
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS settled_markets (
 CREATE TABLE IF NOT EXISTS wallet_bets (
     wallet_id      INTEGER NOT NULL,
     condition_id   TEXT NOT NULL,
+    event          TEXT, market_url TEXT,
     category       TEXT, subcategory TEXT, confidence TEXT, side TEXT,
     total_position REAL, entry_price REAL, odds REAL,
     status         TEXT NOT NULL DEFAULT 'OPEN',
@@ -59,8 +60,8 @@ CREATE TABLE IF NOT EXISTS wallet_bets (
 );
 """
 
-_BET_FIELDS = ("category", "subcategory", "confidence", "side", "total_position",
-               "entry_price", "odds", "status", "pnl")
+_BET_FIELDS = ("event", "market_url", "category", "subcategory", "confidence", "side",
+               "total_position", "entry_price", "odds", "status", "pnl")
 
 
 def _now() -> str:
@@ -74,6 +75,11 @@ def connect(db_path: str = DEFAULT_DB) -> sqlite3.Connection:
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     con.executescript(_SCHEMA)
+    # Migrate older wallet_bets tables that predate the event/market_url columns.
+    cols = {r["name"] for r in con.execute("PRAGMA table_info(wallet_bets)")}
+    for c in ("event", "market_url"):
+        if c not in cols:
+            con.execute(f"ALTER TABLE wallet_bets ADD COLUMN {c} TEXT")
     return con
 
 
@@ -219,5 +225,39 @@ def list_bets(wallet_id: int, db_path: str = DEFAULT_DB) -> list[dict]:
     try:
         return [{k: r[k] for k in r.keys()} for r in con.execute(
             "SELECT * FROM wallet_bets WHERE wallet_id=?", (wallet_id,))]
+    finally:
+        con.close()
+
+
+_SETTLED = "status IN ('WON','LOST','VOID')"
+
+
+def count_settled_bets(wallet_id: int, category: str | None = None,
+                       db_path: str = DEFAULT_DB) -> int:
+    con = connect(db_path)
+    try:
+        if category:
+            return con.execute(
+                f"SELECT COUNT(*) FROM wallet_bets WHERE wallet_id=? AND {_SETTLED} AND category=?",
+                (wallet_id, category)).fetchone()[0]
+        return con.execute(
+            f"SELECT COUNT(*) FROM wallet_bets WHERE wallet_id=? AND {_SETTLED}",
+            (wallet_id,)).fetchone()[0]
+    finally:
+        con.close()
+
+
+def list_settled_bets(wallet_id: int, category: str | None, offset: int, limit: int,
+                      db_path: str = DEFAULT_DB) -> list[dict]:
+    con = connect(db_path)
+    try:
+        base = f"SELECT * FROM wallet_bets WHERE wallet_id=? AND {_SETTLED}"
+        args: list = [wallet_id]
+        if category:
+            base += " AND category=?"
+            args.append(category)
+        base += " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
+        args += [limit, offset]
+        return [{k: r[k] for k in r.keys()} for r in con.execute(base, args)]
     finally:
         con.close()
