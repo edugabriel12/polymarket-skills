@@ -59,5 +59,24 @@ class TestModelBets(unittest.TestCase):
         self.assertEqual(out, {"total": 0, "bets": []})
 
 
+class TestModelOpenBets(unittest.TestCase):
+    def test_row_to_open_bet_shape(self):
+        b = mr._row_to_open_bet(
+            {"game_slug": "epl-ars-che-2026-06-26-total-2pt5", "side": "OVER",
+             "entry_price": 0.5, "decimal_odds": 2.0, "status": "PENDENTE",
+             "updated_at": "2026-06-26", "market_url": "u"}, "Futebol", "Soccer")
+        self.assertEqual(b["status"], "OPEN")     # pending, not settled
+        self.assertIsNone(b["pnl"])               # no result yet
+        self.assertEqual(b["live"], "PRÉ-LIVE")
+        self.assertEqual(b["subcategory"], "Over/Under gols")
+        self.assertEqual(b["event"], "ARS vs CHE")
+        self.assertEqual(b["unit"], 1.0)
+        self.assertAlmostEqual(b["odds"], 2.0)
+
+    def test_model_open_bets_unknown_category_empty(self):
+        out = mr.model_open_bets("Basketball", 0, 20)   # model only does Futebol/Tênis
+        self.assertEqual(out, {"total": 0, "bets": []})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

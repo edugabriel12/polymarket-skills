@@ -8,6 +8,7 @@ const STATUS: Record<string, { label: string; cls: string }> = {
   WON: { label: "Ganhou", cls: "bg-emerald-500/15 text-emerald-400 ring-emerald-500/30" },
   LOST: { label: "Perdeu", cls: "bg-rose-500/15 text-rose-400 ring-rose-500/30" },
   VOID: { label: "Anulado", cls: "bg-slate-500/15 text-slate-400 ring-slate-500/30" },
+  OPEN: { label: "Em aberto", cls: "bg-amber-500/15 text-amber-400 ring-amber-500/30" },
 };
 const pnlCls = (v: number) => (v > 0 ? "text-emerald-500" : v < 0 ? "text-rose-500" : "text-muted-foreground");
 const usd = (v: number) => `${v < 0 ? "-" : "+"}$${Math.abs(v).toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
@@ -23,9 +24,10 @@ function pnlDisplay(b: DashBet): { text: string; v: number } {
 
 const PAGE_SIZE = 20;
 
-export function DashBetList({ fetchKey, fetcher }: {
+export function DashBetList({ fetchKey, fetcher, mode = "settled" }: {
   fetchKey: (string | number)[];
   fetcher: (page: number) => Promise<DashBetsPage>;
+  mode?: "settled" | "open";
 }) {
   const [page, setPage] = useState(1);
   const { data, isLoading } = useQuery({
@@ -33,21 +35,23 @@ export function DashBetList({ fetchKey, fetcher }: {
     queryFn: () => fetcher(page),
   });
 
+  const open = mode === "open";
+  const noun = open ? "em aberto" : "liquidadas";
   if (isLoading) return <div className="skeleton h-32" />;
   const bets = data?.bets ?? [];
   const total = data?.total ?? 0;
   const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
-  if (total === 0) return <div className="px-1 py-2 text-xs text-muted-foreground">Sem apostas liquidadas.</div>;
+  if (total === 0) return <div className="px-1 py-2 text-xs text-muted-foreground">Sem apostas {noun}.</div>;
 
   return (
     <div className="space-y-2">
       <div className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
-        Apostas liquidadas ({total})
+        Apostas {noun} ({total})
       </div>
       <div className="space-y-1.5">
         {bets.map((b, i) => {
           const s = STATUS[b.status] ?? STATUS.VOID;
-          const p = pnlDisplay(b);
+          const p = open ? null : pnlDisplay(b);
           return (
             <div key={b.key ?? i} className="rounded-lg bg-muted/40 px-3 py-2">
               <div className="flex items-start justify-between gap-3">
@@ -61,7 +65,7 @@ export function DashBetList({ fetchKey, fetcher }: {
                 </div>
                 <div className="flex shrink-0 flex-col items-end gap-1">
                   <span className={cn("rounded-full px-2 py-0.5 text-[11px] font-bold ring-1 ring-inset", s.cls)}>{s.label}</span>
-                  <span className={cn("text-sm font-black tabular-nums", pnlCls(p.v))}>{p.text}</span>
+                  {p && <span className={cn("text-sm font-black tabular-nums", pnlCls(p.v))}>{p.text}</span>}
                 </div>
               </div>
               <div className="mt-1 flex items-center gap-3 text-[10px] text-muted-foreground">

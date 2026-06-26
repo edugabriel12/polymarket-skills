@@ -206,6 +206,27 @@ def model_bets_route(category: str = Query(...), page: int = Query(1, ge=1),
     return {"total": out["total"], "page": page, "page_size": page_size, "bets": out["bets"]}
 
 
+@app.get("/api/wallets/{wallet_id}/open-bets")
+def wallet_open_bets_route(wallet_id: int, category: str | None = Query(None),
+                           page: int = Query(1, ge=1),
+                           page_size: int = Query(20, ge=1, le=100)) -> dict:
+    """Paginated OPEN (unsettled) live bets of a wallet — the pending tab."""
+    offset = (page - 1) * page_size
+    return {"total": ws.count_open_bets(wallet_id, category), "page": page,
+            "page_size": page_size,
+            "bets": ws.list_open_bets(wallet_id, category, offset, page_size)}
+
+
+@app.get("/api/model-open-bets")
+def model_open_bets_route(category: str | None = Query(None), page: int = Query(1, ge=1),
+                          page_size: int = Query(20, ge=1, le=100)) -> dict:
+    """Paginated OPEN (PENDENTE) model predictions; category=None merges Futebol + Tênis."""
+    import model_results
+    offset = (page - 1) * page_size
+    out = model_results.model_open_bets(category, offset, page_size)
+    return {"total": out["total"], "page": page, "page_size": page_size, "bets": out["bets"]}
+
+
 @app.post("/api/wallet/csv")
 async def wallet_csv(file: UploadFile = File(...)) -> dict:
     """Analyze an uploaded bet-history CSV (Data;Evento;Aposta;Conf.;Odd;Investido;ROI%;Lucro).

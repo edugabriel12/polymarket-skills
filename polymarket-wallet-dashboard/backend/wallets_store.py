@@ -261,3 +261,38 @@ def list_settled_bets(wallet_id: int, category: str | None, offset: int, limit: 
         return [{k: r[k] for k in r.keys()} for r in con.execute(base, args)]
     finally:
         con.close()
+
+
+_OPEN = "status = 'OPEN'"
+
+
+def count_open_bets(wallet_id: int, category: str | None = None,
+                    db_path: str = DEFAULT_DB) -> int:
+    con = connect(db_path)
+    try:
+        if category:
+            return con.execute(
+                f"SELECT COUNT(*) FROM wallet_bets WHERE wallet_id=? AND {_OPEN} AND category=?",
+                (wallet_id, category)).fetchone()[0]
+        return con.execute(
+            f"SELECT COUNT(*) FROM wallet_bets WHERE wallet_id=? AND {_OPEN}",
+            (wallet_id,)).fetchone()[0]
+    finally:
+        con.close()
+
+
+def list_open_bets(wallet_id: int, category: str | None, offset: int, limit: int,
+                   db_path: str = DEFAULT_DB) -> list[dict]:
+    """Open (unsettled) live bets of a wallet, newest first, paginated."""
+    con = connect(db_path)
+    try:
+        base = f"SELECT * FROM wallet_bets WHERE wallet_id=? AND {_OPEN}"
+        args: list = [wallet_id]
+        if category:
+            base += " AND category=?"
+            args.append(category)
+        base += " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
+        args += [limit, offset]
+        return [{k: r[k] for k in r.keys()} for r in con.execute(base, args)]
+    finally:
+        con.close()
