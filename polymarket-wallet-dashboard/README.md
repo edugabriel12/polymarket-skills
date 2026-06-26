@@ -38,12 +38,12 @@ A "bet" = one CSV row; a win = `Lucro > 0`; ROI = `ΣLucro / ΣInvestido`.
 cd polymarket-wallet-dashboard/backend
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-uvicorn app:app --port 8000 --reload          # http://localhost:8000
+uvicorn app:app --port 8001 --reload          # http://localhost:8001
 
 # 2) Frontend (new shell)
 cd polymarket-wallet-dashboard/frontend
 npm install
-npm run dev                                    # http://localhost:5173  (proxies /api -> :8000)
+npm run dev                                    # http://localhost:5174  (proxies /api -> :8001)
 ```
 
 Or `./dev.sh` from `polymarket-wallet-dashboard/` to start both (macOS/Linux).
@@ -59,8 +59,8 @@ powershell -ExecutionPolicy Bypass -File dev.ps1
 # or just double-click dev.bat
 ```
 
-> **Port note:** the backend runs on **:8000** and the frontend on **:5173** — the same ports as
-> `polymarket-dashboard`. Stop that one first (or change the ports) or the second app won't bind.
+> **Port note:** the backend runs on **:8001** and the frontend on **:5174** — different from
+> `polymarket-dashboard` (:8000 / :5173), so both apps can run simultaneously.
 
 In the UI, drag a `*_historico.csv` onto the dropzone (or **Selecionar CSV**), or click **Ver demo**.
 

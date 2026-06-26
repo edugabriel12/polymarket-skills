@@ -1,5 +1,5 @@
 # Windows/PowerShell launcher for the Polymarket Wallet dashboard.
-# Starts the FastAPI backend (:8000) and the Vite frontend (:5173), each in its
+# Starts the FastAPI backend (:8001) and the Vite frontend (:5174), each in its
 # own window. First run creates the backend venv and installs deps.
 #
 # Run:  powershell -ExecutionPolicy Bypass -File dev.ps1   (or double-click dev.bat)
@@ -27,12 +27,12 @@ if (-not (Test-Path (Join-Path $frontend "node_modules"))) {
 }
 
 # --- Launch both servers in separate windows (close a window to stop it) ---
-$uvicorn = "`"$py`" -m uvicorn app:app --port 8000 --reload"
+$uvicorn = "`"$py`" -m uvicorn app:app --port 8001 --reload"
 Start-Process -FilePath "cmd.exe" -ArgumentList "/k", $uvicorn       -WorkingDirectory $backend
 Start-Process -FilePath "cmd.exe" -ArgumentList "/k", "npm run dev"  -WorkingDirectory $frontend
 
 Write-Host ""
-Write-Host "Backend  -> http://localhost:8000" -ForegroundColor Green
-Write-Host "Frontend -> http://localhost:5173" -ForegroundColor Green
+Write-Host "Backend  -> http://localhost:8001" -ForegroundColor Green
+Write-Host "Frontend -> http://localhost:5174" -ForegroundColor Green
 Write-Host "Demo (offline): open the UI and click 'Ver demo', or:"
-Write-Host "  curl.exe `"http://localhost:8000/api/wallet?address=demo`""
+Write-Host "  curl.exe `"http://localhost:8001/api/wallet?address=demo`""
