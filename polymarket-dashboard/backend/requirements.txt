@@ -2,3 +2,4 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 requests==2.32.3
 httpx==0.28.1
+tzdata==2025.1            # IANA tz database for ZoneInfo (Brasília) where the OS lacks it (Windows)
