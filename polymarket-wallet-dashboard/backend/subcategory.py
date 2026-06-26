@@ -35,7 +35,7 @@ _SLUG_SCORE = re.compile(r"-(?:correct-score|exact-score|cs-\d-\d)", re.I)
 
 # --- title/eventSlug regex (free text) -----------------------------------------
 _T_BTTS = re.compile(r"both teams to score|ambas (?:as )?(?:equipes |times )?marcam|\bbtts\b", re.I)
-_T_TOTALS = re.compile(r"\bover\b|\bunder\b|over/under|total (?:goals|runs|points|maps|games|sets)", re.I)
+_T_TOTALS = re.compile(r"\bover\b|\bunder\b|over/under|\bo/u\b|total (?:goals|runs|points|maps|games|sets)", re.I)
 _T_SPREAD = re.compile(r"\bspread\b|handicap|run line|puck line|[+-]\d+\.5\b|asian", re.I)
 _T_OUTRIGHT = re.compile(
     r"to win the\b|\bchampion\b|winner of\b|\bmvp\b|\bfinals?\b|\b(?:cup|title|trophy)\b|"
@@ -163,6 +163,16 @@ def _esports(blob, slug):
     return "Vencedor (série)"
 
 
+def _combat(blob, slug):
+    if re.search(r"by (?:ko|tko|submission|decision)|method of victory|método", blob):
+        return "Método de vitória"
+    if _totals(blob, slug) or re.search(r"total rounds|round \d|go the distance", blob):
+        return "Rounds/Total"
+    if _outright(blob, slug):
+        return "Outright (torneio)"
+    return "Vencedor da luta"
+
+
 def _cricket(blob, slug):
     if _outright(blob, slug):
         return "Outright"
@@ -198,6 +208,7 @@ _SPORT = {
     "Basketball": _spread_sport,
     "American Football": _spread_sport,
     "Hockey": _hockey,
+    "Combat Sports": _combat,
     "League of Legends": _esports,
     "Counter-Strike": _esports,
     "Dota 2": _esports,

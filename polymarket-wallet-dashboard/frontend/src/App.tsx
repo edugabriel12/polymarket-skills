@@ -1,31 +1,43 @@
-import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { Moon, Sun, Wallet, Search, Sparkles, AlertTriangle } from "lucide-react";
+import { useRef, useState } from "react";
+import { Moon, Sun, Wallet, Upload, Sparkles, AlertTriangle, FileText } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { useTheme } from "@/components/ThemeProvider";
 import { KpiCards } from "@/components/KpiCards";
+import { ConfidenceBreakdown } from "@/components/ConfidenceBreakdown";
 import { CategoryBreakdown } from "@/components/CategoryBreakdown";
 import { Charts } from "@/components/Charts";
-import { fetchWallet } from "@/lib/api";
+import { uploadCsv, fetchCsvDemo, type WalletReport } from "@/lib/api";
+import { cn } from "@/lib/utils";
 
 export default function App() {
   const { theme, toggle } = useTheme();
-  const [input, setInput] = useState("");
-  const [address, setAddress] = useState<string>("");   // the submitted address
+  const [data, setData] = useState<WalletReport | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
 
-  const { data, isFetching, isError, error } = useQuery({
-    queryKey: ["wallet", address],
-    queryFn: () => fetchWallet(address),
-    enabled: address.length > 0,
-    staleTime: 0,
-    refetchOnWindowFocus: false,
-  });
+  const run = async (fn: () => Promise<WalletReport>) => {
+    setLoading(true);
+    setErr(null);
+    setData(null);
+    try {
+      setData(await fn());
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
 
-  const submit = (addr: string) => {
-    const a = addr.trim();
-    setInput(a);
-    setAddress(a);
+  const onFile = (file?: File | null) => {
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".csv")) {
+      setErr("Envie um arquivo .csv");
+      return;
+    }
+    run(() => uploadCsv(file));
   };
 
   return (
@@ -37,9 +49,9 @@ export default function App() {
               <Wallet className="h-6 w-6 text-white" />
             </div>
             <div>
-              <h1 className="text-xl font-black tracking-tight">Análise de Carteiras Polymarket</h1>
+              <h1 className="text-xl font-black tracking-tight">Análise de Carteiras — CSV</h1>
               <p className="text-xs text-muted-foreground">
-                Win rate, apostas, P&L e ROI — geral, por categoria e sub-categoria
+                Win rate, apostas, P&L e ROI — por categoria, sub-categoria e nível de confiança
               </p>
             </div>
           </div>
@@ -50,34 +62,49 @@ export default function App() {
       </header>
 
       <main className="mx-auto max-w-6xl space-y-6 px-5 py-6">
-        {/* Address search */}
-        <form
-          onSubmit={(e) => {
+        {/* CSV dropzone */}
+        <div
+          onDragOver={(e) => {
             e.preventDefault();
-            submit(input);
+            setDragging(true);
           }}
-          className="flex flex-wrap items-center gap-2"
+          onDragLeave={() => setDragging(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragging(false);
+            onFile(e.dataTransfer.files?.[0]);
+          }}
+          className={cn(
+            "flex flex-col items-center justify-center gap-3 rounded-2xl border-2 border-dashed p-8 text-center transition",
+            dragging ? "border-sky-500 bg-sky-500/5" : "border-border bg-card/40"
+          )}
         >
-          <div className="relative min-w-[260px] flex-1">
-            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-            <input
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder="Endereço da carteira (0x…)"
-              spellCheck={false}
-              className="h-10 w-full rounded-xl border border-border bg-card pl-9 pr-3 text-sm outline-none focus:ring-2 focus:ring-sky-500/40"
-            />
+          <Upload className="h-7 w-7 text-muted-foreground" />
+          <div className="text-sm">
+            Arraste o <strong>CSV de histórico</strong> aqui, ou
           </div>
-          <Button type="submit" disabled={isFetching || !input.trim()}>
-            <Search className="h-4 w-4" /> Analisar
-          </Button>
-          <Button type="button" variant="outline" onClick={() => submit("demo")} disabled={isFetching}>
-            <Sparkles className="h-4 w-4" /> Ver demo
-          </Button>
-        </form>
+          <div className="flex flex-wrap items-center justify-center gap-2">
+            <Button onClick={() => inputRef.current?.click()} disabled={loading}>
+              <FileText className="h-4 w-4" /> Selecionar CSV
+            </Button>
+            <Button variant="outline" onClick={() => run(fetchCsvDemo)} disabled={loading}>
+              <Sparkles className="h-4 w-4" /> Ver demo
+            </Button>
+          </div>
+          <input
+            ref={inputRef}
+            type="file"
+            accept=".csv,text/csv"
+            className="hidden"
+            onChange={(e) => onFile(e.target.files?.[0])}
+          />
+          <div className="text-[11px] text-muted-foreground">
+            Colunas esperadas: Data; Evento; Aposta; Conf.; Odd; Investido; ROI%; Lucro
+          </div>
+        </div>
 
         {/* States */}
-        {isFetching && (
+        {loading && (
           <div className="space-y-3">
             <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
               {Array.from({ length: 4 }).map((_, i) => (
@@ -88,24 +115,24 @@ export default function App() {
           </div>
         )}
 
-        {isError && (
+        {err && (
           <Card className="flex items-center gap-3 p-4 text-sm">
-            <AlertTriangle className="h-5 w-5 text-rose-500" />
-            Falha ao buscar: {(error as Error)?.message}
+            <AlertTriangle className="h-5 w-5 text-rose-500" /> {err}
           </Card>
         )}
 
-        {!isFetching && data?.error && (
+        {!loading && data?.error && (
           <Card className="flex items-center gap-3 p-4 text-sm">
-            <AlertTriangle className="h-5 w-5 text-amber-500" />
-            {data.error}
+            <AlertTriangle className="h-5 w-5 text-amber-500" /> {data.error}
           </Card>
         )}
 
-        {!isFetching && data && !data.error && (
+        {!loading && data && !data.error && (
           <div className="space-y-6">
             <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-              <span className="rounded-full bg-muted px-2 py-1 font-mono">{data.address}</span>
+              <span className="rounded-full bg-muted px-2 py-1 font-mono">
+                {data.filename ?? data.address ?? "carteira"}
+              </span>
               {data.demo && (
                 <span className="rounded-full bg-amber-500/15 px-2 py-1 font-bold text-amber-500">
                   dados de exemplo
@@ -115,11 +142,14 @@ export default function App() {
 
             {data.n_markets === 0 ? (
               <Card className="p-6 text-center text-sm text-muted-foreground">
-                Nenhum mercado encontrado para esta carteira.
+                Nenhuma aposta reconhecida no CSV.
               </Card>
             ) : (
               <>
                 <KpiCards overall={data.overall} nMarkets={data.n_markets} nTrades={data.n_trades} />
+                {data.by_confidence && data.by_confidence.length > 0 && (
+                  <ConfidenceBreakdown buckets={data.by_confidence} />
+                )}
                 <Charts categories={data.by_category} />
                 <CategoryBreakdown categories={data.by_category} />
               </>
@@ -127,15 +157,8 @@ export default function App() {
           </div>
         )}
 
-        {!isFetching && !data && !isError && (
-          <Card className="p-6 text-center text-sm text-muted-foreground">
-            Cole um endereço público da Polymarket e clique em <strong>Analisar</strong> — ou veja a
-            <strong> demo</strong>. Read-only, sem chave privada.
-          </Card>
-        )}
-
         <footer className="mt-10 border-t border-border pt-4 text-center text-xs text-muted-foreground">
-          Análise read-only de carteiras públicas. Não é recomendação financeira.
+          Análise de histórico de apostas (CSV). Não é recomendação financeira.
         </footer>
       </main>
     </div>

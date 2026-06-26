@@ -1,23 +1,35 @@
 # Polymarket Wallet Dashboard
 
-A web app (FastAPI + React) that analyzes **any public Polymarket wallet** by address and reports
-**Win rate, número de apostas, P&L e ROI** — overall, **por categoria** (Futebol, Tênis, Baseball,
-LoL, CS2, Dota, Basquete, …) and **por sub-categoria** (Ambas Marcam, Over/Under, Moneyline,
-Vencedor de mapa, Total de mapas, …).
+A web app (FastAPI + React) that analyzes a wallet's **bet-history CSV** and reports
+**Win rate, número de apostas, P&L e ROI** — overall, **por nível de confiança** (Alta / Média /
+Baixa), **por categoria** (Futebol, Baseball, Basquete, Combat Sports, Hockey, Tênis, …) and
+**por sub-categoria** (Ambas Marcam, Over/Under, Moneyline, Run line, Spread, Vencedor da luta, …).
 
-Read-only — it uses the public Polymarket Data API via the `polymarket-wallet-analyzer` engine and
-needs **no private key**. Market text is untrusted and only pattern-matched (CLAUDE.md rule #5).
+You **upload a CSV** (the `*_historico.csv` export) instead of typing an address. Read-only, no
+private key. Event text is untrusted and only pattern-matched (CLAUDE.md rule #5).
+
+## CSV format
+`;`-delimited, Brazilian decimals (`,`), one settled bet per row:
+```
+Data;Evento;Aposta;Conf.;Odd;Investido;ROI%;Lucro
+2026-06-25;"Curaçao vs. Côte d'Ivoire: O/U 3.5";UNDER;Média;1,79;19999,96;78,6;15714,32
+```
+A "bet" = one CSV row; a win = `Lucro > 0`; ROI = `ΣLucro / ΣInvestido`.
 
 ## How it works
-- **Engine:** reuses `polymarket-wallet-analyzer/scripts/analyze_wallet.py` — `/positions` + `/trades`,
-  average-cost realized P&L, category, resolved/won. A "bet" is one market (conditionId).
-- **Sub-categories** (`backend/subcategory.py`): a layered classifier — a sport-specific overlay
-  first, then a universal market-type fallback (Moneyline / Totals / BTTS / Handicap / Outright /
-  Prop), then "Outro". Derived from the market slug suffix + title regex.
-- **Rollup** (`backend/wallet_report.py`): overall → category → subcategory, each with the 4 metrics.
-- **Frontend:** the Polymarket Sports stack (React + Vite + Tailwind + shadcn-style + Recharts +
-  TanStack Query). Address input → 4 KPI cards → P&L/win-rate charts → drill-down cards
-  (category → subcategory). Dark/light theme.
+- **`backend/csv_parser.py`** — parses the CSV; classifies each event into a **category** via team
+  dictionaries (MLB / NBA / WNBA / NHL) + UFC + soccer signals (falling back to the wallet-analyzer
+  keyword classifier), and a **sub-category** via the shared market-type classifier.
+- **`backend/subcategory.py`** — layered market-type classifier (sport-specific overlay → universal
+  fallback → "Outro"), from the event text + the picked side.
+- **`backend/wallet_report.py`** — `rollup_csv`: overall + **by_confidence** + by_category (each
+  nesting its subcategories AND its own confidence split), every bucket with the 4 metrics.
+- **Frontend:** the Polymarket Sports stack (React + Vite + Tailwind + shadcn-style + Recharts).
+  CSV dropzone → 4 KPI cards → **"Por confiança"** cards → P&L/win-rate charts → drill-down cards
+  (category → subcategories + per-confidence). Dark/light theme.
+
+> An on-chain `GET /api/wallet?address=…` endpoint (the original engine) is still available for
+> analyzing a public address directly, but the UI is CSV-first.
 
 ## Run (dev)
 
@@ -50,22 +62,24 @@ powershell -ExecutionPolicy Bypass -File dev.ps1
 > **Port note:** the backend runs on **:8000** and the frontend on **:5173** — the same ports as
 > `polymarket-dashboard`. Stop that one first (or change the ports) or the second app won't bind.
 
-In the UI, paste a `0x…` address and click **Analisar**, or click **Ver demo** for sample data.
+In the UI, drag a `*_historico.csv` onto the dropzone (or **Selecionar CSV**), or click **Ver demo**.
 
 ## API
 | Endpoint | Purpose |
 |---|---|
-| `GET /api/wallet?address=0x…&trade_limit=&enrich_tags=` | Full nested report (overall + by_category + subcategories). `address=demo` serves sample data. |
+| `POST /api/wallet/csv` (multipart `file`) | Analyze a bet-history CSV → overall + by_confidence + by_category (+ subcategories + per-confidence). |
+| `GET /api/csv-demo` | Sample CSV-based report (offline). |
+| `GET /api/wallet?address=0x…` | On-chain analysis of a public address (original engine). `address=demo` serves sample data. |
 | `GET /api/health` | Liveness |
 
 ## Tests
 ```bash
-cd backend && python test_subcategory.py && python test_wallet_report.py
+cd backend && python test_csv_parser.py && python test_subcategory.py && python test_wallet_report.py
 ```
-All offline (the demo fixture exercises the full rollup without network).
+All offline.
 
 ## Notes
-- The Polymarket Data API host is egress-blocked in some sandboxes, and the exact response shapes
-  are inferred (see `polymarket-wallet-analyzer/references/data-api.md`); run a real address on a
-  networked machine and use `?debug=true` to confirm shapes. The **Ver demo** button works offline.
+- The CSV flow is fully offline. The on-chain `?address=` flow hits the Polymarket Data API, whose
+  host is egress-blocked in some sandboxes and whose shapes are inferred (see
+  `polymarket-wallet-analyzer/references/data-api.md`).
 - Read/analysis only. Not financial advice.

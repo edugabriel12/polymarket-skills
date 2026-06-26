@@ -79,10 +79,36 @@ function CategoryItem({ c }: { c: Category }) {
             transition={{ duration: 0.2 }}
             className="overflow-hidden border-t border-border"
           >
-            <div className="space-y-1.5 p-3">
-              {c.subcategories.map((s) => (
-                <SubRow key={s.subcategory} s={s} />
-              ))}
+            <div className="space-y-3 p-3">
+              {c.by_confidence && c.by_confidence.length > 0 && (
+                <div>
+                  <div className="mb-1.5 text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                    Por confiança
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {c.by_confidence.map((b) => (
+                      <span
+                        key={b.confidence}
+                        className="rounded-lg bg-muted/60 px-2 py-1 text-[11px] tabular-nums"
+                      >
+                        <strong>{b.confidence}</strong>: {pct(b.win_rate)} win · {b.markets}{" "}
+                        ap. ·{" "}
+                        <span className={pnlClass(b.total_pnl)}>{signedUsd(b.total_pnl)}</span>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+              <div>
+                <div className="mb-1.5 text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                  Por sub-categoria
+                </div>
+                <div className="space-y-1.5">
+                  {c.subcategories.map((s) => (
+                    <SubRow key={s.subcategory} s={s} />
+                  ))}
+                </div>
+              </div>
             </div>
           </motion.div>
         )}

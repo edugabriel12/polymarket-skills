@@ -46,6 +46,29 @@ DEMO_RECORDS = [
 ]
 
 
+DEMO_CSV = (
+    "Data;Evento;Aposta;Conf.;Odd;Investido;ROI%;Lucro\n"
+    '2026-06-25;"Curaçao vs. Côte d\'Ivoire: O/U 3.5";UNDER;Média;1,79;19999,96;78,6;15714,32\n'
+    '2026-06-24;"Bosnia and Herzegovina vs. Qatar: O/U 2.5";OVER;Alta;1,68;99999,74;67,9;67924,81\n'
+    '2026-06-24;"Spread: Morocco (-1.5)";MOROCCO;Alta;1,54;19999,97;53,8;10769,26\n'
+    '2026-06-23;"Will Algeria win on 2026-06-23?";YES;Baixa;1,54;5999,99;-100;-5999,99\n'
+    '2026-06-23;"Mexico vs. Korea Republic: Both Teams to Score";YES;Baixa;1,82;10000;-100;-10000\n'
+    '2026-06-22;"Knicks vs. Spurs";KNICKS;Alta;1,99;100000;89;89000\n'
+    '2026-06-21;"Boston Red Sox vs. Colorado Rockies";BOSTON RED SOX;Baixa;1,43;10000;-27,3;-2730\n'
+    '2026-06-20;"Stars vs. Wild";STARS;Média;1,48;20000;-49,3;-9860\n'
+    '2026-06-19;"UFC 328: Sean Strickland vs. Khamzat Chimaev";SEAN STRICKLAND;Alta;2,1;12000;79,8;9576\n'
+    '2026-06-18;"Roland Garros ATP: Tiafoe vs Arnaldi";FRANCES TIAFOE;Média;1,7;15000;70;10500\n'
+)
+
+
+def demo_csv_report() -> dict:
+    import wallet_report as wr
+    rep = wr.analyze_csv(DEMO_CSV)
+    rep["demo"] = True
+    rep["filename"] = "exemplo_historico.csv"
+    return rep
+
+
 def demo_report() -> dict:
     import wallet_report as wr
     wr.attach_subcategories(DEMO_RECORDS)
