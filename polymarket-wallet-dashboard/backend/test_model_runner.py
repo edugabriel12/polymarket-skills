@@ -59,6 +59,22 @@ class TestSuggestionToEntry(unittest.TestCase):
         self.assertEqual({e["category"] for e in ents}, {"Soccer", "Tennis"})
         self.assertTrue(all(e["unit"] == 1.0 and e["live"] == en.PRELIVE for e in ents))
 
+    def test_full_name_event_preferred_over_slug_codes(self):
+        sug = {"game": "fifwc-cvi-ksa-2026-06-26-total-2pt5", "event": "Cape Verde vs Saudi Arabia",
+               "market": "TOTAL", "side": "OVER", "recommendation": {"price": 0.5}}
+        e = mr.suggestion_to_entry(sug, "soccer")
+        self.assertEqual(e["event"], "Cape Verde vs Saudi Arabia")   # not "CVI vs KSA"
+
+    def test_market_url_top_level_then_recommendation_fallback(self):
+        base = {"game": "x-a-b-2026-06-25-total-2pt5", "market": "TOTAL", "side": "OVER"}
+        top = mr.suggestion_to_entry({**base, "recommendation": {"price": 0.5},
+                                      "market_url": "https://top"}, "soccer")
+        self.assertEqual(top["market_url"], "https://top")
+        # soccer historically carried the url inside the recommendation block -> fallback
+        rec = mr.suggestion_to_entry(
+            {**base, "recommendation": {"price": 0.5, "market_url": "https://rec"}}, "soccer")
+        self.assertEqual(rec["market_url"], "https://rec")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

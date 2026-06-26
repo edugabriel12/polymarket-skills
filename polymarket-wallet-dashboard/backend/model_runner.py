@@ -62,8 +62,8 @@ def run_tennis(date: str) -> dict:
     # tennis suggestions use {match, side, opponent, surface, price, edge} — normalize keys.
     norm = []
     for s in raw.get("suggestions", []):
-        norm.append({"game": s.get("match"), "market": "MATCH", "side": s.get("side"),
-                     "line": None, "edge": s.get("edge"),
+        norm.append({"game": s.get("match"), "event": s.get("event"), "market": "MATCH",
+                     "side": s.get("side"), "line": None, "edge": s.get("edge"),
                      "recommendation": {"price": s.get("price", 0.0)},
                      "market_url": s.get("market_url")})
     raw["suggestions"] = norm
@@ -87,11 +87,15 @@ def suggestion_to_entry(sug: dict, sport: str) -> dict:
     price = float(sug.get("recommendation", {}).get("price") or 0.0)
     odds = (1.0 / price) if price > 0 else 0.0
     subcat = sc.classify(category, game, game, "")     # slug suffix → Over/Under gols / BTTS / etc.
+    # Prefer the full-name event the models now provide ("Cape Verde vs Saudi Arabia");
+    # fall back to the slug's team codes. market_url may be top-level or in the recommendation.
+    event = sug.get("event") or _event_name(game)
+    market_url = sug.get("market_url") or (sug.get("recommendation") or {}).get("market_url")
     return en.make_entry(
         key=en.make_key("model", category, game, market, side),
-        event=_event_name(game), category=category, subcategory=subcat, side=side,
+        event=event, category=category, subcategory=subcat, side=side,
         odds=odds, entry_price=price, unit=1.0, confidence="Alta", live=en.PRELIVE,
-        market_url=sug.get("market_url"), source="model")
+        market_url=market_url, source="model")
 
 
 def model_entries(date: str) -> list[dict]:
