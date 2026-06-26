@@ -14,6 +14,7 @@ Composable [Agent Skills](https://agentskills.io/specification) for Polymarket p
 | **polymarket-tennis** | Model tennis match-winner with surface-Elo and suggest entries | None | Zero (paper) |
 | **polymarket-forecasting** | Shared pure-stdlib forecasting cores (NegBin/Poisson pmf, CRPS/Brier/log-loss, calibration) reused across sports | None | Zero |
 | **polymarket-dashboard** | React + FastAPI web UI for the soccer/tennis models (Análises + Resultados tabs) | None | Zero (paper) |
+| **polymarket-wallet-dashboard** | React + FastAPI web UI to analyze any public wallet: win rate, P&L, ROI by category + sub-category | None | Zero |
 | **polymarket-paper-trader** | Simulate trades against live prices, portfolio health checks | None | Zero |
 | **polymarket-strategy-advisor** | Trading methodology, recommendations, backtesting | None | Low |
 | **polymarket-live-executor** | Execute real trades (wallet + explicit human opt-in) | L2 Wallet | Medium |
