@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import entries_store as es
 import results_combined as rc
 import telegram_notify as tg
+import telegram_settings as ts
 
 _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.normpath(os.path.join(_BACKEND_DIR, "..", ".."))
@@ -56,8 +57,31 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok", "telegram": bool(tg.TELEGRAM_BOT_TOKEN and tg.TELEGRAM_CHAT_ID),
+    return {"status": "ok", "telegram": tg.configured(),
             "ingest_secured": bool(COPY_INGEST_TOKEN), "dotenv_loaded": _DOTENV_FILES}
+
+
+@app.get("/api/telegram")
+def telegram_status() -> dict:
+    """Current Telegram config (never returns the token)."""
+    cfg = ts.get_config()
+    return {"configured": bool(cfg["token"] and cfg["chat_id"]), "chat_id": cfg["chat_id"]}
+
+
+@app.post("/api/telegram")
+def telegram_config(payload: dict) -> dict:
+    """Save the bot token, auto-discover the chat id, and fire a test alert."""
+    token = (payload.get("token") or "").strip() if isinstance(payload, dict) else ""
+    if not token:
+        return {"ok": False, "error": "informe o token do bot"}
+    chat_id = ts.discover_chat_id(token)
+    if not chat_id:
+        return {"ok": False, "error": "Nenhuma conversa encontrada. Envie /start ao seu bot "
+                "no Telegram e tente de novo."}
+    ts.save_config(token, chat_id)
+    tested = tg.send_test()
+    return {"ok": True, "chat_id": chat_id, "tested": tested,
+            "error": None if tested else "Config salva, mas o alerta de teste falhou."}
 
 
 @app.post("/api/copy/ingest")

@@ -8,13 +8,9 @@ here already stripped of `source`). Config: TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_I
 
 from __future__ import annotations
 
-import os
 import sys
 
 import results_combined as rc
-
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 _LIVE_ICON = {"LIVE": "🔴", "PRÉ-LIVE": "⏳"}
 
@@ -34,11 +30,22 @@ def format_entry(e: dict) -> str:
     return "\n".join(x for x in lines if x.strip())
 
 
+def configured() -> bool:
+    import telegram_settings as ts
+    c = ts.get_config()
+    return bool(c["token"] and c["chat_id"])
+
+
 def send(text: str, *, token: str | None = None, chat_id: str | None = None,
          client=None) -> bool:
-    """POST to the Telegram Bot API. Best-effort; False if unconfigured or on failure."""
-    tok = token if token is not None else TELEGRAM_BOT_TOKEN
-    chat = chat_id if chat_id is not None else TELEGRAM_CHAT_ID
+    """POST to the Telegram Bot API. Token/chat default to the saved settings (then env).
+    Best-effort; False if unconfigured or on failure."""
+    if token is None or chat_id is None:
+        import telegram_settings as ts
+        cfg = ts.get_config()
+        token = cfg["token"] if token is None else token
+        chat_id = cfg["chat_id"] if chat_id is None else chat_id
+    tok, chat = token, chat_id
     if not tok or not chat:
         print("[telegram] not configured (TELEGRAM_BOT_TOKEN/CHAT_ID) — skipping",
               file=sys.stderr, flush=True)
@@ -59,3 +66,10 @@ def send(text: str, *, token: str | None = None, chat_id: str | None = None,
 
 def notify_entry(e: dict, **kw) -> bool:
     return send(format_entry(e), **kw)
+
+
+def send_test(*, token: str | None = None, chat_id: str | None = None, client=None) -> bool:
+    """Send a fixed connection-test message (used right after saving the config)."""
+    msg = ("✅ Polymarket Sports conectado!\n"
+           "Você vai receber aqui as entradas com a Unidade Sugerida e LIVE/PRÉ-LIVE.")
+    return send(msg, token=token, chat_id=chat_id, client=client)

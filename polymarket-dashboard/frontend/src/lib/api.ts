@@ -58,9 +58,31 @@ async function get<T>(url: string): Promise<T> {
   return r.json() as Promise<T>;
 }
 
+export interface TelegramStatus {
+  configured: boolean;
+  chat_id: string;
+}
+
+export interface TelegramSaveResult {
+  ok: boolean;
+  chat_id?: string;
+  tested?: boolean;
+  error?: string | null;
+}
+
 export const api = {
   entries: () => get<EntriesResponse>("/api/entries"),
   results: () => get<ResultsResponse>("/api/results"),
+  telegramStatus: () => get<TelegramStatus>("/api/telegram"),
+  telegramSave: async (token: string): Promise<TelegramSaveResult> => {
+    const r = await fetch("/api/telegram", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+    return r.json() as Promise<TelegramSaveResult>;
+  },
 };
 
 export const unitLabel = (u: number) =>

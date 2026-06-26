@@ -3,7 +3,8 @@ import { Button } from "@/components/ui/button";
 import { useTheme } from "@/components/ThemeProvider";
 import { EntriesTab } from "@/components/EntriesTab";
 import { ResultsTab } from "@/components/ResultsTab";
-import { Moon, Sun, LineChart, Trophy, Sparkles } from "lucide-react";
+import { TelegramTab } from "@/components/TelegramTab";
+import { Moon, Sun, LineChart, Trophy, Sparkles, Send } from "lucide-react";
 
 export default function App() {
   const { theme, toggle } = useTheme();
@@ -38,12 +39,18 @@ export default function App() {
             <TabsTrigger value="results">
               <Trophy className="h-4 w-4" /> Resultados
             </TabsTrigger>
+            <TabsTrigger value="telegram">
+              <Send className="h-4 w-4" /> Telegram
+            </TabsTrigger>
           </TabsList>
           <TabsContent value="entries">
             <EntriesTab />
           </TabsContent>
           <TabsContent value="results">
             <ResultsTab />
+          </TabsContent>
+          <TabsContent value="telegram">
+            <TelegramTab />
           </TabsContent>
         </Tabs>
 

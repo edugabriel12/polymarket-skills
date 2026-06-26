@@ -131,6 +131,67 @@ class TestTelegramFormat(unittest.TestCase):
         self.assertFalse(tg.send("hi", token="", chat_id=""))
 
 
+class TestTelegramConfig(unittest.TestCase):
+    def test_discover_chat_id(self):
+        import telegram_settings as ts
+
+        class _Resp:
+            def raise_for_status(self): pass
+            def json(self):
+                return {"ok": True, "result": [
+                    {"message": {"chat": {"id": 111}}},
+                    {"message": {"chat": {"id": 222}}}]}
+
+        class _C:
+            def get(self, url, timeout=None): return _Resp()
+        self.assertEqual(ts.discover_chat_id("TOK", client=_C()), "222")  # most recent
+
+    def test_discover_none_when_no_messages(self):
+        import telegram_settings as ts
+
+        class _Resp:
+            def raise_for_status(self): pass
+            def json(self): return {"ok": True, "result": []}
+
+        class _C:
+            def get(self, url, timeout=None): return _Resp()
+        self.assertIsNone(ts.discover_chat_id("TOK", client=_C()))
+
+    def test_post_saves_discovers_and_tests(self):
+        # Stub discovery + test-send (no network) on the app's module refs.
+        backend.ts.discover_chat_id = lambda token: "98765"
+        sent = {}
+        backend.tg.send_test = lambda: sent.setdefault("t", True) or True
+        try:
+            r = client.post("/api/telegram", json={"token": "123:ABC"}).json()
+            self.assertTrue(r["ok"])
+            self.assertEqual(r["chat_id"], "98765")
+            self.assertTrue(r["tested"])
+            self.assertTrue(sent.get("t"))
+            # status now reflects configured
+            st = client.get("/api/telegram").json()
+            self.assertTrue(st["configured"])
+            self.assertEqual(st["chat_id"], "98765")
+        finally:
+            import telegram_settings as ts
+            import telegram_notify as tg
+            backend.ts.discover_chat_id = ts.discover_chat_id
+            backend.tg.send_test = tg.send_test
+
+    def test_post_no_chat_returns_hint(self):
+        backend.ts.discover_chat_id = lambda token: None
+        try:
+            r = client.post("/api/telegram", json={"token": "123:ABC"}).json()
+            self.assertFalse(r["ok"])
+            self.assertIn("/start", r["error"])
+        finally:
+            import telegram_settings as ts
+            backend.ts.discover_chat_id = ts.discover_chat_id
+
+    def test_post_empty_token(self):
+        self.assertFalse(client.post("/api/telegram", json={"token": ""}).json()["ok"])
+
+
 class TestHealth(unittest.TestCase):
     def test_health(self):
         b = client.get("/api/health").json()
