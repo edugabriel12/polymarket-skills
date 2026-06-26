@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Phase 2: a wallet's separated Resultados = the CSV snapshot MERGED with its live
-watched bets as they settle.
+"""A wallet's separated Resultados = ONLY its live watched bets after it was added
+(the CSV is used solely to derive the confidence→unit bands, never shown as results).
 
-Both are reduced to the same per-bet record shape and re-aggregated with the existing
-`rollup_csv`, so the merged report has identical by_category / by_confidence structure.
-Only SETTLED live bets (WON/LOST/VOID) join the merge — open ones are cards on the
-Sports side, not results here. (No dedup: the CSV is the historical upload and live
-bets are new markets detected after adding the wallet.)
+Live bets are reduced to the same per-bet record shape and aggregated with the
+existing `rollup_csv`, so the report keeps the by_category / by_confidence structure.
+Only SETTLED bets (WON/LOST/VOID) count toward the figures — open ones are cards on
+the Sports side.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ import wallet_report as wr
 
 
 def bet_to_record(bet: dict) -> dict:
-    """A live wallet_bets row → the CSV-record shape rollup_csv consumes."""
+    """A live wallet_bets row → the record shape rollup_csv consumes."""
     status = bet.get("status")
     won = True if status == "WON" else (False if status == "LOST" else None)
     pnl = float(bet.get("pnl") or 0.0)
@@ -30,10 +29,11 @@ def bet_to_record(bet: dict) -> dict:
     }
 
 
-def merged_analysis(csv_records: list[dict], live_bets: list[dict]) -> dict:
-    """rollup_csv(csv_records + settled live records). Same shape as the CSV analysis."""
-    settled = [b for b in (live_bets or []) if b.get("status") in ("WON", "LOST", "VOID")]
-    records = list(csv_records or []) + [bet_to_record(b) for b in settled]
-    rep = wr.rollup_csv(records)
-    rep["live_settled"] = len(settled)        # how many live bets contributed (for the UI)
+def live_results(live_bets: list[dict]) -> dict:
+    """rollup_csv over the wallet's SETTLED live bets only (no CSV). Same analysis shape."""
+    live_bets = live_bets or []
+    settled = [b for b in live_bets if b.get("status") in ("WON", "LOST", "VOID")]
+    rep = wr.rollup_csv([bet_to_record(b) for b in settled])
+    rep["live_settled"] = len(settled)
+    rep["live_open"] = sum(1 for b in live_bets if b.get("status") == "OPEN")
     return rep

@@ -36,13 +36,20 @@ function WalletView({ id }: { id: number }) {
   const { data: rec } = useQuery({ queryKey: ["wallet", id], queryFn: () => wallets.get(id) });
   if (!rec || "error" in rec) return <div className="skeleton h-60" />;
   const a = rec.analysis;
+  if (a.n_markets === 0) {
+    return (
+      <Card className="p-8 text-center text-sm text-muted-foreground">
+        Ainda sem apostas liquidadas desta carteira (desde que foi adicionada).
+        {!!a.live_open && <div className="mt-1 text-xs">{a.live_open} aposta(s) em aberto.</div>}
+      </Card>
+    );
+  }
   return (
     <div className="space-y-6">
-      {!!a.live_settled && (
-        <div className="rounded-xl bg-sky-500/10 px-3 py-1.5 text-xs font-semibold text-sky-400">
-          CSV + {a.live_settled} aposta(s) ao vivo liquidada(s)
-        </div>
-      )}
+      <div className="rounded-xl bg-sky-500/10 px-3 py-1.5 text-xs font-semibold text-sky-400">
+        Apostas ao vivo desde a adição · {a.live_settled} liquidada(s)
+        {!!a.live_open && ` · ${a.live_open} em aberto`}
+      </div>
       <KpiCards overall={a.overall} nMarkets={a.n_markets} nTrades={a.n_trades} />
       {a.by_confidence && a.by_confidence.length > 0 && <ConfidenceBreakdown buckets={a.by_confidence} />}
       <CategoryBreakdown categories={a.by_category} />
