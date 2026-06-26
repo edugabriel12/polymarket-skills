@@ -255,6 +255,27 @@ def pick_side(sides, fee_rate, odds_min, odds_max, max_edge=MAX_PLAUSIBLE_EDGE):
     return candidates[0], notes
 
 
+def pregame_status(gmarkets: list, min_hours: float = 0.0,
+                   now: datetime | None = None) -> tuple[bool, str | None]:
+    """(ok, reason): only model a game that is PRE-LIVE — not yet kicked off. Mirrors the
+    tennis model. Uses the event's `game_start_time` (shared by all its line markets). A game
+    already underway is LIVE: its prices reflect goals already scored, so a pre-game model
+    produces phantom edges against them. A missing start time can't be judged -> passes through.
+    """
+    now = now or now_utc()
+    start = next((m.get("game_start_time") for m in gmarkets if m.get("game_start_time")), "")
+    if start:
+        try:
+            dt = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+            hours = (dt - now).total_seconds() / 3600.0
+            if hours < min_hours:
+                return (False, f"game already started ({-hours:.1f}h ago) — live, not pre-game"
+                        if hours < 0 else f"game starts in {hours:.1f}h < {min_hours:.0f}h lead")
+        except ValueError:
+            pass
+    return True, None
+
+
 def decision_tree(chosen, market, book_sum, price_sane, *, min_volume, min_edge,
                   min_hours, max_spread=0.10):
     vol = float(market.get("volume_24h") or 0)
@@ -477,6 +498,9 @@ def run(args) -> dict:
 
     # --- TOTAL-GOALS markets ---
     for slug, gmarkets in total_evts.items():
+        ok, why = pregame_status(gmarkets, getattr(args, "min_hours", 0.0))
+        if not ok:
+            _skip(slug, why); continue          # live game: prices reflect goals already scored
         # All goals-total lines for this game (the event groups them); each is modeled,
         # then best-line-per-game keeps only the highest-edge one below.
         tmarkets = [x for x in gmarkets
@@ -541,6 +565,9 @@ def run(args) -> dict:
 
     # --- BTTS markets ---
     for slug, gmarkets in btts_evts.items():
+        ok, why = pregame_status(gmarkets, getattr(args, "min_hours", 0.0))
+        if not ok:
+            _skip(slug, why); continue          # live game: prices reflect goals already scored
         m = next((x for x in gmarkets
                   if sm.GAME_BTTS_RE.search((x.get("slug") or "").lower()) and sm.is_btts_market(x)), None)
         if not m:
