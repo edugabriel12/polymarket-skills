@@ -1,62 +1,40 @@
 # Polymarket Sports — Dashboard (web app)
 
 A modern, colorful UI to interact with the prediction models, with a **sport toggle**
-(⚾ MLB total-runs · ⚽ Futebol total-goals + BTTS). The header switch drives both tabs.
+(⚽ Futebol total-goals + BTTS · 🎾 Tênis vencedor da partida). The header switch drives both tabs.
 
-- **MLB** runs in-process (`polymarket-mlb-totals`, Negative Binomial).
-- **Soccer** runs the `polymarket-soccer-goals` Dixon-Coles model via subprocess (the two skills
-  both define a `data_inputs` module, so importing both in one process would collide). Its
-  predictions live in a separate DB.
+- **Soccer** runs the `polymarket-soccer-goals` Dixon-Coles model via subprocess.
+- **Tennis** runs the `polymarket-tennis` surface-Elo model via subprocess.
 
-Relevant env vars (optional): `PREDICTIONS_DB`, `SOCCER_PREDICTIONS_DB`, `SOCCER_RATINGS_CSV`
-(team-ratings CSV passed to the soccer model), `FOOTBALL_DATA_TOKEN` (football-data.org key — the
-Resultados tab auto-settles soccer from that results feed when set, and the soccer model
-auto-calibrates each league's baseline goals/game from the current season), `APIFOOTBALL_KEY`
-(api-sports.io key — automatic attack/defense + baseline for leagues Club Elo doesn't cover, e.g.
-Brasileirão Série B). The backend subprocess inherits these, so the dashboard uses them automatically.
-API endpoints take `?sport=mlb|soccer`.
+Each skill defines its own `data_inputs` module, so the models run in subprocesses (importing both
+in one process would collide); their predictions live in separate DBs.
 
-### Auto-recalc + sharp-close capture (MLB) — built-in per-game scheduler
-
-By default the Análises tab serves a once-per-day cache and is recomputed **on demand** via the
-**Recalcular** button (a `force` recompute that overwrites the day cache), exactly like soccer/tennis.
-
-Optionally, an automatic per-game recompute loop can be enabled with `AUTO_RECALC=1` (off by default):
-a game can only be predicted while it's **pregame**, so with the loop on the model is recomputed
-**~1 hour before each game starts**; near-simultaneous starts are grouped into one **wave** = one
-Odds-API fetch covering the whole slate (a block of games costs a single call), and each wave also
-snapshots the sharp line into a season-long CSV that `GET /api/clv` scores recorded entries against.
-
-| Env var | Default | Purpose |
-|---|---|---|
-| `ODDS_API_KEY` | — | The Odds API key. **Required** for the live sharp anchor (and the optional auto-recalc loop). |
-| `AUTO_RECALC` | `0` | Set `1` to enable the optional per-game recompute loop (off by default; the Recalcular button is the default path). |
-| `WAVE_LEAD_MIN` | `60` | Minutes before first pitch to recompute a game. |
-| `WAVE_BUCKET_MIN` | `10` | Merge starts within this window into one wave (one fetch). |
-| `WAVE_POLL_SEC` | `300` | How often the loop checks for a due wave (no API cost). |
-| `SHARP_CLOSE_CSV` | `<predictions-db dir>/sharp_close.csv` | Where the accumulated sharp lines/closes are written. |
-
-Endpoints: `GET /api/clv?sport=mlb` (avg_CLV / beat_close), `GET /api/analyses?force=true` (hidden manual
-recompute), `POST /api/capture-close` (force a snapshot), and `GET /api/health` reports the scheduler
-state under `sharp_close`. The API key is never logged. Each wave = ~1 Odds-API call; a daily slate of
-~5–8 start-blocks ≈ 150–240 calls/month.
+Relevant env vars (optional): `SOCCER_PREDICTIONS_DB`, `TENNIS_PREDICTIONS_DB`, `SOCCER_RATINGS_CSV`
+(team-ratings CSV passed to the soccer model), `TENNIS_RATINGS_CSV`, `TENNIS_TOUR` (`atp`/`wta`),
+`FOOTBALL_DATA_TOKEN` (football-data.org key — the Resultados tab auto-settles soccer from that
+results feed when set, and the soccer model auto-calibrates each league's baseline goals/game from
+the current season), `APIFOOTBALL_KEY` (api-sports.io key — automatic attack/defense + baseline for
+leagues Club Elo doesn't cover, e.g. Brasileirão Série B), `ODDS_API_KEY` (The Odds API key for the
+live sharp anchor), `DASHBOARD_CACHE_DB` (override the day-cache DB location). The backend subprocess
+inherits these, so the dashboard uses them automatically. API endpoints take `?sport=soccer|tennis`.
 
 Two tabs:
 
-- **Análises** — the day's Over/Under entry suggestions, rendered as cards with the full NegBin
-  math (μ, variance, P(Over)/P(Under), edge, payout, Kelly size). The heavy model calc runs
-  **once per day** and is cached (backend `analysis_cache` table) until the next UTC day.
-- **Resultados** — ROI, P&L, total/Over/Under win rate for **diário / semanal / mensal**, with
-  charts and a recent-predictions table linking to each Polymarket market. **Every visit triggers
-  settlement** from the authoritative MLB Stats API final total (a total is only reported once a game
-  is Final), moving PENDENTE rows to ACERTO/ERRO. The Polymarket market's closed status is fetched to
-  backfill links and is available as an optional extra guard (`require_closed`), off by default.
+- **Análises** — the day's entry suggestions, rendered as cards with the full model math (soccer:
+  λ_home/λ_away, P(Over)/P(Under)/P(BTTS), edge, payout, Kelly size; tennis: surface-Elo win prob,
+  edge, price). The heavy model calc runs **once per day** and is cached (a dedicated
+  `analysis_cache` table in the dashboard cache DB) until the next UTC day.
+- **Resultados** — ROI, P&L, win rate for **diário / semanal / mensal**, with charts and a
+  recent-predictions table linking to each Polymarket market. **Every visit triggers settlement**,
+  moving PENDENTE rows to ACERTO/ERRO. Soccer settles from the football-data.org results feed;
+  tennis settles from its own Polymarket market resolution (with a tour results-feed fallback).
 
 Dark/light theme toggle. Read/analysis only — it never places live trades (paper-first).
 
 ## Stack
-- **Backend:** FastAPI (`backend/app.py`) wrapping the skill's Python (`suggest_totals`,
-  `predictions_db`, `analytics`, `settlement`). SQLite at `~/.polymarket-mlb-totals/predictions.db`.
+- **Backend:** FastAPI (`backend/app.py`) driving the soccer/tennis model subprocesses and their
+  stdlib-only prediction stores (`soccer_predictions`, `tennis_predictions`). The day-cache is a
+  dedicated SQLite file (`DASHBOARD_CACHE_DB`).
 - **Frontend:** React + Vite + TypeScript + TailwindCSS + shadcn-style components + Recharts +
   TanStack Query + framer-motion + lucide.
 
@@ -88,51 +66,50 @@ powershell -ExecutionPolicy Bypass -File dev.ps1
 ```
 
 **IntelliJ run configs** ship in `.run/` at the repo root (open the project at the repo root so
-they're detected): **Dashboard Frontend (npm dev)**, **Dashboard Backend (uvicorn)**, and
-**MLB Dashboard (Full)** which runs both. Run `dev.ps1` once first to bootstrap the backend
+they're detected): **Dashboard Frontend (npm dev)**, **Dashboard Backend (uvicorn)**, and the
+combined **Dashboard (Full)** which runs both. Run `dev.ps1` once first to bootstrap the backend
 `.venv` and `node_modules`; the backend config points at
 `backend\.venv\Scripts\python.exe` (re-select the interpreter in the dropdown if your IDE asks).
 
 ### Demo data (offline)
-Live games/settlement need network (Polymarket + MLB Stats API). To populate sample predictions
-so both tabs are fully usable offline:
+Live games/settlement need network (Polymarket + the results feeds). To populate sample soccer
+predictions so both tabs are usable offline:
 
 ```bash
-curl -X POST "http://localhost:8000/api/seed-demo?reset=true"
-# or: python ../scripts/seed_demo.py --reset
+curl -X POST "http://localhost:8000/api/seed-demo?sport=soccer&reset=true"
 ```
 
 ## API
 | Endpoint | Purpose |
 |---|---|
-| `GET /api/analyses?date=&force=` | Day's suggestions (cached once/day; `force=true` recomputes) |
-| `GET /api/results` | Runs settlement, then returns daily/weekly/monthly performance + recent |
-| `GET /api/predictions?status=&date=` | Raw prediction rows |
-| `POST /api/cache/clear?date=` | Delete the analyses cache (all, or one date) |
-| `POST /api/seed-demo?reset=` | Seed sample predictions (demo) |
+| `GET /api/analyses?sport=&date=&force=` | Day's suggestions (cached once/day; `force=true` recomputes) |
+| `GET /api/results?sport=` | Runs settlement, then returns daily/weekly/monthly performance + recent |
+| `GET /api/calibration?sport=` | Brier / log-loss / reliability + CLV over the shadow log |
+| `GET /api/predictions?sport=&status=&date=` | Raw prediction rows |
+| `POST /api/cache/clear?sport=&date=` | Delete the analyses cache (all, or one sport/date) |
+| `POST /api/seed-demo?sport=&reset=` | Seed sample predictions (soccer demo) |
 | `GET /api/health` | Liveness |
 
 ### Clear the cache / recompute
 ```bash
 # Recompute today and overwrite the cache (one shot):
-curl "http://localhost:8000/api/analyses?force=true"
+curl "http://localhost:8000/api/analyses?sport=soccer&force=true"
 
 # Delete the whole analyses cache (next call recomputes):
 curl -X POST "http://localhost:8000/api/cache/clear"
 
-# Delete just one day:
-curl -X POST "http://localhost:8000/api/cache/clear?date=2026-06-14"
+# Delete just one sport/day:
+curl -X POST "http://localhost:8000/api/cache/clear?sport=soccer&date=2026-06-14"
 ```
 In the UI, the **Recalcular** button on the Análises tab does the force-recompute. (On Windows
-PowerShell use `curl.exe`.) Without the server, clear it directly:
-`python -c "import sqlite3,os;c=sqlite3.connect(os.path.expanduser('~/.polymarket-mlb-totals/predictions.db'));c.execute('DELETE FROM analysis_cache');c.commit()"`
+PowerShell use `curl.exe`.)
 
 ## Tests
 - Backend: `cd backend && . .venv/bin/activate && python test_api.py`
-- Model/analytics/settlement: see `../scripts/test_analytics.py`, `test_settlement.py`,
-  `test_run_distribution.py`, `test_pipeline.py`.
+- Models: see each skill's `scripts/test_*.py` (soccer in `polymarket-soccer-goals/scripts`,
+  tennis in `polymarket-tennis/scripts`).
 
 ## Notes
-- The sandbox blocks live Polymarket/MLB egress and the Chromium download, so screenshots aren't
+- The sandbox blocks live Polymarket egress and the Chromium download, so screenshots aren't
   captured here; the frontend builds clean (`npm run build`) and the stack serves seeded data.
 - Not financial advice. Real trading involves risk of loss.

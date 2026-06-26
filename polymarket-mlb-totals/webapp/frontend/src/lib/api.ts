@@ -11,13 +11,13 @@ export interface Recommendation {
   fee_rate: number;
 }
 
-export type Sport = "mlb" | "soccer" | "tennis";
+export type Sport = "soccer" | "tennis";
 
-// Layer 1 + 3: per-prediction forecast. Shape varies by sport — a runs/goals DISTRIBUTION
-// (MLB/soccer, with intervals) or a BINARY Bernoulli (tennis match-winner). All fields optional.
+// Layer 1 + 3: per-prediction forecast. Shape varies by sport — a goals DISTRIBUTION
+// (soccer, with intervals) or a BINARY Bernoulli (tennis match-winner). All fields optional.
 export interface Forecast {
   entropy_bits: number;
-  // distribution (MLB = runs, soccer = goals)
+  // distribution (soccer = goals)
   mean_total?: number;
   median_total?: number;
   most_likely_total?: number;
@@ -89,29 +89,6 @@ export interface Skipped {
   reason: string;
 }
 
-// A calibrated prediction for EVERY game, independent of the trade filters.
-export interface GameForecast {
-  game: string;
-  line: number;
-  has_market: boolean;
-  basis: "sharp" | "factors" | "market" | null;
-  mu?: number;
-  forecast: {
-    mean_total: number;
-    median_total: number;
-    most_likely_total: number;
-    pi50: [number, number];
-    pi80: [number, number];
-    pi80_mass: number;
-    entropy_bits: number;
-    p_over: number;
-    p_under: number;
-  } | null;
-  over_price: number | null;
-  edge_vs_market: number | null;
-  reason?: string;
-}
-
 export interface AnalysesResponse {
   sport: Sport;
   date: string;
@@ -119,7 +96,6 @@ export interface AnalysesResponse {
   cached: boolean;
   counts: Record<string, number>;
   suggestions: Suggestion[];
-  forecasts?: GameForecast[];
   skipped: Skipped[];
   disclaimer: string;
   error?: string | null;
@@ -211,17 +187,14 @@ async function get<T>(url: string): Promise<T> {
 }
 
 export interface HealthResponse {
-  odds_api_key: boolean;
-  sharp_close: {
-    enabled: boolean;
-    has_key: boolean;
-    started: boolean;
-    lead_min: number;
-    next_wave: string | null;
-    waves_today?: string[];
-    last_run: string | null;
-    last_suggestions: number | null;
-  };
+  status: string;
+  sports: Sport[];
+  soccer_db: string;
+  tennis_db: string;
+  cache_db: string;
+  football_data_token: boolean;
+  tennis_tour: string;
+  time: string;
 }
 
 export const api = {

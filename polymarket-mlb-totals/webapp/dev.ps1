@@ -1,4 +1,4 @@
-# Windows/PowerShell launcher for the MLB Totals dashboard.
+# Windows/PowerShell launcher for the Polymarket Sports dashboard.
 # Starts the FastAPI backend (:8000) and the Vite frontend (:5173), each in its
 # own window. First run creates the backend venv and installs deps.
 #

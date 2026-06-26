@@ -9,20 +9,18 @@ import type { Sport } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 const SPORTS: { key: Sport; label: string; emoji: string }[] = [
-  { key: "mlb", label: "MLB", emoji: "⚾" },
   { key: "soccer", label: "Futebol", emoji: "⚽" },
   { key: "tennis", label: "Tênis", emoji: "🎾" },
 ];
 
 const SPORT_SUBTITLE: Record<Sport, string> = {
-  mlb: "MLB · total de runs (Binomial Negativa)",
   soccer: "Futebol · total de gols + BTTS (Dixon-Coles)",
   tennis: "Tênis · vencedor da partida (Elo por superfície)",
 };
 
 export default function App() {
   const { theme, toggle } = useTheme();
-  const [sport, setSport] = useState<Sport>("mlb");
+  const [sport, setSport] = useState<Sport>("soccer");
 
   return (
     <div className="min-h-screen">

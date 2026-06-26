@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start the MLB Totals dashboard backend (:8000) + frontend (:5173) for dev.
+# Start the Polymarket Sports dashboard backend (:8000) + frontend (:5173) for dev.
 set -euo pipefail
 cd "$(dirname "$0")"
 

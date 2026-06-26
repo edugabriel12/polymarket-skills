@@ -187,7 +187,7 @@ export function AnalysesTab({ sport }: { sport: Sport }) {
           <div className="flex flex-wrap gap-2">
             {data.skipped.slice(0, 16).map((sk, i) => (
               <span key={i} className="rounded-lg bg-muted px-2 py-1 text-xs text-muted-foreground">
-                {sk.game.replace(/^mlb-/, "")}: {sk.reason}
+                {sk.game}: {sk.reason}
               </span>
             ))}
           </div>
