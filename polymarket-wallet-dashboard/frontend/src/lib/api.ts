@@ -19,9 +19,14 @@ export interface SubCategory extends Metrics {
   subcategory: string;
 }
 
+export interface ConfidenceBucket extends Metrics {
+  confidence: string;
+}
+
 export interface Category extends Metrics {
   category: string;
   subcategories: SubCategory[];
+  by_confidence?: ConfidenceBucket[];
 }
 
 export interface MarketRecord {
@@ -42,21 +47,29 @@ export interface MarketRecord {
 }
 
 export interface WalletReport {
-  address: string;
+  address?: string;
+  filename?: string;
+  source?: string;
   n_markets: number;
   n_trades: number;
   overall: Metrics;
+  by_confidence?: ConfidenceBucket[];
   by_category: Category[];
   markets?: MarketRecord[];
   demo?: boolean;
   error?: string;
 }
 
-export async function fetchWallet(address: string, opts?: { enrichTags?: boolean; tradeLimit?: number }): Promise<WalletReport> {
-  const p = new URLSearchParams({ address: address.trim() });
-  if (opts?.enrichTags) p.set("enrich_tags", "true");
-  if (opts?.tradeLimit) p.set("trade_limit", String(opts.tradeLimit));
-  const r = await fetch(`/api/wallet?${p.toString()}`);
+export async function uploadCsv(file: File): Promise<WalletReport> {
+  const fd = new FormData();
+  fd.append("file", file);
+  const r = await fetch("/api/wallet/csv", { method: "POST", body: fd });
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  return (await r.json()) as WalletReport;
+}
+
+export async function fetchCsvDemo(): Promise<WalletReport> {
+  const r = await fetch("/api/csv-demo");
   if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
   return (await r.json()) as WalletReport;
 }

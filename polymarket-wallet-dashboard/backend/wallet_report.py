@@ -82,6 +82,60 @@ def rollup(address: str, records: list[dict], n_trades_total: int) -> dict:
     }
 
 
+_CONF_ORDER = {"Alta": 0, "Média": 1, "Baixa": 2}
+
+
+def _metrics(records: list[dict]) -> dict:
+    b = _blank()
+    for r in records:
+        _add(b, r)
+    return _finalize(b)
+
+
+def _group(records: list[dict], keyfn) -> dict:
+    out: dict = {}
+    for r in records:
+        out.setdefault(keyfn(r), []).append(r)
+    return out
+
+
+def _by_confidence(records: list[dict]) -> list[dict]:
+    groups = _group(records, lambda r: r.get("confidence") or "—")
+    return [{"confidence": c, **_metrics(rs)}
+            for c, rs in sorted(groups.items(), key=lambda kv: _CONF_ORDER.get(kv[0], 9))]
+
+
+def rollup_csv(records: list[dict]) -> dict:
+    """Roll up CSV bet records: overall + by_confidence + by_category (each nesting
+    its subcategories AND its own by_confidence split). A "bet" is one CSV row."""
+    overall = _metrics(records)
+    by_category = []
+    for cat, crs in _group(records, lambda r: r.get("category") or "Other").items():
+        subs = [{"subcategory": s, **_metrics(rs)}
+                for s, rs in _group(crs, lambda r: r.get("subcategory") or "Outro").items()]
+        subs.sort(key=lambda x: x["total_pnl"], reverse=True)
+        by_category.append({"category": cat, **_metrics(crs),
+                            "subcategories": subs, "by_confidence": _by_confidence(crs)})
+    by_category.sort(key=lambda x: x["total_pnl"], reverse=True)
+    return {
+        "source": "csv",
+        "n_markets": overall["markets"],
+        "n_trades": overall["markets"],          # one bet per row
+        "overall": overall,
+        "by_confidence": _by_confidence(records),
+        "by_category": by_category,
+    }
+
+
+def analyze_csv(data) -> dict:
+    """Parse a bet-history CSV and roll it up. Raises on a malformed file."""
+    import csv_parser
+    records = csv_parser.parse_csv(data)
+    report = rollup_csv(records)
+    report["markets"] = records
+    return report
+
+
 def attach_subcategories(records: list[dict]) -> list[dict]:
     for r in records:
         r["subcategory"] = sc.classify(

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import sys
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, File, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 import wallet_report as wr
@@ -27,6 +27,33 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/api/csv-demo")
+def csv_demo() -> dict:
+    """Sample CSV-based report (offline), same shape as POST /api/wallet/csv."""
+    return demo_mod.demo_csv_report()
+
+
+@app.post("/api/wallet/csv")
+async def wallet_csv(file: UploadFile = File(...)) -> dict:
+    """Analyze an uploaded bet-history CSV (Data;Evento;Aposta;Conf.;Odd;Investido;ROI%;Lucro).
+
+    Returns the same indicators as the address flow — Win rate, nº de apostas, P&L, ROI —
+    overall, por categoria/sub-categoria AND split by confidence level (Alta/Média/Baixa).
+    """
+    try:
+        data = await file.read()
+        report = wr.analyze_csv(data)
+    except Exception as e:  # noqa: BLE001
+        print(f"[csv] parse failed for {file.filename!r}: {e}", file=sys.stderr, flush=True)
+        return {"error": f"falha ao processar o CSV: {e}", "filename": file.filename}
+    if report["n_markets"] == 0:
+        return {"error": "CSV vazio ou sem linhas reconhecidas (cabeçalho esperado: "
+                "Data;Evento;Aposta;Conf.;Odd;Investido;ROI%;Lucro)",
+                "filename": file.filename}
+    report["filename"] = file.filename
+    return report
 
 
 @app.get("/api/wallet")
