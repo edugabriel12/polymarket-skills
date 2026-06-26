@@ -34,7 +34,21 @@ npm install
 npm run dev                                    # http://localhost:5173  (proxies /api -> :8000)
 ```
 
-Or `./dev.sh` from `polymarket-wallet-dashboard/` to start both.
+Or `./dev.sh` from `polymarket-wallet-dashboard/` to start both (macOS/Linux).
+
+### Windows (PowerShell)
+`dev.sh` is bash-only and uses POSIX venv paths (`.venv/bin/…`), which don't exist on Windows
+(`.venv\Scripts\…`). Use the PowerShell launcher instead — it creates the venv, installs deps, and
+opens the backend + frontend in two windows:
+
+```powershell
+# from polymarket-wallet-dashboard\
+powershell -ExecutionPolicy Bypass -File dev.ps1
+# or just double-click dev.bat
+```
+
+> **Port note:** the backend runs on **:8000** and the frontend on **:5173** — the same ports as
+> `polymarket-dashboard`. Stop that one first (or change the ports) or the second app won't bind.
 
 In the UI, paste a `0x…` address and click **Analisar**, or click **Ver demo** for sample data.
 
