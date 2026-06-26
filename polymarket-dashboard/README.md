@@ -22,10 +22,11 @@ Two tabs:
 
 - **Análises** — the day's entry suggestions, rendered as cards with the full model math (soccer:
   λ_home/λ_away, P(Over)/P(Under)/P(BTTS), edge, payout, Kelly size; tennis: surface-Elo win prob,
-  edge, price). An in-process scheduler recomputes **every sport at the top of each UTC hour**
-  (01:00, 02:00, …) and refreshes the cache (a dedicated `analysis_cache` table in the dashboard
-  cache DB), so the panel always shows the latest run — no manual recompute button. Disable the
-  loop with `AUTO_RECALC=0`.
+  edge, price). An in-process scheduler recomputes **every sport at the top of each hour**
+  (01:00, 02:00, …, **Brasília time** by default) and refreshes the cache (a dedicated
+  `analysis_cache` table in the dashboard cache DB), so the panel always shows the latest run —
+  no manual recompute button. The whole dashboard clock (today, the hourly tick, timestamps)
+  follows `RECALC_TZ` (default `America/Sao_Paulo`). Disable the loop with `AUTO_RECALC=0`.
 - **Resultados** — ROI, P&L, win rate for **diário / semanal / mensal**, with charts and a
   recent-predictions table linking to each Polymarket market. **Every visit triggers settlement**,
   moving PENDENTE rows to ACERTO/ERRO. Soccer settles from the football-data.org results feed;

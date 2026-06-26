@@ -2,9 +2,9 @@
 """FastAPI backend for the Polymarket sports dashboard (Soccer + Tennis).
 
 The Analises tab serves a per-sport+date cache that an in-process scheduler refreshes
-at the top of every UTC hour (01:00, 02:00, …); the Resultados tab settles pending
-predictions then returns ROI/P&L/win-rate analytics. Read/analysis only — it never
-places live trades.
+at the top of every hour in the dashboard zone (Brasília by default — 01:00, 02:00, …);
+the Resultados tab settles pending predictions then returns ROI/P&L/win-rate analytics.
+Read/analysis only — it never places live trades.
 
 Both sports run their model via subprocess (each skill defines its own `data_inputs`
 module, so importing them in one process would collide); the stdlib-only prediction
@@ -108,9 +108,19 @@ SPORTS = ("soccer", "tennis")
 CACHE_DB = os.environ.get("DASHBOARD_CACHE_DB") or \
     os.path.join(os.path.dirname(SOCCER_DB) or ".", "dashboard_cache.db")
 
-# Hourly auto-recalc: at the top of every UTC hour (01:00, 02:00, …) every sport's model is
+# Hourly auto-recalc: at the top of every hour (01:00, 02:00, …) every sport's model is
 # recomputed for the current day and its cache refreshed. ON by default; AUTO_RECALC=0 disables.
 AUTO_RECALC = os.environ.get("AUTO_RECALC", "1") not in ("0", "false", "False", "no", "")
+
+# The dashboard's wall clock — "today", the hourly tick, and timestamps all follow this zone.
+# Defaults to Brasília. Falls back to a fixed UTC-3 if the tz database isn't installed (Brazil
+# has no DST since 2019, so the fixed offset is currently exact).
+RECALC_TZ = os.environ.get("RECALC_TZ", "America/Sao_Paulo")
+try:
+    from zoneinfo import ZoneInfo
+    LOCAL_TZ = ZoneInfo(RECALC_TZ)
+except Exception:  # noqa: BLE001 - missing tzdata / bad name -> fixed Brasília offset
+    LOCAL_TZ = timezone(timedelta(hours=-3))
 
 
 class _QuickAPI:
@@ -131,11 +141,11 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 
 def _today() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
+    return datetime.now(LOCAL_TZ).date().isoformat()
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(LOCAL_TZ).isoformat()
 
 
 def _norm_sport(sport: str | None) -> str:
@@ -571,8 +581,8 @@ async def _recalc_all() -> None:
 
 
 def _seconds_to_next_hour() -> float:
-    """Seconds from now until the next top-of-hour (UTC). Always >= 1."""
-    now = datetime.now(timezone.utc)
+    """Seconds from now until the next top-of-hour in the dashboard zone. Always >= 1."""
+    now = datetime.now(LOCAL_TZ)
     nxt = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     return max(1.0, (nxt - now).total_seconds())
 
@@ -589,6 +599,7 @@ async def _start_hourly_recalc() -> None:
     if not AUTO_RECALC:
         print("[recalc] auto-recalc disabled (AUTO_RECALC=0)", file=sys.stderr, flush=True)
         return
-    print(f"[recalc] hourly auto-recalc ON (top of each UTC hour) for {', '.join(SPORTS)}; "
-          f"first run in {_seconds_to_next_hour() / 60:.1f} min", file=sys.stderr, flush=True)
+    print(f"[recalc] hourly auto-recalc ON (top of each hour, {RECALC_TZ}) for "
+          f"{', '.join(SPORTS)}; first run in {_seconds_to_next_hour() / 60:.1f} min",
+          file=sys.stderr, flush=True)
     asyncio.create_task(_hourly_loop())
