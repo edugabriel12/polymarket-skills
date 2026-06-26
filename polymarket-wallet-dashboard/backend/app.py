@@ -112,8 +112,7 @@ async def add_wallet(name: str = Form(...), address: str = Form(...),
         return {"error": f"falha ao processar o CSV: {e}"}
     if not records:
         return {"error": "CSV vazio ou sem linhas reconhecidas"}
-    analysis = wr.rollup_csv(records)
-    analysis["records"] = records          # kept for Phase-2 merging with live bets
+    analysis = wr.rollup_csv(records)      # CSV profile (kept for reference; NOT shown as results)
     thresholds = cm.derive_thresholds(records)
     wid = ws.add_wallet(name, addr, analysis, thresholds, file.filename)
     return _wallet_with_live(wid)
@@ -125,13 +124,13 @@ def list_wallets() -> dict:
 
 
 def _wallet_with_live(wallet_id: int) -> dict:
-    """Wallet record whose `analysis` is the CSV snapshot MERGED with live settled bets."""
+    """Wallet record whose `analysis` is its LIVE results only (settled bets after add).
+    The CSV is never shown as results — it only fed the confidence/unit bands."""
     import wallet_results as wres
     w = ws.get_wallet(wallet_id)
     if not w:
         return {"error": "carteira não encontrada"}
-    records = (w.get("analysis") or {}).get("records", [])
-    w["analysis"] = wres.merged_analysis(records, ws.list_bets(wallet_id))
+    w["analysis"] = wres.live_results(ws.list_bets(wallet_id))
     return w
 
 

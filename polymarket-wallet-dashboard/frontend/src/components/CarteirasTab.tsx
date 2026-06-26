@@ -10,16 +10,58 @@ import { Charts } from "@/components/Charts";
 import { wallets, type WalletRecord } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
+const UNIT_LABEL: Record<number, string> = { 1: "1U", 0.5: "0.5U", 0.25: "0.25U" };
+const usd0 = (v: number) => `$${Math.round(v).toLocaleString("en-US")}`;
+
+function Thresholds({ rec }: { rec: WalletRecord }) {
+  const order = ["Alta", "Média", "Baixa"];
+  const bands = order.filter((t) => rec.thresholds?.[t]);
+  if (!bands.length) return null;
+  return (
+    <Card className="p-4">
+      <div className="mb-2 text-xs font-bold uppercase tracking-wider text-muted-foreground">
+        Faixas aprendidas do CSV (confiança → unidade)
+      </div>
+      <div className="grid gap-2 sm:grid-cols-3">
+        {bands.map((t) => {
+          const b = rec.thresholds[t];
+          return (
+            <div key={t} className="rounded-xl bg-muted/50 px-3 py-2">
+              <div className="text-sm font-black">{t} · {UNIT_LABEL[b.unit] ?? `${b.unit}U`}</div>
+              <div className="text-xs text-muted-foreground">posição ≥ {usd0(b.floor)}</div>
+            </div>
+          );
+        })}
+      </div>
+      <p className="mt-2 text-[11px] text-muted-foreground">
+        O CSV serve só pra estas faixas — os resultados abaixo são só das apostas ao vivo desde a adição.
+      </p>
+    </Card>
+  );
+}
+
 function WalletAnalysis({ rec }: { rec: WalletRecord }) {
   const a = rec.analysis;
-  if (!a || a.n_markets === 0)
-    return <Card className="p-6 text-center text-sm text-muted-foreground">Sem apostas no CSV.</Card>;
   return (
     <div className="space-y-6">
-      <KpiCards overall={a.overall} nMarkets={a.n_markets} nTrades={a.n_trades} />
-      {a.by_confidence && a.by_confidence.length > 0 && <ConfidenceBreakdown buckets={a.by_confidence} />}
-      <Charts categories={a.by_category} />
-      <CategoryBreakdown categories={a.by_category} />
+      <Thresholds rec={rec} />
+      {a && a.n_markets > 0 ? (
+        <>
+          <div className="rounded-xl bg-sky-500/10 px-3 py-1.5 text-xs font-semibold text-sky-400">
+            Apostas ao vivo · {a.live_settled} liquidada(s)
+            {!!a.live_open && ` · ${a.live_open} em aberto`}
+          </div>
+          <KpiCards overall={a.overall} nMarkets={a.n_markets} nTrades={a.n_trades} />
+          {a.by_confidence && a.by_confidence.length > 0 && <ConfidenceBreakdown buckets={a.by_confidence} />}
+          <Charts categories={a.by_category} />
+          <CategoryBreakdown categories={a.by_category} />
+        </>
+      ) : (
+        <Card className="p-6 text-center text-sm text-muted-foreground">
+          Ainda sem apostas liquidadas desde a adição.
+          {!!a?.live_open && <div className="mt-1 text-xs">{a.live_open} aposta(s) em aberto.</div>}
+        </Card>
+      )}
     </div>
   );
 }
