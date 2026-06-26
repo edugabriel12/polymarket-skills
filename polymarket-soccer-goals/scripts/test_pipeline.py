@@ -13,6 +13,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -264,11 +265,14 @@ class TestAutoRatings(unittest.TestCase):
 
 
 def _rich(slug, question, outcomes, prices, tokens, vol=40000, event_slug=None):
+    # Pre-game kickoff (future vs the wall clock) so the live-game filter treats these
+    # injected markets as PRE-LIVE; otherwise a fixed past date reads as already started.
+    start = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {"event_slug": event_slug if event_slug is not None else slug,
             "slug": slug, "question": question, "outcomes": outcomes,
             "outcome_prices": prices, "token_ids": tokens, "volume_24h": vol,
             "end_date": "2027-01-01T00:00:00Z", "accepting_orders": True,
-            "game_start_time": "2026-06-14T18:00:00Z", "condition_id": "0x" + slug}
+            "game_start_time": start, "condition_id": "0x" + slug}
 
 
 class _NoNetAPI:
@@ -478,6 +482,31 @@ class TestLoadSharpLogging(unittest.TestCase):
         out, log = self._run({}, key=None)
         self.assertEqual(out, {})
         self.assertIn("no ODDS_API_KEY", log)
+
+
+class TestPregameStatus(unittest.TestCase):
+    """Live games (kicked off) must be skipped so the pre-game model never prices live odds."""
+
+    @staticmethod
+    def _evt(start):
+        return [{"slug": "fifwc-nor-fra-2026-06-26-total-2pt5", "game_start_time": start}]
+
+    def test_future_game_is_pregame(self):
+        now = datetime(2026, 6, 26, 12, 0, tzinfo=timezone.utc)
+        ok, why = ss.pregame_status(self._evt("2026-06-26T18:00:00Z"), 0.0, now)
+        self.assertTrue(ok)
+        self.assertIsNone(why)
+
+    def test_started_game_is_live(self):
+        now = datetime(2026, 6, 26, 19, 0, tzinfo=timezone.utc)   # kickoff was 18:00 -> live
+        ok, why = ss.pregame_status(self._evt("2026-06-26T18:00:00Z"), 0.0, now)
+        self.assertFalse(ok)
+        self.assertIn("already started", why)
+
+    def test_missing_start_passes_through(self):
+        now = datetime(2026, 6, 26, 19, 0, tzinfo=timezone.utc)
+        ok, why = ss.pregame_status(self._evt(""), 0.0, now)   # can't judge -> don't drop
+        self.assertTrue(ok)
 
 
 if __name__ == "__main__":

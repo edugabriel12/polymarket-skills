@@ -340,7 +340,18 @@ def fetch_sharp_soccer(api_key: str | None, keys: list[str], *, date: str | None
             r.raise_for_status()
             events = r.json() or []
         except Exception as e:  # noqa: BLE001
+            status = getattr(getattr(e, "response", None), "status_code", None)
             vlog(f"  [odds-api] {key} totals failed: {_redact(e)}")
+            if status in (401, 403, 429):
+                # The Odds API returns 401 for BOTH an invalid key AND an exhausted quota.
+                # /sports already listed leagues, so the key authenticates -> exhausted quota
+                # is the likely cause. Either way every remaining league call fails identically,
+                # so abort now instead of hammering the API once per league.
+                vlog(f"  [odds-api] HTTP {status} on odds — the key authenticates (/sports "
+                     f"listed leagues), so this is most likely EXHAUSTED QUOTA (or an invalid "
+                     f"key). Aborting the remaining {len(keys)} league(s); all would fail the "
+                     f"same. Check your The Odds API plan/usage at the-odds-api.com/account.")
+                break
             continue
         if date:
             events = [e for e in events if (e.get("commence_time") or "")[:10] == date] or events

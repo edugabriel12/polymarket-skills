@@ -210,5 +210,45 @@ class TestEndToEndMatch(unittest.TestCase):
         self.assertGreater(ref[1], 0.5)   # -130 over -> fair over > 0.5
 
 
+class TestQuotaAbort(unittest.TestCase):
+    def test_401_on_odds_aborts_remaining_leagues(self):
+        # A 401 on the first league's /odds (exhausted quota or bad key) must abort the rest
+        # instead of firing a doomed call at every remaining league.
+        import types
+
+        class _HTTPError(Exception):
+            def __init__(self, resp):
+                super().__init__("401 Client Error: Unauthorized")
+                self.response = resp
+
+        class _Resp:
+            status_code = 401
+            headers = {}
+            def raise_for_status(self): raise _HTTPError(self)
+            def json(self): return []
+
+        calls = {"n": 0}
+
+        def fake_get(url, params=None, timeout=None):
+            calls["n"] += 1
+            return _Resp()
+
+        logs = []
+        fake_requests = types.SimpleNamespace(get=fake_get)
+        orig = sys.modules.get("requests")
+        sys.modules["requests"] = fake_requests
+        try:
+            out = so.fetch_sharp_soccer("k", ["soccer_a", "soccer_b", "soccer_c"],
+                                        with_btts=True, vlog=lambda m: logs.append(m))
+        finally:
+            if orig is not None:
+                sys.modules["requests"] = orig
+            else:
+                sys.modules.pop("requests", None)
+        self.assertEqual(out, {})              # nothing parsed
+        self.assertEqual(calls["n"], 1)        # aborted after the first league's 401, not 3 calls
+        self.assertTrue(any("Aborting" in m for m in logs))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
