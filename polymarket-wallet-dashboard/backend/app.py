@@ -14,11 +14,14 @@ from __future__ import annotations
 
 import sys
 
-from fastapi import FastAPI, File, Query, UploadFile
+from fastapi import FastAPI, File, Form, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 import wallet_report as wr
 import demo as demo_mod
+import csv_parser
+import confidence_model as cm
+import wallets_store as ws
 
 app = FastAPI(title="Polymarket Wallet Analyzer API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -33,6 +36,47 @@ def health() -> dict:
 def csv_demo() -> dict:
     """Sample CSV-based report (offline), same shape as POST /api/wallet/csv."""
     return demo_mod.demo_csv_report()
+
+
+# ---------------------------------------------------------------------------
+# Watched wallets (copy-trade source list): add = name + address + CSV.
+# The CSV drives the analysis AND the confidence→value-band thresholds the live
+# watcher uses to size each tier (Alta=1U / Média=0.5U / Baixa=0.25U).
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/wallets")
+async def add_wallet(name: str = Form(...), address: str = Form(...),
+                     file: UploadFile = File(...)) -> dict:
+    addr = (address or "").strip()
+    if not wr.wa.is_address(addr):
+        return {"error": "endereço inválido — esperado 0x + 40 hex"}
+    try:
+        records = csv_parser.parse_csv(await file.read())
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"falha ao processar o CSV: {e}"}
+    if not records:
+        return {"error": "CSV vazio ou sem linhas reconhecidas"}
+    analysis = wr.rollup_csv(records)
+    thresholds = cm.derive_thresholds(records)
+    wid = ws.add_wallet(name, addr, analysis, thresholds, file.filename)
+    return ws.get_wallet(wid)
+
+
+@app.get("/api/wallets")
+def list_wallets() -> dict:
+    return {"wallets": ws.list_wallets()}
+
+
+@app.get("/api/wallets/{wallet_id}")
+def get_wallet(wallet_id: int) -> dict:
+    w = ws.get_wallet(wallet_id)
+    return w or {"error": "carteira não encontrada"}
+
+
+@app.delete("/api/wallets/{wallet_id}")
+def delete_wallet(wallet_id: int) -> dict:
+    return {"deleted": ws.delete_wallet(wallet_id)}
 
 
 @app.post("/api/wallet/csv")
