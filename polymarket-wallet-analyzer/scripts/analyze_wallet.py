@@ -470,6 +470,11 @@ def _end_in_past(end: str | None) -> bool:
         dt = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
     except ValueError:
         return False
+    # Polymarket's endDate may arrive WITHOUT a timezone (offset-naive). Comparing a naive
+    # datetime to an aware now() raises "can't compare offset-naive and offset-aware
+    # datetimes" — assume UTC for naive timestamps so the comparison is always valid.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
     return dt < datetime.now(timezone.utc)
 
 
