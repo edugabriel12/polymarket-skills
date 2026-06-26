@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Send, CheckCircle2, AlertTriangle, Loader2 } from "lucide-react";
+import { Send, CheckCircle2, AlertTriangle, Loader2, Copy, Check } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { api, type TelegramSaveResult } from "@/lib/api";
@@ -11,6 +11,17 @@ export function TelegramTab() {
   const [saving, setSaving] = useState(false);
   const [result, setResult] = useState<TelegramSaveResult | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const copyStart = async () => {
+    try {
+      await navigator.clipboard.writeText("/start");
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* clipboard blocked — the user can still type /start manually */
+    }
+  };
 
   const { data: status } = useQuery({ queryKey: ["telegram"], queryFn: () => api.telegramStatus() });
 
@@ -58,6 +69,22 @@ export function TelegramTab() {
           <li>Abra seu bot e envie <code>/start</code> (pra ele te enxergar).</li>
           <li>Cole o token abaixo e salve — o <strong>chat ID é preenchido sozinho</strong> e um alerta de teste é disparado.</li>
         </ol>
+
+        {/* Prominent /start reminder — required for chat-id auto-discovery */}
+        <div className="flex flex-wrap items-center gap-2 rounded-xl border border-sky-500/30 bg-sky-500/10 px-3 py-2.5 text-sm">
+          <AlertTriangle className="h-4 w-4 shrink-0 text-sky-400" />
+          <span>
+            <strong>Importante:</strong> antes de salvar, abra seu bot no Telegram e envie{" "}
+            <button
+              onClick={copyStart}
+              title="Copiar /start"
+              className="inline-flex items-center gap-1 rounded-md bg-sky-500/20 px-1.5 py-0.5 font-mono font-bold text-sky-300 transition hover:bg-sky-500/30"
+            >
+              /start {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+            </button>
+            . Sem isso o chat ID não é detectado.
+          </span>
+        </div>
 
         <div className="flex flex-wrap items-center gap-2">
           <input
