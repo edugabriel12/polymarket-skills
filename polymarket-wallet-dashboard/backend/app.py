@@ -134,6 +134,13 @@ def delete_wallet(wallet_id: int) -> dict:
     return {"deleted": ws.delete_wallet(wallet_id)}
 
 
+@app.get("/api/model-results")
+def model_results_route() -> dict:
+    """The Modelo entity's performance for the separated Resultados (by category only)."""
+    import model_results
+    return model_results.model_results()
+
+
 @app.post("/api/wallet/csv")
 async def wallet_csv(file: UploadFile = File(...)) -> dict:
     """Analyze an uploaded bet-history CSV (Data;Evento;Aposta;Conf.;Odd;Investido;ROI%;Lucro).

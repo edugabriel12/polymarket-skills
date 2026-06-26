@@ -73,3 +73,70 @@ export async function fetchCsvDemo(): Promise<WalletReport> {
   if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
   return (await r.json()) as WalletReport;
 }
+
+// --- watched-wallet management + separated results ---------------------------
+export interface ThresholdBand {
+  floor: number;
+  unit: number;
+  n: number;
+  min: number;
+  median: number;
+  max: number;
+}
+
+export interface WalletSummary {
+  id: number;
+  name: string;
+  address: string;
+  csv_filename?: string;
+  created_at: string;
+  n_markets?: number;
+}
+
+export interface WalletRecord extends WalletSummary {
+  analysis: WalletReport;
+  thresholds: Record<string, ThresholdBand>;
+}
+
+export interface ModelCategory {
+  category: string;
+  n_bets: number;
+  wins: number;
+  losses: number;
+  win_rate: number | null;
+  invested: number;
+  total_pnl: number;
+  roi: number | null;
+}
+
+export interface ModelResults {
+  entity: string;
+  by_category: ModelCategory[];
+  by_confidence: null;
+}
+
+async function jget<T>(url: string): Promise<T> {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  return r.json() as Promise<T>;
+}
+
+export const wallets = {
+  list: () => jget<{ wallets: WalletSummary[] }>("/api/wallets").then((x) => x.wallets),
+  get: (id: number) => jget<WalletRecord>(`/api/wallets/${id}`),
+  modelResults: () => jget<ModelResults>("/api/model-results"),
+  add: async (name: string, address: string, file: File) => {
+    const fd = new FormData();
+    fd.append("name", name);
+    fd.append("address", address);
+    fd.append("file", file);
+    const r = await fetch("/api/wallets", { method: "POST", body: fd });
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+    return r.json() as Promise<WalletRecord>;
+  },
+  remove: async (id: number) => {
+    const r = await fetch(`/api/wallets/${id}`, { method: "DELETE" });
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+    return r.json();
+  },
+};
