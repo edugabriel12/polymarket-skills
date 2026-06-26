@@ -80,12 +80,25 @@ function CategoryRow({ c }: { c: CategoryResult }) {
 }
 
 export function ResultsTab() {
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["results"],
     queryFn: () => api.results(),
     refetchInterval: 30 * 1000,
     refetchOnWindowFocus: false,
   });
+
+  if (isError) {
+    console.error("[ResultsTab] erro ao carregar /api/results:", error);
+    return (
+      <Card className="p-10 text-center text-sm text-rose-500">
+        Falha ao carregar os resultados.
+        <div className="mt-1 break-all text-xs text-muted-foreground">
+          {(error as Error)?.message ?? String(error)}
+        </div>
+        <div className="mt-1 text-xs text-muted-foreground">Veja o console do navegador (F12) para detalhes.</div>
+      </Card>
+    );
+  }
 
   if (isLoading) return <div className="skeleton h-72" />;
   const ov = data?.overall;

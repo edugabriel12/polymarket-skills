@@ -53,9 +53,25 @@ export interface ResultsResponse {
 }
 
 async function get<T>(url: string): Promise<T> {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-  return r.json() as Promise<T>;
+  let r: Response;
+  try {
+    r = await fetch(url);
+  } catch (err) {
+    // backend fora do ar, proxy/porta errada, DNS, CORS…
+    console.error(`[api] GET ${url} — falha de rede/fetch:`, err);
+    throw err;
+  }
+  if (!r.ok) {
+    const body = await r.text().catch(() => "");
+    console.error(`[api] GET ${url} -> HTTP ${r.status} ${r.statusText}`, body);
+    throw new Error(`HTTP ${r.status} ${r.statusText}${body ? ` — ${body.slice(0, 500)}` : ""}`);
+  }
+  try {
+    return (await r.json()) as T;
+  } catch (err) {
+    console.error(`[api] GET ${url} — resposta não é JSON válido:`, err);
+    throw err;
+  }
 }
 
 export interface TelegramStatus {

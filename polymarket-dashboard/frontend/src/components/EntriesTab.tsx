@@ -1,16 +1,30 @@
 import { useQuery } from "@tanstack/react-query";
-import { Inbox } from "lucide-react";
+import { Inbox, AlertTriangle } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { EntryCard } from "@/components/EntryCard";
 import { api } from "@/lib/api";
 
 export function EntriesTab() {
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["entries"],
     queryFn: () => api.entries(),
     refetchInterval: 30 * 1000, // pick up new pushes
     refetchOnWindowFocus: false,
   });
+
+  if (isError) {
+    console.error("[EntriesTab] erro ao carregar /api/entries:", error);
+    return (
+      <Card className="flex flex-col items-center gap-2 p-10 text-center text-sm text-rose-500">
+        <AlertTriangle className="h-7 w-7" />
+        Falha ao carregar as entradas.
+        <span className="max-w-full break-all text-xs text-muted-foreground">
+          {(error as Error)?.message ?? String(error)}
+        </span>
+        <span className="text-xs text-muted-foreground">Veja o console do navegador (F12) para detalhes.</span>
+      </Card>
+    );
+  }
 
   if (isLoading) {
     return (
