@@ -64,6 +64,20 @@ powershell -ExecutionPolicy Bypass -File dev.ps1
 
 In the UI, drag a `*_historico.csv` onto the dropzone (or **Selecionar CSV**), or click **Ver demo**.
 
+## Configuration (.env) — model keys
+
+The brain (this app) runs the soccer/tennis models and pushes entries to Sports.
+Copy `.env.example` to `backend/.env` — it is **auto-loaded at startup** (the real shell
+environment always wins over the file). On Windows, just create `backend\.env`.
+
+| Key | Effect |
+|---|---|
+| `ODDS_API_KEY` | Sharp odds anchor. Without it the model is Elo-only and large edges get capped. Biggest win. |
+| `APIFOOTBALL_KEY` | Strength model for club leagues Club Elo lacks (e.g. Série B). |
+| `FOOTBALL_DATA_TOKEN` | Results / baseline calibration (`track_soccer.py`). |
+
+Check it loaded via `GET /api/health` → `dotenv_loaded` lists the files read.
+
 ## API
 | Endpoint | Purpose |
 |---|---|

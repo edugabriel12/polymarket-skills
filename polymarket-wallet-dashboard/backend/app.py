@@ -20,12 +20,47 @@ from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, File, Form, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-import wallet_report as wr
-import demo as demo_mod
-import csv_parser
-import confidence_model as cm
-import wallets_store as ws
-import brain
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.normpath(os.path.join(_BACKEND_DIR, "..", ".."))
+
+
+def _load_dotenv() -> list[str]:
+    """Load KEY=VALUE from backend/.env, ../.env, or repo .env (real env wins).
+
+    Mirrors the Sports backend. Must run BEFORE `import brain` (brain -> model_runner
+    reads SOCCER_PREDICTIONS_DB etc. at import time) and before the soccer/tennis
+    subprocesses inherit the environment at runtime (ODDS_API_KEY, APIFOOTBALL_KEY,
+    FOOTBALL_DATA_TOKEN).
+    """
+    loaded = []
+    for path in (os.path.join(_BACKEND_DIR, ".env"),
+                 os.path.normpath(os.path.join(_BACKEND_DIR, "..", ".env")),
+                 os.path.join(_REPO_ROOT, ".env")):
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, val = line.partition("=")
+                    if key.strip():
+                        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+            loaded.append(path)
+        except OSError:
+            pass
+    return loaded
+
+
+_DOTENV_FILES = _load_dotenv()
+
+import wallet_report as wr  # noqa: E402
+import demo as demo_mod  # noqa: E402
+import csv_parser  # noqa: E402
+import confidence_model as cm  # noqa: E402
+import wallets_store as ws  # noqa: E402
+import brain  # noqa: E402
 
 # Scheduler config. The brain runs the models at the top of every hour (Brasília by
 # default) and polls the watched wallets every WATCH_POLL_SEC; both push to Sports.
@@ -84,7 +119,7 @@ async def _start_brain() -> None:
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok"}
+    return {"status": "ok", "dotenv_loaded": _DOTENV_FILES}
 
 
 @app.get("/api/csv-demo")
