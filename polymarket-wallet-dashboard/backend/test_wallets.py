@@ -8,6 +8,7 @@ import unittest
 
 _TMP = tempfile.mkdtemp()
 os.environ["DASHBOARD_WALLETS_DB"] = os.path.join(_TMP, "wallets.db")
+os.environ["AUTO_BRAIN"] = "0"   # don't start the model/watch scheduler during tests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
