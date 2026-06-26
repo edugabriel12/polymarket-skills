@@ -7,14 +7,14 @@ __pycache__/
 !.env.example
 *.key
 
-# Web app (polymarket-mlb-totals/webapp)
+# Web app (polymarket-dashboard)
 node_modules/
 dist/
 .vite/
 *.tsbuildinfo
-webapp/backend/.venv/
 **/.venv/
 *.db
-.polymarket-mlb-totals/
-webapp/frontend/vite.config.js
-webapp/frontend/vite.config.d.ts
+.polymarket-soccer/
+.polymarket-tennis/
+**/frontend/vite.config.js
+**/frontend/vite.config.d.ts

@@ -151,8 +151,8 @@ Games that fall in divergence mode without a sharp anchor are now still **modele
 **Full math audit:** dump the complete `stats_log` (λ_home/λ_away, ρ, P(model), edge, sizing) for
 every soccer prediction with the shared `audit_log.py`:
 ```bash
-python polymarket-mlb-totals/scripts/audit_log.py --sport soccer            # all, full audit
-python polymarket-mlb-totals/scripts/audit_log.py --sport soccer --json > audit.json
+python polymarket-forecasting/scripts/audit_log.py --sport soccer            # all, full audit
+python polymarket-forecasting/scripts/audit_log.py --sport soccer --json > audit.json
 ```
 
 ## Auto-settlement (`track_soccer.py`)

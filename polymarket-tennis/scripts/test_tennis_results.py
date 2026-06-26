@@ -171,10 +171,12 @@ class _FakeGamma:
         self.by_slug = by_slug or {}
         self.calls = 0
         self.slug_calls = 0
+        self.seen_params = []
 
     def get(self, url, params=None):
         self.calls += 1
         params = params or {}
+        self.seen_params.append(params)
         if "slug" in params:
             self.slug_calls += 1
             m = self.by_slug.get(params["slug"])
@@ -310,6 +312,18 @@ class TestSettleFromMarket(unittest.TestCase):
             self.assertEqual(out["settled"][0]["status"], "ACERTO")
             self.assertGreaterEqual(api.slug_calls, 1)                  # used the slug fallback
             self.assertTrue(any("found by slug fallback" in x for x in out["diagnostics"]))
+
+    def test_condition_query_requests_closed_markets(self):
+        # A settled match's market is closed; Gamma's /markets defaults to active-only, so the
+        # query MUST pass closed=true or resolved markets come back empty (the live failure).
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "t.db")
+            self._seed(db)
+            api = _FakeGamma({"c_you": _resolved_market(
+                "c_you", ["tok_you", "tok_jean"], ["Xiaodi You", "Leolia Jeanjean"], ["1", "0"])})
+            tr.settle_pending_from_market(api, db)
+            self.assertTrue(any(p.get("closed") == "true" and "condition_ids" in p
+                                for p in api.seen_params))
 
     def test_found_but_open_market_stays_pending_with_note(self):
         with tempfile.TemporaryDirectory() as d:

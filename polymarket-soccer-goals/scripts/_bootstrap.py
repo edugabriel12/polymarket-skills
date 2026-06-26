@@ -5,7 +5,7 @@ Reused (by import, never modified):
   - category_common  (polymarket-category-watcher)
   - advisor.kelly_half (polymarket-strategy-advisor)
   - execute_paper / paper_engine (polymarket-paper-trader)
-  - predictions_db (polymarket-mlb-totals) — the shared SQLite prediction store
+  - congruence / forecast / scoring / calibration_core (polymarket-forecasting) — shared cores
 """
 
 from __future__ import annotations
@@ -20,12 +20,11 @@ _REUSED_SCRIPT_DIRS = (
     os.path.join(_REPO_ROOT, "polymarket-category-watcher", "scripts"),
     os.path.join(_REPO_ROOT, "polymarket-strategy-advisor", "scripts"),
     os.path.join(_REPO_ROOT, "polymarket-paper-trader", "scripts"),
-    os.path.join(_REPO_ROOT, "polymarket-mlb-totals", "scripts"),
+    os.path.join(_REPO_ROOT, "polymarket-forecasting", "scripts"),
 )
 
-# This skill's own scripts dir must win on name collisions (both this skill and
-# polymarket-mlb-totals define `data_inputs`/`_bootstrap`), so put it FIRST and
-# APPEND the reused dirs after it.
+# This skill's own scripts dir must win on name collisions (e.g. its own
+# `data_inputs`/`_bootstrap`), so put it FIRST and APPEND the reused dirs after it.
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 for _d in _REUSED_SCRIPT_DIRS:

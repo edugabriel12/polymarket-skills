@@ -5,8 +5,8 @@
     <envs>
       <env name="PYTHONUNBUFFERED" value="1" />
     </envs>
-    <option name="SDK_HOME" value="$PROJECT_DIR$/polymarket-mlb-totals/webapp/backend/.venv/Scripts/python.exe" />
-    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/polymarket-mlb-totals/webapp/backend" />
+    <option name="SDK_HOME" value="$PROJECT_DIR$/polymarket-dashboard/backend/.venv/Scripts/python.exe" />
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/polymarket-dashboard/backend" />
     <option name="IS_MODULE_SDK" value="false" />
     <option name="ADD_CONTENT_ROOTS" value="true" />
     <option name="ADD_SOURCE_ROOTS" value="true" />

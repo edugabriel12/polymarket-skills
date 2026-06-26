@@ -128,42 +128,54 @@ def _absorb_markets(rows, out: dict) -> None:
             out[str(m["slug"])] = m
 
 
+# A settled match's market is CLOSED (active:false, closed:true). Gamma's /markets defaults
+# to active markets, so a resolved market is only returned when closed=true is passed —
+# without it the lookup comes back empty for exactly the matches we want to settle.
+_CLOSED_PARAMS = {"closed": "true"}
+
+
+def _gamma_markets(api, params: dict) -> list:
+    try:
+        rows = api.get(f"{GAMMA_API}/markets", params=params)
+    except Exception:  # noqa: BLE001 - best-effort; offline/forbidden -> empty
+        return []
+    return rows if isinstance(rows, list) else []
+
+
 def _fetch_markets_by_condition(api, condition_ids: list[str]) -> dict:
-    """{conditionId|slug: market_dict} from Gamma /markets?condition_ids=. Best-effort, {} offline."""
+    """{conditionId|slug: market_dict} from Gamma /markets?condition_ids=. Best-effort, {} offline.
+
+    Queries with closed=true so RESOLVED markets (the ones ready to settle) are returned.
+    """
     ids = [c for c in dict.fromkeys(condition_ids) if c]
     if not ids:
         return {}
     out: dict[str, dict] = {}
-    try:
-        _absorb_markets(api.get(f"{GAMMA_API}/markets", params={"condition_ids": ids}), out)
-    except Exception:  # noqa: BLE001 - batch failed (offline/forbidden): give up
-        return out
+    _absorb_markets(_gamma_markets(api, {"condition_ids": ids, **_CLOSED_PARAMS}), out)
     for cid in ids:                              # per-id fallback for any the batch missed
         if cid in out:
             continue
-        try:
-            _absorb_markets(api.get(f"{GAMMA_API}/markets", params={"condition_ids": cid}), out)
-        except Exception:  # noqa: BLE001
-            continue
+        _absorb_markets(_gamma_markets(api, {"condition_ids": cid, **_CLOSED_PARAMS}), out)
     return out
 
 
 def _fetch_market_by_slug(api, slug: str) -> dict | None:
     """The Polymarket market for an exact slug via Gamma /markets?slug=. None offline/missing.
 
-    match_slug is the real Polymarket market slug (discovery read it from Gamma), so this
-    finds the market even when the condition_ids query doesn't return a resolved/closed one.
+    match_slug is the real Polymarket market slug (discovery read it from Gamma). Tries
+    closed=true first (a settled match's market is closed), then a plain query (a not-yet-
+    resolved market is still open) — so both resolved and open markets are found.
     """
     if not slug:
         return None
-    try:
-        rows = api.get(f"{GAMMA_API}/markets", params={"slug": slug})
-    except Exception:  # noqa: BLE001
-        return None
-    for m in rows if isinstance(rows, list) else []:
-        if isinstance(m, dict) and str(m.get("slug", "")) == slug:
-            return m
-    return rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else None
+    for extra in (_CLOSED_PARAMS, {}):           # resolved (closed) first, then still-open
+        rows = _gamma_markets(api, {"slug": slug, **extra})
+        for m in rows:
+            if isinstance(m, dict) and str(m.get("slug", "")) == slug:
+                return m
+        if rows and isinstance(rows[0], dict):
+            return rows[0]
+    return None
 
 
 def _unresolved_note(market: dict) -> str:
