@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Offline API tests (FastAPI TestClient) for soccer + tennis against temp DBs.
-
-Run inside the backend venv:
-    cd polymarket-dashboard/backend && . .venv/bin/activate && python test_api.py
-"""
+"""Offline tests for Polymarket Sports — the storefront (ingest → entries/results/Telegram)."""
 
 from __future__ import annotations
 
@@ -13,140 +9,133 @@ import tempfile
 import unittest
 
 _TMP = tempfile.mkdtemp()
-os.environ["SOCCER_PREDICTIONS_DB"] = os.path.join(_TMP, "soccer.db")
-os.environ["TENNIS_PREDICTIONS_DB"] = os.path.join(_TMP, "tennis.db")
-os.environ["DASHBOARD_CACHE_DB"] = os.path.join(_TMP, "cache.db")
-os.environ["AUTO_RECALC"] = "0"   # don't start the hourly loop during tests
+os.environ["SPORTS_ENTRIES_DB"] = os.path.join(_TMP, "entries.db")
+os.environ.pop("TELEGRAM_BOT_TOKEN", None)   # keep Telegram unconfigured (no network) in tests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fastapi.testclient import TestClient  # noqa: E402
 import app as backend  # noqa: E402
-
-# Stub the network/subprocess model runs (their logic is covered in the skills'
-# offline suites); here we verify the sport-dispatch + cache wiring.
-backend._run_soccer = lambda date: {
-    "counts": {"total_markets": 0, "btts_markets": 0, "suggestions": 0, "skipped": 0},
-    "suggestions": [], "skipped": [], "disclaimer": "test"}
-backend._run_tennis = lambda date: {
-    "counts": {"matches": 0, "suggestions": 0, "skipped": 0},
-    "suggestions": [], "skipped": [], "disclaimer": "test"}
+import entries_store as es  # noqa: E402
+import results_combined as rc  # noqa: E402
+import telegram_notify as tg  # noqa: E402
 
 client = TestClient(backend.app)
 
 
-class TestApi(unittest.TestCase):
-    def test_health_lists_sports(self):
-        r = client.get("/api/health")
-        self.assertEqual(r.status_code, 200)
+def _entry(key, *, category="Soccer", subcategory="Over/Under gols", side="OVER",
+           odds=1.8, unit=1.0, confidence="Alta", live="PRÉ-LIVE", status="OPEN", pnl=None,
+           event="ARS vs CHE"):
+    return {"key": key, "event": event, "category": category, "subcategory": subcategory,
+            "side": side, "odds": odds, "entry_price": round(1 / odds, 4), "unit": unit,
+            "confidence": confidence, "live": live, "market_url": "https://polymarket.com/x",
+            "game_start": None, "status": status, "pnl": pnl}
+
+
+def _reset():
+    con = es.connect()
+    with con:
+        con.execute("DELETE FROM entries")
+    con.close()
+
+
+class TestIngestAndEntries(unittest.TestCase):
+    def setUp(self):
+        _reset()
+
+    def test_new_then_cards_by_category(self):
+        r = client.post("/api/copy/ingest", json={"entries": [
+            _entry("k1"), _entry("k2", category="Baseball", subcategory="Moneyline")]})
         body = r.json()
-        self.assertEqual(set(body["sports"]), {"soccer", "tennis"})
-        self.assertNotIn("mlb", body["sports"])
+        self.assertEqual(body["ingested"], 2)
+        self.assertEqual(body["new"], 2)
+        cards = client.get("/api/entries").json()
+        cats = {c["category"] for c in cards["categories"]}
+        self.assertIn("Soccer", cats)
+        self.assertIn("Baseball", cats)
+        self.assertEqual(cards["n_open"], 2)
 
-    def test_health_has_no_mlb_fields(self):
-        body = client.get("/api/health").json()
-        self.assertNotIn("mlb_db", body)
-        self.assertNotIn("odds_api_key", body)
-        self.assertNotIn("sharp_close", body)
-        self.assertIn("cache_db", body)
+    def test_upgrade_then_settle(self):
+        client.post("/api/copy/ingest", json={"entries": [_entry("u1", unit=0.5, confidence="Média")]})
+        up = client.post("/api/copy/ingest", json={"entries": [
+            _entry("u1", unit=1.0, confidence="Alta")]}).json()
+        self.assertEqual(up["upgrade"], 1)
+        # same unit again -> unchanged
+        same = client.post("/api/copy/ingest", json={"entries": [
+            _entry("u1", unit=1.0, confidence="Alta")]}).json()
+        self.assertEqual(same["unchanged"], 1)
+        # settle it
+        st = client.post("/api/copy/ingest", json={"entries": [
+            _entry("u1", unit=1.0, status="WON", pnl=80.0)]}).json()
+        self.assertEqual(st["settled"], 1)
+        # no longer open; shows in results
+        self.assertNotIn("u1", [e["key"] for c in client.get("/api/entries").json()["categories"]
+                                for e in c["entries"]])
+        res = client.get("/api/results").json()
+        self.assertGreaterEqual(res["overall"]["wins"], 1)
 
-    def test_mlb_endpoints_are_gone(self):
-        # The MLB-only routes were removed entirely.
-        self.assertEqual(client.get("/api/clv?sport=mlb").status_code, 404)
-        self.assertEqual(client.post("/api/capture-close").status_code, 404)
 
-    def test_unknown_sport_falls_back_to_soccer(self):
-        # An "mlb" (or any unknown) sport param normalizes to the soccer default.
-        self.assertEqual(client.get("/api/results?sport=mlb").json()["sport"], "soccer")
+class TestAuth(unittest.TestCase):
+    def test_token_required_when_set(self):
+        backend.COPY_INGEST_TOKEN = "secret"
+        try:
+            bad = client.post("/api/copy/ingest", json={"entries": [_entry("a1")]})
+            self.assertEqual(bad.json().get("error"), "unauthorized")
+            ok = client.post("/api/copy/ingest", json={"entries": [_entry("a1")]},
+                             headers={"Authorization": "Bearer secret"})
+            self.assertEqual(ok.json()["ingested"], 1)
+        finally:
+            backend.COPY_INGEST_TOKEN = ""
 
-    def test_seed_and_results_soccer(self):
-        self.assertGreater(
-            client.post("/api/seed-demo?sport=soccer&reset=true").json()["seeded"], 0)
-        body = client.get("/api/results?sport=soccer").json()
-        self.assertEqual(body["sport"], "soccer")
-        for w in ("daily", "weekly", "monthly"):
-            self.assertIn(w, body["performance"])
-        self.assertIn("roi", body["performance"]["monthly"])
-        self.assertGreater(len(body["recent"]), 0)
-        self.assertTrue(all(row.get("market_url") for row in body["recent"]))
-        self.assertTrue(any(r["market"] == "BTTS" for r in body["recent"]))
-        self.assertTrue(any(r["side"] in ("YES", "NO", "OVER", "UNDER") for r in body["recent"]))
 
-    def test_results_tennis_runs(self):
-        body = client.get("/api/results?sport=tennis").json()
-        self.assertEqual(body["sport"], "tennis")
-        self.assertIn("monthly", body["performance"])
+class TestResultsUnits(unittest.TestCase):
+    def test_unit_based_metrics(self):
+        # 1U won at 1.8 → +0.8U ; 1U lost → −1U  ⇒ pnl=−0.2U over 2U staked, win_rate 0.5
+        entries = [_entry("w", unit=1.0, odds=1.8, status="WON"),
+                   _entry("l", unit=1.0, odds=2.0, status="LOST")]
+        out = rc.combined(entries)
+        self.assertEqual(out["overall"]["wins"], 1)
+        self.assertEqual(out["overall"]["losses"], 1)
+        self.assertAlmostEqual(out["overall"]["pnl_u"], -0.2, places=3)
+        self.assertAlmostEqual(out["overall"]["staked_u"], 2.0, places=3)
+        self.assertAlmostEqual(out["overall"]["win_rate"], 0.5, places=3)
+        self.assertAlmostEqual(out["overall"]["roi"], -0.1, places=3)
+        # by_unit present with the 1U bucket
+        labels = {b["unit_label"] for b in out["by_unit"]}
+        self.assertIn("1U", labels)
 
-    def test_seed_demo_tennis_is_noop(self):
-        body = client.post("/api/seed-demo?sport=tennis&reset=true").json()
-        self.assertEqual(body["sport"], "tennis")
-        self.assertEqual(body["seeded"], 0)
 
-    def test_analyses_always_shows_pending_predictions(self):
-        # An open PENDENTE position the (stubbed, empty) recompute does NOT surface must
-        # still appear in the panel.
-        date = "2026-07-01"
-        backend.spdb.record_prediction({
-            "game_slug": "bra2-cui-lon-2026-07-01-total-1pt5", "game_date": date, "league": "bra2",
-            "market": "TOTAL", "line": 1.5, "side": "OVER", "entry_price": 0.55,
-            "decimal_odds": 1.82, "model_prob": 0.63, "edge": 0.08, "size_pct": 0.02,
-            "size_usd": 200.0, "confidence": 0.6, "kelly_fraction": 0.04, "used_external": 0,
-            "fee_rate": 0.0, "strategy": "divergence",
-            "market_url": "https://polymarket.com/event/bra2-cui-lon-2026-07-01",
-            "stats_log": "{}"}, backend.SOCCER_DB)
-        body = client.get(f"/api/analyses?sport=soccer&date={date}&force=true").json()
-        pend = [s for s in body["suggestions"] if s.get("status") == "PENDENTE"]
-        self.assertEqual(len(pend), 1)
-        self.assertEqual(pend[0]["game"], "bra2-cui-lon-2026-07-01-total-1pt5")
-        self.assertEqual(pend[0]["recommendation"]["price"], 0.55)   # PredictionCard needs this
-        self.assertGreaterEqual(body["counts"]["pending_shown"], 1)
+class TestTelegramFormat(unittest.TestCase):
+    def test_format_no_wallet_no_position(self):
+        msg = tg.format_entry(_entry("k", live="PRÉ-LIVE"))
+        self.assertIn("1U", msg)
+        self.assertIn("PRÉ-LIVE", msg)
+        self.assertIn("ARS vs CHE", msg)
+        self.assertNotIn("0x", msg)        # no wallet
+        self.assertNotIn("$", msg)         # no position size
 
-    def test_pending_not_duplicated_when_recompute_surfaces_it(self):
-        # Regression: a suggestion the recompute DID surface must not be doubled by the
-        # pending merge. Dedupe is by prediction_id.
-        date = "2026-07-02"
-        pid = backend.spdb.record_prediction({
-            "game_slug": "epl-ars-che-2026-07-02-total-2pt5", "game_date": date, "league": "epl",
-            "market": "TOTAL", "line": 2.5, "side": "OVER", "entry_price": 0.5,
-            "decimal_odds": 2.0, "model_prob": 0.6, "edge": 0.1, "size_pct": 0.02,
-            "size_usd": 200.0, "confidence": 0.6, "kelly_fraction": 0.04, "used_external": 0,
-            "fee_rate": 0.0, "strategy": "x", "market_url": "u", "stats_log": "{}"},
-            backend.SOCCER_DB)
-        model_sug = {"game": "epl-ars-che-2026-07-02-total-2pt5", "line": 2.5,
-                     "edge": 0.1, "prediction_id": pid,
-                     "recommendation": {"side": "OVER", "price": 0.5, "size_pct": 0.02}}
-        merged = backend._with_pending(
-            {"suggestions": [model_sug], "counts": {}}, "soccer", date)
-        same = [s for s in merged["suggestions"]
-                if s["game"] == "epl-ars-che-2026-07-02-total-2pt5"]
-        self.assertEqual(len(same), 1)                       # exactly one card, not two
-        self.assertEqual(merged["counts"]["pending_shown"], 0)
+    def test_send_uses_bot_api(self):
+        class _Resp:
+            def raise_for_status(self): pass
 
-    def test_hourly_scheduler_recomputes_and_caches(self):
-        # The top-of-hour scheduler refreshes the cache for both sports. Bound the sleep
-        # interval and verify _recalc_all writes a fresh payload (stubbed runners).
-        import asyncio
-        self.assertTrue(0 < backend._seconds_to_next_hour() <= 3600)
-        backend._RUNNERS["soccer"] = lambda d: {"counts": {}, "suggestions": [{"game": "g"}],
-                                                 "skipped": []}
-        backend._RUNNERS["tennis"] = lambda d: {"counts": {}, "suggestions": [], "skipped": []}
-        asyncio.run(backend._recalc_all())
-        today = backend._today()
-        self.assertIsNotNone(backend._cache_get("soccer", today))
-        self.assertIsNotNone(backend._cache_get("tennis", today))
+        class _Fake:
+            def __init__(self): self.calls = []
+            def post(self, url, json=None, timeout=None):
+                self.calls.append((url, json)); return _Resp()
+        c = _Fake()
+        ok = tg.send("hi", token="T", chat_id="C", client=c)
+        self.assertTrue(ok)
+        self.assertIn("/botT/sendMessage", c.calls[0][0])
+        self.assertEqual(c.calls[0][1]["chat_id"], "C")
 
-    def test_analyses_cache_per_sport(self):
-        r1 = client.get("/api/analyses?sport=soccer&date=2026-06-14")
-        self.assertEqual(r1.json()["sport"], "soccer")
-        self.assertFalse(r1.json()["cached"])
-        self.assertTrue(client.get("/api/analyses?sport=soccer&date=2026-06-14").json()["cached"])
-        # Tennis cache is independent of soccer's.
-        self.assertFalse(client.get("/api/analyses?sport=tennis&date=2026-06-14").json()["cached"])
-        self.assertTrue(client.get("/api/analyses?sport=tennis&date=2026-06-14").json()["cached"])
-        # force recomputes.
-        self.assertFalse(client.get("/api/analyses?sport=soccer&date=2026-06-14&force=true").json()["cached"])
-        # clear by sport.
-        client.post("/api/cache/clear?sport=soccer")
-        self.assertFalse(client.get("/api/analyses?sport=soccer&date=2026-06-14").json()["cached"])
+    def test_send_unconfigured_skips(self):
+        self.assertFalse(tg.send("hi", token="", chat_id=""))
+
+
+class TestHealth(unittest.TestCase):
+    def test_health(self):
+        b = client.get("/api/health").json()
+        self.assertEqual(b["status"], "ok")
+        self.assertIn("telegram", b)
 
 
 if __name__ == "__main__":
