@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import os
 import sys
+import traceback
 
-from fastapi import FastAPI, Header, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 import entries_store as es
@@ -109,31 +110,55 @@ def ingest(payload: dict, authorization: str | None = Header(default=None)) -> d
     return {"ingested": len(items), **counts}
 
 
+def _guard(name: str, fn):
+    """Run a read endpoint, logging any exception (full traceback to stderr) and
+    surfacing the error class+message in the HTTP 500 body — so both the server
+    log AND the browser console capture exactly what failed."""
+    try:
+        return fn()
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc(file=sys.stderr)
+        print(f"[{name}] ERROR: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
+
+
 @app.get("/api/entries")
 def entries(category: str | None = Query(None)) -> dict:
     """OPEN entries grouped by category (the cards). Categories with no open entry
     are absent. Optional ?category= filter."""
-    rows = es.list_open()
-    if category:
-        rows = [r for r in rows if (r.get("category") or "").lower() == category.lower()]
-    by_cat: dict[str, list] = {}
-    for r in rows:
-        by_cat.setdefault(r.get("category") or "Other", []).append(r)
-    categories = [{"category": c, "entries": v} for c, v in by_cat.items()]
-    categories.sort(key=lambda c: len(c["entries"]), reverse=True)
-    return {"n_open": len(rows), "categories": categories}
+    def _build() -> dict:
+        rows = es.list_open()
+        if category:
+            rows = [r for r in rows if (r.get("category") or "").lower() == category.lower()]
+        by_cat: dict[str, list] = {}
+        for r in rows:
+            by_cat.setdefault(r.get("category") or "Other", []).append(r)
+        categories = [{"category": c, "entries": v} for c, v in by_cat.items()]
+        categories.sort(key=lambda c: len(c["entries"]), reverse=True)
+        print(f"[entries] {len(rows)} open in {len(categories)} categor(ies)",
+              file=sys.stderr, flush=True)
+        return {"n_open": len(rows), "categories": categories}
+    return _guard("entries", _build)
 
 
 @app.get("/api/results")
 def results() -> dict:
     """Combined settled results (model + wallets together) in Unidade Sugerida."""
-    return rc.combined(es.list_settled())
+    def _build() -> dict:
+        settled = es.list_settled()
+        out = rc.combined(settled)
+        print(f"[results] {len(settled)} settled -> {len(out['by_category'])} categor(ies)",
+              file=sys.stderr, flush=True)
+        return out
+    return _guard("results", _build)
 
 
 @app.get("/api/results/bets")
 def results_bets(category: str | None = Query(None), page: int = Query(1, ge=1),
                  page_size: int = Query(20, ge=1, le=100)) -> dict:
     """Paginated list of the settled bets of a category (the drill-down detail)."""
-    offset = (page - 1) * page_size
-    return {"total": es.count_settled(category), "page": page, "page_size": page_size,
-            "bets": es.list_settled_page(category, offset, page_size)}
+    def _build() -> dict:
+        offset = (page - 1) * page_size
+        return {"total": es.count_settled(category), "page": page, "page_size": page_size,
+                "bets": es.list_settled_page(category, offset, page_size)}
+    return _guard("results/bets", _build)
