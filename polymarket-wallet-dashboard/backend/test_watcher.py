@@ -143,5 +143,30 @@ class TestPollWalletPersists(unittest.TestCase):
             _ = captured
 
 
+class TestPersistBets(unittest.TestCase):
+    def test_persist_open_then_settled(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "w.db")
+            ws.add_wallet(WALLET["name"], WALLET["address"], {"n_markets": 0},
+                          WALLET["thresholds"], db_path=db)
+            wallet = ws.get_wallet(ws.list_wallets(db)[0]["id"], db)
+            # open at Alta -> wallet_bets row OPEN
+            w.persist_bets(wallet, [_pos("c1", 45000)], db)
+            bets = ws.list_bets(wallet["id"], db)
+            self.assertEqual(len(bets), 1)
+            self.assertEqual(bets[0]["status"], "OPEN")
+            self.assertEqual(bets[0]["confidence"], "Alta")
+            self.assertAlmostEqual(bets[0]["total_position"], 45000.0)
+            # resolves -> same row updated to WON with pnl
+            w.persist_bets(wallet, [_pos("c1", 45000, redeemable=True, cashPnl=120.0)], db)
+            bets = ws.list_bets(wallet["id"], db)
+            self.assertEqual(len(bets), 1)                       # upsert, not a new row
+            self.assertEqual(bets[0]["status"], "WON")
+            self.assertAlmostEqual(bets[0]["pnl"], 120.0)
+            # below-floor positions are not tracked
+            w.persist_bets(wallet, [_pos("c2", 300)], db)
+            self.assertEqual(len(ws.list_bets(wallet["id"], db)), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
