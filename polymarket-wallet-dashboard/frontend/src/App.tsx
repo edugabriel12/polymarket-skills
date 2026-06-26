@@ -2,8 +2,9 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { useTheme } from "@/components/ThemeProvider";
 import { CarteirasTab } from "@/components/CarteirasTab";
+import { PendentesTab } from "@/components/PendentesTab";
 import { SeparatedResultsTab } from "@/components/SeparatedResultsTab";
-import { Moon, Sun, Wallet, Trophy } from "lucide-react";
+import { Moon, Sun, Wallet, Trophy, Clock } from "lucide-react";
 
 export default function App() {
   const { theme, toggle } = useTheme();
@@ -35,12 +36,18 @@ export default function App() {
             <TabsTrigger value="carteiras">
               <Wallet className="h-4 w-4" /> Carteiras
             </TabsTrigger>
+            <TabsTrigger value="pendentes">
+              <Clock className="h-4 w-4" /> Pendentes
+            </TabsTrigger>
             <TabsTrigger value="resultados">
               <Trophy className="h-4 w-4" /> Resultados
             </TabsTrigger>
           </TabsList>
           <TabsContent value="carteiras">
             <CarteirasTab />
+          </TabsContent>
+          <TabsContent value="pendentes">
+            <PendentesTab />
           </TabsContent>
           <TabsContent value="resultados">
             <SeparatedResultsTab />

@@ -121,3 +121,43 @@ def model_bets(category: str, offset: int, limit: int) -> dict:
     rows.sort(key=lambda r: (r.get("settled_at") or ""), reverse=True)
     page = rows[offset:offset + limit]
     return {"total": len(rows), "bets": [_row_to_bet(r, category, cat_en) for r in page]}
+
+
+def _row_to_open_bet(r: dict, category: str, cat_en: str) -> dict:
+    """A PENDENTE prediction → the open-bet row shape (no result, no P&L yet)."""
+    import subcategory as sc
+    slug = r.get("game_slug") or r.get("match_slug") or ""
+    ep = _f(r.get("entry_price"))
+    odds = _f(r.get("decimal_odds")) or ((1.0 / ep) if ep > 0 else 0.0)
+    title = r.get("market_question") or _pretty(slug)
+    return {
+        "key": f"model-open-{slug}-{r.get('side','')}", "event": title, "category": category,
+        "subcategory": sc.classify(cat_en, title, slug, ""), "side": r.get("side") or "",
+        "odds": round(odds, 4), "entry_price": round(ep, 4), "unit": 1.0, "confidence": "Alta",
+        "live": "PRÉ-LIVE", "market_url": r.get("market_url"),
+        "status": "OPEN", "pnl": None,
+        "updated_at": r.get("updated_at") or r.get("created_at"),
+    }
+
+
+def _open_rows_for(category: str) -> list[dict]:
+    """All PENDENTE predictions of one model category, mapped to open-bet rows."""
+    store, db, cat_en = _store_for(category)
+    if not store:
+        return []
+    try:
+        rows = [r for r in store.get_predictions(db) if r.get("status") == "PENDENTE"]
+    except Exception as e:  # noqa: BLE001
+        print(f"[model-open-bets] {category} skipped: {e}", file=sys.stderr, flush=True)
+        return []
+    return [_row_to_open_bet(r, category, cat_en) for r in rows]
+
+
+def model_open_bets(category: str | None, offset: int, limit: int) -> dict:
+    """Paginated OPEN (PENDENTE) model predictions. category=None merges Futebol + Tênis."""
+    cats = [category] if category else ["Futebol", "Tênis"]
+    bets: list[dict] = []
+    for c in cats:
+        bets.extend(_open_rows_for(c))
+    bets.sort(key=lambda b: (b.get("updated_at") or ""), reverse=True)
+    return {"total": len(bets), "bets": bets[offset:offset + limit]}

@@ -160,6 +160,10 @@ export const wallets = {
     jget<DashBetsPage>(
       `/api/model-bets?category=${encodeURIComponent(category)}&page=${page}&page_size=${pageSize}`
     ),
+  openBets: (id: number, page: number, pageSize = 20) =>
+    jget<DashBetsPage>(`/api/wallets/${id}/open-bets?page=${page}&page_size=${pageSize}`),
+  modelOpenBets: (page: number, pageSize = 20) =>
+    jget<DashBetsPage>(`/api/model-open-bets?page=${page}&page_size=${pageSize}`),
   add: async (name: string, address: string, file: File) => {
     const fd = new FormData();
     fd.append("name", name);
