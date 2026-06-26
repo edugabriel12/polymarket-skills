@@ -38,6 +38,11 @@ function WalletView({ id }: { id: number }) {
   const a = rec.analysis;
   return (
     <div className="space-y-6">
+      {!!a.live_settled && (
+        <div className="rounded-xl bg-sky-500/10 px-3 py-1.5 text-xs font-semibold text-sky-400">
+          CSV + {a.live_settled} aposta(s) ao vivo liquidada(s)
+        </div>
+      )}
       <KpiCards overall={a.overall} nMarkets={a.n_markets} nTrades={a.n_trades} />
       {a.by_confidence && a.by_confidence.length > 0 && <ConfidenceBreakdown buckets={a.by_confidence} />}
       <CategoryBreakdown categories={a.by_category} />

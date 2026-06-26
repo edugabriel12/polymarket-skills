@@ -56,6 +56,7 @@ export interface WalletReport {
   by_confidence?: ConfidenceBucket[];
   by_category: Category[];
   markets?: MarketRecord[];
+  live_settled?: number;   // live watched bets merged into this snapshot (Phase 2)
   demo?: boolean;
   error?: string;
 }

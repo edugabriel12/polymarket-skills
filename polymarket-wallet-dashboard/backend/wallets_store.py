@@ -45,7 +45,22 @@ CREATE TABLE IF NOT EXISTS settled_markets (
     at           TEXT NOT NULL,
     PRIMARY KEY (wallet_id, condition_id)
 );
+-- Phase 2: live watched bets per wallet (latest state per market), so the wallet's
+-- separated Resultados can merge them with the CSV snapshot. One row per (wallet, market).
+CREATE TABLE IF NOT EXISTS wallet_bets (
+    wallet_id      INTEGER NOT NULL,
+    condition_id   TEXT NOT NULL,
+    category       TEXT, subcategory TEXT, confidence TEXT, side TEXT,
+    total_position REAL, entry_price REAL, odds REAL,
+    status         TEXT NOT NULL DEFAULT 'OPEN',
+    pnl            REAL,
+    updated_at     TEXT NOT NULL,
+    PRIMARY KEY (wallet_id, condition_id)
+);
 """
+
+_BET_FIELDS = ("category", "subcategory", "confidence", "side", "total_position",
+               "entry_price", "odds", "status", "pnl")
 
 
 def _now() -> str:
@@ -131,6 +146,7 @@ def delete_wallet(wallet_id: int, db_path: str = DEFAULT_DB) -> bool:
         with con:
             con.execute("DELETE FROM seen_alerts WHERE wallet_id=?", (wallet_id,))
             con.execute("DELETE FROM settled_markets WHERE wallet_id=?", (wallet_id,))
+            con.execute("DELETE FROM wallet_bets WHERE wallet_id=?", (wallet_id,))
             cur = con.execute("DELETE FROM wallets WHERE id=?", (wallet_id,))
             return cur.rowcount > 0
     finally:
@@ -177,5 +193,31 @@ def mark_settled(wallet_id: int, condition_id: str, db_path: str = DEFAULT_DB) -
         with con:
             con.execute("INSERT OR IGNORE INTO settled_markets(wallet_id, condition_id, at) "
                         "VALUES(?,?,?)", (wallet_id, condition_id, _now()))
+    finally:
+        con.close()
+
+
+# --- live wallet bets (Phase 2) --------------------------------------------
+def upsert_bet(wallet_id: int, condition_id: str, bet: dict,
+               db_path: str = DEFAULT_DB) -> None:
+    """Upsert the latest state of one watched market for a wallet."""
+    con = connect(db_path)
+    try:
+        with con:
+            con.execute(
+                f"INSERT INTO wallet_bets(wallet_id, condition_id, {','.join(_BET_FIELDS)}, "
+                f"updated_at) VALUES(?,?{',?' * len(_BET_FIELDS)},?) "
+                f"ON CONFLICT(wallet_id, condition_id) DO UPDATE SET "
+                f"{','.join(f'{f}=excluded.{f}' for f in _BET_FIELDS)}, updated_at=excluded.updated_at",
+                (wallet_id, condition_id, *[bet.get(f) for f in _BET_FIELDS], _now()))
+    finally:
+        con.close()
+
+
+def list_bets(wallet_id: int, db_path: str = DEFAULT_DB) -> list[dict]:
+    con = connect(db_path)
+    try:
+        return [{k: r[k] for k in r.keys()} for r in con.execute(
+            "SELECT * FROM wallet_bets WHERE wallet_id=?", (wallet_id,))]
     finally:
         con.close()

@@ -113,9 +113,10 @@ async def add_wallet(name: str = Form(...), address: str = Form(...),
     if not records:
         return {"error": "CSV vazio ou sem linhas reconhecidas"}
     analysis = wr.rollup_csv(records)
+    analysis["records"] = records          # kept for Phase-2 merging with live bets
     thresholds = cm.derive_thresholds(records)
     wid = ws.add_wallet(name, addr, analysis, thresholds, file.filename)
-    return ws.get_wallet(wid)
+    return _wallet_with_live(wid)
 
 
 @app.get("/api/wallets")
@@ -123,10 +124,20 @@ def list_wallets() -> dict:
     return {"wallets": ws.list_wallets()}
 
 
+def _wallet_with_live(wallet_id: int) -> dict:
+    """Wallet record whose `analysis` is the CSV snapshot MERGED with live settled bets."""
+    import wallet_results as wres
+    w = ws.get_wallet(wallet_id)
+    if not w:
+        return {"error": "carteira não encontrada"}
+    records = (w.get("analysis") or {}).get("records", [])
+    w["analysis"] = wres.merged_analysis(records, ws.list_bets(wallet_id))
+    return w
+
+
 @app.get("/api/wallets/{wallet_id}")
 def get_wallet(wallet_id: int) -> dict:
-    w = ws.get_wallet(wallet_id)
-    return w or {"error": "carteira não encontrada"}
+    return _wallet_with_live(wallet_id)
 
 
 @app.delete("/api/wallets/{wallet_id}")

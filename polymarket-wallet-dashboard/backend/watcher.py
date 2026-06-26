@@ -37,26 +37,57 @@ def _cond(pos: dict) -> str:
     return str(pos.get("conditionId") or pos.get("market") or "")
 
 
-def _entry_for_position(wallet: dict, pos: dict, tier: dict,
-                        status: str = "OPEN", pnl: float | None = None) -> dict:
+def _market_fields(pos: dict) -> dict:
+    """Common parsed fields for a position (reused by the entry + the persisted bet)."""
     title = wa.sanitize_text(pos.get("title"))
     slug = pos.get("slug", "")
     eslug = pos.get("eventSlug", "")
     side = wa.sanitize_text(pos.get("outcome") or "")
     price = wa.to_float(pos.get("avgPrice")) or wa.to_float(pos.get("curPrice"))
-    odds = (1.0 / price) if price > 0 else 0.0
     # Live position titles can be plain club matchups ("Arsenal vs Chelsea") with no
-    # soccer keyword; the SLUG carries the league prefix (epl-/bra-/mlb-/nba-…), so
-    # include it in the category text.
+    # soccer keyword; the SLUG carries the league prefix (epl-/bra-/mlb-/nba-…).
     category = csv_parser.classify_event(f"{title} {slug} {eslug}", side)
-    start = pos.get("gameStartTime") or pos.get("startDate")
+    return {
+        "title": title, "slug": slug, "side": side.upper(), "price": price,
+        "odds": (1.0 / price) if price > 0 else 0.0, "category": category,
+        "subcategory": sc.classify(category, title, slug, eslug),
+        "start": pos.get("gameStartTime") or pos.get("startDate"),
+        "url": pos.get("url") or (f"https://polymarket.com/event/{slug}" if slug else None),
+    }
+
+
+def _entry_for_position(wallet: dict, pos: dict, tier: dict,
+                        status: str = "OPEN", pnl: float | None = None) -> dict:
+    f = _market_fields(pos)
     return en.make_entry(
         key=en.make_key(wallet["address"], _cond(pos)),       # one entry per (wallet, market)
-        event=title, category=category, subcategory=sc.classify(category, title, slug, eslug),
-        side=side.upper(), odds=odds, entry_price=price, unit=tier["unit"],
-        confidence=tier["confidence"], live=en.live_flag(start),
-        market_url=pos.get("url") or (f"https://polymarket.com/event/{slug}" if slug else None),
-        game_start=start, source=wallet.get("name", ""), status=status, pnl=pnl)
+        event=f["title"], category=f["category"], subcategory=f["subcategory"],
+        side=f["side"], odds=f["odds"], entry_price=f["price"], unit=tier["unit"],
+        confidence=tier["confidence"], live=en.live_flag(f["start"]),
+        market_url=f["url"], game_start=f["start"],
+        source=wallet.get("name", ""), status=status, pnl=pnl)
+
+
+def persist_bets(wallet: dict, positions: list, db_path: str = ws.DEFAULT_DB) -> None:
+    """Upsert the latest state of every tiered market into wallet_bets (Phase 2), so the
+    wallet's separated Resultados can merge live settled bets with the CSV snapshot."""
+    th = wallet.get("thresholds") or {}
+    for pos in positions:
+        cond = _cond(pos)
+        if not cond:
+            continue
+        tier = cm.classify_position(_total_position(pos), th)
+        if not tier:
+            continue
+        f = _market_fields(pos)
+        resolved = _is_resolved(pos)
+        pnl = wa.to_float(pos.get("cashPnl")) if resolved else None
+        status = (("WON" if pnl > 0 else "LOST" if pnl < 0 else "VOID") if resolved else "OPEN")
+        ws.upsert_bet(wallet["id"], cond, {
+            "category": f["category"], "subcategory": f["subcategory"],
+            "confidence": tier["confidence"], "side": f["side"],
+            "total_position": _total_position(pos), "entry_price": f["price"],
+            "odds": f["odds"], "status": status, "pnl": pnl}, db_path)
 
 
 def detect_entries(wallet: dict, positions: list, seen_conf: dict) -> tuple[list, list]:
@@ -119,6 +150,7 @@ def poll_wallet(api, wallet: dict, db_path: str = ws.DEFAULT_DB) -> list:
         print(f"[watcher] {wallet.get('name')}: fetch failed — {e}", file=sys.stderr, flush=True)
         return []
     wid = wallet["id"]
+    persist_bets(wallet, positions, db_path)          # Phase 2: keep live bet state per wallet
     seen_conf = ws.seen_confidences(wid, db_path)
     settled = ws.settled_keys(wid, db_path)
 
