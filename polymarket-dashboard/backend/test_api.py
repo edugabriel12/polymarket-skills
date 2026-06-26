@@ -74,6 +74,34 @@ class TestIngestAndEntries(unittest.TestCase):
         self.assertGreaterEqual(res["overall"]["wins"], 1)
 
 
+class TestResultsBetsPagination(unittest.TestCase):
+    def setUp(self):
+        _reset()
+
+    def test_paginated_by_category(self):
+        # 25 settled Soccer + 3 Baseball
+        for i in range(25):
+            client.post("/api/copy/ingest", json={"entries": [
+                _entry(f"s{i}", category="Soccer", status="WON", pnl=10.0)]})
+        for i in range(3):
+            client.post("/api/copy/ingest", json={"entries": [
+                _entry(f"b{i}", category="Baseball", status="LOST", pnl=-10.0)]})
+
+        p1 = client.get("/api/results/bets?category=Soccer&page=1&page_size=20").json()
+        self.assertEqual(p1["total"], 25)
+        self.assertEqual(len(p1["bets"]), 20)
+        self.assertTrue(all(b["category"] == "Soccer" for b in p1["bets"]))
+        p2 = client.get("/api/results/bets?category=Soccer&page=2&page_size=20").json()
+        self.assertEqual(len(p2["bets"]), 5)
+        # bet rows carry the detail fields
+        b = p1["bets"][0]
+        for k in ("event", "side", "subcategory", "unit", "odds", "status", "pnl", "market_url"):
+            self.assertIn(k, b)
+        # no category filter -> all settled
+        allb = client.get("/api/results/bets?page=1&page_size=100").json()
+        self.assertEqual(allb["total"], 28)
+
+
 class TestAuth(unittest.TestCase):
     def test_token_required_when_set(self):
         backend.COPY_INGEST_TOKEN = "secret"

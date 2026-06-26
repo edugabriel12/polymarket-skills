@@ -5,6 +5,7 @@ import { ChevronRight, Trophy, Layers, TrendingUp, Percent } from "lucide-react"
 import { Card } from "@/components/ui/card";
 import { cn, pct } from "@/lib/utils";
 import { api, type CategoryResult, type UnitMetrics } from "@/lib/api";
+import { BetList } from "@/components/BetList";
 
 const signedU = (v: number) => `${v >= 0 ? "+" : "-"}${Math.abs(v).toFixed(2)}U`;
 const pnlCls = (v: number) => (v > 0 ? "text-emerald-500" : v < 0 ? "text-rose-500" : "text-muted-foreground");
@@ -60,13 +61,16 @@ function CategoryRow({ c }: { c: CategoryResult }) {
       <AnimatePresence initial={false}>
         {open && (
           <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.2 }} className="overflow-hidden border-t border-border">
-            <div className="space-y-1.5 p-3">
-              {c.by_unit.map((u) => (
-                <div key={u.unit_label} className="flex items-center justify-between gap-4 rounded-lg bg-muted/40 px-3 py-2">
-                  <div className="text-sm font-bold">{u.unit_label}</div>
-                  <div className="w-[70%]"><UnitStrip m={u} /></div>
-                </div>
-              ))}
+            <div className="space-y-3 p-3">
+              <div className="space-y-1.5">
+                {c.by_unit.map((u) => (
+                  <div key={u.unit_label} className="flex items-center justify-between gap-4 rounded-lg bg-muted/40 px-3 py-2">
+                    <div className="text-sm font-bold">{u.unit_label}</div>
+                    <div className="w-[70%]"><UnitStrip m={u} /></div>
+                  </div>
+                ))}
+              </div>
+              <BetList category={c.category} />
             </div>
           </motion.div>
         )}

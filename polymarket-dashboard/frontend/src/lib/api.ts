@@ -70,9 +70,20 @@ export interface TelegramSaveResult {
   error?: string | null;
 }
 
+export interface BetsPage {
+  total: number;
+  page: number;
+  page_size: number;
+  bets: Entry[];
+}
+
 export const api = {
   entries: () => get<EntriesResponse>("/api/entries"),
   results: () => get<ResultsResponse>("/api/results"),
+  resultsBets: (category: string, page: number, pageSize = 20) =>
+    get<BetsPage>(
+      `/api/results/bets?category=${encodeURIComponent(category)}&page=${page}&page_size=${pageSize}`
+    ),
   telegramStatus: () => get<TelegramStatus>("/api/telegram"),
   telegramSave: async (token: string): Promise<TelegramSaveResult> => {
     const r = await fetch("/api/telegram", {

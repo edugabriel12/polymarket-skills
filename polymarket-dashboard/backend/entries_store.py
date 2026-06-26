@@ -116,3 +116,35 @@ def list_settled(db_path: str = DEFAULT_DB) -> list[dict]:
             "ORDER BY updated_at DESC")]
     finally:
         con.close()
+
+
+_SETTLED = "status IN ('WON','LOST','VOID')"
+
+
+def count_settled(category: str | None = None, db_path: str = DEFAULT_DB) -> int:
+    con = connect(db_path)
+    try:
+        if category:
+            return con.execute(f"SELECT COUNT(*) FROM entries WHERE {_SETTLED} AND category=?",
+                               (category,)).fetchone()[0]
+        return con.execute(f"SELECT COUNT(*) FROM entries WHERE {_SETTLED}").fetchone()[0]
+    finally:
+        con.close()
+
+
+def list_settled_page(category: str | None, offset: int, limit: int,
+                      db_path: str = DEFAULT_DB) -> list[dict]:
+    """Settled entries (optionally by category), newest first, paginated."""
+    con = connect(db_path)
+    try:
+        if category:
+            rows = con.execute(
+                f"SELECT * FROM entries WHERE {_SETTLED} AND category=? "
+                f"ORDER BY updated_at DESC LIMIT ? OFFSET ?", (category, limit, offset))
+        else:
+            rows = con.execute(
+                f"SELECT * FROM entries WHERE {_SETTLED} ORDER BY updated_at DESC "
+                f"LIMIT ? OFFSET ?", (limit, offset))
+        return [_row(r) for r in rows]
+    finally:
+        con.close()
