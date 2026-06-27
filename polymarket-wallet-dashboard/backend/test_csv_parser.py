@@ -152,5 +152,50 @@ class TestTennisHeadToHead(unittest.TestCase):
         self.assertEqual([s["subcategory"] for s in ten["subcategories"]], ["Vencedor da partida"])
 
 
+class TestClassifierHardening(unittest.TestCase):
+    """Market-type + O/U line-magnitude precedence — the cases that the soccer `o/u` signal and
+    team-nickname collisions used to mis-route (validated against the DaBossHogg history)."""
+
+    def test_tennis_total_games_and_set_handicap(self):
+        self.assertEqual(cp.classify_event("Cobolli vs. Zverev: Match O/U 36.5", "OVER"), "Tennis")
+        self.assertEqual(cp.classify_event("Maria vs. Keys: Match O/U 21.5", "OVER"), "Tennis")
+        self.assertEqual(cp.classify_event("Set Handicap: Osaka (-1.5) vs Wang (+1.5)", "OSAKA"), "Tennis")
+
+    def test_combat_rounds_and_method(self):
+        self.assertEqual(cp.classify_event("O/U 1.5 Rounds", "UNDER"), "Combat Sports")
+        self.assertEqual(cp.classify_event("Will Josh Hokit win by KO or TKO?", "YES"), "Combat Sports")
+
+    def test_soccer_goalscorer_props(self):
+        self.assertEqual(cp.classify_event("Harry Kane: 1+ goals", "YES"), "Soccer")
+        self.assertEqual(cp.classify_event("Erling Haaland: Anytime Goalscorer", "YES"), "Soccer")
+
+    def test_basketball_player_props(self):
+        self.assertEqual(cp.classify_event("Donovan Mitchell: Points O/U 26.5", "YES"), "Basketball")
+        self.assertEqual(cp.classify_event("Victor Wembanyama: Rebounds O/U 12.5", "YES"), "Basketball")
+
+    def test_line_magnitude_beats_nickname_collisions(self):
+        # College games whose nicknames collide with MLB/NHL must stay Basketball (line >= 100).
+        self.assertEqual(cp.classify_event("Louisville Cardinals vs. Michigan State Spartans: O/U 151.5", "OVER"), "Basketball")
+        self.assertEqual(cp.classify_event("Utah State Aggies vs. Arizona Wildcats: O/U 154.5", "OVER"), "Basketball")
+        self.assertEqual(cp.classify_event("Spurs vs. Knicks: 1H O/U 112.5", "UNDER"), "Basketball")
+
+    def test_ou_line_routes_other_sports(self):
+        self.assertEqual(cp.classify_event("Los Angeles Dodgers vs. Minnesota Twins: O/U 9.5", "OVER"), "Baseball")
+        self.assertEqual(cp.classify_event("Golden Knights vs. Hurricanes: O/U 5.5", "OVER"), "Hockey")
+        self.assertEqual(cp.classify_event("Morocco vs. Haiti: O/U 5.5", "OVER"), "Soccer")
+
+    def test_soccer_corners_not_baseball(self):
+        self.assertEqual(cp.classify_event("Arsenal FC vs. Burnley FC: O/U 10.5 Total Corners", "UNDER"), "Soccer")
+
+    def test_college_moneyline_without_line(self):
+        self.assertEqual(cp.classify_event("Houston Cougars vs. Arizona Wildcats", "ARIZONA WILDCATS"), "Basketball")
+
+    def test_wbc_final_stage(self):
+        self.assertEqual(cp.classify_event("Final Stage: Dominican Rep. vs. USA", "USA"), "Baseball")
+
+    def test_crypto(self):
+        self.assertEqual(cp.classify_event("Bitcoin Up or Down - March 19, 10:20PM-10:25PM ET", "UP"), "Crypto")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

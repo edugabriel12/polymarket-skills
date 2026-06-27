@@ -87,6 +87,14 @@ _MLB = _words(
     "diamondbacks", "giants", "reds", "guardians", "padres", "astros", "yankees",
     "blue jays", "tigers", "twins", "angels", "athletics", "orioles", "rangers",
     "white sox", "mariners")
+# College (NCAA) basketball nicknames — only needed for the rare college game with NO O/U line
+# (an O/U line already routes to Basketball by magnitude). Tokens picked to avoid pro collisions
+# (so NOT "cardinals"/"tigers"/"hurricanes"/"royals", which are disambiguated by line magnitude).
+_COLLEGE = _words(
+    "red storm", "wildcats", "cougars", "jayhawks", "cyclones", "boilermakers", "spartans",
+    "blue devils", "billikens", "wolverines", "lancers", "hawkeyes", "redhawks", "volunteers",
+    "zips", "red raiders", "broncos", "longhorns", "buckeyes", "wolfpack", "razorbacks",
+    "commodores", "cornhuskers", "horned frogs", "fighting illini", "aggies")
 
 # Soccer market phrasings (with non-US-league events => national-team soccer here).
 _SOCCER_SIGNAL = re.compile(
@@ -95,19 +103,66 @@ _SOCCER_SIGNAL = re.compile(
 
 # Tennis head-to-head shape: "{Tournament}: {Player} vs {Player}". Challenger/ITF/qualifying
 # events often carry no tour keyword (atp/wta/wimbledon), so the keyword classifier drops them
-# into "Other". This structure recovers them — but it's applied ONLY when keyword classification
-# already gave up, so soccer/esports/combat "A vs B" matches (caught earlier or by keyword) are
-# never stolen.
+# into "Other". This structure recovers them — applied ONLY when keyword classification already
+# gave up, so soccer/esports/combat "A vs B" matches are never stolen.
 _TENNIS_H2H = re.compile(r":\s*.+\bvs\b\.?\s+.+", re.I)
+
+# Over/Under line magnitude — the most reliable cross-sport signal, immune to team-nickname
+# collisions (college "Utah State"/"Cardinals"/"Tigers" vs NHL/MLB nicknames).
+_OU_LINE = re.compile(r"o/u\s*(\d+(?:\.\d+)?)", re.I)
+
+
+def _ou_line(blob: str) -> float | None:
+    m = _OU_LINE.search(blob)
+    return float(m.group(1)) if m else None
 
 
 def classify_event(event: str, side: str) -> str:
+    """Category for one market from its text. Layered so specific market-type and line-magnitude
+    signals win before the broad team-nickname / keyword fallbacks (which over-grabbed before:
+    the soccer `o/u` signal stole tennis/MMA/basketball totals; college nicknames collided with
+    NHL/MLB). Used by the CSV analysis AND by the live watcher (fallback when no Gamma tag)."""
     blob = f"{event} {side}".lower()
-    if "ufc" in blob or re.search(r"\bmma\b", blob):
+    # 1. Crypto
+    if "bitcoin" in blob or "up or down" in blob:
+        return "Crypto"
+    # 2. Combat (UFC/MMA): explicit, round totals, or method-of-victory
+    if ("ufc" in blob or re.search(r"\bmma\b", blob) or "by ko or tko" in blob
+            or ("rounds" in blob and "o/u" in blob)):
         return "Combat Sports"
+    # 3. Tennis market types with no tour keyword: total games & set handicap
+    #    (tournament-winner "{Tournament}: A vs B" is recovered by _TENNIS_H2H at the end).
+    if "match o/u" in blob or "set handicap" in blob:
+        return "Tennis"
+    # 4. Soccer goalscorer props ("X: 1+ goals", "X: Anytime Goalscorer")
+    if "1+ goals" in blob or "goalscorer" in blob:
+        return "Soccer"
+    # 5. Basketball player props ("X: Points/Rebounds/Assists O/U")
+    if re.search(r"\b(?:points|rebounds|assists)\b\s*o/u", blob):
+        return "Basketball"
+    # 6. World Baseball Classic knockout ("Final Stage: <country> vs <country>") — un-classifiable
+    #    from text alone, so a narrow special-case (the live path resolves it via Gamma tags).
+    if "final stage" in blob and "dominican" in blob:
+        return "Baseball"
+    # 7. Soccer corners
+    if "corners" in blob:
+        return "Soccer"
+    # 8. Over/Under markets — line magnitude decides, and it beats nickname collisions.
+    line = _ou_line(blob)
+    if line is not None:
+        if line >= 100:
+            return "Basketball"     # NBA ~200+, NCAA ~130-170, WNBA ~155-180, 1st-half ~105-115
+        if _NHL.search(blob):
+            return "Hockey"         # NHL totals ~5.5-7.5
+        if line >= 6.5:
+            return "Baseball"       # MLB totals ~6.5-19.5
+        return "Soccer"             # soccer goals ~1.5-5.5
+    # 9. No O/U line: wording, then team nickname, then keyword/structural fallback.
+    if "both teams to score" in blob or "end in a draw" in blob or "exact score" in blob:
+        return "Soccer"
     if _NHL.search(blob):
         return "Hockey"
-    if _WNBA.search(blob) or _NBA.search(blob):
+    if _WNBA.search(blob) or _NBA.search(blob) or _COLLEGE.search(blob):
         return "Basketball"
     if _MLB.search(blob):
         return "Baseball"
