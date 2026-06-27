@@ -105,6 +105,17 @@ class TestSettlePendingModels(unittest.TestCase):
             mr.settle_pending_models = orig
         self.assertEqual(len(calls), 1)
 
+    def test_model_open_bets_settles_only_on_first_page(self):
+        calls = []
+        orig = mr.settle_pending_models
+        mr.settle_pending_models = lambda: calls.append(1)
+        try:
+            mr.model_open_bets(None, 0, 20)                   # abrir Pendentes (1ª página) -> liquida
+            mr.model_open_bets(None, 20, 20)                  # página 2 -> NÃO liquida de novo
+        finally:
+            mr.settle_pending_models = orig
+        self.assertEqual(len(calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

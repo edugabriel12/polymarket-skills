@@ -192,7 +192,13 @@ def _open_rows_for(category: str) -> list[dict]:
 
 
 def model_open_bets(category: str | None, offset: int, limit: int) -> dict:
-    """Paginated OPEN (PENDENTE) model predictions. category=None merges Futebol + Tênis."""
+    """Paginated OPEN (PENDENTE) model predictions. category=None merges Futebol + Tênis.
+
+    On the first page (offset 0 = tab open) finished PENDENTE rows are settled first, so the
+    pending list shows only what's genuinely still open. Skipped on later pages to avoid
+    re-settling on every pagination click."""
+    if offset == 0:
+        settle_pending_models()
     cats = [category] if category else ["Futebol", "Tênis"]
     bets: list[dict] = []
     for c in cats:
