@@ -272,5 +272,53 @@ class TestFilterSettleConsistency(unittest.TestCase):
                 w.wa.fetch_positions = orig
 
 
+class TestTagCategory(unittest.TestCase):
+    """Tags-first resolver: Polymarket's own category (Gamma tags) wins, cached per event,
+    with the keyword/structural classifier as the fallback."""
+
+    def _patch_tags(self, tags):
+        calls = []
+        self._orig = w.wa.fetch_event_tags
+        w.wa.fetch_event_tags = lambda api, slug: (calls.append(slug), tags)[1]
+        return calls
+
+    def tearDown(self):
+        if hasattr(self, "_orig"):
+            w.wa.fetch_event_tags = self._orig
+
+    def test_resolve_prefers_specific_over_generic_and_caches(self):
+        calls = self._patch_tags(["sports", "tennis"])     # generic + specific -> specific wins
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "w.db")
+            self.assertEqual(w.resolve_category(object(), "atp-foo", db), "Tennis")
+            self.assertEqual(w.resolve_category(object(), "atp-foo", db), "Tennis")   # cached
+            self.assertEqual(len(calls), 1)                # fetched once, then served from cache
+
+    def test_miss_is_cached_not_refetched(self):
+        calls = self._patch_tags([])                       # no mapped tag
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "w.db")
+            self.assertIsNone(w.resolve_category(object(), "mystery", db))
+            self.assertIsNone(w.resolve_category(object(), "mystery", db))
+            self.assertEqual(len(calls), 1)                # known miss cached -> keyword fallback
+
+    def test_no_event_slug_no_network(self):
+        calls = self._patch_tags(["tennis"])
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(w.resolve_category(object(), None, os.path.join(d, "w.db")))
+        self.assertEqual(calls, [])                         # no slug -> never calls Gamma
+
+    def test_market_fields_prefers_tag_category(self):
+        pos = _pos("c1", 45000, title="Felix Balshaw vs Martin Krumich", slug="atp-targu-mures")
+        pos["_category"] = "Tennis"                         # as stamped by _enrich_categories
+        f = w._market_fields(pos)
+        self.assertEqual(f["category"], "Tennis")
+        self.assertEqual(f["subcategory"], "Vencedor da partida")
+
+    def test_market_fields_falls_back_to_keyword(self):
+        f = w._market_fields(_pos("c1", 45000))            # default slug epl-… -> Soccer
+        self.assertEqual(f["category"], "Soccer")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

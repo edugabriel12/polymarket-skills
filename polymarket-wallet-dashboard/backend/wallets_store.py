@@ -59,6 +59,13 @@ CREATE TABLE IF NOT EXISTS wallet_bets (
     updated_at     TEXT NOT NULL,
     PRIMARY KEY (wallet_id, condition_id)
 );
+-- Polymarket's own category per event (from Gamma tags), cached so the watcher resolves it
+-- once instead of every poll. category '' = a known miss (no mapped tag) to avoid refetching.
+CREATE TABLE IF NOT EXISTS market_category (
+    event_slug TEXT PRIMARY KEY,
+    category   TEXT NOT NULL,
+    at         TEXT NOT NULL
+);
 """
 
 _BET_FIELDS = ("event", "market_url", "category", "subcategory", "confidence", "side",
@@ -229,6 +236,32 @@ def mark_settled(wallet_id: int, condition_id: str, db_path: str = DEFAULT_DB) -
         with con:
             con.execute("INSERT OR IGNORE INTO settled_markets(wallet_id, condition_id, at) "
                         "VALUES(?,?,?)", (wallet_id, condition_id, _now()))
+    finally:
+        con.close()
+
+
+# --- Gamma tag-derived category cache --------------------------------------
+def get_market_category(event_slug: str, db_path: str = DEFAULT_DB) -> str | None:
+    """Cached Polymarket category for an event: a category string, '' for a known miss, or
+    None if the event hasn't been resolved yet."""
+    con = connect(db_path)
+    try:
+        r = con.execute("SELECT category FROM market_category WHERE event_slug=?",
+                        (event_slug,)).fetchone()
+        return r["category"] if r else None
+    finally:
+        con.close()
+
+
+def set_market_category(event_slug: str, category: str, db_path: str = DEFAULT_DB) -> None:
+    """Cache an event's resolved category ('' = known miss) so it's not refetched every poll."""
+    con = connect(db_path)
+    try:
+        with con:
+            con.execute(
+                "INSERT INTO market_category(event_slug, category, at) VALUES(?,?,?) "
+                "ON CONFLICT(event_slug) DO UPDATE SET category=excluded.category, at=excluded.at",
+                (event_slug, category, _now()))
     finally:
         con.close()
 
