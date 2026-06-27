@@ -15,7 +15,8 @@ import sys
 _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.normpath(os.path.join(_BACKEND_DIR, "..", ".."))
 for _d in (os.path.join(_REPO_ROOT, "polymarket-soccer-goals", "scripts"),
-           os.path.join(_REPO_ROOT, "polymarket-tennis", "scripts")):
+           os.path.join(_REPO_ROOT, "polymarket-tennis", "scripts"),
+           os.path.join(_REPO_ROOT, "polymarket-category-watcher", "scripts")):
     if _d not in sys.path:
         sys.path.append(_d)
 
@@ -48,8 +49,45 @@ def aggregate(rows: list[dict], category: str) -> dict:
     }
 
 
+def settle_pending_models() -> dict:
+    """Liquida (best-effort) as previsões PENDENTE cujo jogo/partida já terminou — chamado
+    ao abrir a aba Resultados, para que apareçam nos resultados em vez de ficarem pendentes.
+    Futebol: results feed (FOOTBALL_DATA_TOKEN). Tênis: resolução do mercado Polymarket (+ feed).
+    Cada esporte é isolado: falha (sem token / rede / import) é logada e não interrompe a página."""
+    def log(m: str) -> None:
+        print(f"[settle] {m}", file=sys.stderr, flush=True)
+
+    out: dict = {}
+    try:
+        import soccer_results as sr
+        import soccer_predictions as spdb
+        db = os.environ.get("SOCCER_PREDICTIONS_DB", spdb.DEFAULT_DB)
+        res = sr.settle_pending(db, vlog=log)
+        out["soccer"] = {"matched": res.get("games_matched", 0),
+                         "settled_rows": len(res.get("settled", []))}
+        log(f"soccer -> {out['soccer']}")
+    except Exception as e:  # noqa: BLE001
+        log(f"soccer skipped: {type(e).__name__}: {e}")
+    try:
+        import tennis_results as tr
+        import tennis_predictions as tdb
+        from category_common import APIClient
+        db = os.environ.get("TENNIS_PREDICTIONS_DB", tdb.DEFAULT_DB)
+        tour = os.environ.get("TENNIS_TOUR", "atp")
+        res = tr.settle_pending(db, tour=tour, api=APIClient())
+        for d in res.get("diagnostics", []):
+            log(f"tennis: {d}")
+        out["tennis"] = {"settled_rows": len(res.get("settled", []))}
+        log(f"tennis -> {out['tennis']}")
+    except Exception as e:  # noqa: BLE001
+        log(f"tennis skipped: {type(e).__name__}: {e}")
+    return out
+
+
 def model_results() -> dict:
-    """Best-effort per-category model performance. Empty categories are omitted."""
+    """Best-effort per-category model performance. Empty categories are omitted.
+    Settles finished PENDENTE predictions first so they move into the results."""
+    settle_pending_models()
     by_category = []
     try:
         import soccer_predictions as spdb
