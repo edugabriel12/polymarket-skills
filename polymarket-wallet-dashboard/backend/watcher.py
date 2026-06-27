@@ -28,6 +28,26 @@ wa = wr.wa  # analyze_wallet (fetch_positions, to_float, sanitize_text, _end_in_
 _RANK = {t: i for i, t in enumerate(reversed(cm.TIERS))}  # Baixa=0, Média=1, Alta=2
 
 
+def passes_filter(wallet_filters: dict | None, category: str, subcategory: str,
+                  confidence: str) -> bool:
+    """Whether a (category, subcategory, confidence) triple is forwarded to Sports/Telegram.
+
+    `None` → no restriction, forward everything (legacy wallets + the user selected ALL combos,
+    which the API collapses to None so live categories the CSV never had still pass). A non-null
+    dict is strict: a triple passes only if its category AND subcategory are selected AND the
+    confidence is listed — so an explicit empty dict `{}` forwards NOTHING.
+    """
+    if wallet_filters is None:
+        return True
+    subs = wallet_filters.get(category)
+    if not subs:
+        return False                                          # category not selected
+    confs = subs.get(subcategory)
+    if not confs:
+        return False                                          # subcategory not selected
+    return confidence in confs
+
+
 def _total_position(pos: dict) -> float:
     return (wa.to_float(pos.get("initialValue")) or wa.to_float(pos.get("totalBought"))
             or wa.to_float(pos.get("currentValue")))
@@ -70,7 +90,10 @@ def _entry_for_position(wallet: dict, pos: dict, tier: dict,
 
 def persist_bets(wallet: dict, positions: list, db_path: str = ws.DEFAULT_DB) -> None:
     """Upsert the latest state of every tiered market into wallet_bets (Phase 2), so the
-    wallet's separated Resultados can merge live settled bets with the CSV snapshot."""
+    wallet's separated Resultados can merge live settled bets with the CSV snapshot.
+
+    Intentionally NOT gated by the wallet's forwarding filters: the owner sees full live
+    performance in Resultados; the filter only governs what is pushed to Sports/Telegram."""
     th = wallet.get("thresholds") or {}
     for pos in positions:
         cond = _cond(pos)
@@ -109,6 +132,15 @@ def detect_entries(wallet: dict, positions: list, seen_conf: dict) -> tuple[list
         prev = seen_conf.get(cond)
         if prev is not None and _RANK[tier["confidence"]] <= _RANK.get(prev, -1):
             continue                                          # same/lower tier — already alerted
+        f = _market_fields(pos)
+        if not passes_filter(wallet.get("filters"), f["category"], f["subcategory"],
+                             tier["confidence"]):
+            # Filtered out by this wallet's forwarding rules. Crucially we do NOT persist the
+            # tier, so the market never enters seen_alerts and can never settle (orphan-free).
+            print(f"[watcher] {wallet.get('name')}: filtered out "
+                  f"{f['category']}/{f['subcategory']}/{tier['confidence']} ({cond})",
+                  file=sys.stderr, flush=True)
+            continue
         out.append(_entry_for_position(wallet, pos, tier))
         persist.append((cond, tier["confidence"]))
     return out, persist
@@ -125,6 +157,11 @@ def detect_settlements(wallet: dict, positions: list, settled: set,
     """Settlement updates for markets we ALERTED and that have now resolved.
 
     Returns (entries with status WON/LOST/VOID + pnl, [condition_id] to mark settled).
+
+    No forwarding filter is applied here on purpose: it gates on `cond in seen_conf`, and
+    detect_entries only records seen_conf for markets that PASSED the filter. So a filtered-out
+    market never settles (no orphan card on Sports), while a market that WAS forwarded always
+    gets its terminal settle — even if the user later narrows the filter.
     """
     out, persist = [], []
     for pos in positions:

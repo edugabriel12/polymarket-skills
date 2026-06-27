@@ -17,6 +17,12 @@ def _rec(cat, sub, total, realized, invested, won, n=1):
             "current_value": 0.0, "won": won, "n_trades": n}
 
 
+def _rec_conf(cat, sub, conf):
+    return {"category": cat, "subcategory": sub, "confidence": conf, "total_pnl": 0.0,
+            "realized_pnl": 0.0, "unrealized_pnl": 0.0, "invested": 10.0,
+            "current_value": 0.0, "won": True, "n_trades": 1}
+
+
 class TestRollup(unittest.TestCase):
     def test_overall_and_nesting(self):
         records = [
@@ -61,6 +67,41 @@ class TestRollup(unittest.TestCase):
         self.assertIsNone(rep["overall"]["win_rate"])
         self.assertIsNone(rep["overall"]["roi"])
         self.assertEqual(rep["by_category"], [])
+
+
+class TestFilterTree(unittest.TestCase):
+    def test_shape_and_canonical_order(self):
+        records = [
+            _rec_conf("Soccer", "Over/Under gols", "Baixa"),
+            _rec_conf("Soccer", "Over/Under gols", "Alta"),
+            _rec_conf("Soccer", "Ambas Marcam", "Média"),
+            _rec_conf("Tennis", "Vencedor da partida", "Alta"),
+        ]
+        tree = wr.filter_tree(records)
+        self.assertEqual(set(tree), {"Soccer", "Tennis"})
+        self.assertEqual(set(tree["Soccer"]), {"Over/Under gols", "Ambas Marcam"})
+        self.assertEqual(tree["Soccer"]["Over/Under gols"], ["Alta", "Baixa"])  # Alta<Média<Baixa
+        self.assertEqual(tree["Tennis"]["Vencedor da partida"], ["Alta"])
+
+    def test_defaults_match_rollup(self):
+        # missing category/subcategory/confidence -> the same defaults rollup_csv uses
+        self.assertEqual(wr.filter_tree([{"total_pnl": 0.0, "invested": 0.0}]),
+                         {"Other": {"Outro": ["—"]}})
+
+
+class TestSubcategoryConfidence(unittest.TestCase):
+    def test_each_subcategory_has_by_confidence(self):
+        records = [
+            _rec_conf("Soccer", "Over/Under gols", "Alta"),
+            _rec_conf("Soccer", "Over/Under gols", "Baixa"),
+            _rec_conf("Soccer", "Ambas Marcam", "Média"),
+        ]
+        rep = wr.rollup_csv(records)
+        soccer = next(c for c in rep["by_category"] if c["category"] == "Soccer")
+        self.assertTrue(all("by_confidence" in s for s in soccer["subcategories"]))
+        ou = next(s for s in soccer["subcategories"] if s["subcategory"] == "Over/Under gols")
+        self.assertEqual([b["confidence"] for b in ou["by_confidence"]], ["Alta", "Baixa"])
+        self.assertIn("filter_tree", rep)
 
 
 class TestAttachSubcategories(unittest.TestCase):

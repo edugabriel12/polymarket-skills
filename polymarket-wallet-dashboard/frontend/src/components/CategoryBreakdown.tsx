@@ -35,16 +35,31 @@ function MetricStrip({ m, dense = false }: { m: Metrics; dense?: boolean }) {
 
 function SubRow({ s }: { s: SubCategory }) {
   return (
-    <div className="flex items-center justify-between gap-4 rounded-lg bg-muted/40 px-3 py-2">
-      <div className="min-w-0 flex-1">
-        <div className="truncate text-sm font-semibold">{s.subcategory}</div>
-        <div className="text-[11px] text-muted-foreground">
-          {s.resolved} resolvidos · {s.wins}V/{s.losses}D · investido {usd(s.invested)}
+    <div className="rounded-lg bg-muted/40 px-3 py-2">
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-sm font-semibold">{s.subcategory}</div>
+          <div className="text-[11px] text-muted-foreground">
+            {s.resolved} resolvidos · {s.wins}V/{s.losses}D · investido {usd(s.invested)}
+          </div>
+        </div>
+        <div className="w-[52%] shrink-0">
+          <MetricStrip m={s} dense />
         </div>
       </div>
-      <div className="w-[52%] shrink-0">
-        <MetricStrip m={s} dense />
-      </div>
+      {s.by_confidence && s.by_confidence.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          {s.by_confidence.map((b) => (
+            <span
+              key={b.confidence}
+              className="rounded-md bg-muted/70 px-2 py-0.5 text-[10px] tabular-nums"
+            >
+              <strong>{b.confidence}</strong>: {pct(b.win_rate)} · {b.markets} ap. ·{" "}
+              <span className={pnlClass(b.total_pnl)}>{signedUsd(b.total_pnl)}</span>
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

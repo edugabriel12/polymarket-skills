@@ -17,6 +17,7 @@ export interface Metrics {
 
 export interface SubCategory extends Metrics {
   subcategory: string;
+  by_confidence?: ConfidenceBucket[];
 }
 
 export interface ConfidenceBucket extends Metrics {
@@ -28,6 +29,11 @@ export interface Category extends Metrics {
   subcategories: SubCategory[];
   by_confidence?: ConfidenceBucket[];
 }
+
+// Per-wallet forwarding filter: {category: {subcategory: [confidences]}}.
+// `FilterTree` = options discovered in the CSV; `WalletFilters` = the user's selection.
+export type FilterTree = Record<string, Record<string, string[]>>;
+export type WalletFilters = Record<string, Record<string, string[]>>;
 
 export interface MarketRecord {
   condition_id: string;
@@ -55,6 +61,7 @@ export interface WalletReport {
   overall: Metrics;
   by_confidence?: ConfidenceBucket[];
   by_category: Category[];
+  filter_tree?: FilterTree;   // category -> subcategory -> [confidences] available to forward
   markets?: MarketRecord[];
   live_settled?: number;   // settled live bets in this report
   live_open?: number;      // open live bets (cards on Sports, not in the figures)
@@ -101,11 +108,13 @@ export interface WalletSummary {
   csv_filename?: string;
   created_at: string;
   n_markets?: number;
+  filters?: WalletFilters | null;   // null = forward everything to Sports/Telegram
 }
 
 export interface WalletRecord extends WalletSummary {
   analysis: WalletReport;
   thresholds: Record<string, ThresholdBand>;
+  filter_tree?: FilterTree;         // selectable options for the edit UI (from the CSV analysis)
 }
 
 export interface ModelCategory {
@@ -183,13 +192,21 @@ export const wallets = {
     jget<DashBetsPage>(`/api/wallets/${id}/open-bets?page=${page}&page_size=${pageSize}`),
   modelOpenBets: (page: number, pageSize = 20) =>
     jget<DashBetsPage>(`/api/model-open-bets?page=${page}&page_size=${pageSize}`),
-  add: async (name: string, address: string, file: File) => {
+  add: async (name: string, address: string, file: File, filters?: WalletFilters) => {
     const fd = new FormData();
     fd.append("name", name);
     fd.append("address", address);
     fd.append("file", file);
+    if (filters) fd.append("filters", JSON.stringify(filters));
     const r = await fetch("/api/wallets", { method: "POST", body: fd });
     if (!r.ok) throw await httpError(r, "POST", "/api/wallets");
+    return r.json() as Promise<WalletRecord>;
+  },
+  updateFilters: async (id: number, filters: WalletFilters) => {
+    const fd = new FormData();
+    fd.append("filters", JSON.stringify(filters));
+    const r = await fetch(`/api/wallets/${id}`, { method: "PATCH", body: fd });
+    if (!r.ok) throw await httpError(r, "PATCH", `/api/wallets/${id}`);
     return r.json() as Promise<WalletRecord>;
   },
   remove: async (id: number) => {
