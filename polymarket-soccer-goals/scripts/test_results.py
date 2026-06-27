@@ -63,6 +63,20 @@ class TestDecide(unittest.TestCase):
                     "home": "liv", "away": "mci"}]
         self.assertEqual(sr.decide_settlements(pending, lk), [])
 
+    def test_cape_verde_slug_cvi_matches_feed_cpv(self):
+        # The reported bug: slug uses 'cvi' for Cape Verde, the feed lists it as 'CPV'.
+        payload = {"matches": [
+            {"status": "FINISHED", "utcDate": "2026-06-26T18:00:00Z",
+             "homeTeam": {"tla": "CPV"}, "awayTeam": {"tla": "KSA"},
+             "score": {"fullTime": {"home": 2, "away": 1}}}]}
+        lk = sr.parse_finished(payload)
+        pending = [{"game_slug": "fifwc-cvi-ksa-2026-06-26-total-2pt5", "game_date": "2026-06-26",
+                    "home": "cvi", "away": "ksa"}]
+        out = sr.decide_settlements(pending, lk)
+        self.assertEqual(len(out), 1)              # cvi/ksa now reconciles with feed cpv/ksa
+        self.assertEqual(out[0]["actual_total"], 3.0)
+        self.assertTrue(out[0]["actual_btts"])
+
 
 class TestSettlePending(unittest.TestCase):
     def _seed(self, db):

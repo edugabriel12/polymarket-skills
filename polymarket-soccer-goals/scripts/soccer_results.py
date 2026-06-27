@@ -40,6 +40,7 @@ TLA_TO_CODE: dict[str, str] = {
     "crc": "cri", "hon": "hnd", "gua": "gtm", "hai": "hti", "tri": "tto",
     # --- CAF ---
     "rsa": "zaf", "alg": "dza", "mar": "mar", "civ": "civ", "zam": "zmb",
+    "cvi": "cpv",   # Polymarket slug 'cvi' (Cape Verde) -> ISO/FIFA 'cpv' (as the feed lists it)
     # --- AFC ---
     "kor": "kor", "uae": "are", "ksa": "sau", "iri": "irn",
 }
@@ -243,8 +244,13 @@ def settle_pending(db_path: str = spdb.DEFAULT_DB, token: str | None = None,
                      f"under {alt} but the prediction is dated {g['game_date']} "
                      f"(date mismatch — likely UTC rollover)")
             else:
+                # Surface feed pairs sharing one side, so an unmapped team code is obvious
+                # (e.g. the partner shows under a code we didn't reconcile in TLA_TO_CODE).
+                near = sorted(f"{k[1]}/{k[2]}@{k[0]}" for k in lookup
+                              if pair[0] in k[1:] or pair[1] in k[1:])
+                hint = f"; feed has a side under: {', '.join(near[:5])}" if near else ""
                 note(f"✗ {g['game_slug']}: {pair[0]}/{pair[1]} @ {g['game_date']} not FINISHED "
-                     f"in feed (not played yet, or team code not mapped in TLA_TO_CODE)")
+                     f"in feed (not played yet, or team code not mapped in TLA_TO_CODE){hint}")
 
     settled = []
     for ins in instructions:
