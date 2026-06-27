@@ -14,8 +14,9 @@ import os
 import sys
 import traceback
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 import entries_store as es
 import results_combined as rc
@@ -54,6 +55,25 @@ COPY_INGEST_TOKEN = os.environ.get("COPY_INGEST_TOKEN", "")
 
 app = FastAPI(title="Polymarket Sports API", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.exception_handler(Exception)
+async def _log_unhandled(request: Request, exc: Exception) -> JSONResponse:
+    """Catch-all for any unhandled error: full traceback to stderr + error in the 500 body."""
+    traceback.print_exc(file=sys.stderr)
+    print(f"[api] ERROR {request.method} {request.url.path}: {type(exc).__name__}: {exc}",
+          file=sys.stderr, flush=True)
+    return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
+
+
+@app.middleware("http")
+async def _log_requests(request: Request, call_next):
+    """One line per request; flags non-2xx so a failing flow is obvious in the log."""
+    resp = await call_next(request)
+    if resp.status_code >= 400:
+        print(f"[api] {resp.status_code} {request.method} {request.url.path}",
+              file=sys.stderr, flush=True)
+    return resp
 
 
 @app.get("/api/health")

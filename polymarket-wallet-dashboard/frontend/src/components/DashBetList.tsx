@@ -30,13 +30,21 @@ export function DashBetList({ fetchKey, fetcher, mode = "settled" }: {
   mode?: "settled" | "open";
 }) {
   const [page, setPage] = useState(1);
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: [...fetchKey, page],
     queryFn: () => fetcher(page),
   });
 
   const open = mode === "open";
   const noun = open ? "em aberto" : "liquidadas";
+  if (isError) {
+    console.error(`[DashBetList] ${JSON.stringify(fetchKey)} falhou:`, error);
+    return (
+      <div className="px-1 py-2 text-xs text-rose-500">
+        Falha ao carregar apostas {noun} — veja o console (F12).
+      </div>
+    );
+  }
   if (isLoading) return <div className="skeleton h-32" />;
   const bets = data?.bets ?? [];
   const total = data?.total ?? 0;

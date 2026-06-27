@@ -1,6 +1,6 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, QueryCache } from "@tanstack/react-query";
 import { ThemeProvider } from "@/components/ThemeProvider";
 import App from "@/App";
 import "./index.css";
@@ -33,6 +33,11 @@ class ErrorBoundary extends React.Component<
 }
 
 const queryClient = new QueryClient({
+  // Loga TODA query que falhar (qualquer aba/fluxo), identificada pela sua queryKey.
+  queryCache: new QueryCache({
+    onError: (error, query) =>
+      console.error(`[query] ${JSON.stringify(query.queryKey)} falhou:`, error),
+  }),
   defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: false } },
 });
 

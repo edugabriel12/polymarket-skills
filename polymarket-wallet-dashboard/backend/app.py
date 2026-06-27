@@ -15,10 +15,12 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import traceback
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, File, Form, Query, UploadFile
+from fastapi import FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.normpath(os.path.join(_BACKEND_DIR, "..", ".."))
@@ -77,6 +79,27 @@ app = FastAPI(title="Polymarket Wallet Analyzer API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
+@app.exception_handler(Exception)
+async def _log_unhandled(request: Request, exc: Exception) -> JSONResponse:
+    """Catch-all for ANY unhandled error in any endpoint: full traceback to stderr +
+    error class/message in the 500 body, so both the server log and the browser console
+    pinpoint exactly which flow broke."""
+    traceback.print_exc(file=sys.stderr)
+    print(f"[api] ERROR {request.method} {request.url.path}: {type(exc).__name__}: {exc}",
+          file=sys.stderr, flush=True)
+    return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
+
+
+@app.middleware("http")
+async def _log_requests(request: Request, call_next):
+    """One line per request; flags non-2xx so a failing flow is obvious in the log."""
+    resp = await call_next(request)
+    if resp.status_code >= 400:
+        print(f"[api] {resp.status_code} {request.method} {request.url.path}",
+              file=sys.stderr, flush=True)
+    return resp
+
+
 def _today() -> str:
     return datetime.now(LOCAL_TZ).date().isoformat()
 
@@ -93,7 +116,9 @@ async def _models_loop() -> None:
         try:
             await asyncio.to_thread(brain.run_models_once, _today())
         except Exception as e:  # noqa: BLE001
-            print(f"[brain] models cycle failed: {e}", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
+            print(f"[brain] models cycle failed: {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
 
 
 async def _watch_loop() -> None:
@@ -101,7 +126,9 @@ async def _watch_loop() -> None:
         try:
             await asyncio.to_thread(brain.run_watch_once)
         except Exception as e:  # noqa: BLE001
-            print(f"[brain] watch cycle failed: {e}", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
+            print(f"[brain] watch cycle failed: {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
         await asyncio.sleep(WATCH_POLL_SEC)
 
 
