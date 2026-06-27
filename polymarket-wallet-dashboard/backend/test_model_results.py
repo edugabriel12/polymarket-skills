@@ -78,5 +78,44 @@ class TestModelOpenBets(unittest.TestCase):
         self.assertEqual(out, {"total": 0, "bets": []})
 
 
+class TestSettlePendingModels(unittest.TestCase):
+    """Liquidação on-demand: orquestra soccer+tennis e isola a falha de um esporte."""
+
+    def test_best_effort_isolates_failures(self):
+        import soccer_results
+        import tennis_results
+        orig_s, orig_t = soccer_results.settle_pending, tennis_results.settle_pending
+        soccer_results.settle_pending = lambda *a, **k: {"games_matched": 2, "settled": [1, 2]}
+        tennis_results.settle_pending = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            out = mr.settle_pending_models()                  # não deve lançar
+        finally:
+            soccer_results.settle_pending = orig_s
+            tennis_results.settle_pending = orig_t
+        self.assertEqual(out["soccer"]["settled_rows"], 2)    # soccer liquidou
+        self.assertNotIn("tennis", out)                       # tennis falhou, mas isolado
+
+    def test_model_results_triggers_settle(self):
+        calls = []
+        orig = mr.settle_pending_models
+        mr.settle_pending_models = lambda: calls.append(1)
+        try:
+            mr.model_results()                                # abrir Resultados deve liquidar antes
+        finally:
+            mr.settle_pending_models = orig
+        self.assertEqual(len(calls), 1)
+
+    def test_model_open_bets_settles_only_on_first_page(self):
+        calls = []
+        orig = mr.settle_pending_models
+        mr.settle_pending_models = lambda: calls.append(1)
+        try:
+            mr.model_open_bets(None, 0, 20)                   # abrir Pendentes (1ª página) -> liquida
+            mr.model_open_bets(None, 20, 20)                  # página 2 -> NÃO liquida de novo
+        finally:
+            mr.settle_pending_models = orig
+        self.assertEqual(len(calls), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
