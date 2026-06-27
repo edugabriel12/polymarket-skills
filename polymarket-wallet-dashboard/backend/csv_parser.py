@@ -93,6 +93,13 @@ _SOCCER_SIGNAL = re.compile(
     r"\bo/u\b|both teams to score|exact score|\bspread:|will .* win on|end in a draw|"
     r"halftime|1st half|1h o/u|leading at|both teams", re.I)
 
+# Tennis head-to-head shape: "{Tournament}: {Player} vs {Player}". Challenger/ITF/qualifying
+# events often carry no tour keyword (atp/wta/wimbledon), so the keyword classifier drops them
+# into "Other". This structure recovers them — but it's applied ONLY when keyword classification
+# already gave up, so soccer/esports/combat "A vs B" matches (caught earlier or by keyword) are
+# never stolen.
+_TENNIS_H2H = re.compile(r":\s*.+\bvs\b\.?\s+.+", re.I)
+
 
 def classify_event(event: str, side: str) -> str:
     blob = f"{event} {side}".lower()
@@ -106,7 +113,10 @@ def classify_event(event: str, side: str) -> str:
         return "Baseball"
     if _SOCCER_SIGNAL.search(blob):
         return "Soccer"
-    return wa.classify_category(blob)
+    cat = wa.classify_category(blob)
+    if cat == "Other" and _TENNIS_H2H.search(event or ""):
+        return "Tennis"
+    return cat
 
 
 def _record(date, event, side, conf, odd, invested, profit) -> dict:

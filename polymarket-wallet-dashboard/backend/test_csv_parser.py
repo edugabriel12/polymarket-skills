@@ -113,5 +113,44 @@ class TestParseAndRollup(unittest.TestCase):
         self.assertEqual(cp.parse_csv("Data;Evento;Aposta;Conf.;Odd;Investido;ROI%;Lucro\n"), [])
 
 
+class TestTennisHeadToHead(unittest.TestCase):
+    """Obscure tennis (Challenger/ITF/qualifying) carries no tour keyword — only the
+    '{Tournament}: Player vs Player' shape. It must still classify as Tennis, without
+    stealing soccer/combat matches that are caught earlier or by keyword."""
+
+    def test_obscure_tournament_matches_are_tennis(self):
+        for ev in ["Targu Mures: Felix Balshaw vs Martin Krumich",
+                   "Plovdiv: Andres Santamarta vs Ognjen Milic",
+                   "Mallorca Championships: Ethan Quinn vs Vit Kopriva",
+                   "Lexus Eastbourne Open: Gabriel Diallo vs Tomas Etcheverry",
+                   "Bad Homburg Open: Iga Swiatek vs Emma Navarro"]:
+            self.assertEqual(cp.classify_event(ev, "PLAYER"), "Tennis", ev)
+
+    def test_keyworded_tennis_still_tennis(self):
+        self.assertEqual(
+            cp.classify_event("Wimbledon, Qualification ATP: Keegan Smith vs Moez Echargui",
+                              "KEEGAN SMITH"), "Tennis")
+
+    def test_soccer_and_combat_not_stolen(self):
+        self.assertEqual(cp.classify_event("Champions League: Real Madrid vs Barcelona",
+                                           "REAL MADRID"), "Soccer")           # keyword wins
+        self.assertEqual(cp.classify_event("Arsenal vs Chelsea epl-ars-che-2026-06-25",
+                                           "ARSENAL"), "Soccer")               # slug keyword
+        self.assertEqual(cp.classify_event("UFC 328: Sean Strickland vs. Khamzat Chimaev",
+                                           "SEAN STRICKLAND"), "Combat Sports")  # caught earlier
+
+    def test_non_head_to_head_other_stays_other(self):
+        self.assertEqual(cp.classify_event("Some random prop about a thing", "YES"), "Other")
+
+    def test_obscure_tennis_counted_in_rollup(self):
+        csv = ("Data;Evento;Aposta;Conf.;Odd;Investido;ROI%;Lucro\n"
+               '2026-06-25;"Targu Mures: Felix Balshaw vs Martin Krumich";FELIX BALSHAW;Alta;1,75;100;75,1;75\n'
+               '2026-06-25;"Plovdiv: Andres Santamarta vs Ognjen Milic";ANDRES SANTAMARTA;Baixa;1,62;100;62,1;62\n')
+        rep = wr.rollup_csv(cp.parse_csv(csv))
+        ten = next(c for c in rep["by_category"] if c["category"] == "Tennis")
+        self.assertEqual(ten["markets"], 2)
+        self.assertEqual([s["subcategory"] for s in ten["subcategories"]], ["Vencedor da partida"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
