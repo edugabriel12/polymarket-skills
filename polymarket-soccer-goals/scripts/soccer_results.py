@@ -55,6 +55,27 @@ def _pair_key(date: str, a: str, b: str) -> tuple:
     return (date, *tuple(sorted((norm_code(a), norm_code(b)))))
 
 
+def _match_with_tolerance(lookup: dict[tuple, tuple], game_date: str, a: str, b: str,
+                          days: int = 1) -> tuple | None:
+    """Find a finished result for the (a, b) pair on `game_date`, tolerating a ±`days`
+    feed-date difference. The slug dates a game by its local day while the feed uses the
+    UTC date, so a late kickoff lands one day apart (the Cape Verde case). Exact date wins;
+    a ±1-day hit is accepted only when unambiguous, so we never guess between two games of
+    the same pair."""
+    pair = tuple(sorted((norm_code(a), norm_code(b))))
+    exact = lookup.get((game_date, *pair))
+    if exact is not None:
+        return exact
+    try:
+        d = datetime.strptime(game_date, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+    hits = [r for delta in range(1, days + 1)
+            for dd in ((d - timedelta(days=delta)).isoformat(), (d + timedelta(days=delta)).isoformat())
+            if (r := lookup.get((dd, *pair))) is not None]
+    return hits[0] if len(hits) == 1 else None
+
+
 # ---------------------------------------------------------------------------
 # Fetch finished matches (network; best-effort)
 # ---------------------------------------------------------------------------
@@ -109,8 +130,7 @@ def decide_settlements(pending_games: list[dict], lookup: dict[tuple, tuple]) ->
     """
     out = []
     for g in pending_games:
-        key = _pair_key(g["game_date"], g["home"], g["away"])
-        res = lookup.get(key)
+        res = _match_with_tolerance(lookup, g["game_date"], g["home"], g["away"])
         if res is not None:
             out.append({"game_slug": g["game_slug"], "actual_total": res[0],
                         "actual_btts": res[1]})
@@ -219,7 +239,8 @@ def settle_pending(db_path: str = spdb.DEFAULT_DB, token: str | None = None,
                 "games_matched": 0, "diagnostics": diag}
     today = datetime.now(timezone.utc).date().isoformat()
     date_from = min(dates[0], (datetime.now(timezone.utc).date() - timedelta(days=days_back)).isoformat())
-    date_to = max(dates[-1], today)
+    # +1 day so a game whose feed UTC date rolled past its slug date is still in the window
+    date_to = (datetime.strptime(max(dates[-1], today), "%Y-%m-%d").date() + timedelta(days=1)).isoformat()
     note(f"querying results feed {date_from}…{date_to} for {len(games)} game(s)")
     lookup = fetch_finished(date_from, date_to, token)
     note(f"FINISHED games returned by feed: {len(lookup)}")
@@ -229,28 +250,23 @@ def settle_pending(db_path: str = spdb.DEFAULT_DB, token: str | None = None,
 
     instructions = []
     for g in games.values():
-        key = _pair_key(g["game_date"], g["home"], g["away"])
-        res = lookup.get(key)
         pair = tuple(sorted((norm_code(g["home"]), norm_code(g["away"]))))
+        res = _match_with_tolerance(lookup, g["game_date"], g["home"], g["away"])
         if res is not None:
-            note(f"✓ {g['game_slug']}: matched {pair[0]}/{pair[1]} @ {g['game_date']} "
+            fed = sorted(k[0] for k in lookup if k[1:] == pair)
+            when = "" if g["game_date"] in fed else f" (feed dated {fed}, ±1d tolerance)"
+            note(f"✓ {g['game_slug']}: matched {pair[0]}/{pair[1]} @ {g['game_date']}{when} "
                  f"→ total={res[0]}, btts={res[1]}")
             instructions.append({"game_slug": g["game_slug"], "actual_total": res[0],
                                  "actual_btts": res[1]})
         else:
-            alt = sorted({k[0] for k in lookup if k[1:] == pair})
-            if alt:
-                note(f"✗ {g['game_slug']}: pair {pair[0]}/{pair[1]} is FINISHED in the feed "
-                     f"under {alt} but the prediction is dated {g['game_date']} "
-                     f"(date mismatch — likely UTC rollover)")
-            else:
-                # Surface feed pairs sharing one side, so an unmapped team code is obvious
-                # (e.g. the partner shows under a code we didn't reconcile in TLA_TO_CODE).
-                near = sorted(f"{k[1]}/{k[2]}@{k[0]}" for k in lookup
-                              if pair[0] in k[1:] or pair[1] in k[1:])
-                hint = f"; feed has a side under: {', '.join(near[:5])}" if near else ""
-                note(f"✗ {g['game_slug']}: {pair[0]}/{pair[1]} @ {g['game_date']} not FINISHED "
-                     f"in feed (not played yet, or team code not mapped in TLA_TO_CODE){hint}")
+            # Surface feed pairs sharing one side, so an unmapped team code OR an out-of-
+            # tolerance date (>1 day, or an ambiguous double) is obvious from the log.
+            near = sorted(f"{k[1]}/{k[2]}@{k[0]}" for k in lookup
+                          if pair[0] in k[1:] or pair[1] in k[1:])
+            hint = f"; feed has a side under: {', '.join(near[:5])}" if near else ""
+            note(f"✗ {g['game_slug']}: {pair[0]}/{pair[1]} @ {g['game_date']} not settled "
+                 f"(not FINISHED yet, team code not mapped, or date >1d off){hint}")
 
     settled = []
     for ins in instructions:

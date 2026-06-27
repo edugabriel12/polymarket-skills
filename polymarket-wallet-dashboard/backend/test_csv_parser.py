@@ -103,6 +103,11 @@ class TestParseAndRollup(unittest.TestCase):
         soccer = next(c for c in rep["by_category"] if c["category"] == "Soccer")
         self.assertTrue(soccer["subcategories"])
         self.assertTrue(soccer["by_confidence"])
+        # each subcategory now carries its OWN confidence split, and the report exposes the
+        # filter_tree options (category -> subcategory -> [confidences]) for the Add screen.
+        self.assertTrue(all("by_confidence" in s for s in soccer["subcategories"]))
+        self.assertIn("filter_tree", rep)
+        self.assertIn("Soccer", rep["filter_tree"])
 
     def test_empty_csv(self):
         self.assertEqual(cp.parse_csv("Data;Evento;Aposta;Conf.;Odd;Investido;ROI%;Lucro\n"), [])

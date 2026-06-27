@@ -165,9 +165,9 @@ class TestSettleDiagnostics(unittest.TestCase):
             res = sr.settle_pending(db, token=None)
             self.assertTrue(any("no FOOTBALL_DATA_TOKEN" in x for x in res["diagnostics"]))
 
-    def test_date_mismatch_flagged(self):
-        # Feed has the game FINISHED on 06-14, but the prediction is dated 06-13 (UTC
-        # rollover). The diagnostics must call out the date mismatch, not silently skip.
+    def test_date_within_one_day_settles(self):
+        # UTC rollover: the feed has the game FINISHED on 06-14 while the prediction is dated
+        # 06-13. With ±1-day tolerance this now SETTLES (was skipped before). The Cape Verde case.
         with tempfile.TemporaryDirectory() as d:
             db = os.path.join(d, "p.db")
             self._seed_one(db, "fifwc-nld-jpn-2026-06-13", "2026-06-13")
@@ -177,12 +177,11 @@ class TestSettleDiagnostics(unittest.TestCase):
                 res = sr.settle_pending(db, token="fake")
             finally:
                 sr.fetch_finished = orig
-            self.assertEqual(res["settled"], [])
-            self.assertTrue(any("date mismatch" in x and "2026-06-14" in x
-                                for x in res["diagnostics"]))
+            self.assertEqual(len(res["settled"]), 1)                       # settled via tolerance
+            self.assertTrue(any("±1d tolerance" in x for x in res["diagnostics"]))
 
     def test_not_played_flagged(self):
-        # Team pair absent from the feed entirely -> "not FINISHED in feed".
+        # Team pair absent from the feed entirely -> reported as not settled.
         with tempfile.TemporaryDirectory() as d:
             db = os.path.join(d, "p.db")
             self._seed_one(db, "epl-liv-mci-2026-06-14", "2026-06-14")
@@ -193,7 +192,7 @@ class TestSettleDiagnostics(unittest.TestCase):
             finally:
                 sr.fetch_finished = orig
             self.assertEqual(res["settled"], [])
-            self.assertTrue(any("not FINISHED in feed" in x for x in res["diagnostics"]))
+            self.assertTrue(any("not settled" in x for x in res["diagnostics"]))
 
 
 if __name__ == "__main__":

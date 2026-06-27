@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline tests for the watched-wallets store + the add/list/get/delete endpoints."""
 
+import json
 import os
 import sys
 import tempfile
@@ -46,6 +47,23 @@ class TestStore(unittest.TestCase):
         self.assertTrue(ws.delete_wallet(wid, db_path=_DB))
         self.assertEqual(ws.list_wallets(db_path=_DB), [])
 
+    def test_filters_round_trip_and_update(self):
+        flt = {"Soccer": {"Over/Under gols": ["Alta"]}}
+        a_flt = "0x" + "cc" * 20
+        wid = ws.add_wallet("F", a_flt, {"n_markets": 0, "overall": {}},
+                            {"Alta": {"floor": 1, "unit": 1.0}}, "f.csv",
+                            filters=flt, db_path=_DB)
+        self.assertEqual(ws.get_wallet(wid, db_path=_DB)["filters"], flt)
+        # a wallet added without filters stores NULL -> None
+        a_none = "0x" + "dd" * 20
+        wid2 = ws.add_wallet("G", a_none, {"n_markets": 0, "overall": {}}, {}, "g.csv", db_path=_DB)
+        self.assertIsNone(ws.get_wallet(wid2, db_path=_DB)["filters"])
+        # update_filters changes ONLY the filters (no cascade)
+        self.assertTrue(ws.update_filters(wid2, flt, db_path=_DB))
+        self.assertEqual(ws.get_wallet(wid2, db_path=_DB)["filters"], flt)
+        ws.delete_wallet(wid, db_path=_DB)
+        ws.delete_wallet(wid2, db_path=_DB)
+
 
 class TestEndpoints(unittest.TestCase):
     def setUp(self):
@@ -74,6 +92,47 @@ class TestEndpoints(unittest.TestCase):
 
         self.assertTrue(self.client.delete(f"/api/wallets/{wid}").json()["deleted"])
 
+    def test_filters_persisted_and_tree_returned(self):
+        r = self.client.post(
+            "/api/wallets",
+            data={"name": "Filt", "address": "0x" + "ce" * 20,
+                  "filters": json.dumps({"Soccer": {"Over/Under gols": ["Alta"]}})},
+            files={"file": ("hist.csv", _CSV, "text/csv")})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertNotIn("error", body)
+        self.assertEqual(body["filters"], {"Soccer": {"Over/Under gols": ["Alta"]}})
+        self.assertIn("filter_tree", body)               # options for the (edit) UI
+        self.assertIn("Soccer", body["filter_tree"])
+        self.client.delete(f"/api/wallets/{body['id']}")
+
+    def test_patch_filters_preserves_history(self):
+        import watcher
+        addr = "0x" + "ef" * 20
+        wid = self.client.post(
+            "/api/wallets", data={"name": "PatchMe", "address": addr},
+            files={"file": ("hist.csv", _CSV, "text/csv")}).json()["id"]
+        # seed a live settled bet so we can prove the edit does NOT wipe history
+        watcher.persist_bets(ws.get_wallet(wid), [{
+            "conditionId": "cx", "initialValue": 45000, "title": "Arsenal vs. Chelsea",
+            "outcome": "OVER", "avgPrice": 0.5, "curPrice": 0.5, "cashPnl": 12.0,
+            "redeemable": True, "slug": "epl-ars-che-2026-06-25-total-2pt5"}])
+        self.assertTrue(ws.list_bets(wid))
+        pr = self.client.patch(
+            f"/api/wallets/{wid}",
+            data={"filters": json.dumps({"Soccer": {"Over/Under gols": ["Alta", "Média"]}})})
+        self.assertEqual(pr.status_code, 200)
+        self.assertEqual(pr.json()["filters"], {"Soccer": {"Over/Under gols": ["Alta", "Média"]}})
+        self.assertTrue(ws.list_bets(wid))               # history survived the edit
+        self.client.delete(f"/api/wallets/{wid}")
+
+    def test_invalid_filters_rejected(self):
+        r = self.client.post(
+            "/api/wallets",
+            data={"name": "Bad", "address": "0x" + "13" * 20, "filters": "{not json"},
+            files={"file": ("hist.csv", _CSV, "text/csv")})
+        self.assertIn("error", r.json())
+
     def test_invalid_address_rejected(self):
         r = self.client.post(
             "/api/wallets",
@@ -84,6 +143,38 @@ class TestEndpoints(unittest.TestCase):
     def test_thresholds_match_confidence_model(self):
         recs = __import__("csv_parser").parse_csv(_CSV)
         self.assertEqual(set(cm.derive_thresholds(recs)), {"Alta", "Média", "Baixa"})
+
+
+class TestCleanFilters(unittest.TestCase):
+    """app._clean_filters semantics: blank/full → None; subset kept; {} → nothing."""
+
+    def test_full_selection_collapses_to_none(self):
+        tree = {"Soccer": {"O/U": ["Alta", "Média"]}, "Tennis": {"ML": ["Alta"]}}
+        self.assertIsNone(app._clean_filters(json.dumps(tree), tree))   # all selected = no restriction
+
+    def test_strict_subset_kept(self):
+        tree = {"Soccer": {"O/U": ["Alta", "Média"], "ML": ["Baixa"]}}
+        self.assertEqual(app._clean_filters(json.dumps({"Soccer": {"O/U": ["Alta"]}}), tree),
+                         {"Soccer": {"O/U": ["Alta"]}})
+
+    def test_empty_means_nothing(self):
+        self.assertEqual(app._clean_filters("{}", {"Soccer": {"O/U": ["Alta"]}}), {})
+
+    def test_blank_is_none(self):
+        self.assertIsNone(app._clean_filters("", {"Soccer": {"O/U": ["Alta"]}}))
+
+    def test_unknown_combos_dropped(self):
+        tree = {"Soccer": {"O/U": ["Alta"]}}
+        self.assertEqual(app._clean_filters(json.dumps({"Basketball": {"ML": ["Alta"]}}), tree), {})
+
+    def test_confidence_normalized_and_ordered(self):
+        tree = {"Soccer": {"O/U": ["Alta", "Média", "Baixa"]}}
+        self.assertEqual(app._clean_filters(json.dumps({"Soccer": {"O/U": ["baixa", "alta"]}}), tree),
+                         {"Soccer": {"O/U": ["Alta", "Baixa"]}})
+
+    def test_invalid_json_raises(self):
+        with self.assertRaises(ValueError):
+            app._clean_filters("{not json", {"Soccer": {"O/U": ["Alta"]}})
 
 
 if __name__ == "__main__":

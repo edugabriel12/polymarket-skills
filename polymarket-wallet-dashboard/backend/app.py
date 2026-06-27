@@ -13,6 +13,7 @@ pattern-matched (CLAUDE.md rule #5).
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import traceback
@@ -162,9 +163,65 @@ def csv_demo() -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _clean_filters(raw: str, tree: dict) -> dict | None:
+    """Parse the `filters` form field (JSON {category:{subcategory:[confidences]}}) and keep
+    only real combos present in the CSV's filter_tree, normalizing each confidence label and
+    preserving the tree's canonical order.
+
+    Semantics:
+      • blank/absent field → None  (unconfigured → forward everything)
+      • the FULL tree selected → None  (no restriction; also forwards live categories the CSV
+        never had, so "keep all" behaves like today)
+      • a strict subset → that dict  (forward only those combos)
+      • explicit empty {} → {}  (forward NOTHING)
+    Raises ValueError on malformed JSON / wrong shape."""
+    if not raw or not raw.strip():
+        return None
+    parsed = json.loads(raw)                                   # may raise ValueError
+    if not isinstance(parsed, dict):
+        raise ValueError("esperado um objeto categoria→sub-categoria→confianças")
+    clean: dict = {}
+    for cat, subs in parsed.items():
+        if cat not in tree or not isinstance(subs, dict):
+            continue
+        for sub, confs in subs.items():
+            allowed = tree[cat].get(sub)
+            if not allowed or not isinstance(confs, (list, tuple)):
+                continue
+            picked = {csv_parser._norm_conf(str(x)) for x in confs}
+            ordered = [c for c in allowed if c in picked]      # keep canonical order
+            if ordered:
+                clean.setdefault(cat, {})[sub] = ordered
+    full = {c: {s: list(cs) for s, cs in sv.items()} for c, sv in tree.items()}
+    return None if clean == full else clean                   # all selected == no restriction
+
+
+def _filter_tree_from_analysis(analysis: dict) -> dict:
+    """The {category:{subcategory:[confidences]}} OPTIONS for the filter UI. Prefer the
+    persisted filter_tree (wallets added after this feature); else rebuild from the stored
+    by_category subcategories, offering the tiers seen there or all of cm.TIERS (legacy)."""
+    tree = analysis.get("filter_tree")
+    if tree:
+        return tree
+    out: dict = {}
+    for cat in analysis.get("by_category", []):
+        name = cat.get("category")
+        if not name:
+            continue
+        subs = {}
+        for sub in cat.get("subcategories", []):
+            sname = sub.get("subcategory")
+            if not sname:
+                continue
+            seen = [b.get("confidence") for b in sub.get("by_confidence", []) if b.get("confidence")]
+            subs[sname] = seen or list(cm.TIERS)
+        out[name] = subs
+    return out
+
+
 @app.post("/api/wallets")
 async def add_wallet(name: str = Form(...), address: str = Form(...),
-                     file: UploadFile = File(...)) -> dict:
+                     file: UploadFile = File(...), filters: str = Form("")) -> dict:
     addr = (address or "").strip()
     if not wr.wa.is_address(addr):
         return {"error": "endereço inválido — esperado 0x + 40 hex"}
@@ -176,7 +233,11 @@ async def add_wallet(name: str = Form(...), address: str = Form(...),
         return {"error": "CSV vazio ou sem linhas reconhecidas"}
     analysis = wr.rollup_csv(records)      # CSV profile (kept for reference; NOT shown as results)
     thresholds = cm.derive_thresholds(records)
-    wid = ws.add_wallet(name, addr, analysis, thresholds, file.filename)
+    try:
+        clean_filters = _clean_filters(filters, analysis.get("filter_tree") or {})
+    except ValueError as e:
+        return {"error": f"filtros inválidos: {e}"}
+    wid = ws.add_wallet(name, addr, analysis, thresholds, file.filename, filters=clean_filters)
     return _wallet_with_live(wid)
 
 
@@ -187,11 +248,14 @@ def list_wallets() -> dict:
 
 def _wallet_with_live(wallet_id: int) -> dict:
     """Wallet record whose `analysis` is its LIVE results only (settled bets after add).
-    The CSV is never shown as results — it only fed the confidence/unit bands."""
+    The CSV is never shown as results — it only fed the confidence/unit bands. We surface
+    `filter_tree` (the selectable options, from the stored CSV analysis) BEFORE overwriting
+    `analysis` with the live rollup, so the edit UI can render + pre-check the boxes."""
     import wallet_results as wres
     w = ws.get_wallet(wallet_id)
     if not w:
         return {"error": "carteira não encontrada"}
+    w["filter_tree"] = _filter_tree_from_analysis(w.get("analysis") or {})
     w["analysis"] = wres.live_results(ws.list_bets(wallet_id))
     return w
 
@@ -204,6 +268,22 @@ def get_wallet(wallet_id: int) -> dict:
 @app.delete("/api/wallets/{wallet_id}")
 def delete_wallet(wallet_id: int) -> dict:
     return {"deleted": ws.delete_wallet(wallet_id)}
+
+
+@app.patch("/api/wallets/{wallet_id}")
+async def update_wallet_filters(wallet_id: int, filters: str = Form("")) -> dict:
+    """Edit a wallet's forwarding filters in place — preserves analysis/thresholds/live history
+    (unlike DELETE, which cascades). `filters` is JSON {category:{subcategory:[confidences]}};
+    blank clears the filter (= forward everything)."""
+    w = ws.get_wallet(wallet_id)
+    if not w:
+        return {"error": "carteira não encontrada"}
+    try:
+        clean_filters = _clean_filters(filters, _filter_tree_from_analysis(w.get("analysis") or {}))
+    except ValueError as e:
+        return {"error": f"filtros inválidos: {e}"}
+    ws.update_filters(wallet_id, clean_filters)
+    return _wallet_with_live(wallet_id)
 
 
 @app.get("/api/model-results")

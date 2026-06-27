@@ -105,13 +105,28 @@ def _by_confidence(records: list[dict]) -> list[dict]:
             for c, rs in sorted(groups.items(), key=lambda kv: _CONF_ORDER.get(kv[0], 9))]
 
 
+def filter_tree(records: list[dict]) -> dict:
+    """{category: {subcategory: [confidences present, in Alta/Média/Baixa order]}} — the
+    options the user picks from on the Add screen. Defaults MUST match rollup_csv
+    ("Other"/"Outro"/"—") so the tree keys line up 1:1 with by_category/subcategories."""
+    tree: dict[str, dict] = {}
+    for r in records:
+        cat = r.get("category") or "Other"
+        sub = r.get("subcategory") or "Outro"
+        conf = r.get("confidence") or "—"
+        tree.setdefault(cat, {}).setdefault(sub, set()).add(conf)
+    return {cat: {sub: sorted(cs, key=lambda c: _CONF_ORDER.get(c, 9))
+                  for sub, cs in subs.items()}
+            for cat, subs in tree.items()}
+
+
 def rollup_csv(records: list[dict]) -> dict:
     """Roll up CSV bet records: overall + by_confidence + by_category (each nesting
     its subcategories AND its own by_confidence split). A "bet" is one CSV row."""
     overall = _metrics(records)
     by_category = []
     for cat, crs in _group(records, lambda r: r.get("category") or "Other").items():
-        subs = [{"subcategory": s, **_metrics(rs)}
+        subs = [{"subcategory": s, **_metrics(rs), "by_confidence": _by_confidence(rs)}
                 for s, rs in _group(crs, lambda r: r.get("subcategory") or "Outro").items()]
         subs.sort(key=lambda x: x["total_pnl"], reverse=True)
         by_category.append({"category": cat, **_metrics(crs),
@@ -124,6 +139,7 @@ def rollup_csv(records: list[dict]) -> dict:
         "overall": overall,
         "by_confidence": _by_confidence(records),
         "by_category": by_category,
+        "filter_tree": filter_tree(records),
     }
 
 

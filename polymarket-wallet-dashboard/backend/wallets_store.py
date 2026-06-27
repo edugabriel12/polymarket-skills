@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS wallets (
     address      TEXT NOT NULL UNIQUE,
     csv_filename TEXT,
     analysis     TEXT NOT NULL,     -- JSON: rollup_csv report (by category + confidence)
-    thresholds   TEXT NOT NULL      -- JSON: confidence_model.derive_thresholds
+    thresholds   TEXT NOT NULL,     -- JSON: confidence_model.derive_thresholds
+    filters      TEXT               -- JSON {category:{subcategory:[confidences]}} forwarded to Sports/Telegram; NULL = forward all
 );
 -- The watcher's dedup state: ONE row per (wallet, market) holding the highest
 -- confidence tier already alerted (a tier UPGRADE re-pushes the same entry), plus
@@ -80,24 +81,35 @@ def connect(db_path: str = DEFAULT_DB) -> sqlite3.Connection:
     for c in ("event", "market_url"):
         if c not in cols:
             con.execute(f"ALTER TABLE wallet_bets ADD COLUMN {c} TEXT")
+    # Migrate older wallets tables that predate the per-wallet forwarding filters.
+    wcols = {r["name"] for r in con.execute("PRAGMA table_info(wallets)")}
+    if "filters" not in wcols:
+        con.execute("ALTER TABLE wallets ADD COLUMN filters TEXT")
     return con
 
 
 def add_wallet(name: str, address: str, analysis: dict, thresholds: dict,
-               csv_filename: str | None = None, db_path: str = DEFAULT_DB) -> int:
-    """Insert or update (by address) a watched wallet. Returns its id."""
+               csv_filename: str | None = None, filters: dict | None = None,
+               db_path: str = DEFAULT_DB) -> int:
+    """Insert or update (by address) a watched wallet. Returns its id.
+
+    `filters` (optional) = {category: {subcategory: [confidences]}} the user chose to forward to
+    Sports/Telegram. None stores SQL NULL = forward everything; an empty {} = forward nothing.
+    """
     addr = (address or "").strip().lower()
     con = connect(db_path)
     try:
         with con:
             con.execute(
                 "INSERT INTO wallets(created_at, updated_at, name, address, csv_filename, "
-                "analysis, thresholds) VALUES(?,?,?,?,?,?,?) "
+                "analysis, thresholds, filters) VALUES(?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(address) DO UPDATE SET updated_at=excluded.updated_at, "
                 "name=excluded.name, csv_filename=excluded.csv_filename, "
-                "analysis=excluded.analysis, thresholds=excluded.thresholds",
+                "analysis=excluded.analysis, thresholds=excluded.thresholds, "
+                "filters=excluded.filters",
                 (_now(), _now(), name.strip() or addr[:10], addr, csv_filename,
-                 json.dumps(analysis, default=str), json.dumps(thresholds, default=str)))
+                 json.dumps(analysis, default=str), json.dumps(thresholds, default=str),
+                 json.dumps(filters, default=str) if filters is not None else None))
             row = con.execute("SELECT id FROM wallets WHERE address=?", (addr,)).fetchone()
             return int(row["id"])
     finally:
@@ -113,6 +125,7 @@ def _summary(r: sqlite3.Row) -> dict:
         "updated_at": r["updated_at"], "n_markets": analysis.get("n_markets", 0),
         "win_rate": ov.get("win_rate"), "total_pnl": ov.get("total_pnl"), "roi": ov.get("roi"),
         "thresholds": json.loads(r["thresholds"]),
+        "filters": json.loads(r["filters"]) if r["filters"] else None,
     }
 
 
@@ -142,6 +155,23 @@ def get_by_address(address: str, db_path: str = DEFAULT_DB) -> dict | None:
         r = con.execute("SELECT * FROM wallets WHERE address=?",
                         ((address or "").strip().lower(),)).fetchone()
         return {**_summary(r), "analysis": json.loads(r["analysis"])} if r else None
+    finally:
+        con.close()
+
+
+def update_filters(wallet_id: int, filters: dict | None, db_path: str = DEFAULT_DB) -> bool:
+    """Update ONLY a wallet's forwarding filters (+ updated_at). Does NOT cascade, so the
+    live bet history (wallet_bets / seen_alerts / settled_markets) survives an edit — unlike
+    delete_wallet. None stores SQL NULL = forward everything; an empty {} = forward nothing.
+    Returns True if a row matched."""
+    con = connect(db_path)
+    try:
+        with con:
+            cur = con.execute(
+                "UPDATE wallets SET filters=?, updated_at=? WHERE id=?",
+                (json.dumps(filters, default=str) if filters is not None else None,
+                 _now(), wallet_id))
+            return cur.rowcount > 0
     finally:
         con.close()
 

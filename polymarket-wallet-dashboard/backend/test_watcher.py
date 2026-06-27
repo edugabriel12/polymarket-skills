@@ -22,6 +22,10 @@ WALLET = {
 }
 
 
+# Same wallet but only forwarding Soccer "Over/Under gols" at Alta confidence.
+FILTERED = {**WALLET, "filters": {"Soccer": {"Over/Under gols": ["Alta"]}}}
+
+
 def _pos(cond, invested, *, title="Arsenal vs. Chelsea", outcome="OVER",
          avg=0.56, cur=0.56, cashPnl=0.0, redeemable=False, endDate=None,
          slug="epl-ars-che-2026-06-25-total-2pt5"):
@@ -201,6 +205,71 @@ class TestPersistBets(unittest.TestCase):
             self.assertEqual(len(page), 2)
             self.assertTrue(all(b["status"] == "OPEN" for b in page))
             self.assertTrue(all(b["event"] and b["market_url"] for b in page))   # event/url stored
+
+
+class TestPassesFilter(unittest.TestCase):
+    def test_none_forwards_all(self):
+        self.assertTrue(w.passes_filter(None, "Soccer", "Over/Under gols", "Alta"))
+
+    def test_empty_dict_forwards_nothing(self):
+        # explicit {} = "forward nothing" (distinct from None = no restriction)
+        self.assertFalse(w.passes_filter({}, "Soccer", "Over/Under gols", "Alta"))
+
+    def test_category_not_selected(self):
+        f = {"Tennis": {"Vencedor da partida": ["Alta"]}}
+        self.assertFalse(w.passes_filter(f, "Soccer", "Over/Under gols", "Alta"))
+
+    def test_subcategory_not_selected(self):
+        f = {"Soccer": {"Ambas Marcam": ["Alta"]}}
+        self.assertFalse(w.passes_filter(f, "Soccer", "Over/Under gols", "Alta"))
+
+    def test_confidence_not_listed(self):
+        f = {"Soccer": {"Over/Under gols": ["Alta"]}}
+        self.assertFalse(w.passes_filter(f, "Soccer", "Over/Under gols", "Média"))
+
+    def test_exact_match(self):
+        f = {"Soccer": {"Over/Under gols": ["Alta", "Média"]}}
+        self.assertTrue(w.passes_filter(f, "Soccer", "Over/Under gols", "Média"))
+
+
+class TestDetectEntriesFilter(unittest.TestCase):
+    def test_media_dropped_when_only_alta_selected(self):
+        # $16k -> Média; filter forwards only Alta -> nothing emitted AND nothing persisted
+        # (so the market never enters seen_alerts and can never settle).
+        ents, persist = w.detect_entries(FILTERED, [_pos("c1", 16000)], {})
+        self.assertEqual(ents, [])
+        self.assertEqual(persist, [])
+
+    def test_alta_forwarded(self):
+        ents, persist = w.detect_entries(FILTERED, [_pos("c1", 45000)], {})
+        self.assertEqual(len(ents), 1)
+        self.assertEqual(ents[0]["confidence"], "Alta")
+        self.assertEqual(persist, [("c1", "Alta")])
+
+    def test_unfiltered_wallet_unchanged(self):
+        # WALLET has no "filters" key -> forward everything (legacy behavior preserved).
+        ents, _ = w.detect_entries(WALLET, [_pos("c1", 16000)], {})
+        self.assertEqual(len(ents), 1)
+
+
+class TestFilterSettleConsistency(unittest.TestCase):
+    def test_filtered_market_never_settles(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "w.db")
+            ws.add_wallet(WALLET["name"], WALLET["address"], {"n_markets": 0},
+                          WALLET["thresholds"],
+                          filters={"Soccer": {"Over/Under gols": ["Alta"]}}, db_path=db)
+            wallet = ws.get_wallet(ws.list_wallets(db)[0]["id"], db)
+            orig = w.wa.fetch_positions
+            w.wa.fetch_positions = lambda api, addr: api          # `api` is the positions list
+            try:
+                # Média position is filtered out -> not alerted
+                self.assertEqual(w.poll_wallet([_pos("c1", 16000)], wallet, db), [])
+                # It resolves: because it was never alerted, no orphan settle is emitted
+                resolved = [_pos("c1", 16000, redeemable=True, cashPnl=50.0)]
+                self.assertEqual(w.poll_wallet(resolved, wallet, db), [])
+            finally:
+                w.wa.fetch_positions = orig
 
 
 if __name__ == "__main__":
