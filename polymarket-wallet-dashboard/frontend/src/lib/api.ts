@@ -62,17 +62,25 @@ export interface WalletReport {
   error?: string;
 }
 
+// Lê o corpo de uma resposta não-ok, loga no console (com o detail do FastAPI) e
+// devolve um Error rico. Usado por todos os fluxos de fetch para facilitar o debug.
+async function httpError(r: Response, method: string, url: string): Promise<Error> {
+  const body = await r.text().catch(() => "");
+  console.error(`[api] ${method} ${url} -> HTTP ${r.status} ${r.statusText}`, body);
+  return new Error(`HTTP ${r.status} ${r.statusText}${body ? ` — ${body.slice(0, 500)}` : ""}`);
+}
+
 export async function uploadCsv(file: File): Promise<WalletReport> {
   const fd = new FormData();
   fd.append("file", file);
   const r = await fetch("/api/wallet/csv", { method: "POST", body: fd });
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  if (!r.ok) throw await httpError(r, "POST", "/api/wallet/csv");
   return (await r.json()) as WalletReport;
 }
 
 export async function fetchCsvDemo(): Promise<WalletReport> {
   const r = await fetch("/api/csv-demo");
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  if (!r.ok) throw await httpError(r, "GET", "/api/csv-demo");
   return (await r.json()) as WalletReport;
 }
 
@@ -118,9 +126,20 @@ export interface ModelResults {
 }
 
 async function jget<T>(url: string): Promise<T> {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-  return r.json() as Promise<T>;
+  let r: Response;
+  try {
+    r = await fetch(url);
+  } catch (err) {
+    console.error(`[api] GET ${url} — falha de rede/fetch (backend fora do ar?):`, err);
+    throw err;
+  }
+  if (!r.ok) throw await httpError(r, "GET", url);
+  try {
+    return (await r.json()) as T;
+  } catch (err) {
+    console.error(`[api] GET ${url} — resposta não é JSON válido:`, err);
+    throw err;
+  }
 }
 
 export interface DashBet {
@@ -170,12 +189,12 @@ export const wallets = {
     fd.append("address", address);
     fd.append("file", file);
     const r = await fetch("/api/wallets", { method: "POST", body: fd });
-    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+    if (!r.ok) throw await httpError(r, "POST", "/api/wallets");
     return r.json() as Promise<WalletRecord>;
   },
   remove: async (id: number) => {
     const r = await fetch(`/api/wallets/${id}`, { method: "DELETE" });
-    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+    if (!r.ok) throw await httpError(r, "DELETE", `/api/wallets/${id}`);
     return r.json();
   },
 };
