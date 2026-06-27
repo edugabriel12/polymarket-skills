@@ -57,6 +57,51 @@ def _cond(pos: dict) -> str:
     return str(pos.get("conditionId") or pos.get("market") or "")
 
 
+_GENERIC_TAGS = {"Sports (other)", "Esports (other)"}
+
+
+def _category_from_tags(api, event_slug: str) -> str | None:
+    """Map an event's Gamma tags to a category, preferring a specific sport over the generic
+    'Sports (other)'/'Esports (other)' tag. None when no tag maps."""
+    generic = None
+    for tg in wa.fetch_event_tags(api, event_slug):
+        cat = wa.TAG_TO_CATEGORY.get(tg)
+        if not cat:
+            continue
+        if cat in _GENERIC_TAGS:
+            generic = generic or cat
+        else:
+            return cat                                     # specific sport wins
+    return generic
+
+
+def resolve_category(api, event_slug, db_path: str = ws.DEFAULT_DB) -> str | None:
+    """Polymarket's OWN category for an event via Gamma tags, cached in the DB so it's fetched
+    once per event (not per poll). None when no tag maps — the caller keyword-classifies. A
+    transient Gamma failure is NOT cached (retried next poll); a real 'no mapping' is."""
+    if not event_slug:
+        return None
+    cached = ws.get_market_category(event_slug, db_path)
+    if cached is not None:
+        return cached or None                              # '' = known miss -> keyword fallback
+    try:
+        cat = _category_from_tags(api, event_slug)
+    except Exception:  # noqa: BLE001
+        return None
+    ws.set_market_category(event_slug, cat or "", db_path)
+    return cat
+
+
+def _enrich_categories(api, positions: list, db_path: str = ws.DEFAULT_DB) -> None:
+    """Stamp each position with pos['_category'] from Gamma tags (cached). Leaves it None on a
+    miss/failure so _market_fields falls back to the keyword/structural classifier."""
+    for pos in positions:
+        try:
+            pos["_category"] = resolve_category(api, pos.get("eventSlug"), db_path)
+        except Exception:  # noqa: BLE001 — tag resolution must never break the poll
+            pos["_category"] = None
+
+
 def _market_fields(pos: dict) -> dict:
     """Common parsed fields for a position (reused by the entry + the persisted bet)."""
     title = wa.sanitize_text(pos.get("title"))
@@ -64,9 +109,10 @@ def _market_fields(pos: dict) -> dict:
     eslug = pos.get("eventSlug", "")
     side = wa.sanitize_text(pos.get("outcome") or "")
     price = wa.to_float(pos.get("avgPrice")) or wa.to_float(pos.get("curPrice"))
-    # Live position titles can be plain club matchups ("Arsenal vs Chelsea") with no
-    # soccer keyword; the SLUG carries the league prefix (epl-/bra-/mlb-/nba-…).
-    category = csv_parser.classify_event(f"{title} {slug} {eslug}", side)
+    # Prefer Polymarket's OWN category (Gamma tag, resolved + cached in poll_wallet). Fall back
+    # to the keyword/structural classifier — live titles can be plain club matchups ("Arsenal vs
+    # Chelsea") with no sport keyword, but the SLUG carries the league prefix (epl-/bra-/mlb-…).
+    category = pos.get("_category") or csv_parser.classify_event(f"{title} {slug} {eslug}", side)
     return {
         "title": title, "slug": slug, "side": side.upper(), "price": price,
         "odds": (1.0 / price) if price > 0 else 0.0, "category": category,
@@ -187,6 +233,7 @@ def poll_wallet(api, wallet: dict, db_path: str = ws.DEFAULT_DB) -> list:
     except Exception as e:  # noqa: BLE001
         print(f"[watcher] {wallet.get('name')}: fetch failed — {e}", file=sys.stderr, flush=True)
         return []
+    _enrich_categories(api, positions, db_path)       # Polymarket tags -> category (cached)
     wid = wallet["id"]
     persist_bets(wallet, positions, db_path)          # Phase 2: keep live bet state per wallet
     seen_conf = ws.seen_confidences(wid, db_path)
