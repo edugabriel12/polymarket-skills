@@ -136,3 +136,37 @@ def rate_limited(key: str, limit: int, window_s: int) -> bool:
     bucket[:] = [t for t in bucket if t > cutoff]
     bucket.append(now)
     return len(bucket) > limit
+
+
+# --- verification-resend throttle: cooldown + capped retries (in-process) ---
+RESEND_COOLDOWN_S = int(os.environ.get("VERIFY_RESEND_COOLDOWN_S", "60"))  # min gap between resends
+RESEND_MAX = int(os.environ.get("VERIFY_RESEND_MAX", "3"))                 # max resends per window
+RESEND_RESET_S = int(os.environ.get("VERIFY_RESEND_RESET_S", "3600"))      # window after which it resets
+
+_RESEND: dict[str, list[float]] = defaultdict(list)
+
+
+def resend_throttle(key: str, *, now: float | None = None) -> dict:
+    """Cooldown + capped retries for verification-email resends, keyed per request (email+IP).
+
+    Returns ``{allowed, retry_after, remaining, reason}``:
+      - at most ``RESEND_MAX`` resends within a rolling ``RESEND_RESET_S`` window — older attempts
+        age out, so the counter RESETS over time and the user can try again later;
+      - at least ``RESEND_COOLDOWN_S`` between attempts.
+    Records the attempt only when allowed. Applied to EVERY request regardless of whether the
+    account exists, so it never leaks account existence (anti-enumeration). In-process only — a
+    multi-instance deploy would need a shared store (e.g. Redis). ``now`` is injectable for tests.
+    """
+    now = time.monotonic() if now is None else now
+    hits = _RESEND[key]
+    hits[:] = [t for t in hits if t > now - RESEND_RESET_S]    # the reset policy: window slides
+    if hits and (now - hits[-1]) < RESEND_COOLDOWN_S:          # still within the 60s cooldown
+        return {"allowed": False, "reason": "cooldown",
+                "retry_after": int(RESEND_COOLDOWN_S - (now - hits[-1])) + 1,
+                "remaining": max(0, RESEND_MAX - len(hits))}
+    if len(hits) >= RESEND_MAX:                                # cap reached for this window
+        return {"allowed": False, "reason": "max", "remaining": 0,
+                "retry_after": max(1, int(RESEND_RESET_S - (now - hits[0])) + 1)}
+    hits.append(now)
+    return {"allowed": True, "reason": None, "retry_after": RESEND_COOLDOWN_S,
+            "remaining": max(0, RESEND_MAX - len(hits))}

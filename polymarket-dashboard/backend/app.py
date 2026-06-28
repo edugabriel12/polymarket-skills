@@ -183,17 +183,25 @@ def verify_email(payload: dict) -> dict:
 
 @app.post("/api/auth/resend-verification")
 def resend_verification(payload: dict, request: Request) -> dict:
-    """Re-send the verification link for an unverified account (generic response)."""
+    """Re-send the verification link for an unverified account. Throttled: 60s cooldown + max 3
+    per rolling window (resets over time), keyed by request (email+IP) so it never leaks whether
+    the account exists. `retry_after`/`remaining` let the UI show a countdown + tries left."""
     email = (payload.get("email") or "").strip().lower() if isinstance(payload, dict) else ""
-    if not auth.rate_limited(f"resend:{email}:{_client_ip(request)}", limit=5, window_s=3600):
+    th = auth.resend_throttle(f"resend:{email}:{_client_ip(request)}")
+    if th["allowed"]:
         u = us.get_user_by_email(email)
         if u and not u["email_verified"]:
             us.invalidate_tokens(u["id"], "verify")
             raw, h = auth.new_token()
             us.create_token(u["id"], "verify", h, auth.VERIFY_TTL_HOURS)
             email_send.send_verification(email, raw)
-    return {"ok": True, "message": "Se houver uma conta não confirmada com esse e-mail, "
-            "enviamos um novo link."}
+        msg = "Se houver uma conta não confirmada com esse e-mail, enviamos um novo link."
+    elif th["reason"] == "max":
+        msg = "Limite de reenvios atingido. Tente novamente mais tarde."
+    else:
+        msg = f"Aguarde {th['retry_after']}s para reenviar."
+    return {"ok": th["allowed"], "message": msg,
+            "retry_after": th["retry_after"], "remaining": th["remaining"]}
 
 
 @app.post("/api/auth/login")
