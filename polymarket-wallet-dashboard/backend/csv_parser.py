@@ -87,14 +87,62 @@ _MLB = _words(
     "diamondbacks", "giants", "reds", "guardians", "padres", "astros", "yankees",
     "blue jays", "tigers", "twins", "angels", "athletics", "orioles", "rangers",
     "white sox", "mariners")
-# College (NCAA) basketball nicknames — only needed for the rare college game with NO O/U line
-# (an O/U line already routes to Basketball by magnitude). Tokens picked to avoid pro collisions
-# (so NOT "cardinals"/"tigers"/"hurricanes"/"royals", which are disambiguated by line magnitude).
+# American football (NFL). Nicknames that collide with another league's team are OMITTED
+# (giants=SF MLB, jets/panthers=NHL, dolphins/cardinals=other) and recovered by context.
+_NFL = _words(
+    "ravens", "steelers", "chiefs", "raiders", "falcons", "saints", "eagles", "bills", "bears",
+    "49ers", "lions", "patriots", "rams", "seahawks", "packers", "colts", "cowboys",
+    "buccaneers", "texans", "chargers", "vikings", "commanders", "jaguars", "titans", "bengals",
+    "browns")
+
+# Soccer: national teams + club markers, so "Spread: France"/"Spread: Chelsea FC" => Soccer while
+# "Spread: Cowboys" does not. Countries are stable; clubs via fc/cf + well-known names.
+_COUNTRIES = _words(
+    "france", "brazil", "germany", "spain", "switzerland", "morocco", "argentina", "portugal",
+    "mexico", "egypt", "england", "netherlands", "belgium", "croatia", "senegal", "ghana",
+    "japan", "iran", "ir iran", "uruguay", "colombia", "ecuador", "cabo verde", "haiti", "qatar",
+    "dr congo", "paraguay", "south africa", "canada", "norway", "austria", "jordan", "algeria",
+    "tunisia", "turkey", "türkiye", "panama", "uzbekistan", "new zealand", "saudi arabia",
+    "korea", "korea republic", "united states", "côte d'ivoire", "curaçao", "sweden", "bosnia")
+_CLUB = re.compile(
+    r"\bfc\b|\bcf\b|barcelona|arsenal|chelsea|real madrid|bayern|liverpool|manchester|tottenham|"
+    r"juventus|internazionale|aston villa|leverkusen|leipzig|frankfurt|stuttgart|valencia|"
+    r"sevilla|osasuna|brentford|burnley|brighton|nottingham forest|crystal palace|sassuolo|"
+    r"inter miami|whitecaps|paris saint", re.I)
+
+# College basketball-only / mid-major / Ivy programs + a few FBS schools these feeds write with
+# their MASCOT for hoops ("Michigan Wolverines") but the bare school name for football ("Michigan
+# vs. Texas") — the mascot disambiguates CBB from CFB. Forces Basketball (beats the date heuristic).
+_CBB_ONLY = _words(
+    "gonzaga", "saint joseph", "duquesne", "canisius", "golden griffins", "merrimack",
+    "bellarmine", "furman", "grand canyon", "antelopes", "central arkansas", "james madison",
+    "florida gulf coast", "gulf coast", "navy", "midshipmen", "murray", "racers", "yale",
+    "cornell", "columbia", "princeton", "big red", "rhode island", "st. bonaventure", "bonnies",
+    "umbc", "retrievers", "vermont", "catamounts", "drake", "southern illinois", "salukis",
+    "wichita", "shockers", "saint louis", "billikens", "davidson", "ut martin", "skyhawks",
+    "charleston southern", "mississippi valley", "delta devils", "jackson state", "grambling",
+    "alcorn", "prairie view", "howard", "norfolk", "alabama state", "jacksonville state",
+    "gamecocks", "new mexico state", "north dakota state", "lehigh", "mountain hawks", "tulsa",
+    "golden hurricane", "red storm", "st. john", "duke", "blue devils", "kentucky", "villanova",
+    "marquette", "creighton", "xavier", "butler", "providence", "georgetown", "uconn",
+    "connecticut", "wolverines", "gators", "badgers", "volunteers", "cougars")
+
+# Distinctive college identifiers (mascots/bare schools) that DON'T collide with a pro nickname.
+# A college marker; CFB-vs-CBB is then split by O/U magnitude + date (see _college_sport).
 _COLLEGE = _words(
-    "red storm", "wildcats", "cougars", "jayhawks", "cyclones", "boilermakers", "spartans",
-    "blue devils", "billikens", "wolverines", "lancers", "hawkeyes", "redhawks", "volunteers",
-    "zips", "red raiders", "broncos", "longhorns", "buckeyes", "wolfpack", "razorbacks",
-    "commodores", "cornhuskers", "horned frogs", "fighting illini", "aggies")
+    "wildcats", "crimson tide", "boilermakers", "billikens", "hawkeyes", "horned frogs", "zips",
+    "razorbacks", "commodores", "spartans", "golden gophers", "fighting illini", "huskies",
+    "paladins", "dukes", "mustangs", "sooners", "green wave", "tar heels", "wolfpack", "bulldogs",
+    "aggies", "bison", "sun devils", "jayhawks", "cyclones", "redhawks", "red raiders",
+    "longhorns", "buckeyes", "lancers", "cornhuskers", "broncos",
+    # bare school names with no pro-nickname collision in these feeds
+    "usc", "tcu", "vanderbilt", "missouri", "oklahoma", "hawaii", "new mexico", "smu", "oregon",
+    "indiana", "ole miss", "north texas", "georgia tech", "georgia southern", "western michigan",
+    "northwestern", "auburn", "nebraska", "virginia", "illinois", "clemson", "purdue", "iowa",
+    "michigan", "ohio state", "penn state", "alabama", "arkansas", "texas a&m", "a&m",
+    "north dakota", "louisville", "tennessee", "california", "wisconsin")
+
+_STATE = re.compile(r"\bstate\b|\ba&m\b|\(oh\)", re.I)   # "X State"/"A&M" => college (not "United States")
 
 # Soccer market phrasings (with non-US-league events => national-team soccer here).
 _SOCCER_SIGNAL = re.compile(
@@ -117,12 +165,37 @@ def _ou_line(blob: str) -> float | None:
     return float(m.group(1)) if m else None
 
 
-def classify_event(event: str, side: str) -> str:
+def _is_college(blob: str) -> bool:
+    return bool(_STATE.search(blob) or _COLLEGE.search(blob) or _CBB_ONLY.search(blob))
+
+
+def _college_sport(blob: str, month, line) -> str:
+    """CFB vs CBB for a college game. O/U magnitude is decisive; else basketball-only programs and
+    the Feb–Apr window are CBB, and the rest of the year (CFB season/bowls) is American Football.
+    Text alone can't always separate them — the live path resolves it precisely via Gamma tags."""
+    if line is not None and line >= 100:
+        return "Basketball"
+    if line is not None and 25 <= line <= 90:
+        return "American Football"
+    if _CBB_ONLY.search(blob):
+        return "Basketball"
+    if month in (2, 3, 4):
+        return "Basketball"               # CBB-only window (no college football)
+    return "American Football"            # CFB season / bowls (Sep–Jan)
+
+
+def _soccer_team(blob: str) -> bool:
+    return bool(_COUNTRIES.search(blob) or _CLUB.search(blob))
+
+
+def classify_event(event: str, side: str, month: int | None = None) -> str:
     """Category for one market from its text. Layered so specific market-type and line-magnitude
-    signals win before the broad team-nickname / keyword fallbacks (which over-grabbed before:
-    the soccer `o/u` signal stole tennis/MMA/basketball totals; college nicknames collided with
-    NHL/MLB). Used by the CSV analysis AND by the live watcher (fallback when no Gamma tag)."""
+    signals win before broad team-nickname / keyword fallbacks. Covers soccer, tennis, baseball,
+    basketball (incl. NCAA), American football (NFL + college), hockey (incl. Olympic), combat and
+    crypto. `month` (from the CSV date) splits college football vs basketball. Used by the CSV
+    analysis AND by the live watcher (fallback when no Gamma tag — which resolves it precisely)."""
     blob = f"{event} {side}".lower()
+    line = _ou_line(blob)
     # 1. Crypto
     if "bitcoin" in blob or "up or down" in blob:
         return "Crypto"
@@ -147,35 +220,68 @@ def classify_event(event: str, side: str) -> str:
     # 7. Soccer corners
     if "corners" in blob:
         return "Soccer"
-    # 8. Over/Under markets — line magnitude decides, and it beats nickname collisions.
-    line = _ou_line(blob)
+    # 8. Baseball first-inning prop (NRFI); Olympic ice-hockey group stage.
+    if "nrfi" in blob or "run scored in the first inning" in blob:
+        return "Baseball"
+    if re.search(r"men's group [a-h]\b", blob):
+        return "Hockey"
+    # 9. Over/Under markets — line magnitude decides, and it beats nickname collisions.
+    college = _is_college(blob)
     if line is not None:
         if line >= 100:
-            return "Basketball"     # NBA ~200+, NCAA ~130-170, WNBA ~155-180, 1st-half ~105-115
+            return "Basketball"             # NBA ~200+, NCAA ~130-170, WNBA ~155-180, 1H ~105-115
+        if college:
+            return _college_sport(blob, month, line)
+        if 25 <= line <= 90:
+            return "American Football"       # NFL ~40-55, CFB ~40-75
         if _NHL.search(blob):
-            return "Hockey"         # NHL totals ~5.5-7.5
+            return "Hockey"                 # NHL totals ~5.5-7.5
         if line >= 6.5:
-            return "Baseball"       # MLB totals ~6.5-19.5
-        return "Soccer"             # soccer goals ~1.5-5.5
-    # 9. No O/U line: wording, then team nickname, then keyword/structural fallback.
+            return "Baseball"               # MLB totals ~6.5-19.5
+        return "Soccer"                     # soccer goals ~1.5-5.5
+    # 10. No O/U line: wording, then college, then soccer team, then pro nickname, then fallback.
     if "both teams to score" in blob or "end in a draw" in blob or "exact score" in blob:
         return "Soccer"
+    if "win on" in blob and "will" in blob:
+        if college:
+            return _college_sport(blob, month, line)
+        if _NFL.search(blob):
+            return "American Football"
+        if _NBA.search(blob) or _WNBA.search(blob):
+            return "Basketball"
+        if _NHL.search(blob):
+            return "Hockey"
+        if _MLB.search(blob):
+            return "Baseball"
+        return "Soccer"
+    if college:
+        return _college_sport(blob, month, line)
+    if _soccer_team(blob):
+        return "Soccer"
+    if _NFL.search(blob):
+        return "American Football"
+    if _NBA.search(blob) or _WNBA.search(blob):
+        return "Basketball"
     if _NHL.search(blob):
         return "Hockey"
-    if _WNBA.search(blob) or _NBA.search(blob) or _COLLEGE.search(blob):
-        return "Basketball"
     if _MLB.search(blob):
         return "Baseball"
-    if _SOCCER_SIGNAL.search(blob):
-        return "Soccer"
     cat = wa.classify_category(blob)
     if cat == "Other" and _TENNIS_H2H.search(event or ""):
         return "Tennis"
     return cat
 
 
+def _month(date) -> int | None:
+    """Month (1-12) from a 'YYYY-MM-DD' date, or None — used to split college football vs basketball."""
+    try:
+        return int(str(date)[5:7])
+    except (TypeError, ValueError):
+        return None
+
+
 def _record(date, event, side, conf, odd, invested, profit) -> dict:
-    cat = classify_event(event, side)
+    cat = classify_event(event, side, _month(date))
     title = f"{event} {side}"
     sub = sc.classify(cat, title, "", "")
     won = True if profit > 0 else (False if profit < 0 else None)
