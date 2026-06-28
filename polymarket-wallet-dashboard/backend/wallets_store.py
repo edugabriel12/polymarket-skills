@@ -47,9 +47,9 @@ CREATE TABLE IF NOT EXISTS settled_markets (
     at           TEXT NOT NULL,
     PRIMARY KEY (wallet_id, condition_id)
 );
--- Markets the wallet ALREADY held the first time we polled it (open OR already settled).
--- Snapshotted once and ignored forever: only positions opened AFTER a wallet is added are
--- tracked, so bets that pre-date adding the wallet never leak into Resultados or to Sports.
+-- Markets the wallet had ALREADY SETTLED before the first time we polled it. Snapshotted once
+-- and ignored forever, so bets that settled BEFORE the wallet was added never leak into
+-- Resultados or to Sports. (Open positions are tracked normally and are NOT listed here.)
 CREATE TABLE IF NOT EXISTS baseline_markets (
     wallet_id    INTEGER NOT NULL,
     condition_id TEXT NOT NULL,
@@ -265,9 +265,9 @@ def baseline_established(wallet_id: int, db_path: str = DEFAULT_DB) -> bool:
 
 
 def set_baseline(wallet_id: int, condition_ids, db_path: str = DEFAULT_DB) -> None:
-    """Snapshot the markets a wallet ALREADY held at its first poll (ignored forever) and stamp
-    baseline_at so it's done exactly once. Pass an empty iterable for a wallet holding nothing —
-    baseline_at is still set, so every future position counts as new."""
+    """Snapshot the markets a wallet had ALREADY SETTLED before its first poll (ignored forever)
+    and stamp baseline_at so it's done exactly once. Pass an empty iterable when nothing was
+    pre-settled — baseline_at is still set, so the snapshot isn't retaken."""
     con = connect(db_path)
     try:
         with con:
@@ -281,7 +281,7 @@ def set_baseline(wallet_id: int, condition_ids, db_path: str = DEFAULT_DB) -> No
 
 
 def baseline_markets(wallet_id: int, db_path: str = DEFAULT_DB) -> set:
-    """The condition IDs a wallet already held when first polled (never tracked/forwarded)."""
+    """Condition IDs the wallet had already SETTLED before first poll (never tracked/forwarded)."""
     con = connect(db_path)
     try:
         return {r["condition_id"] for r in con.execute(
@@ -293,8 +293,8 @@ def baseline_markets(wallet_id: int, db_path: str = DEFAULT_DB) -> set:
 def reset_tracking(wallet_id: int, db_path: str = DEFAULT_DB) -> dict:
     """Wipe a wallet's LIVE tracking but KEEP the wallet itself (name/address/CSV analysis/
     thresholds/filters). Clears wallet_bets + the entry/settle dedup state + the baseline, and
-    nulls baseline_at so the NEXT poll re-snapshots the baseline from the wallet's current
-    holdings. Use this to purge pre-add bets that leaked before the baseline fix existed.
+    nulls baseline_at so the NEXT poll re-snapshots the already-settled baseline from now.
+    Use this to purge pre-add bets that leaked before the baseline fix existed.
     Returns the per-table row counts removed."""
     tables = ("wallet_bets", "seen_alerts", "settled_markets", "baseline_markets")
     con = connect(db_path)

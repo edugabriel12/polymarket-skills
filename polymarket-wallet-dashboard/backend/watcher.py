@@ -8,10 +8,10 @@ confidence tier's floor (learned from the wallet's CSV), it emits ONE entry per
 position has grown into a HIGHER tier re-emits the same entry (an upgrade). When the
 market resolves, it emits a settlement update (status + pnl).
 
-The FIRST poll after a wallet is added only snapshots a BASELINE of everything it already
-holds (open or already settled) and emits nothing — those markets pre-date watching, so they
-are ignored forever. Only positions the wallet opens AFTER it is added are ever tracked,
-persisted, or pushed; pre-add bets never leak into Resultados or to Sports.
+The FIRST poll after a wallet is added snapshots a BASELINE of the markets it had ALREADY
+SETTLED before then — those bets pre-date watching and are ignored forever, so settled-before-add
+never leaks into Resultados or to Sports. OPEN positions (pre-existing or opened later) ARE
+tracked: they show as entries and count in Resultados only once they settle while being watched.
 
 Pure detection (`detect_entries` / `detect_settlements`) is offline-testable; the
 polling loop is best-effort and no-ops when the Data API is unreachable.
@@ -250,16 +250,17 @@ def poll_wallet(api, wallet: dict, db_path: str = ws.DEFAULT_DB) -> list:
     _enrich_categories(api, positions, db_path)       # Polymarket tags -> category (cached)
     wid = wallet["id"]
 
-    # First poll after the wallet was added: snapshot everything it ALREADY holds (open OR
-    # already settled) as the baseline and emit NOTHING. Those markets pre-date the wallet being
-    # watched — they must never show in Resultados or be pushed to Sports. Only positions opened
-    # AFTER this point are tracked. (`reset_tracking` nulls baseline_at to re-snapshot from now.)
+    # First poll after the wallet was added: snapshot ONLY the markets it had ALREADY SETTLED
+    # before now — those bets pre-date watching and are ignored forever (settled-before-add never
+    # leaks into Resultados or Sports). OPEN positions (pre-existing or new) are NOT baselined:
+    # they're processed below as entries on this very poll and settle normally while watched.
+    # (`reset_tracking` nulls baseline_at to re-snapshot from now.)
     if not ws.baseline_established(wid, db_path):
-        ws.set_baseline(wid, [_cond(p) for p in positions], db_path)
+        settled_pre = [_cond(p) for p in positions if _cond(p) and _is_resolved(p)]
+        ws.set_baseline(wid, settled_pre, db_path)
         print(f"[watcher] {wallet.get('name')}: baseline set — "
-              f"{len(positions)} pre-existing market(s) will be ignored",
+              f"{len(settled_pre)} already-settled market(s) will be ignored",
               file=sys.stderr, flush=True)
-        return []
 
     base = ws.baseline_markets(wid, db_path)
     persist_bets(wallet, positions, db_path, baseline=base)  # Phase 2: keep live bet state per wallet
