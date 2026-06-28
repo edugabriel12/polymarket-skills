@@ -1,33 +1,56 @@
 #!/usr/bin/env python3
 """Telegram delivery for new/upgraded entries.
 
-Message shows the Unidade Sugerida and a LIVE/PRÉ-LIVE flag. It deliberately omits
-the wallet and the position size, and carries NO model/wallet origin (entries reach
-here already stripped of `source`). Config: TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID.
+The card header is the LIVE/PRÉ-LIVE flag (🔴/⏳) — NOT the source wallet — followed by the
+market, then Lado / Cotação / Unidade sugerida / Confiança / Encerra and a "Ver mercado" link.
+It deliberately omits the wallet name and the position size (e.g. how much was invested), and
+carries NO model/wallet origin (entries reach here already stripped of `source`). Sent as HTML
+so the link renders as clickable text. Config: per-user bot token + chat id.
 """
 
 from __future__ import annotations
 
+import html
 import sys
 
-import results_combined as rc
-
 _LIVE_ICON = {"LIVE": "🔴", "PRÉ-LIVE": "⏳"}
+_CONF_BARS = {"Alta": "■ ■ ■", "Média": "■ ■", "Baixa": "■"}
+
+
+def _fmt_unit(u) -> str:
+    """1.0 -> '1.0', 0.5 -> '0.5', 0.25 -> '0.25' (keeps at least one decimal)."""
+    s = f"{float(u or 0):.2f}".rstrip("0").rstrip(".")
+    return s if "." in s else f"{s}.0"
+
+
+def _fmt_date(s) -> str:
+    """An ISO date/datetime -> 'YYYY-MM-DD' (empty when absent)."""
+    return str(s)[:10] if s else ""
 
 
 def format_entry(e: dict) -> str:
-    unit = rc.unit_label(e.get("unit"))
+    """Build the Telegram card (HTML). Header = LIVE/PRÉ-LIVE flag; no wallet, no position size."""
     live = e.get("live") or "PRÉ-LIVE"
     icon = _LIVE_ICON.get(live, "")
+    price = float(e.get("entry_price") or 0)
     odds = float(e.get("odds") or 0)
+    conf = str(e.get("confidence") or "")
     lines = [
-        f"🎯 {e.get('event','')} — {e.get('side','')}",
-        f"{e.get('category','')} · {e.get('subcategory','')} · {unit}",
-        f"odds {odds:.2f} · {icon} {live}".strip(),
+        f"{icon} <b>{html.escape(live)}</b>",
+        f"<b>{html.escape(str(e.get('event', '')))}</b>",
+        "",
+        f"Lado: <b>{html.escape(str(e.get('side', '')))}</b>",
+        f"Cotação: <b>{price * 100:.1f}%</b> (Odd {odds:.2f})",
+        f"Unidade sugerida: <b>{_fmt_unit(e.get('unit'))}</b>",
     ]
+    if conf:
+        lines.append(f"Confiança: {_CONF_BARS.get(conf, '')} {html.escape(conf)}".rstrip())
+    date = _fmt_date(e.get("game_start"))
+    if date:
+        lines.append(f"⏰ Encerra: {date}")
     if e.get("market_url"):
-        lines.append(e["market_url"])
-    return "\n".join(x for x in lines if x.strip())
+        lines.append(f'<a href="{html.escape(str(e["market_url"]), quote=True)}">🔗 Ver mercado</a>')
+    return "\n".join(lines)
 
 
 def configured() -> bool:
@@ -37,9 +60,10 @@ def configured() -> bool:
 
 
 def send(text: str, *, token: str | None = None, chat_id: str | None = None,
-         client=None) -> bool:
+         parse_mode: str | None = None, client=None) -> bool:
     """POST to the Telegram Bot API. Token/chat default to the saved settings (then env).
-    Best-effort; False if unconfigured or on failure."""
+    `parse_mode` (e.g. 'HTML') is sent only when provided. Best-effort; False if unconfigured
+    or on failure."""
     if token is None or chat_id is None:
         import telegram_settings as ts
         cfg = ts.get_config()
@@ -53,10 +77,11 @@ def send(text: str, *, token: str | None = None, chat_id: str | None = None,
     if client is None:
         import requests
         client = requests
+    payload = {"chat_id": chat, "text": text, "disable_web_page_preview": True}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     try:
-        r = client.post(f"https://api.telegram.org/bot{tok}/sendMessage",
-                        json={"chat_id": chat, "text": text, "disable_web_page_preview": True},
-                        timeout=8)
+        r = client.post(f"https://api.telegram.org/bot{tok}/sendMessage", json=payload, timeout=8)
         r.raise_for_status()
         return True
     except Exception as e:  # noqa: BLE001 - never break ingest on a Telegram failure
@@ -65,6 +90,8 @@ def send(text: str, *, token: str | None = None, chat_id: str | None = None,
 
 
 def notify_entry(e: dict, **kw) -> bool:
+    """Send an entry card. Rendered as HTML (so 'Ver mercado' is a clickable link)."""
+    kw.setdefault("parse_mode", "HTML")
     return send(format_entry(e), **kw)
 
 

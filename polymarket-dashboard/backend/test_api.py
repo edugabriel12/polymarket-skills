@@ -152,11 +152,19 @@ class TestResultsUnits(unittest.TestCase):
 class TestTelegramFormat(unittest.TestCase):
     def test_format_no_wallet_no_position(self):
         msg = tg.format_entry(_entry("k", live="PRÉ-LIVE"))
-        self.assertIn("1U", msg)
-        self.assertIn("PRÉ-LIVE", msg)
+        self.assertIn("⏳ <b>PRÉ-LIVE</b>", msg)          # header = LIVE/PRÉ-LIVE flag, not the source
+        self.assertIn("Lado: <b>OVER</b>", msg)
+        self.assertIn("Cotação:", msg)
+        self.assertIn("Unidade sugerida: <b>1.0</b>", msg)
         self.assertIn("ARS vs CHE", msg)
-        self.assertNotIn("0x", msg)        # no wallet
-        self.assertNotIn("$", msg)         # no position size
+        self.assertIn(">🔗 Ver mercado</a>", msg)         # clickable market link
+        self.assertNotIn("0x", msg)                       # no wallet
+        self.assertNotIn("$", msg)                        # no position size
+
+    def test_format_live_flag_and_confidence(self):
+        msg = tg.format_entry(_entry("k", live="LIVE", confidence="Média"))
+        self.assertIn("🔴 <b>LIVE</b>", msg)
+        self.assertIn("Confiança: ■ ■ Média", msg)        # 2 bars for Média
 
     def test_send_uses_bot_api(self):
         class _Resp:
