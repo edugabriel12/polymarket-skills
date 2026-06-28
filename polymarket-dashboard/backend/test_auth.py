@@ -206,5 +206,56 @@ class TestPerUserTelegramAndFanout(unittest.TestCase):
         self.assertEqual(chats, ["2001", "2002"])           # only the two configured users
 
 
+class TestActivateUser(unittest.TestCase):
+    """The admin activate-user path: list pending accounts and flip one to verified (unblocks login)."""
+
+    def setUp(self):
+        _TOKENS["verify"].clear(); _TOKENS["reset"].clear(); _auth._ATTEMPTS.clear()
+
+    def test_list_unverified_then_activation_unblocks_login(self):
+        c = _client()
+        _register(c, "pend@example.com")                          # creates an UNVERIFIED account
+        self.assertIn("pend@example.com", {u["email"] for u in us.list_unverified()})
+        # blocked before activation
+        self.assertTrue(c.post("/api/auth/login",
+                               json={"email": "pend@example.com", "password": _PW})
+                        .json().get("needs_verification"))
+        # activate via the same store calls the CLI uses
+        uid = us.get_user_by_email("pend@example.com")["id"]
+        us.mark_verified(uid)
+        us.invalidate_tokens(uid, "verify")
+        self.assertNotIn("pend@example.com", {u["email"] for u in us.list_unverified()})
+        # login now succeeds
+        self.assertTrue(c.post("/api/auth/login",
+                               json={"email": "pend@example.com", "password": _PW}).json().get("ok"))
+
+    def test_cli_email_dry_run_then_apply(self):
+        import activate_user
+        us.create_user("CLI User", "cli@example.com", _auth.hash_password(_PW))
+        argv = sys.argv
+        try:
+            sys.argv = ["activate_user.py", "--email", "cli@example.com"]        # dry-run
+            activate_user.main()
+            self.assertFalse(us.get_user_by_email("cli@example.com")["email_verified"])
+            sys.argv = ["activate_user.py", "--email", "cli@example.com", "--apply"]
+            activate_user.main()
+            self.assertTrue(us.get_user_by_email("cli@example.com")["email_verified"])
+        finally:
+            sys.argv = argv
+
+    def test_cli_all_activates_every_pending(self):
+        import activate_user
+        for e in ("a1@example.com", "a2@example.com"):
+            us.create_user("U", e, _auth.hash_password(_PW))
+        argv = sys.argv
+        try:
+            sys.argv = ["activate_user.py", "--all", "--apply"]
+            activate_user.main()
+        finally:
+            sys.argv = argv
+        self.assertNotIn("a1@example.com", {u["email"] for u in us.list_unverified()})
+        self.assertNotIn("a2@example.com", {u["email"] for u in us.list_unverified()})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

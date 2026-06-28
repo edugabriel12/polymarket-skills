@@ -140,6 +140,17 @@ def mark_verified(user_id: int, db_path: str = DEFAULT_DB) -> None:
         con.close()
 
 
+def list_unverified(db_path: str = DEFAULT_DB) -> list[dict]:
+    """Pending accounts (e-mail not yet verified), oldest first — for the activate-user CLI."""
+    con = connect(db_path)
+    try:
+        return [{k: r[k] for k in r.keys()} for r in con.execute(
+            "SELECT id, full_name, email, created_at FROM users WHERE email_verified=0 "
+            "ORDER BY created_at")]
+    finally:
+        con.close()
+
+
 # --- sessions --------------------------------------------------------------
 def create_session(user_id: int, id_hash: str, ttl_days: int = 30,
                    db_path: str = DEFAULT_DB) -> None:
