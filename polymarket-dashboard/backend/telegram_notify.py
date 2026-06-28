@@ -2,7 +2,7 @@
 """Telegram delivery for new/upgraded entries.
 
 The card header is the LIVE/PRÉ-LIVE flag (🔴/⏳) — NOT the source wallet — followed by the
-market, then Lado / Cotação / Unidade sugerida / Confiança / Encerra and a "Ver mercado" link.
+market, then Lado / Cotação / Unidade sugerida / Encerra and a "Ver mercado" link.
 It deliberately omits the wallet name and the position size (e.g. how much was invested), and
 carries NO model/wallet origin (entries reach here already stripped of `source`). Sent as HTML
 so the link renders as clickable text. Config: per-user bot token + chat id.
@@ -14,7 +14,6 @@ import html
 import sys
 
 _LIVE_ICON = {"LIVE": "🔴", "PRÉ-LIVE": "⏳"}
-_CONF_BARS = {"Alta": "■ ■ ■", "Média": "■ ■", "Baixa": "■"}
 
 
 def _fmt_unit(u) -> str:
@@ -34,7 +33,6 @@ def format_entry(e: dict) -> str:
     icon = _LIVE_ICON.get(live, "")
     price = float(e.get("entry_price") or 0)
     odds = float(e.get("odds") or 0)
-    conf = str(e.get("confidence") or "")
     lines = [
         f"{icon} <b>{html.escape(live)}</b>",
         f"<b>{html.escape(str(e.get('event', '')))}</b>",
@@ -43,8 +41,6 @@ def format_entry(e: dict) -> str:
         f"Cotação: <b>{price * 100:.1f}%</b> (Odd {odds:.2f})",
         f"Unidade sugerida: <b>{_fmt_unit(e.get('unit'))}</b>",
     ]
-    if conf:
-        lines.append(f"Confiança: {_CONF_BARS.get(conf, '')} {html.escape(conf)}".rstrip())
     date = _fmt_date(e.get("game_start"))
     if date:
         lines.append(f"⏰ Encerra: {date}")

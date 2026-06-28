@@ -161,10 +161,10 @@ class TestTelegramFormat(unittest.TestCase):
         self.assertNotIn("0x", msg)                       # no wallet
         self.assertNotIn("$", msg)                        # no position size
 
-    def test_format_live_flag_and_confidence(self):
+    def test_format_live_flag_no_confidence(self):
         msg = tg.format_entry(_entry("k", live="LIVE", confidence="Média"))
         self.assertIn("🔴 <b>LIVE</b>", msg)
-        self.assertIn("Confiança: ■ ■ Média", msg)        # 2 bars for Média
+        self.assertNotIn("Confiança", msg)                # confidence removed from the card
 
     def test_send_uses_bot_api(self):
         class _Resp:
