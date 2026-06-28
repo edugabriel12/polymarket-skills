@@ -64,6 +64,33 @@ class TestStore(unittest.TestCase):
         ws.delete_wallet(wid, db_path=_DB)
         ws.delete_wallet(wid2, db_path=_DB)
 
+    def test_baseline_and_reset_tracking(self):
+        a = "0x" + "ba" * 20
+        wid = ws.add_wallet("B", a, {"n_markets": 0, "overall": {}},
+                            {"Alta": {"floor": 1, "unit": 1.0}}, "b.csv", db_path=_DB)
+        # a fresh wallet has no baseline yet
+        self.assertFalse(ws.baseline_established(wid, db_path=_DB))
+        ws.set_baseline(wid, ["m1", "m2", "m1", ""], db_path=_DB)   # dedups + drops blank
+        self.assertTrue(ws.baseline_established(wid, db_path=_DB))
+        self.assertEqual(ws.baseline_markets(wid, db_path=_DB), {"m1", "m2"})
+        # seed some live tracking, then reset it
+        ws.upsert_bet(wid, "m9", {"event": "x", "category": "Soccer", "subcategory": "Outro",
+                                  "confidence": "Alta", "side": "OVER", "total_position": 100.0,
+                                  "entry_price": 0.5, "odds": 2.0, "status": "WON", "pnl": 5.0},
+                      db_path=_DB)
+        ws.set_seen_confidence(wid, "m9", "Alta", db_path=_DB)
+        ws.mark_settled(wid, "m9", db_path=_DB)
+        removed = ws.reset_tracking(wid, db_path=_DB)
+        self.assertEqual(removed["wallet_bets"], 1)
+        self.assertEqual(removed["baseline_markets"], 2)
+        # reset nulls the baseline and wipes tracking, but KEEPS the wallet
+        self.assertFalse(ws.baseline_established(wid, db_path=_DB))
+        self.assertEqual(ws.baseline_markets(wid, db_path=_DB), set())
+        self.assertEqual(ws.list_bets(wid, db_path=_DB), [])
+        self.assertEqual(ws.seen_confidences(wid, db_path=_DB), {})
+        self.assertEqual(ws.get_wallet(wid, db_path=_DB)["name"], "B")
+        ws.delete_wallet(wid, db_path=_DB)
+
 
 class TestEndpoints(unittest.TestCase):
     def setUp(self):

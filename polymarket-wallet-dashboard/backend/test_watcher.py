@@ -127,7 +127,10 @@ class TestPollWalletPersists(unittest.TestCase):
             orig = w.wa.fetch_positions
             w.wa.fetch_positions = fake_fetch
             try:
-                # first poll: a $45k market -> Alta entry
+                # first poll only snapshots the baseline (wallet held nothing) -> emits nothing
+                self.assertEqual(w.poll_wallet(_Api([]), wallet, db), [])
+                self.assertTrue(ws.baseline_established(wid, db))
+                # a NEW $45k market opens after add -> Alta entry
                 ents = w.poll_wallet(_Api([_pos("c1", 45000)]), wallet, db)
                 self.assertEqual(len(ents), 1)
                 self.assertEqual(ents[0]["confidence"], "Alta")
@@ -263,13 +266,85 @@ class TestFilterSettleConsistency(unittest.TestCase):
             orig = w.wa.fetch_positions
             w.wa.fetch_positions = lambda api, addr: api          # `api` is the positions list
             try:
-                # Média position is filtered out -> not alerted
+                # first poll snapshots an (empty) baseline
+                self.assertEqual(w.poll_wallet([], wallet, db), [])
+                # a NEW Média position opens -> filtered out -> not alerted
                 self.assertEqual(w.poll_wallet([_pos("c1", 16000)], wallet, db), [])
                 # It resolves: because it was never alerted, no orphan settle is emitted
                 resolved = [_pos("c1", 16000, redeemable=True, cashPnl=50.0)]
                 self.assertEqual(w.poll_wallet(resolved, wallet, db), [])
             finally:
                 w.wa.fetch_positions = orig
+
+
+class TestBaseline(unittest.TestCase):
+    """The first poll snapshots a wallet's pre-existing holdings (open OR already settled) and
+    ignores them forever — only positions opened AFTER the wallet is added are tracked."""
+
+    def setUp(self):
+        self._orig = w.wa.fetch_positions
+        w.wa.fetch_positions = lambda api, addr: api      # `api` is the positions list
+
+    def tearDown(self):
+        w.wa.fetch_positions = self._orig
+
+    def _new_wallet(self, d):
+        db = os.path.join(d, "w.db")
+        ws.add_wallet(WALLET["name"], WALLET["address"], {"n_markets": 0},
+                      WALLET["thresholds"], db_path=db)
+        wid = ws.list_wallets(db)[0]["id"]
+        return db, wid, ws.get_wallet(wid, db)
+
+    def test_pre_existing_holdings_ignored_forever(self):
+        with tempfile.TemporaryDirectory() as d:
+            db, wid, wallet = self._new_wallet(d)
+            pre = [_pos("old_open", 45000),                                   # open at add
+                   _pos("old_done", 45000, redeemable=True, cashPnl=120.0)]   # ALREADY settled
+            # first poll: baseline only — nothing emitted, nothing persisted
+            self.assertEqual(w.poll_wallet(pre, wallet, db), [])
+            self.assertTrue(ws.baseline_established(wid, db))
+            self.assertEqual(ws.list_bets(wid, db), [])                       # no pre-add bets
+            self.assertEqual(ws.baseline_markets(wid, db), {"old_open", "old_done"})
+            # the open one later resolves -> STILL ignored (it pre-dated watching)
+            later = [_pos("old_open", 45000, redeemable=True, cashPnl=77.0),
+                     _pos("old_done", 45000, redeemable=True, cashPnl=120.0)]
+            self.assertEqual(w.poll_wallet(later, wallet, db), [])
+            self.assertEqual(ws.list_bets(wid, db), [])
+
+    def test_new_position_after_baseline_is_tracked(self):
+        with tempfile.TemporaryDirectory() as d:
+            db, wid, wallet = self._new_wallet(d)
+            self.assertEqual(w.poll_wallet([_pos("old", 45000)], wallet, db), [])  # baseline
+            ents = w.poll_wallet([_pos("old", 45000), _pos("new", 45000)], wallet, db)
+            self.assertEqual(len(ents), 1)
+            self.assertEqual(ents[0]["key"], en.make_key(WALLET["address"], "new"))
+            self.assertEqual({b["condition_id"] for b in ws.list_bets(wid, db)}, {"new"})
+
+    def test_empty_first_poll_then_first_position_is_new(self):
+        # cold start: wallet holds nothing at add -> empty baseline -> first position counts
+        with tempfile.TemporaryDirectory() as d:
+            db, wid, wallet = self._new_wallet(d)
+            self.assertEqual(w.poll_wallet([], wallet, db), [])
+            self.assertTrue(ws.baseline_established(wid, db))
+            ents = w.poll_wallet([_pos("c1", 45000)], wallet, db)
+            self.assertEqual(len(ents), 1)
+            self.assertEqual(ents[0]["confidence"], "Alta")
+
+    def test_reset_tracking_reseeds_baseline(self):
+        with tempfile.TemporaryDirectory() as d:
+            db, wid, wallet = self._new_wallet(d)
+            w.poll_wallet([], wallet, db)                          # baseline (empty)
+            w.poll_wallet([_pos("c1", 45000)], wallet, db)        # c1 tracked
+            self.assertTrue(ws.list_bets(wid, db))
+            removed = ws.reset_tracking(wid, db)
+            self.assertGreaterEqual(removed["wallet_bets"], 1)
+            self.assertFalse(ws.baseline_established(wid, db))     # must re-baseline
+            self.assertEqual(ws.list_bets(wid, db), [])
+            # the wallet config is untouched by a reset
+            self.assertEqual(ws.get_wallet(wid, db)["name"], WALLET["name"])
+            # current holdings become the NEW baseline -> ignored from now on
+            self.assertEqual(w.poll_wallet([_pos("c1", 45000)], wallet, db), [])
+            self.assertEqual(ws.list_bets(wid, db), [])
 
 
 class TestTagCategory(unittest.TestCase):

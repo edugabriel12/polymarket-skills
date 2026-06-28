@@ -8,6 +8,11 @@ confidence tier's floor (learned from the wallet's CSV), it emits ONE entry per
 position has grown into a HIGHER tier re-emits the same entry (an upgrade). When the
 market resolves, it emits a settlement update (status + pnl).
 
+The FIRST poll after a wallet is added only snapshots a BASELINE of everything it already
+holds (open or already settled) and emits nothing — those markets pre-date watching, so they
+are ignored forever. Only positions the wallet opens AFTER it is added are ever tracked,
+persisted, or pushed; pre-add bets never leak into Resultados or to Sports.
+
 Pure detection (`detect_entries` / `detect_settlements`) is offline-testable; the
 polling loop is best-effort and no-ops when the Data API is unreachable.
 """
@@ -134,16 +139,21 @@ def _entry_for_position(wallet: dict, pos: dict, tier: dict,
         source=wallet.get("name", ""), status=status, pnl=pnl)
 
 
-def persist_bets(wallet: dict, positions: list, db_path: str = ws.DEFAULT_DB) -> None:
+def persist_bets(wallet: dict, positions: list, db_path: str = ws.DEFAULT_DB,
+                 baseline: set | None = None) -> None:
     """Upsert the latest state of every tiered market into wallet_bets (Phase 2), so the
     wallet's separated Resultados can merge live settled bets with the CSV snapshot.
 
     Intentionally NOT gated by the wallet's forwarding filters: the owner sees full live
-    performance in Resultados; the filter only governs what is pushed to Sports/Telegram."""
+    performance in Resultados; the filter only governs what is pushed to Sports/Telegram.
+
+    `baseline` = markets the wallet already held when first polled. They pre-date watching, so
+    they are skipped here too — a pre-add (often already-settled) bet must never appear in
+    Resultados."""
     th = wallet.get("thresholds") or {}
     for pos in positions:
         cond = _cond(pos)
-        if not cond:
+        if not cond or (baseline and cond in baseline):
             continue
         tier = cm.classify_position(_total_position(pos), th)
         if not tier:
@@ -160,17 +170,21 @@ def persist_bets(wallet: dict, positions: list, db_path: str = ws.DEFAULT_DB) ->
             "odds": f["odds"], "status": status, "pnl": pnl}, db_path)
 
 
-def detect_entries(wallet: dict, positions: list, seen_conf: dict) -> tuple[list, list]:
+def detect_entries(wallet: dict, positions: list, seen_conf: dict,
+                   baseline: set | None = None) -> tuple[list, list]:
     """New/upgraded entries. Returns (entries, [(condition_id, confidence)] to persist).
 
     `seen_conf` = {condition_id: highest tier already alerted}. An entry fires when a
     market is first sized into a tier, or when it climbs into a HIGHER tier.
+
+    `baseline` = markets the wallet already held when first polled — skipped, so a position that
+    pre-dates adding the wallet is never alerted as if it were a fresh entry.
     """
     out, persist = [], []
     th = wallet.get("thresholds") or {}
     for pos in positions:
         cond = _cond(pos)
-        if not cond:
+        if not cond or (baseline and cond in baseline):
             continue
         tier = cm.classify_position(_total_position(pos), th)
         if not tier:
@@ -235,11 +249,24 @@ def poll_wallet(api, wallet: dict, db_path: str = ws.DEFAULT_DB) -> list:
         return []
     _enrich_categories(api, positions, db_path)       # Polymarket tags -> category (cached)
     wid = wallet["id"]
-    persist_bets(wallet, positions, db_path)          # Phase 2: keep live bet state per wallet
+
+    # First poll after the wallet was added: snapshot everything it ALREADY holds (open OR
+    # already settled) as the baseline and emit NOTHING. Those markets pre-date the wallet being
+    # watched — they must never show in Resultados or be pushed to Sports. Only positions opened
+    # AFTER this point are tracked. (`reset_tracking` nulls baseline_at to re-snapshot from now.)
+    if not ws.baseline_established(wid, db_path):
+        ws.set_baseline(wid, [_cond(p) for p in positions], db_path)
+        print(f"[watcher] {wallet.get('name')}: baseline set — "
+              f"{len(positions)} pre-existing market(s) will be ignored",
+              file=sys.stderr, flush=True)
+        return []
+
+    base = ws.baseline_markets(wid, db_path)
+    persist_bets(wallet, positions, db_path, baseline=base)  # Phase 2: keep live bet state per wallet
     seen_conf = ws.seen_confidences(wid, db_path)
     settled = ws.settled_keys(wid, db_path)
 
-    new_entries, persist = detect_entries(wallet, positions, seen_conf)
+    new_entries, persist = detect_entries(wallet, positions, seen_conf, baseline=base)
     for cond, conf in persist:
         ws.set_seen_confidence(wid, cond, conf, db_path)
         seen_conf[cond] = conf
