@@ -257,5 +257,41 @@ class TestActivateUser(unittest.TestCase):
         self.assertNotIn("a2@example.com", {u["email"] for u in us.list_unverified()})
 
 
+class TestResendThrottle(unittest.TestCase):
+    """Verification resend: 60s cooldown + max 3 per window, with a sliding reset (anti-enum-safe)."""
+
+    def setUp(self):
+        _auth._RESEND.clear(); _auth._ATTEMPTS.clear()
+
+    def test_cooldown_cap_and_reset(self):
+        k = "resend:t@e.com:ip"
+        r1 = _auth.resend_throttle(k, now=0)
+        self.assertTrue(r1["allowed"]); self.assertEqual(r1["remaining"], 2)
+        r2 = _auth.resend_throttle(k, now=30)                 # within 60s -> cooldown
+        self.assertFalse(r2["allowed"]); self.assertEqual(r2["reason"], "cooldown")
+        self.assertEqual(r2["retry_after"], 31)
+        self.assertTrue(_auth.resend_throttle(k, now=60)["allowed"])   # 2nd
+        r4 = _auth.resend_throttle(k, now=120)               # 3rd
+        self.assertTrue(r4["allowed"]); self.assertEqual(r4["remaining"], 0)
+        r5 = _auth.resend_throttle(k, now=180)               # 4th -> capped
+        self.assertFalse(r5["allowed"]); self.assertEqual(r5["reason"], "max")
+        # after the reset window the oldest attempt ages out -> allowed again
+        self.assertTrue(_auth.resend_throttle(k, now=3661)["allowed"])
+
+    def test_endpoint_first_ok_then_cooldown(self):
+        c = _client()
+        _register(c, "rt@example.com")                       # creates an unverified account
+        r1 = c.post("/api/auth/resend-verification", json={"email": "rt@example.com"}).json()
+        self.assertTrue(r1["ok"]); self.assertEqual(r1["retry_after"], 60)
+        r2 = c.post("/api/auth/resend-verification", json={"email": "rt@example.com"}).json()
+        self.assertFalse(r2["ok"]); self.assertGreater(r2["retry_after"], 0)
+
+    def test_endpoint_same_response_for_unknown_email(self):
+        # anti-enumeration: an unknown e-mail is throttled identically (no existence leak)
+        c = _client()
+        r = c.post("/api/auth/resend-verification", json={"email": "ghost@example.com"}).json()
+        self.assertTrue(r["ok"]); self.assertEqual(r["retry_after"], 60)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

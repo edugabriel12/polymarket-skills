@@ -139,6 +139,8 @@ export interface AuthResult {
   message?: string;
   needs_verification?: boolean;
   user?: User;
+  retry_after?: number; // seconds until a resend is allowed again (verification resend throttle)
+  remaining?: number; // resends left in the current window
 }
 
 export const api = {

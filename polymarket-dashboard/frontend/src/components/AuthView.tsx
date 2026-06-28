@@ -95,14 +95,15 @@ function LoginForm({ onMode }: { onMode: (m: Mode) => void }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [needVerify, setNeedVerify] = useState(false);
-  const [resent, setResent] = useState(false);
+  const [cooldown, setCooldown] = useState(0);          // seconds until a resend is allowed again
+  const [resendMsg, setResendMsg] = useState<string | null>(null);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusy(true);
     setErr(null);
     setNeedVerify(false);
-    setResent(false);
+    setResendMsg(null);
     try {
       const r: AuthResult = await api.auth.login(email.trim(), password);
       if (r.ok && r.user) {
@@ -118,12 +119,23 @@ function LoginForm({ onMode }: { onMode: (m: Mode) => void }) {
     }
   };
 
+  // Tick the resend cooldown down to 0 (drives the disabled button + countdown).
+  useEffect(() => {
+    if (cooldown <= 0) return;
+    const t = setInterval(() => setCooldown((s) => Math.max(0, s - 1)), 1000);
+    return () => clearInterval(t);
+  }, [cooldown]);
+
   const resend = async () => {
+    if (cooldown > 0) return;                            // respect the 60s cooldown
     try {
-      await api.auth.resendVerification(email.trim());
-      setResent(true);
+      const r = await api.auth.resendVerification(email.trim());
+      let m = r.message || "";
+      if (r.ok && typeof r.remaining === "number") m += ` (${r.remaining} reenvio(s) restante(s))`;
+      setResendMsg(m || null);
+      if (typeof r.retry_after === "number") setCooldown(Math.min(r.retry_after, 120));
     } catch {
-      /* generic — ignore */
+      setResendMsg("Falha ao reenviar. Tente novamente.");
     }
   };
 
@@ -132,12 +144,19 @@ function LoginForm({ onMode }: { onMode: (m: Mode) => void }) {
       <Field label="E-mail" type="email" value={email} onChange={setEmail} autoComplete="email" placeholder="voce@exemplo.com" />
       <Field label="Senha" type="password" value={password} onChange={setPassword} autoComplete="current-password" />
       {err && <ErrorMsg>{err}</ErrorMsg>}
-      {needVerify && !resent && (
-        <button type="button" onClick={resend} className="text-sm font-semibold text-sky-400 hover:underline">
-          Reenviar e-mail de confirmação
-        </button>
+      {needVerify && (
+        <div className="space-y-1">
+          <button
+            type="button"
+            onClick={resend}
+            disabled={cooldown > 0}
+            className="text-sm font-semibold text-sky-400 hover:underline disabled:cursor-not-allowed disabled:text-muted-foreground disabled:no-underline"
+          >
+            {cooldown > 0 ? `Reenviar e-mail em ${cooldown}s` : "Reenviar e-mail de confirmação"}
+          </button>
+          {resendMsg && <p className="text-xs text-muted-foreground">{resendMsg}</p>}
+        </div>
       )}
-      {resent && <OkMsg>Se a conta existir e estiver pendente, enviamos um novo link.</OkMsg>}
       <Button type="submit" disabled={busy} className="w-full">
         {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />} Entrar
       </Button>
