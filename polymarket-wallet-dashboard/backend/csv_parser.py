@@ -108,7 +108,8 @@ _CLUB = re.compile(
     r"\bfc\b|\bcf\b|barcelona|arsenal|chelsea|real madrid|bayern|liverpool|manchester|tottenham|"
     r"juventus|internazionale|aston villa|leverkusen|leipzig|frankfurt|stuttgart|valencia|"
     r"sevilla|osasuna|brentford|burnley|brighton|nottingham forest|crystal palace|sassuolo|"
-    r"inter miami|whitecaps|paris saint", re.I)
+    r"inter miami|whitecaps|paris saint|sporting|benfica|\bporto\b|ajax|napoli|\broma\b|milan|"
+    r"marseille|dortmund|atl[eé]tico|real sociedad", re.I)
 
 # College basketball-only / mid-major / Ivy programs + a few FBS schools these feeds write with
 # their MASCOT for hoops ("Michigan Wolverines") but the bare school name for football ("Michigan

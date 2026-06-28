@@ -242,6 +242,11 @@ class TestAmericanFootballAndCollege(unittest.TestCase):
         self.assertEqual(cp.classify_event("Will Morocco win on 2026-06-24?", "YES"), "Soccer")
         self.assertEqual(cp.classify_event("Morocco vs. Haiti: O/U 2.5", "OVER"), "Soccer")
 
+    def test_european_club_spreads_are_soccer(self):
+        # clubs whose name lacks "FC"/"CF" and appear in spread form (e.g. Sporting CP -> "Other" before)
+        for ev in ["Spread: Sporting CP (-1.5)", "Spread: Benfica (-1.5)", "Spread: SSC Napoli (-0.5)"]:
+            self.assertEqual(cp.classify_event(ev, "X"), "Soccer", ev)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
