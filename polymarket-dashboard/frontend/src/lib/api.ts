@@ -52,15 +52,23 @@ export interface ResultsResponse {
   by_category: CategoryResult[];
 }
 
+// Fired whenever any request gets a 401 — lets the AuthProvider drop back to the login screen
+// the moment a session expires or is revoked (e.g. after a password reset elsewhere).
+let _onUnauthorized: (() => void) | null = null;
+export function setUnauthorizedHandler(fn: (() => void) | null) {
+  _onUnauthorized = fn;
+}
+
 async function get<T>(url: string): Promise<T> {
   let r: Response;
   try {
-    r = await fetch(url);
+    r = await fetch(url, { credentials: "include" }); // send the session cookie
   } catch (err) {
     // backend fora do ar, proxy/porta errada, DNS, CORS…
     console.error(`[api] GET ${url} — falha de rede/fetch:`, err);
     throw err;
   }
+  if (r.status === 401) _onUnauthorized?.();
   if (!r.ok) {
     const body = await r.text().catch(() => "");
     console.error(`[api] GET ${url} -> HTTP ${r.status} ${r.statusText}`, body);
@@ -70,6 +78,30 @@ async function get<T>(url: string): Promise<T> {
     return (await r.json()) as T;
   } catch (err) {
     console.error(`[api] GET ${url} — resposta não é JSON válido:`, err);
+    throw err;
+  }
+}
+
+// POST JSON and return the parsed body. The auth endpoints answer 200 with {error|message},
+// so we only throw on a network/parse failure — logical errors come back in the body.
+async function post<T>(url: string, body: unknown): Promise<T> {
+  let r: Response;
+  try {
+    r = await fetch(url, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body ?? {}),
+    });
+  } catch (err) {
+    console.error(`[api] POST ${url} — falha de rede/fetch:`, err);
+    throw err;
+  }
+  if (r.status === 401) _onUnauthorized?.();
+  try {
+    return (await r.json()) as T;
+  } catch (err) {
+    console.error(`[api] POST ${url} — resposta não é JSON válido:`, err);
     throw err;
   }
 }
@@ -93,6 +125,22 @@ export interface BetsPage {
   bets: Entry[];
 }
 
+export interface User {
+  id: number;
+  full_name: string;
+  email: string;
+  email_verified: boolean;
+}
+
+// Auth endpoints answer 200 with a subset of these fields.
+export interface AuthResult {
+  ok?: boolean;
+  error?: string;
+  message?: string;
+  needs_verification?: boolean;
+  user?: User;
+}
+
 export const api = {
   entries: () => get<EntriesResponse>("/api/entries"),
   results: () => get<ResultsResponse>("/api/results"),
@@ -101,14 +149,23 @@ export const api = {
       `/api/results/bets?category=${encodeURIComponent(category)}&page=${page}&page_size=${pageSize}`
     ),
   telegramStatus: () => get<TelegramStatus>("/api/telegram"),
-  telegramSave: async (token: string): Promise<TelegramSaveResult> => {
-    const r = await fetch("/api/telegram", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token }),
-    });
-    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-    return r.json() as Promise<TelegramSaveResult>;
+  telegramSave: (token: string) =>
+    post<TelegramSaveResult>("/api/telegram", { token }),
+
+  me: () => get<{ user: User }>("/api/me"),
+  auth: {
+    register: (full_name: string, email: string, password: string, password_confirm: string) =>
+      post<AuthResult>("/api/auth/register", { full_name, email, password, password_confirm }),
+    login: (email: string, password: string) =>
+      post<AuthResult>("/api/auth/login", { email, password }),
+    logout: () => post<AuthResult>("/api/auth/logout", {}),
+    verify: (token: string) => post<AuthResult>("/api/auth/verify", { token }),
+    resendVerification: (email: string) =>
+      post<AuthResult>("/api/auth/resend-verification", { email }),
+    forgotPassword: (email: string) =>
+      post<AuthResult>("/api/auth/forgot-password", { email }),
+    resetPassword: (token: string, password: string, password_confirm: string) =>
+      post<AuthResult>("/api/auth/reset-password", { token, password, password_confirm }),
   },
 };
 

@@ -11,15 +11,32 @@ import unittest
 _TMP = tempfile.mkdtemp()
 os.environ["SPORTS_ENTRIES_DB"] = os.path.join(_TMP, "entries.db")
 os.environ.pop("TELEGRAM_BOT_TOKEN", None)   # keep Telegram unconfigured (no network) in tests
+os.environ["SESSION_COOKIE_SECURE"] = "0"    # TestClient speaks http; allow the cookie over http
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fastapi.testclient import TestClient  # noqa: E402
 import app as backend  # noqa: E402
+import auth as _auth  # noqa: E402
 import entries_store as es  # noqa: E402
 import results_combined as rc  # noqa: E402
 import telegram_notify as tg  # noqa: E402
+import users_store as us  # noqa: E402
 
 client = TestClient(backend.app)
+
+# The dashboard is now gated: log in a verified user once so the TestClient's cookie jar
+# carries the session through every protected request (entries/results/telegram).
+_TEST_EMAIL, _TEST_PW = "tester@example.com", "supersecret123"
+
+
+def _login() -> None:
+    if not us.get_user_by_email(_TEST_EMAIL):
+        us.mark_verified(us.create_user("Tester", _TEST_EMAIL, _auth.hash_password(_TEST_PW)))
+    r = client.post("/api/auth/login", json={"email": _TEST_EMAIL, "password": _TEST_PW})
+    assert r.json().get("ok"), r.text
+
+
+_login()
 
 
 def _entry(key, *, category="Soccer", subcategory="Over/Under gols", side="OVER",
@@ -189,7 +206,7 @@ class TestTelegramConfig(unittest.TestCase):
         # Stub discovery + test-send (no network) on the app's module refs.
         backend.ts.discover_chat_id = lambda token: "98765"
         sent = {}
-        backend.tg.send_test = lambda: sent.setdefault("t", True) or True
+        backend.tg.send_test = lambda **kw: sent.setdefault("t", True) or True
         try:
             r = client.post("/api/telegram", json={"token": "123:ABC"}).json()
             self.assertTrue(r["ok"])
