@@ -197,5 +197,56 @@ class TestClassifierHardening(unittest.TestCase):
         self.assertEqual(cp.classify_event("Bitcoin Up or Down - March 19, 10:20PM-10:25PM ET", "UP"), "Crypto")
 
 
+class TestAmericanFootballAndCollege(unittest.TestCase):
+    """American football (NFL + college) as a category, pro/college nickname-collision fixes, and
+    Olympic/NRFI handling — validated against the Latina history."""
+
+    def test_nfl_moneyline_spread_total(self):
+        self.assertEqual(cp.classify_event("Ravens vs. Steelers", "STEELERS"), "American Football")
+        self.assertEqual(cp.classify_event("Spread: Falcons (-3.5)", "SAINTS"), "American Football")
+        self.assertEqual(cp.classify_event("Buccaneers vs. Rams: O/U 49.5", "OVER"), "American Football")
+
+    def test_spread_no_longer_blanket_soccer(self):
+        self.assertEqual(cp.classify_event("Spread: Cowboys (-3.5)", "COWBOYS"), "American Football")
+        self.assertEqual(cp.classify_event("Spread: France (-1.5)", "FRANCE"), "Soccer")
+        self.assertEqual(cp.classify_event("Spread: Chelsea FC (-1.5)", "CHELSEA FC"), "Soccer")
+
+    def test_college_football_vs_basketball_by_date(self):
+        self.assertEqual(cp.classify_event("Michigan vs. Texas", "MICHIGAN", 12), "American Football")
+        self.assertEqual(cp.classify_event("USC vs. TCU", "USC", 12), "American Football")
+        self.assertEqual(cp.classify_event("Connecticut Huskies vs. Duke Blue Devils", "DUKE BLUE DEVILS", 3), "Basketball")
+        # FBS school written with its MASCOT => hoops, even in CFB season
+        self.assertEqual(cp.classify_event("Michigan Wolverines vs. Auburn Tigers", "MICHIGAN WOLVERINES", 11), "Basketball")
+
+    def test_college_ou_line_magnitude(self):
+        self.assertEqual(cp.classify_event("Louisville Cardinals vs. Michigan State: O/U 151.5", "OVER", 11), "Basketball")
+        self.assertEqual(cp.classify_event("Boise State vs. Memphis: O/U 52.5", "OVER", 12), "American Football")
+
+    def test_nickname_collisions_resolved(self):
+        self.assertEqual(cp.classify_event("Louisville Cardinals vs. Miami Hurricanes", "MIAMI HURRICANES", 3), "Basketball")
+        self.assertEqual(cp.classify_event("Spread: Oregon Ducks (-3.5)", "OREGON DUCKS", 3), "Basketball")
+        self.assertEqual(cp.classify_event("Spread: Vermont Catamounts (-3.5)", "PRINCETON TIGERS", 12), "Basketball")
+        # real NHL/MLB are unaffected
+        self.assertEqual(cp.classify_event("Golden Knights vs. Hurricanes: O/U 5.5", "OVER"), "Hockey")
+        self.assertEqual(cp.classify_event("Chicago Cubs vs. St. Louis Cardinals", "ST. LOUIS CARDINALS"), "Baseball")
+
+    def test_olympic_hockey_and_nrfi(self):
+        self.assertEqual(cp.classify_event("Men's Group C - Germany vs. Latvia", "GERMANY"), "Hockey")
+        self.assertEqual(cp.classify_event("NRFI: Texas Rangers vs. Baltimore Orioles", "YES"), "Baseball")
+        self.assertEqual(
+            cp.classify_event("Will there be a run scored in the first inning?: Minnesota Twins vs. Kansas City Royals",
+                              "NO RUN"), "Baseball")
+
+    def test_tennis_and_soccer_unaffected(self):
+        self.assertEqual(cp.classify_event("Roland Garros ATP: Frances Tiafoe vs Matteo Arnaldi", "FRANCES TIAFOE"), "Tennis")
+        self.assertEqual(cp.classify_event("Will Morocco win on 2026-06-24?", "YES"), "Soccer")
+        self.assertEqual(cp.classify_event("Morocco vs. Haiti: O/U 2.5", "OVER"), "Soccer")
+
+    def test_european_club_spreads_are_soccer(self):
+        # clubs whose name lacks "FC"/"CF" and appear in spread form (e.g. Sporting CP -> "Other" before)
+        for ev in ["Spread: Sporting CP (-1.5)", "Spread: Benfica (-1.5)", "Spread: SSC Napoli (-0.5)"]:
+            self.assertEqual(cp.classify_event(ev, "X"), "Soccer", ev)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
