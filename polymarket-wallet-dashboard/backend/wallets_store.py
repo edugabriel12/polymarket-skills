@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS wallets (
     csv_filename TEXT,
     analysis     TEXT NOT NULL,     -- JSON: rollup_csv report (by category + confidence)
     thresholds   TEXT NOT NULL,     -- JSON: confidence_model.derive_thresholds
-    filters      TEXT               -- JSON {category:{subcategory:[confidences]}} forwarded to Sports/Telegram; NULL = forward all
+    filters      TEXT,              -- JSON {category:{subcategory:[confidences]}} forwarded to Sports/Telegram; NULL = forward all
+    baseline_at  TEXT               -- ISO ts the pre-existing holdings were baselined; NULL = not yet (first poll seeds it)
 );
 -- The watcher's dedup state: ONE row per (wallet, market) holding the highest
 -- confidence tier already alerted (a tier UPGRADE re-pushes the same entry), plus
@@ -41,6 +42,15 @@ CREATE TABLE IF NOT EXISTS seen_alerts (
     PRIMARY KEY (wallet_id, condition_id)
 );
 CREATE TABLE IF NOT EXISTS settled_markets (
+    wallet_id    INTEGER NOT NULL,
+    condition_id TEXT NOT NULL,
+    at           TEXT NOT NULL,
+    PRIMARY KEY (wallet_id, condition_id)
+);
+-- Markets the wallet ALREADY held the first time we polled it (open OR already settled).
+-- Snapshotted once and ignored forever: only positions opened AFTER a wallet is added are
+-- tracked, so bets that pre-date adding the wallet never leak into Resultados or to Sports.
+CREATE TABLE IF NOT EXISTS baseline_markets (
     wallet_id    INTEGER NOT NULL,
     condition_id TEXT NOT NULL,
     at           TEXT NOT NULL,
@@ -88,10 +98,12 @@ def connect(db_path: str = DEFAULT_DB) -> sqlite3.Connection:
     for c in ("event", "market_url"):
         if c not in cols:
             con.execute(f"ALTER TABLE wallet_bets ADD COLUMN {c} TEXT")
-    # Migrate older wallets tables that predate the per-wallet forwarding filters.
+    # Migrate older wallets tables that predate the per-wallet forwarding filters / baseline.
     wcols = {r["name"] for r in con.execute("PRAGMA table_info(wallets)")}
     if "filters" not in wcols:
         con.execute("ALTER TABLE wallets ADD COLUMN filters TEXT")
+    if "baseline_at" not in wcols:
+        con.execute("ALTER TABLE wallets ADD COLUMN baseline_at TEXT")
     return con
 
 
@@ -189,6 +201,7 @@ def delete_wallet(wallet_id: int, db_path: str = DEFAULT_DB) -> bool:
         with con:
             con.execute("DELETE FROM seen_alerts WHERE wallet_id=?", (wallet_id,))
             con.execute("DELETE FROM settled_markets WHERE wallet_id=?", (wallet_id,))
+            con.execute("DELETE FROM baseline_markets WHERE wallet_id=?", (wallet_id,))
             con.execute("DELETE FROM wallet_bets WHERE wallet_id=?", (wallet_id,))
             cur = con.execute("DELETE FROM wallets WHERE id=?", (wallet_id,))
             return cur.rowcount > 0
@@ -236,6 +249,64 @@ def mark_settled(wallet_id: int, condition_id: str, db_path: str = DEFAULT_DB) -
         with con:
             con.execute("INSERT OR IGNORE INTO settled_markets(wallet_id, condition_id, at) "
                         "VALUES(?,?,?)", (wallet_id, condition_id, _now()))
+    finally:
+        con.close()
+
+
+# --- pre-existing-holdings baseline ----------------------------------------
+def baseline_established(wallet_id: int, db_path: str = DEFAULT_DB) -> bool:
+    """True once the wallet's pre-existing holdings have been snapshotted (first poll done)."""
+    con = connect(db_path)
+    try:
+        r = con.execute("SELECT baseline_at FROM wallets WHERE id=?", (wallet_id,)).fetchone()
+        return bool(r and r["baseline_at"])
+    finally:
+        con.close()
+
+
+def set_baseline(wallet_id: int, condition_ids, db_path: str = DEFAULT_DB) -> None:
+    """Snapshot the markets a wallet ALREADY held at its first poll (ignored forever) and stamp
+    baseline_at so it's done exactly once. Pass an empty iterable for a wallet holding nothing —
+    baseline_at is still set, so every future position counts as new."""
+    con = connect(db_path)
+    try:
+        with con:
+            now = _now()
+            for cond in {c for c in condition_ids if c}:
+                con.execute("INSERT OR IGNORE INTO baseline_markets(wallet_id, condition_id, at) "
+                            "VALUES(?,?,?)", (wallet_id, cond, now))
+            con.execute("UPDATE wallets SET baseline_at=? WHERE id=?", (now, wallet_id))
+    finally:
+        con.close()
+
+
+def baseline_markets(wallet_id: int, db_path: str = DEFAULT_DB) -> set:
+    """The condition IDs a wallet already held when first polled (never tracked/forwarded)."""
+    con = connect(db_path)
+    try:
+        return {r["condition_id"] for r in con.execute(
+            "SELECT condition_id FROM baseline_markets WHERE wallet_id=?", (wallet_id,))}
+    finally:
+        con.close()
+
+
+def reset_tracking(wallet_id: int, db_path: str = DEFAULT_DB) -> dict:
+    """Wipe a wallet's LIVE tracking but KEEP the wallet itself (name/address/CSV analysis/
+    thresholds/filters). Clears wallet_bets + the entry/settle dedup state + the baseline, and
+    nulls baseline_at so the NEXT poll re-snapshots the baseline from the wallet's current
+    holdings. Use this to purge pre-add bets that leaked before the baseline fix existed.
+    Returns the per-table row counts removed."""
+    tables = ("wallet_bets", "seen_alerts", "settled_markets", "baseline_markets")
+    con = connect(db_path)
+    try:
+        with con:
+            counts = {t: con.execute(f"SELECT COUNT(*) FROM {t} WHERE wallet_id=?",
+                                     (wallet_id,)).fetchone()[0] for t in tables}
+            for t in tables:
+                con.execute(f"DELETE FROM {t} WHERE wallet_id=?", (wallet_id,))
+            con.execute("UPDATE wallets SET baseline_at=NULL, updated_at=? WHERE id=?",
+                        (_now(), wallet_id))
+        return counts
     finally:
         con.close()
 
