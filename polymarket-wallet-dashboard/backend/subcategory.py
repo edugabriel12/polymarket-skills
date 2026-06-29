@@ -25,6 +25,7 @@ import re
 
 # --- slug-suffix signals (sports markets encode the type in the slug) ----------
 _SLUG_TOTALS = re.compile(r"-(?:total|totals|o-?u|over-?under)-?\d", re.I)
+_SLUG_CORNERS = re.compile(r"-corners?(?:$|[-/?#])|-total-corners?", re.I)
 _SLUG_BTTS = re.compile(r"-(?:btts|both-teams-to-score|gg-ng|gg)(?:$|[-/?#])", re.I)
 _SLUG_SPREAD = re.compile(r"-(?:spread|handicap|hcap|run-?line|puck-?line|asian)", re.I)
 _SLUG_MAP = re.compile(r"-map-\d|-map-winner", re.I)
@@ -36,6 +37,7 @@ _SLUG_SCORE = re.compile(r"-(?:correct-score|exact-score|cs-\d-\d)", re.I)
 # --- title/eventSlug regex (free text) -----------------------------------------
 _T_BTTS = re.compile(r"both teams to score|ambas (?:as )?(?:equipes |times )?marcam|\bbtts\b", re.I)
 _T_TOTALS = re.compile(r"\bover\b|\bunder\b|over/under|\bo/u\b|total (?:goals|runs|points|maps|games|sets)", re.I)
+_T_CORNERS = re.compile(r"\bcorners?\b|\bescanteios?\b", re.I)
 _T_SPREAD = re.compile(r"\bspread\b|handicap|run line|puck line|[+-]\d+\.5\b|asian", re.I)
 _T_OUTRIGHT = re.compile(
     r"to win the\b|\bchampion\b|winner of\b|\bmvp\b|\bfinals?\b|\b(?:cup|title|trophy)\b|"
@@ -100,6 +102,10 @@ def universal_type(blob: str, slug: str) -> str | None:
 def _soccer(blob, slug):
     if _SLUG_BTTS.search(slug) or _T_BTTS.search(blob):
         return "Ambas Marcam"
+    # Corners are an O/U-style market too — match them BEFORE the goals-totals rule so a
+    # "O/U 9.5 Total Corners" isn't counted as a goals over/under.
+    if _SLUG_CORNERS.search(slug) or _T_CORNERS.search(blob):
+        return "Escanteios"
     if _totals(blob, slug):
         return "Over/Under gols"
     if _SLUG_SCORE.search(slug) or _T_SCORE.search(blob):
