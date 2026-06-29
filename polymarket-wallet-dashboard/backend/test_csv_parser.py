@@ -187,6 +187,17 @@ class TestClassifierHardening(unittest.TestCase):
     def test_soccer_corners_not_baseball(self):
         self.assertEqual(cp.classify_event("Arsenal FC vs. Burnley FC: O/U 10.5 Total Corners", "UNDER"), "Soccer")
 
+    def test_corners_parse_to_escanteios_subcategory(self):
+        # end-to-end: a corners O/U row -> Soccer / Escanteios (not 'Over/Under gols')
+        csv = ("Data;Evento;Aposta;Conf.;Odd;Investido;ROI%;Lucro\n"
+               '2026-06-21;"Tunisia vs. Japan: O/U 8.5 Total Corners";UNDER;Alta;2;100;100,2;100\n'
+               '2026-06-06;"Brazil vs. Egypt: O/U 3.5";UNDER;Alta;1,56;100;56,4;56\n').encode("utf-8")
+        recs = {r["title"]: r for r in cp.parse_csv(csv)}
+        corner = recs["Tunisia vs. Japan: O/U 8.5 Total Corners"]
+        self.assertEqual((corner["category"], corner["subcategory"]), ("Soccer", "Escanteios"))
+        goals = recs["Brazil vs. Egypt: O/U 3.5"]
+        self.assertEqual((goals["category"], goals["subcategory"]), ("Soccer", "Over/Under gols"))
+
     def test_college_moneyline_without_line(self):
         self.assertEqual(cp.classify_event("Houston Cougars vs. Arizona Wildcats", "ARIZONA WILDCATS"), "Basketball")
 

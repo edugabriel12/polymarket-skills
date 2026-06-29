@@ -19,6 +19,15 @@ class TestSoccer(unittest.TestCase):
         self.assertEqual(sc.classify("Soccer", "Over/Under 2.5 goals",
                                      "epl-mci-tot-2026-02-02-total-2pt5"), "Over/Under gols")
 
+    def test_corners_are_their_own_subcategory(self):
+        # corners O/U must NOT be lumped into the goals over/under bucket
+        self.assertEqual(sc.classify("Soccer", "Japan vs. Sweden: O/U 9.5 Total Corners UNDER"),
+                         "Escanteios")
+        self.assertEqual(sc.classify("Soccer", "Tunisia vs. Japan",
+                                     "wc-tun-jpn-2026-06-21-total-corners-8pt5"), "Escanteios")
+        # a real goals O/U still classifies as goals (no regression)
+        self.assertEqual(sc.classify("Soccer", "Brazil vs. Egypt: O/U 3.5", ""), "Over/Under gols")
+
     def test_moneyline_default(self):
         self.assertEqual(sc.classify("Soccer", "Arsenal vs Chelsea", "epl-ars-che-2026-02-01"),
                          "Moneyline (1X2)")
