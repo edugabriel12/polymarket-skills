@@ -3,7 +3,7 @@
 
 NO third-party imports (numpy/scipy are unavailable) — only the `math` module.
 A fully deterministic, offline-testable core so `test_run_distribution.py` runs
-with zero setup. Sport-agnostic and reused across the soccer/tennis models.
+with zero setup. Sport-agnostic and reused by the soccer model.
 
 Model: the GAME TOTAL T is Negative Binomial. Sports totals are typically
 overdispersed (variance > mean), so plain Poisson under-states the tails. We fit

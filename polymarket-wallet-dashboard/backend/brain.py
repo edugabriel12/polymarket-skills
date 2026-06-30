@@ -22,7 +22,7 @@ def _vlog(msg: str) -> None:
 
 
 def run_models_once(date: str, *, pusher=None) -> dict:
-    """Run soccer+tennis for `date` and push their entries. Returns the push result."""
+    """Run the soccer model for `date` and push its entries. Returns the push result."""
     pusher = pusher or push_client.push_entries
     entries = model_runner.model_entries(date)
     _vlog(f"models {date}: {len(entries)} entry(ies)")

@@ -1,8 +1,8 @@
 # polymarket-forecasting
 
-Shared, sport-agnostic forecasting cores reused by the prediction models (soccer, tennis) and
-the dashboard. **Pure stdlib, no skill imports** — the soccer/tennis skills put this `scripts/`
-dir on `sys.path` via their `_bootstrap.py` and import these modules directly.
+Shared, sport-agnostic forecasting cores reused by the prediction models (soccer) and
+the dashboard. **Pure stdlib, no skill imports** — the soccer skill puts this `scripts/`
+dir on `sys.path` via its `_bootstrap.py` and imports these modules directly.
 
 | Module | Purpose |
 |--------|---------|
@@ -10,9 +10,9 @@ dir on `sys.path` via their `_bootstrap.py` and import these modules directly.
 | `forecast.py` | Distributional forecast helpers (pmf → cdf / quantile / interval / entropy) + per-prediction confidence |
 | `scoring.py` | Proper scoring rules — CRPS, Brier, log-loss |
 | `calibration_core.py` | ECE / reliability / Brier decomposition primitives |
-| `calibration.py` | Calibration report over the `model_log` shadow log (`--sport soccer\|tennis`) |
+| `calibration.py` | Calibration report over the `model_log` shadow log (`--sport soccer`) |
 | `congruence.py` | Cross-source agreement scoring |
-| `audit_log.py` | Dump the full math audit (`stats_log`) of every prediction (`--sport soccer\|tennis`) |
+| `audit_log.py` | Dump the full math audit (`stats_log`) of every prediction (`--sport soccer`) |
 
 ## Tests
 

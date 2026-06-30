@@ -1,42 +1,38 @@
 # Polymarket Sports — Dashboard (web app)
 
-A modern, colorful UI to interact with the prediction models, with a **sport toggle**
-(⚽ Futebol total-goals + BTTS · 🎾 Tênis vencedor da partida). The header switch drives both tabs.
+A modern, colorful UI to interact with the **⚽ Futebol** prediction model (total-goals + BTTS).
 
 - **Soccer** runs the `polymarket-soccer-goals` Dixon-Coles model via subprocess.
-- **Tennis** runs the `polymarket-tennis` surface-Elo model via subprocess.
 
-Each skill defines its own `data_inputs` module, so the models run in subprocesses (importing both
-in one process would collide); their predictions live in separate DBs.
+The model runs in a subprocess; its predictions live in a dedicated DB.
 
-Relevant env vars (optional): `SOCCER_PREDICTIONS_DB`, `TENNIS_PREDICTIONS_DB`, `SOCCER_RATINGS_CSV`
-(team-ratings CSV passed to the soccer model), `TENNIS_RATINGS_CSV`, `TENNIS_TOUR` (`atp`/`wta`),
+Relevant env vars (optional): `SOCCER_PREDICTIONS_DB`, `SOCCER_RATINGS_CSV`
+(team-ratings CSV passed to the soccer model),
 `FOOTBALL_DATA_TOKEN` (football-data.org key — the Resultados tab auto-settles soccer from that
 results feed when set, and the soccer model auto-calibrates each league's baseline goals/game from
 the current season), `APIFOOTBALL_KEY` (api-sports.io key — automatic attack/defense + baseline for
 leagues Club Elo doesn't cover, e.g. Brasileirão Série B), `ODDS_API_KEY` (The Odds API key for the
 live sharp anchor), `DASHBOARD_CACHE_DB` (override the day-cache DB location). The backend subprocess
-inherits these, so the dashboard uses them automatically. API endpoints take `?sport=soccer|tennis`.
+inherits these, so the dashboard uses them automatically. API endpoints take `?sport=soccer`.
 
 Two tabs:
 
 - **Análises** — the day's entry suggestions, rendered as cards with the full model math (soccer:
-  λ_home/λ_away, P(Over)/P(Under)/P(BTTS), edge, payout, Kelly size; tennis: surface-Elo win prob,
-  edge, price). An in-process scheduler recomputes **every sport at the top of each hour**
+  λ_home/λ_away, P(Over)/P(Under)/P(BTTS), edge, payout, Kelly size). An in-process scheduler
+  recomputes **at the top of each hour**
   (01:00, 02:00, …, **Brasília time** by default) and refreshes the cache (a dedicated
   `analysis_cache` table in the dashboard cache DB), so the panel always shows the latest run —
   no manual recompute button. The whole dashboard clock (today, the hourly tick, timestamps)
   follows `RECALC_TZ` (default `America/Sao_Paulo`). Disable the loop with `AUTO_RECALC=0`.
 - **Resultados** — ROI, P&L, win rate for **diário / semanal / mensal**, with charts and a
   recent-predictions table linking to each Polymarket market. **Every visit triggers settlement**,
-  moving PENDENTE rows to ACERTO/ERRO. Soccer settles from the football-data.org results feed;
-  tennis settles from its own Polymarket market resolution (with a tour results-feed fallback).
+  moving PENDENTE rows to ACERTO/ERRO. Soccer settles from the football-data.org results feed.
 
 Dark/light theme toggle. Read/analysis only — it never places live trades (paper-first).
 
 ## Stack
-- **Backend:** FastAPI (`backend/app.py`) driving the soccer/tennis model subprocesses and their
-  stdlib-only prediction stores (`soccer_predictions`, `tennis_predictions`). The day-cache is a
+- **Backend:** FastAPI (`backend/app.py`) driving the soccer model subprocess and its
+  stdlib-only prediction store (`soccer_predictions`). The day-cache is a
   dedicated SQLite file (`DASHBOARD_CACHE_DB`).
 - **Frontend:** React + Vite + TypeScript + TailwindCSS + shadcn-style components + Recharts +
   TanStack Query + framer-motion + lucide.
@@ -110,8 +106,7 @@ curl -X POST "http://localhost:8000/api/cache/clear?sport=soccer&date=2026-06-14
 
 ## Tests
 - Backend: `cd backend && . .venv/bin/activate && python test_api.py`
-- Models: see each skill's `scripts/test_*.py` (soccer in `polymarket-soccer-goals/scripts`,
-  tennis in `polymarket-tennis/scripts`).
+- Models: see the skill's `scripts/test_*.py` (soccer in `polymarket-soccer-goals/scripts`).
 
 ## Notes
 - The sandbox blocks live Polymarket egress and the Chromium download, so screenshots aren't

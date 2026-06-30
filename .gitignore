@@ -17,6 +17,5 @@ dist/
 dumps/
 *.sql.gz
 .polymarket-soccer/
-.polymarket-tennis/
 **/frontend/vite.config.js
 **/frontend/vite.config.d.ts

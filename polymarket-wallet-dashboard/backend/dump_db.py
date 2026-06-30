@@ -5,7 +5,6 @@ By default it dumps every SQLite DB the dashboard uses (skipping any that don't 
   - ``wallets``            — DASHBOARD_WALLETS_DB   (~/.polymarket-wallet-dashboard/wallets.db):
                               watched wallets, tracking, baseline, per-wallet bets, tag cache.
   - ``soccer-predictions`` — SOCCER_PREDICTIONS_DB  (~/.polymarket-soccer/predictions.db)
-  - ``tennis-predictions`` — TENNIS_PREDICTIONS_DB  (~/.polymarket-tennis/predictions.db)
 
 For each DB it writes, into the output dir (default ``./dumps``), timestamped:
   - ``<label>.<UTCts>.db``  — a consistent BINARY snapshot (SQLite online backup API)
@@ -42,8 +41,6 @@ def _defaults() -> list[tuple[str, str]]:
             os.path.expanduser("~/.polymarket-wallet-dashboard/wallets.db"))),
         ("soccer-predictions", os.environ.get(
             "SOCCER_PREDICTIONS_DB", os.path.expanduser("~/.polymarket-soccer/predictions.db"))),
-        ("tennis-predictions", os.environ.get(
-            "TENNIS_PREDICTIONS_DB", os.path.expanduser("~/.polymarket-tennis/predictions.db"))),
     ]
 
 

@@ -11,7 +11,7 @@ that game) is propagated to ALL of the game's shadow rows, so non-bet lines of a
 game get scored too. Games where nothing was bet need the results feed (a documented
 follow-up), as does CLV (needs a closing-price snapshot).
 
-Pure stdlib; works for both the soccer and tennis stores (`--sport`).
+Pure stdlib; works for the soccer store (`--sport`).
 """
 
 from __future__ import annotations
@@ -27,7 +27,6 @@ import calibration_core as cc
 
 DEFAULT_DBS = {
     "soccer": os.path.expanduser("~/.polymarket-soccer/predictions.db"),
-    "tennis": os.path.expanduser("~/.polymarket-tennis/predictions.db"),
 }
 
 _SUFFIX_RE = re.compile(r"-(?:total-\d{1,2}(?:pt5)?|btts|both-teams-to-score|gg)$")
@@ -343,7 +342,7 @@ def format_report(rep: dict) -> str:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Calibration report over the model_log shadow log.")
-    p.add_argument("--sport", choices=("soccer", "tennis"), default="soccer")
+    p.add_argument("--sport", choices=("soccer",), default="soccer")
     p.add_argument("--db", default=None, help="Override DB path (default per --sport)")
     p.add_argument("--settle", action="store_true",
                    help="Settle model_log from settled predictions (offline cross-propagation)")
@@ -381,9 +380,6 @@ def main() -> None:
 def _settle_feed(sport: str, db: str) -> int:
     """Dispatch to sport-specific feed settlement."""
     try:
-        if sport == "tennis":
-            import tennis_results
-            return tennis_results.settle_model_log_from_feed(db)
         import soccer_results
         return soccer_results.settle_model_log_from_feed(db)
     except Exception as e:
@@ -394,9 +390,6 @@ def _settle_feed(sport: str, db: str) -> int:
 def _capture_close(sport: str, db: str) -> int:
     """Dispatch to sport-specific close-price capture."""
     try:
-        if sport == "tennis":
-            import tennis_results
-            return tennis_results.capture_close_prices(db)
         import soccer_results
         return soccer_results.capture_close_prices(db)
     except Exception as e:

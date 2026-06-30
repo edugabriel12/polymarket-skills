@@ -31,8 +31,8 @@ def _load_dotenv() -> list[str]:
     """Load KEY=VALUE from backend/.env, ../.env, or repo .env (real env wins).
 
     Mirrors the Sports backend. Must run BEFORE `import brain` (brain -> model_runner
-    reads SOCCER_PREDICTIONS_DB etc. at import time) and before the soccer/tennis
-    subprocesses inherit the environment at runtime (ODDS_API_KEY, APIFOOTBALL_KEY,
+    reads SOCCER_PREDICTIONS_DB etc. at import time) and before the soccer
+    subprocess inherits the environment at runtime (ODDS_API_KEY, APIFOOTBALL_KEY,
     FOOTBALL_DATA_TOKEN).
     """
     loaded = []
@@ -340,7 +340,7 @@ def wallet_bets_route(wallet_id: int, category: str | None = Query(None),
 @app.get("/api/model-bets")
 def model_bets_route(category: str = Query(...), page: int = Query(1, ge=1),
                      page_size: int = Query(20, ge=1, le=100)) -> dict:
-    """Paginated settled model predictions of a category (Futebol/Tênis)."""
+    """Paginated settled model predictions of a category (Futebol)."""
     import model_results
     offset = (page - 1) * page_size
     out = model_results.model_bets(category, offset, page_size)
@@ -359,7 +359,7 @@ def wallet_open_bets_route(wallet_id: int, category: str | None = Query(None),
 @app.get("/api/model-open-bets")
 def model_open_bets_route(category: str | None = Query(None), page: int = Query(1, ge=1),
                           page_size: int = Query(20, ge=1, le=100)) -> dict:
-    """Paginated OPEN (PENDENTE) model predictions; category=None merges Futebol + Tênis."""
+    """Paginated OPEN (PENDENTE) model predictions (category=None → Futebol)."""
     import model_results
     offset = (page - 1) * page_size
     out = model_results.model_open_bets(category, offset, page_size)
