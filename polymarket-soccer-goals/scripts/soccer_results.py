@@ -82,8 +82,13 @@ def _match_with_tolerance(lookup: dict[tuple, tuple], game_date: str, a: str, b:
 
 
 def fetch_finished(date_from: str, date_to: str, token: str | None,
-                   timeout: int = 8) -> dict[tuple, tuple]:
-    """Return {(date, code_a, code_b): (total_goals, btts_bool)} for FINISHED games."""
+                   timeout: int = 8, skipped: set | None = None) -> dict[tuple, tuple]:
+    """Return {(date, code_a, code_b): (total_goals, btts_bool)} for FINISHED games.
+
+    If ``skipped`` (a set) is given, the pair keys of FINISHED games decided in extra
+    time / penalties — which are NOT auto-settled — are added to it, so callers can tell
+    "went to extra time" apart from "team code not mapped" when a row stays PENDENTE.
+    """
     if not token:
         return {}
     try:
@@ -95,10 +100,10 @@ def fetch_finished(date_from: str, date_to: str, token: str | None,
         data = resp.json()
     except Exception:  # noqa: BLE001
         return {}
-    return parse_finished(data)
+    return parse_finished(data, skipped=skipped)
 
 
-def parse_finished(data: dict) -> dict[tuple, tuple]:
+def parse_finished(data: dict, skipped: set | None = None) -> dict[tuple, tuple]:
     """Pure: normalize a football-data.org /matches payload into the pair lookup.
 
     ONLY regular-time results are returned. Polymarket's goals O/U + BTTS markets settle on the
@@ -107,20 +112,28 @@ def parse_finished(data: dict) -> dict[tuple, tuple]:
     90' that becomes 2-1 in ET would wrongly LOSE an UNDER 2.5). The feed doesn't expose the 90'
     score for those, so EXTRA_TIME / PENALTY_SHOOTOUT games are skipped (predictions stay PENDENTE
     for manual settlement) rather than mis-settled. Missing/REGULAR ``duration`` settles normally.
+
+    When ``skipped`` is provided, the pair key of each skipped (ET/penalty) FINISHED game is
+    added to it. Settlement diagnostics use this to report a stuck row as "finished in extra
+    time — settle manually" instead of the misleading generic "team code not mapped" miss.
     """
     out: dict[tuple, tuple] = {}
     for m in (data or {}).get("matches", []):
         if (m.get("status") or "").upper() not in ("FINISHED", "AWARDED"):
             continue
-        score = m.get("score", {}) or {}
-        if str(score.get("duration") or "REGULAR").upper() != "REGULAR":
-            continue                       # ET/penalties: fullTime includes ET goals -> don't settle
         home, away = m.get("homeTeam", {}), m.get("awayTeam", {})
         ha = home.get("tla") or home.get("shortName") or home.get("name")
         aa = away.get("tla") or away.get("shortName") or away.get("name")
+        date = (m.get("utcDate") or "")[:10]
+        score = m.get("score", {}) or {}
+        if str(score.get("duration") or "REGULAR").upper() != "REGULAR":
+            # ET/penalties: fullTime includes ET goals -> don't auto-settle. Record the pair
+            # so a PENDENTE row for this game can be flagged for manual (90') settlement.
+            if skipped is not None and ha and aa and date:
+                skipped.add(_pair_key(date, ha, aa))
+            continue
         ft = score.get("fullTime", {}) or {}
         hg, ag = ft.get("home"), ft.get("away")
-        date = (m.get("utcDate") or "")[:10]
         if ha is None or aa is None or hg is None or ag is None or not date:
             continue
         total = float(hg) + float(ag)
@@ -253,11 +266,15 @@ def settle_pending(db_path: str = spdb.DEFAULT_DB, token: str | None = None,
     # +1 day so a game whose feed UTC date rolled past its slug date is still in the window
     date_to = (datetime.strptime(max(dates[-1], today), "%Y-%m-%d").date() + timedelta(days=1)).isoformat()
     note(f"querying results feed {date_from}…{date_to} for {len(games)} game(s)")
-    lookup = fetch_finished(date_from, date_to, token)
-    note(f"FINISHED games returned by feed: {len(lookup)}")
-    if not lookup:
+    skipped: set = set()   # pair keys of FINISHED games skipped because they went to ET/penalties
+    lookup = fetch_finished(date_from, date_to, token, skipped=skipped)
+    note(f"FINISHED games returned by feed: {len(lookup)}"
+         + (f" ({len(skipped)} more finished in extra time/penalties — manual settle)" if skipped else ""))
+    if not lookup and not skipped:
         note("feed returned 0 finished games — bad/expired token, rate-limit, network, "
              "or no covered competition finished in the window")
+    # Reuse the ±1-day tolerant matcher to test the skipped (ET) set; value = the feed date.
+    et_lookup = {pk: pk[0] for pk in skipped}
 
     instructions = []
     for g in games.values():
@@ -270,14 +287,24 @@ def settle_pending(db_path: str = spdb.DEFAULT_DB, token: str | None = None,
                  f"→ total={res[0]}, btts={res[1]}")
             instructions.append({"game_slug": g["game_slug"], "actual_total": res[0],
                                  "actual_btts": res[1]})
-        else:
-            # Surface feed pairs sharing one side, so an unmapped team code OR an out-of-
-            # tolerance date (>1 day, or an ambiguous double) is obvious from the log.
-            near = sorted(f"{k[1]}/{k[2]}@{k[0]}" for k in lookup
-                          if pair[0] in k[1:] or pair[1] in k[1:])
-            hint = f"; feed has a side under: {', '.join(near[:5])}" if near else ""
-            note(f"✗ {g['game_slug']}: {pair[0]}/{pair[1]} @ {g['game_date']} not settled "
-                 f"(not FINISHED yet, team code not mapped, or date >1d off){hint}")
+            continue
+        # Finished in extra time / penalties? Then it's PENDENTE BY DESIGN (we settle on 90',
+        # the feed's fullTime over-counts ET goals) — say so and point to manual settlement,
+        # instead of the misleading "team code not mapped / date off" miss below.
+        et_date = _match_with_tolerance(et_lookup, g["game_date"], g["home"], g["away"])
+        if et_date is not None:
+            note(f"↺ {g['game_slug']}: {pair[0]}/{pair[1]} @ {g['game_date']} finished in EXTRA "
+                 f"TIME / penalties — not auto-settled (Polymarket settles on the 90' score). "
+                 f"Settle manually with the regulation score: "
+                 f"resettle_game.py --match \"<teams>\" --home H --away A --apply")
+            continue
+        # Surface feed pairs sharing one side, so an unmapped team code OR an out-of-
+        # tolerance date (>1 day, or an ambiguous double) is obvious from the log.
+        near = sorted(f"{k[1]}/{k[2]}@{k[0]}" for k in lookup
+                      if pair[0] in k[1:] or pair[1] in k[1:])
+        hint = f"; feed has a side under: {', '.join(near[:5])}" if near else ""
+        note(f"✗ {g['game_slug']}: {pair[0]}/{pair[1]} @ {g['game_date']} not settled "
+             f"(not FINISHED yet, team code not mapped, or date >1d off){hint}")
 
     settled = []
     for ins in instructions:
