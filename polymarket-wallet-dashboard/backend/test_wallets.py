@@ -231,6 +231,50 @@ class TestFilteredResults(unittest.TestCase):
         self.client.delete(f"/api/wallets/{wid}")
 
 
+class TestTotalView(unittest.TestCase):
+    """Carteiras tab = TOTAL (CSV + ALL live, unfiltered); Resultados tab = filtered live.
+    GET /api/wallets/{id} returns both `analysis` (filtered) and `total_analysis` (total); the
+    list cards reflect the total; /bets?filtered=false returns all live bets."""
+
+    def setUp(self):
+        self.client = TestClient(app.app)
+
+    def _seed(self, wid, cond, cat, sub, conf, status, pnl, pos=100.0):
+        ws.upsert_bet(wid, cond, {"event": cond, "category": cat, "subcategory": sub,
+                                  "confidence": conf, "side": "OVER", "total_position": pos,
+                                  "entry_price": 0.5, "odds": 2.0, "status": status, "pnl": pnl})
+
+    def test_total_includes_csv_and_all_live(self):
+        addr = "0x" + "f3" * 20
+        wid = self.client.post(
+            "/api/wallets",
+            data={"name": "Tot", "address": addr,
+                  "filters": json.dumps({"Soccer": {"Over/Under gols": ["Alta"]}})},
+            files={"file": ("hist.csv", _CSV, "text/csv")}).json()["id"]
+        self._seed(wid, "k1", "Soccer", "Over/Under gols", "Alta", "WON", 80.0)   # filtered-in
+        self._seed(wid, "x1", "Tennis", "Vencedor da partida", "Alta", "WON", 40.0)  # filtered-out
+
+        body = self.client.get(f"/api/wallets/{wid}").json()
+        # Resultados (filtered): only the filtered-in live bet
+        self.assertEqual(body["analysis"]["live_settled"], 1)
+        # Total: CSV (3 settled rows in _CSV) + ALL live settled (2), unfiltered
+        tot = body["total_analysis"]
+        self.assertEqual(tot["overall"]["markets"], 5)
+        self.assertEqual(tot["live_settled"], 2)
+        self.assertIn("Tennis", {c["category"] for c in tot["by_category"]})  # unfiltered present
+
+        # List card reflects the total (5 markets)
+        card = next(w for w in self.client.get("/api/wallets").json()["wallets"] if w["id"] == wid)
+        self.assertEqual(card["n_markets"], 5)
+        self.assertIsNotNone(card["total_pnl"])
+
+        # /bets: default filtered (1), filtered=false = all live settled (2)
+        self.assertEqual(self.client.get(f"/api/wallets/{wid}/bets").json()["total"], 1)
+        self.assertEqual(self.client.get(f"/api/wallets/{wid}/bets?filtered=false").json()["total"], 2)
+
+        self.client.delete(f"/api/wallets/{wid}")
+
+
 class TestCleanFilters(unittest.TestCase):
     """app._clean_filters semantics: blank/full → None; subset kept; {} → nothing."""
 

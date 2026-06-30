@@ -8,6 +8,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import wallet_results as wres  # noqa: E402
+import wallet_report as wr      # noqa: E402
 
 
 def _bet(cat, sub, conf, pnl, pos, status):
@@ -104,6 +105,35 @@ class TestLiveResultsFilter(unittest.TestCase):
         self.assertEqual(m["live_open"], 0)
         self.assertEqual(m["overall"]["markets"], 0)
         self.assertEqual(m["by_category"], [])
+
+
+class TestTotalResults(unittest.TestCase):
+    """total_results = stored CSV rollup + ALL live bets (filter IGNORED) — the Carteiras TOTAL."""
+
+    def _csv(self):
+        return wr.rollup_csv([
+            {"category": "Soccer", "subcategory": "Over/Under gols", "confidence": "Alta",
+             "total_pnl": 100.0, "realized_pnl": 100.0, "unrealized_pnl": 0.0, "invested": 50.0,
+             "current_value": 0.0, "won": True, "n_trades": 1}])
+
+    def test_csv_plus_all_live_unfiltered(self):
+        live = [
+            _bet("Soccer", "Over/Under gols", "Alta", 40.0, 80.0, "WON"),
+            _bet("Tennis", "Vencedor da partida", "Baixa", 10.0, 20.0, "WON"),  # would be filtered out
+            _bet("Soccer", "Over/Under gols", "Alta", 0.0, 999.0, "OPEN"),
+        ]
+        total = wres.total_results(self._csv(), live)
+        ov = total["overall"]
+        self.assertEqual(ov["markets"], 3)                  # 1 CSV + 2 live settled
+        self.assertAlmostEqual(ov["total_pnl"], 150.0)      # 100 + 40 + 10
+        self.assertEqual(ov["wins"], 3)
+        self.assertEqual(total["live_settled"], 2)
+        self.assertEqual(total["live_open"], 1)
+        self.assertEqual({c["category"] for c in total["by_category"]}, {"Soccer", "Tennis"})
+
+    def test_none_csv_is_just_live(self):
+        total = wres.total_results(None, [_bet("Soccer", "Over/Under gols", "Alta", 5.0, 10.0, "WON")])
+        self.assertEqual(total["overall"]["markets"], 1)
 
 
 if __name__ == "__main__":

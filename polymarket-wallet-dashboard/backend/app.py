@@ -244,7 +244,18 @@ async def add_wallet(name: str = Form(...), address: str = Form(...),
 
 @app.get("/api/wallets")
 def list_wallets() -> dict:
-    return {"wallets": ws.list_wallets()}
+    """Wallet cards show the TOTAL (attached CSV + all live bets), so the list matches the wallet
+    detail. O(N) wallets — each merges its stored CSV rollup with a rollup of its live bets."""
+    import wallet_results as wres
+    cards = []
+    for s in ws.list_wallets():
+        full = ws.get_wallet(s["id"]) or {}
+        total = wres.total_results(full.get("analysis") or {}, ws.list_bets(s["id"]))
+        ov = total.get("overall") or {}
+        s.update({"n_markets": total.get("n_markets", 0), "win_rate": ov.get("win_rate"),
+                  "total_pnl": ov.get("total_pnl"), "roi": ov.get("roi")})
+        cards.append(s)
+    return {"wallets": cards}
 
 
 def _wallet_with_live(wallet_id: int) -> dict:
@@ -256,10 +267,14 @@ def _wallet_with_live(wallet_id: int) -> dict:
     w = ws.get_wallet(wallet_id)
     if not w:
         return {"error": "carteira não encontrada"}
-    w["filter_tree"] = _filter_tree_from_analysis(w.get("analysis") or {})
-    # Results count ONLY what passes the wallet's filter (same predicate as forwarding); the
+    csv_report = w.get("analysis") or {}
+    bets = ws.list_bets(wallet_id)
+    w["filter_tree"] = _filter_tree_from_analysis(csv_report)
+    # Resultados tab: ONLY what passes the wallet's filter (same predicate as forwarding); the
     # filter_tree above stays the FULL option set so the edit UI can still offer every combo.
-    w["analysis"] = wres.live_results(ws.list_bets(wallet_id), w.get("filters"))
+    w["analysis"] = wres.live_results(bets, w.get("filters"))
+    # Carteiras tab: the wallet's TOTAL = attached CSV + ALL live bets (filtered or not).
+    w["total_analysis"] = wres.total_results(csv_report, bets)
     return w
 
 
@@ -297,14 +312,16 @@ def model_results_route() -> dict:
 
 
 def _wallet_bets_page(wallet_id: int, statuses: tuple, category: str | None,
-                      page: int, page_size: int) -> dict:
-    """Paginated wallet bets of the given statuses, honoring the wallet's forwarding filter (so
-    the lists match the filtered Resultados) plus an optional category. wallet_bets is tiny (one
-    row per market), so we filter/sort/paginate in Python on the same `passes_filter` predicate."""
+                      page: int, page_size: int, filtered: bool = True) -> dict:
+    """Paginated wallet bets of the given statuses, optionally honoring the wallet's forwarding
+    filter (so the Resultados/Pendentes lists match the filtered figures) plus an optional category.
+    `filtered=False` returns ALL live bets — used by the Carteiras TOTAL view. wallet_bets is tiny
+    (one row per market), so we filter/sort/paginate in Python on the same `passes_filter`."""
     w = ws.get_wallet(wallet_id)
     rows = [b for b in ws.list_bets(wallet_id)
             if b.get("status") in statuses and (not category or b.get("category") == category)]
-    rows = wf.filter_bets(w.get("filters") if w else None, rows)
+    if filtered:
+        rows = wf.filter_bets(w.get("filters") if w else None, rows)
     rows.sort(key=lambda b: b.get("updated_at") or "", reverse=True)
     offset = (page - 1) * page_size
     return {"total": len(rows), "page": page, "page_size": page_size,
@@ -313,9 +330,11 @@ def _wallet_bets_page(wallet_id: int, statuses: tuple, category: str | None,
 
 @app.get("/api/wallets/{wallet_id}/bets")
 def wallet_bets_route(wallet_id: int, category: str | None = Query(None),
-                      page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)) -> dict:
-    """Paginated SETTLED live bets of a wallet — honors the wallet's filter (+ optional category)."""
-    return _wallet_bets_page(wallet_id, ("WON", "LOST", "VOID"), category, page, page_size)
+                      page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
+                      filtered: bool = Query(True)) -> dict:
+    """Paginated SETTLED live bets of a wallet. Honors the wallet's filter by default (Resultados);
+    pass filtered=false for ALL live bets (the Carteiras TOTAL view)."""
+    return _wallet_bets_page(wallet_id, ("WON", "LOST", "VOID"), category, page, page_size, filtered)
 
 
 @app.get("/api/model-bets")
@@ -330,10 +349,11 @@ def model_bets_route(category: str = Query(...), page: int = Query(1, ge=1),
 
 @app.get("/api/wallets/{wallet_id}/open-bets")
 def wallet_open_bets_route(wallet_id: int, category: str | None = Query(None),
-                           page: int = Query(1, ge=1),
-                           page_size: int = Query(20, ge=1, le=100)) -> dict:
-    """Paginated OPEN (unsettled) live bets of a wallet — the pending tab; honors the filter."""
-    return _wallet_bets_page(wallet_id, ("OPEN",), category, page, page_size)
+                           page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
+                           filtered: bool = Query(True)) -> dict:
+    """Paginated OPEN (unsettled) live bets of a wallet — the pending tab; honors the filter by
+    default. Pass filtered=false for ALL open live bets."""
+    return _wallet_bets_page(wallet_id, ("OPEN",), category, page, page_size, filtered)
 
 
 @app.get("/api/model-open-bets")

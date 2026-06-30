@@ -143,6 +143,91 @@ def rollup_csv(records: list[dict]) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Merge two reports (e.g. the stored CSV rollup + a live rollup) into a TOTAL.
+# Metrics are additive, so we sum the raw components at every level and re-derive
+# win_rate / roi via the same _finalize used by the rollups — no raw records needed.
+# ---------------------------------------------------------------------------
+
+_ADDITIVE = ("markets", "resolved", "wins", "losses", "n_trades", "total_pnl",
+             "realized_pnl", "unrealized_pnl", "invested", "current_value")
+
+
+def _accumulate(bucket: dict, row: dict) -> None:
+    """Add a finalized metrics row's additive components into a _blank() bucket."""
+    for k in _ADDITIVE:
+        bucket[k] += (row.get(k) or 0)
+
+
+def _merge_conf(rows_a: list | None, rows_b: list | None) -> list[dict]:
+    groups: dict[str, dict] = {}
+    order: list[str] = []
+    for r in (rows_a or []) + (rows_b or []):
+        c = r.get("confidence")
+        if c not in groups:
+            groups[c] = _blank(); order.append(c)
+        _accumulate(groups[c], r)
+    out = [{"confidence": c, **_finalize(groups[c])} for c in order]
+    out.sort(key=lambda x: _CONF_ORDER.get(x["confidence"], 9))
+    return out
+
+
+def _merge_subs(rows_a: list | None, rows_b: list | None) -> list[dict]:
+    groups: dict[str, dict] = {}
+    order: list[str] = []
+    for r in (rows_a or []) + (rows_b or []):
+        s = r.get("subcategory")
+        if s not in groups:
+            groups[s] = {"bucket": _blank(), "conf": []}; order.append(s)
+        _accumulate(groups[s]["bucket"], r)
+        groups[s]["conf"].extend(r.get("by_confidence") or [])
+    out = [{"subcategory": s, **_finalize(groups[s]["bucket"]),
+            "by_confidence": _merge_conf(groups[s]["conf"], None)} for s in order]
+    out.sort(key=lambda x: x["total_pnl"], reverse=True)
+    return out
+
+
+def _merge_cats(rows_a: list | None, rows_b: list | None) -> list[dict]:
+    groups: dict[str, dict] = {}
+    order: list[str] = []
+    for r in (rows_a or []) + (rows_b or []):
+        c = r.get("category")
+        if c not in groups:
+            groups[c] = {"bucket": _blank(), "subs": [], "conf": []}; order.append(c)
+        _accumulate(groups[c]["bucket"], r)
+        groups[c]["subs"].extend(r.get("subcategories") or [])
+        groups[c]["conf"].extend(r.get("by_confidence") or [])
+    out = [{"category": c, **_finalize(groups[c]["bucket"]),
+            "subcategories": _merge_subs(groups[c]["subs"], None),
+            "by_confidence": _merge_conf(groups[c]["conf"], None)} for c in order]
+    out.sort(key=lambda x: x["total_pnl"], reverse=True)
+    return out
+
+
+def merge_reports(a: dict | None, b: dict | None) -> dict:
+    """Combine two rollup_csv-shaped reports into one TOTAL, summing additive metrics at every
+    level (overall, by_confidence, by_category → subcategories → by_confidence) and recomputing
+    win_rate/roi. Used for a wallet's TOTAL view (stored CSV rollup + all live bets). Either side
+    may be {}/None (merge with empty returns the other side)."""
+    a = a or {}
+    b = b or {}
+    overall = _blank()
+    _accumulate(overall, a.get("overall") or {})
+    _accumulate(overall, b.get("overall") or {})
+    overall = _finalize(overall)
+    return {
+        "source": "combined",
+        "n_markets": overall["markets"],
+        "n_trades": (a.get("n_trades") or 0) + (b.get("n_trades") or 0),
+        "overall": overall,
+        "by_confidence": _merge_conf(a.get("by_confidence"), b.get("by_confidence")),
+        "by_category": _merge_cats(a.get("by_category"), b.get("by_category")),
+        "filter_tree": a.get("filter_tree") or b.get("filter_tree") or {},
+        "live_settled": (a.get("live_settled") or 0) + (b.get("live_settled") or 0),
+        "live_open": (a.get("live_open") or 0) + (b.get("live_open") or 0),
+    }
+
+
 def analyze_csv(data) -> dict:
     """Parse a bet-history CSV and roll it up. Raises on a malformed file."""
     import csv_parser

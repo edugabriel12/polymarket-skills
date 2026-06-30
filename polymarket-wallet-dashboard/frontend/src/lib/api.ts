@@ -107,12 +107,16 @@ export interface WalletSummary {
   address: string;
   csv_filename?: string;
   created_at: string;
-  n_markets?: number;
+  n_markets?: number;               // TOTAL (CSV + all live) — the card headline
+  win_rate?: number | null;
+  total_pnl?: number | null;
+  roi?: number | null;
   filters?: WalletFilters | null;   // null = forward everything to Sports/Telegram
 }
 
 export interface WalletRecord extends WalletSummary {
-  analysis: WalletReport;
+  analysis: WalletReport;           // Resultados tab: filtered live bets only
+  total_analysis?: WalletReport;    // Carteiras tab: TOTAL = attached CSV + ALL live bets
   thresholds: Record<string, ThresholdBand>;
   filter_tree?: FilterTree;         // selectable options for the edit UI (from the CSV analysis)
 }
@@ -180,9 +184,10 @@ export const wallets = {
   list: () => jget<{ wallets: WalletSummary[] }>("/api/wallets").then((x) => x.wallets),
   get: (id: number) => jget<WalletRecord>(`/api/wallets/${id}`),
   modelResults: () => jget<ModelResults>("/api/model-results"),
-  bets: (id: number, category: string, page: number, pageSize = 20) =>
+  bets: (id: number, category: string, page: number, pageSize = 20, filtered = true) =>
     jget<DashBetsPage>(
-      `/api/wallets/${id}/bets?category=${encodeURIComponent(category)}&page=${page}&page_size=${pageSize}`
+      `/api/wallets/${id}/bets?category=${encodeURIComponent(category)}&page=${page}&page_size=${pageSize}` +
+        (filtered ? "" : "&filtered=false")
     ),
   modelBets: (category: string, page: number, pageSize = 20) =>
     jget<DashBetsPage>(
