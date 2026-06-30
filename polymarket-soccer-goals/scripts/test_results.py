@@ -45,6 +45,25 @@ class TestParse(unittest.TestCase):
         # the unfinished GER-BRA game is excluded
         self.assertNotIn(("2026-06-14", "bra", "ger"), lk)
 
+    def test_extra_time_and_penalties_are_skipped(self):
+        # Polymarket O/U + BTTS settle on 90'; the feed's fullTime includes ET goals for
+        # knockouts, so ET / penalty games must NOT auto-settle (they'd over-count goals).
+        payload = {"matches": [
+            {"status": "FINISHED", "utcDate": "2026-06-29T18:00:00Z",
+             "homeTeam": {"tla": "GER"}, "awayTeam": {"tla": "PAR"},   # 1-1 at 90', 2-1 in ET
+             "score": {"duration": "EXTRA_TIME", "fullTime": {"home": 2, "away": 1}}},
+            {"status": "FINISHED", "utcDate": "2026-06-29T21:00:00Z",
+             "homeTeam": {"tla": "ESP"}, "awayTeam": {"tla": "ITA"},   # decided on penalties
+             "score": {"duration": "PENALTY_SHOOTOUT", "fullTime": {"home": 1, "away": 1}}},
+            {"status": "FINISHED", "utcDate": "2026-06-29T15:00:00Z",
+             "homeTeam": {"tla": "BRA"}, "awayTeam": {"tla": "ARG"},   # normal 90' result
+             "score": {"duration": "REGULAR", "fullTime": {"home": 1, "away": 0}}},
+        ]}
+        lk = sr.parse_finished(payload)
+        self.assertEqual(len(lk), 1)                              # only the REGULAR game
+        self.assertIn(("2026-06-29", "arg", "bra"), lk)
+        self.assertNotIn(("2026-06-29", "deu", "pry"), lk)       # GER->deu, PAR->pry (ET, skipped)
+
 
 class TestDecide(unittest.TestCase):
     def test_order_independent_match(self):
