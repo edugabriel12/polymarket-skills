@@ -172,6 +172,65 @@ class TestEndpoints(unittest.TestCase):
         self.assertEqual(set(cm.derive_thresholds(recs)), {"Alta", "Média", "Baixa"})
 
 
+class TestFilteredResults(unittest.TestCase):
+    """The wallet's Resultados (analysis) AND its bet lists (/bets, /open-bets) must count only
+    the bets passing the wallet's filter — while filter_tree stays the full option universe."""
+
+    def setUp(self):
+        self.client = TestClient(app.app)
+
+    def _seed(self, wid, cond, cat, sub, conf, status, pnl, pos=100.0):
+        ws.upsert_bet(wid, cond, {"event": cond, "category": cat, "subcategory": sub,
+                                  "confidence": conf, "side": "OVER", "total_position": pos,
+                                  "entry_price": 0.5, "odds": 2.0, "status": status, "pnl": pnl})
+
+    def test_results_and_lists_honor_filter(self):
+        addr = "0x" + "f1" * 20
+        wid = self.client.post(
+            "/api/wallets",
+            data={"name": "Filtered", "address": addr,
+                  "filters": json.dumps({"Soccer": {"Over/Under gols": ["Alta"]}})},
+            files={"file": ("hist.csv", _CSV, "text/csv")}).json()["id"]
+        # kept by the filter (Soccer / Over/Under gols / Alta)
+        self._seed(wid, "k1", "Soccer", "Over/Under gols", "Alta", "WON", 80.0)
+        self._seed(wid, "k2", "Soccer", "Over/Under gols", "Alta", "OPEN", 0.0)
+        # filtered out: wrong confidence, subcategory, category (settled + open)
+        self._seed(wid, "x1", "Soccer", "Over/Under gols", "Média", "WON", 30.0)
+        self._seed(wid, "x2", "Soccer", "Ambas Marcam", "Alta", "LOST", -20.0)
+        self._seed(wid, "x3", "Tennis", "Vencedor da partida", "Alta", "WON", 40.0)
+        self._seed(wid, "x4", "Tennis", "Vencedor da partida", "Alta", "OPEN", 0.0)
+
+        body = self.client.get(f"/api/wallets/{wid}").json()
+        an = body["analysis"]
+        self.assertEqual(an["live_settled"], 1)            # only k1
+        self.assertEqual(an["live_open"], 1)               # only k2
+        self.assertAlmostEqual(an["overall"]["total_pnl"], 80.0)
+        self.assertEqual({c["category"] for c in an["by_category"]}, {"Soccer"})
+        self.assertIn("Soccer", body["filter_tree"])       # full options preserved (re-add UI)
+
+        settled = self.client.get(f"/api/wallets/{wid}/bets").json()
+        self.assertEqual(settled["total"], 1)
+        self.assertEqual({b["condition_id"] for b in settled["bets"]}, {"k1"})
+
+        openb = self.client.get(f"/api/wallets/{wid}/open-bets").json()
+        self.assertEqual(openb["total"], 1)
+        self.assertEqual({b["condition_id"] for b in openb["bets"]}, {"k2"})
+
+        self.client.delete(f"/api/wallets/{wid}")
+
+    def test_no_filter_keeps_all(self):
+        addr = "0x" + "f2" * 20
+        wid = self.client.post(
+            "/api/wallets", data={"name": "AllIn", "address": addr},
+            files={"file": ("hist.csv", _CSV, "text/csv")}).json()["id"]
+        self._seed(wid, "a1", "Soccer", "Over/Under gols", "Alta", "WON", 10.0)
+        self._seed(wid, "a2", "Tennis", "Vencedor da partida", "Baixa", "LOST", -5.0)
+        an = self.client.get(f"/api/wallets/{wid}").json()["analysis"]
+        self.assertEqual(an["live_settled"], 2)            # no filter -> both count
+        self.assertEqual(self.client.get(f"/api/wallets/{wid}/bets").json()["total"], 2)
+        self.client.delete(f"/api/wallets/{wid}")
+
+
 class TestCleanFilters(unittest.TestCase):
     """app._clean_filters semantics: blank/full → None; subset kept; {} → nothing."""
 

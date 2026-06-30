@@ -27,30 +27,11 @@ import entries as en
 import subcategory as sc
 import wallet_report as wr
 import wallets_store as ws
+from wallet_filters import passes_filter  # single source of truth (also used by Resultados)
 
 wa = wr.wa  # analyze_wallet (fetch_positions, to_float, sanitize_text, _end_in_past, …)
 
 _RANK = {t: i for i, t in enumerate(reversed(cm.TIERS))}  # Baixa=0, Média=1, Alta=2
-
-
-def passes_filter(wallet_filters: dict | None, category: str, subcategory: str,
-                  confidence: str) -> bool:
-    """Whether a (category, subcategory, confidence) triple is forwarded to Sports/Telegram.
-
-    `None` → no restriction, forward everything (legacy wallets + the user selected ALL combos,
-    which the API collapses to None so live categories the CSV never had still pass). A non-null
-    dict is strict: a triple passes only if its category AND subcategory are selected AND the
-    confidence is listed — so an explicit empty dict `{}` forwards NOTHING.
-    """
-    if wallet_filters is None:
-        return True
-    subs = wallet_filters.get(category)
-    if not subs:
-        return False                                          # category not selected
-    confs = subs.get(subcategory)
-    if not confs:
-        return False                                          # subcategory not selected
-    return confidence in confs
 
 
 def _total_position(pos: dict) -> float:
@@ -144,8 +125,11 @@ def persist_bets(wallet: dict, positions: list, db_path: str = ws.DEFAULT_DB,
     """Upsert the latest state of every tiered market into wallet_bets (Phase 2), so the
     wallet's separated Resultados can merge live settled bets with the CSV snapshot.
 
-    Intentionally NOT gated by the wallet's forwarding filters: the owner sees full live
-    performance in Resultados; the filter only governs what is pushed to Sports/Telegram.
+    Storage is deliberately UNFILTERED — every tiered market is kept regardless of the wallet's
+    forwarding filter — so that editing the (non-cascading) filter never loses history. The
+    filter is instead applied at READ time, on the same `passes_filter` predicate, by
+    `wallet_results.live_results` and the `/bets` `/open-bets` routes, so the Resultados show only
+    the selected category/subcategory/confidence combos.
 
     `baseline` = markets the wallet already held when first polled. They pre-date watching, so
     they are skipped here too — a pre-add (often already-settled) bet must never appear in

@@ -59,5 +59,52 @@ class TestLiveResults(unittest.TestCase):
         self.assertEqual(m["overall"]["markets"], 0)
 
 
+class TestLiveResultsFilter(unittest.TestCase):
+    """Resultados must count ONLY bets passing the wallet's filter (category+subcategory+confidence),
+    the same predicate the watcher uses to forward to Sports/Telegram."""
+
+    def _bets(self):
+        return [
+            _bet("Soccer", "Over/Under gols", "Alta", 80.0, 100.0, "WON"),     # kept by the subset
+            _bet("Soccer", "Over/Under gols", "Média", 30.0, 60.0, "WON"),     # confidence not selected
+            _bet("Soccer", "Ambas Marcam", "Alta", 25.0, 50.0, "WON"),         # subcategory not selected
+            _bet("Tennis", "Vencedor da partida", "Alta", 40.0, 80.0, "WON"),  # category not selected
+            _bet("Soccer", "Over/Under gols", "Alta", 0.0, 999.0, "OPEN"),     # kept, open
+            _bet("Tennis", "Vencedor da partida", "Alta", 0.0, 10.0, "OPEN"),  # category not selected, open
+        ]
+
+    def test_filter_restricts_to_selected_triple(self):
+        f = {"Soccer": {"Over/Under gols": ["Alta"]}}
+        m = wres.live_results(self._bets(), f)
+        self.assertEqual(m["live_settled"], 1)                   # only Soccer/OU/Alta settled
+        self.assertEqual(m["live_open"], 1)                      # only Soccer/OU/Alta open
+        ov = m["overall"]
+        self.assertEqual(ov["markets"], 1)
+        self.assertEqual(ov["wins"], 1)
+        self.assertAlmostEqual(ov["total_pnl"], 80.0)
+        self.assertEqual({c["category"] for c in m["by_category"]}, {"Soccer"})
+        soccer = next(c for c in m["by_category"] if c["category"] == "Soccer")
+        self.assertEqual({s["subcategory"] for s in soccer["subcategories"]}, {"Over/Under gols"})
+        self.assertEqual({b["confidence"] for b in soccer["by_confidence"]}, {"Alta"})
+
+    def test_two_confidences_selected(self):
+        f = {"Soccer": {"Over/Under gols": ["Alta", "Média"]}}
+        m = wres.live_results(self._bets(), f)
+        self.assertEqual(m["live_settled"], 2)                   # Alta + Média Soccer/OU
+        self.assertAlmostEqual(m["overall"]["total_pnl"], 110.0)  # 80 + 30
+
+    def test_none_keeps_everything(self):
+        m = wres.live_results(self._bets(), None)
+        self.assertEqual(m["live_settled"], 4)
+        self.assertEqual(m["live_open"], 2)
+
+    def test_empty_filter_keeps_nothing(self):
+        m = wres.live_results(self._bets(), {})
+        self.assertEqual(m["live_settled"], 0)
+        self.assertEqual(m["live_open"], 0)
+        self.assertEqual(m["overall"]["markets"], 0)
+        self.assertEqual(m["by_category"], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
