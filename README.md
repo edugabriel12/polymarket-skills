@@ -11,9 +11,8 @@ Composable [Agent Skills](https://agentskills.io/specification) for Polymarket p
 | **polymarket-monitor** | Price alerts and position monitoring | None | Zero |
 | **polymarket-category-watcher** | List & continuously listen to all live markets of a category (basketball, tennis, soccer) | None | Zero |
 | **polymarket-soccer-goals** | Model soccer total-goals (O/U) + BTTS with Dixon-Coles and suggest entries | None | Zero (paper) |
-| **polymarket-tennis** | Model tennis match-winner with surface-Elo and suggest entries | None | Zero (paper) |
 | **polymarket-forecasting** | Shared pure-stdlib forecasting cores (NegBin/Poisson pmf, CRPS/Brier/log-loss, calibration) reused across sports | None | Zero |
-| **polymarket-dashboard** | React + FastAPI web UI for the soccer/tennis models (Análises + Resultados tabs) | None | Zero (paper) |
+| **polymarket-dashboard** | React + FastAPI web UI for the soccer model (Análises + Resultados tabs) | None | Zero (paper) |
 | **polymarket-wallet-dashboard** | React + FastAPI web UI to analyze any public wallet: win rate, P&L, ROI by category + sub-category | None | Zero |
 | **polymarket-paper-trader** | Simulate trades against live prices, portfolio health checks | None | Zero |
 | **polymarket-strategy-advisor** | Trading methodology, recommendations, backtesting | None | Low |
@@ -143,16 +142,16 @@ Self-contained skill (own `category_common.py`); maps friendly names + PT-BR ali
 | `scoring.py` | Proper scoring rules (CRPS / Brier / log-loss) |
 | `calibration_core.py` / `calibration.py` | ECE / reliability + the calibration report over the model_log shadow log |
 | `congruence.py` | Cross-source agreement scoring |
-| `audit_log.py` | Dump the full math audit of every prediction (`--sport soccer\|tennis`) |
+| `audit_log.py` | Dump the full math audit of every prediction (`--sport soccer`) |
 
-Sport-agnostic, pure stdlib, no skill imports. The soccer and tennis models import these via
-their `_bootstrap.py`. Offline tests: `python polymarket-forecasting/scripts/test_run_distribution.py`
+Sport-agnostic, pure stdlib, no skill imports. The soccer model imports these via
+its `_bootstrap.py`. Offline tests: `python polymarket-forecasting/scripts/test_run_distribution.py`
 (and `test_forecast.py`, `test_scoring.py`, `test_calibration.py`, …).
 
-### polymarket-dashboard/ -- Web UI (Soccer + Tennis)
+### polymarket-dashboard/ -- Web UI (Soccer)
 
 React + Vite + Tailwind frontend with a FastAPI backend. Two tabs (Análises / Resultados) over the
-soccer Dixon-Coles and tennis surface-Elo models, with a once-per-day analysis cache and
+soccer Dixon-Coles model, with a once-per-day analysis cache and
 auto-settlement. Read/analysis only — never places live trades. See `polymarket-dashboard/README.md`.
 
 ### polymarket-paper-trader/ -- Simulation Engine

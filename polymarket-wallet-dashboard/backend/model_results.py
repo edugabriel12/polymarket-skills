@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Model performance for the wallet-dashboard's separated Resultados — by category
-only (the Modelo entity has no confidence axis). The model is soccer + tennis, so
-its categories are Futebol (soccer store) and Tênis (tennis store).
+only (the Modelo entity has no confidence axis). The model is soccer, so its single
+category is Futebol (soccer store).
 
 Metrics mirror the wallet CSV rollup ($-based) so the two entities are comparable:
-win rate, n_bets, P&L, ROI — from each store's settled predictions.
+win rate, n_bets, P&L, ROI — from the store's settled predictions.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ import sys
 _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.normpath(os.path.join(_BACKEND_DIR, "..", ".."))
 for _d in (os.path.join(_REPO_ROOT, "polymarket-soccer-goals", "scripts"),
-           os.path.join(_REPO_ROOT, "polymarket-tennis", "scripts"),
            os.path.join(_REPO_ROOT, "polymarket-category-watcher", "scripts")):
     if _d not in sys.path:
         sys.path.append(_d)
@@ -50,10 +49,10 @@ def aggregate(rows: list[dict], category: str) -> dict:
 
 
 def settle_pending_models() -> dict:
-    """Liquida (best-effort) as previsões PENDENTE cujo jogo/partida já terminou — chamado
-    ao abrir a aba Resultados, para que apareçam nos resultados em vez de ficarem pendentes.
-    Futebol: results feed (FOOTBALL_DATA_TOKEN). Tênis: resolução do mercado Polymarket (+ feed).
-    Cada esporte é isolado: falha (sem token / rede / import) é logada e não interrompe a página."""
+    """Liquida (best-effort) as previsões PENDENTE cujo jogo já terminou — chamado ao abrir a
+    aba Resultados, para que apareçam nos resultados em vez de ficarem pendentes.
+    Futebol: results feed (FOOTBALL_DATA_TOKEN). Falha (sem token / rede / import) é logada e
+    não interrompe a página."""
     def log(m: str) -> None:
         print(f"[settle] {m}", file=sys.stderr, flush=True)
 
@@ -68,19 +67,6 @@ def settle_pending_models() -> dict:
         log(f"soccer -> {out['soccer']}")
     except Exception as e:  # noqa: BLE001
         log(f"soccer skipped: {type(e).__name__}: {e}")
-    try:
-        import tennis_results as tr
-        import tennis_predictions as tdb
-        from category_common import APIClient
-        db = os.environ.get("TENNIS_PREDICTIONS_DB", tdb.DEFAULT_DB)
-        tour = os.environ.get("TENNIS_TOUR", "atp")
-        res = tr.settle_pending(db, tour=tour, api=APIClient())
-        for d in res.get("diagnostics", []):
-            log(f"tennis: {d}")
-        out["tennis"] = {"settled_rows": len(res.get("settled", []))}
-        log(f"tennis -> {out['tennis']}")
-    except Exception as e:  # noqa: BLE001
-        log(f"tennis skipped: {type(e).__name__}: {e}")
     return out
 
 
@@ -97,14 +83,6 @@ def model_results() -> dict:
             by_category.append(agg)
     except Exception as e:  # noqa: BLE001
         print(f"[model-results] soccer skipped: {e}", file=sys.stderr, flush=True)
-    try:
-        import tennis_predictions as tdb
-        rows = tdb.get_predictions(os.environ.get("TENNIS_PREDICTIONS_DB", tdb.DEFAULT_DB))
-        agg = aggregate(rows, "Tênis")
-        if agg["n_bets"]:
-            by_category.append(agg)
-    except Exception as e:  # noqa: BLE001
-        print(f"[model-results] tennis skipped: {e}", file=sys.stderr, flush=True)
 
     by_category.sort(key=lambda c: c["total_pnl"], reverse=True)
     return {"entity": "Modelo", "by_category": by_category, "by_confidence": None}
@@ -124,9 +102,6 @@ def _store_for(category: str):
     if category == "Futebol":
         import soccer_predictions as s
         return s, os.environ.get("SOCCER_PREDICTIONS_DB", s.DEFAULT_DB), "Soccer"
-    if category == "Tênis":
-        import tennis_predictions as t
-        return t, os.environ.get("TENNIS_PREDICTIONS_DB", t.DEFAULT_DB), "Tennis"
     return None, None, None
 
 
@@ -147,7 +122,7 @@ def _row_to_bet(r: dict, category: str, cat_en: str) -> dict:
 
 
 def model_bets(category: str, offset: int, limit: int) -> dict:
-    """Paginated settled model predictions of a category (Futebol/Tênis)."""
+    """Paginated settled model predictions of a category (Futebol)."""
     store, db, cat_en = _store_for(category)
     if not store:
         return {"total": 0, "bets": []}
@@ -192,14 +167,14 @@ def _open_rows_for(category: str) -> list[dict]:
 
 
 def model_open_bets(category: str | None, offset: int, limit: int) -> dict:
-    """Paginated OPEN (PENDENTE) model predictions. category=None merges Futebol + Tênis.
+    """Paginated OPEN (PENDENTE) model predictions (category=None → Futebol).
 
     On the first page (offset 0 = tab open) finished PENDENTE rows are settled first, so the
     pending list shows only what's genuinely still open. Skipped on later pages to avoid
     re-settling on every pagination click."""
     if offset == 0:
         settle_pending_models()
-    cats = [category] if category else ["Futebol", "Tênis"]
+    cats = [category] if category else ["Futebol"]
     bets: list[dict] = []
     for c in cats:
         bets.extend(_open_rows_for(c))

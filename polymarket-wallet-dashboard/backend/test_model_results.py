@@ -30,7 +30,7 @@ class TestAggregate(unittest.TestCase):
         self.assertAlmostEqual(a["roi"], 150.0 / 250.0, places=4)
 
     def test_empty(self):
-        a = mr.aggregate([], "Tênis")
+        a = mr.aggregate([], "Futebol")
         self.assertEqual(a["n_bets"], 0)
         self.assertIsNone(a["win_rate"])
         self.assertIsNone(a["roi"])
@@ -55,7 +55,7 @@ class TestModelBets(unittest.TestCase):
         self.assertAlmostEqual(b["odds"], 1.79)
 
     def test_model_bets_unknown_category_empty(self):
-        out = mr.model_bets("Basketball", 0, 20)   # model only does Futebol/Tênis
+        out = mr.model_bets("Basketball", 0, 20)   # model only does Futebol
         self.assertEqual(out, {"total": 0, "bets": []})
 
 
@@ -74,26 +74,33 @@ class TestModelOpenBets(unittest.TestCase):
         self.assertAlmostEqual(b["odds"], 2.0)
 
     def test_model_open_bets_unknown_category_empty(self):
-        out = mr.model_open_bets("Basketball", 0, 20)   # model only does Futebol/Tênis
+        out = mr.model_open_bets("Basketball", 0, 20)   # model only does Futebol
         self.assertEqual(out, {"total": 0, "bets": []})
 
 
 class TestSettlePendingModels(unittest.TestCase):
-    """Liquidação on-demand: orquestra soccer+tennis e isola a falha de um esporte."""
+    """Liquidação on-demand: roda o soccer e nunca quebra a página (tênis foi removido)."""
 
-    def test_best_effort_isolates_failures(self):
+    def test_soccer_settles_and_no_tennis(self):
         import soccer_results
-        import tennis_results
-        orig_s, orig_t = soccer_results.settle_pending, tennis_results.settle_pending
+        orig = soccer_results.settle_pending
         soccer_results.settle_pending = lambda *a, **k: {"games_matched": 2, "settled": [1, 2]}
-        tennis_results.settle_pending = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
         try:
-            out = mr.settle_pending_models()                  # não deve lançar
+            out = mr.settle_pending_models()
         finally:
-            soccer_results.settle_pending = orig_s
-            tennis_results.settle_pending = orig_t
+            soccer_results.settle_pending = orig
         self.assertEqual(out["soccer"]["settled_rows"], 2)    # soccer liquidou
-        self.assertNotIn("tennis", out)                       # tennis falhou, mas isolado
+        self.assertNotIn("tennis", out)                       # tênis removido do modelo
+
+    def test_soccer_failure_isolated(self):
+        import soccer_results
+        orig = soccer_results.settle_pending
+        soccer_results.settle_pending = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            out = mr.settle_pending_models()                  # não deve lançar mesmo se o soccer falhar
+        finally:
+            soccer_results.settle_pending = orig
+        self.assertNotIn("soccer", out)
 
     def test_model_results_triggers_settle(self):
         calls = []

@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Dump the full math audit (stats_log JSON) of every prediction, readably.
 
-Reads a predictions SQLite DB directly — works for BOTH the soccer and tennis stores
-(they share the predictions(stats_log) shape). Pure stdlib, no skill imports.
+Reads the soccer predictions SQLite DB directly. Pure stdlib, no skill imports.
 
 Examples:
   python audit_log.py                         # all soccer predictions, full audit
-  python audit_log.py --sport tennis          # all tennis predictions
   python audit_log.py --status PENDENTE       # only pending
   python audit_log.py --date 2026-06-16       # one day
   python audit_log.py --id 7                   # a single prediction
@@ -23,7 +21,6 @@ import sys
 
 DEFAULT_DBS = {
     "soccer": os.path.expanduser("~/.polymarket-soccer/predictions.db"),
-    "tennis": os.path.expanduser("~/.polymarket-tennis/predictions.db"),
 }
 
 # Header fields shown above each audit (only those present in the row are printed).
@@ -83,7 +80,7 @@ def dump(db: str, *, status=None, date=None, pid=None, limit=None, as_json=False
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Dump the full math audit (stats_log) of all predictions.")
-    p.add_argument("--sport", choices=("soccer", "tennis"), default="soccer",
+    p.add_argument("--sport", choices=("soccer",), default="soccer",
                    help="Which store to read (default soccer)")
     p.add_argument("--db", default=None, help="Override the DB path (default: per --sport)")
     p.add_argument("--status", default=None, help="Filter by status (PENDENTE/ACERTO/ERRO/ANULADO)")

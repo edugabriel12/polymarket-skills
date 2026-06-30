@@ -3,7 +3,7 @@
 
 Run: python polymarket-forecasting/scripts/test_run_distribution.py
 Covers run_distribution.py (NegBin pmf, P(Over), market-implied mu, odds filter, market
-anchor) — the sport-agnostic totals math reused across the soccer/tennis models.
+anchor) — the sport-agnostic totals math reused by the soccer model.
 """
 
 from __future__ import annotations
