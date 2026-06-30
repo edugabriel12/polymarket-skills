@@ -213,6 +213,33 @@ class TestSettleDiagnostics(unittest.TestCase):
             self.assertEqual(res["settled"], [])
             self.assertTrue(any("not settled" in x for x in res["diagnostics"]))
 
+    def test_extra_time_game_flagged_for_manual_settlement(self):
+        # A knockout decided in extra time is no longer auto-settled (the feed's fullTime
+        # over-counts ET goals; Polymarket settles on 90'). The diagnostics must NOT blame a
+        # missing team-code/date — they must say it went to extra time and point to manual
+        # settlement, so the operator knows to run resettle_game.py with the 90' score.
+        # (Reproduces the reported DR Congo vs. Uzbekistan case: COD/UZB, ET.)
+        payload = {"matches": [
+            {"status": "FINISHED", "utcDate": "2026-06-28T18:00:00Z",
+             "homeTeam": {"tla": "COD"}, "awayTeam": {"tla": "UZB"},   # 1-1 at 90', 2-1 in ET
+             "score": {"duration": "EXTRA_TIME", "fullTime": {"home": 2, "away": 1}}}]}
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "p.db")
+            self._seed_one(db, "fifwc-cod-uzb-2026-06-28", "2026-06-28")
+            orig = sr.fetch_finished
+            sr.fetch_finished = (lambda df, dt, tok, timeout=8, skipped=None:
+                                 sr.parse_finished(payload, skipped=skipped))
+            try:
+                res = sr.settle_pending(db, token="fake")
+            finally:
+                sr.fetch_finished = orig
+            self.assertEqual(res["settled"], [])                      # not auto-settled
+            self.assertEqual(spdb.summary(db)["pendente"], 1)         # stays PENDENTE
+            self.assertTrue(any("EXTRA TIME" in x for x in res["diagnostics"]))
+            self.assertTrue(any("resettle_game.py" in x for x in res["diagnostics"]))
+            # and it must NOT be misreported as an unmapped/missing game
+            self.assertFalse(any("team code not mapped" in x for x in res["diagnostics"]))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
