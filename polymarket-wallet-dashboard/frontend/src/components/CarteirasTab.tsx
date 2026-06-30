@@ -41,21 +41,22 @@ function Thresholds({ rec }: { rec: WalletRecord }) {
         })}
       </div>
       <p className="mt-2 text-[11px] text-muted-foreground">
-        O CSV serve só pra estas faixas — os resultados abaixo são só das apostas ao vivo desde a adição.
+        O CSV define estas faixas — e os resultados abaixo somam o CSV + as apostas ao vivo.
       </p>
     </Card>
   );
 }
 
 function WalletAnalysis({ rec }: { rec: WalletRecord }) {
-  const a = rec.analysis;
+  const a = rec.total_analysis ?? rec.analysis;   // Carteiras = TOTAL (CSV anexado + todas as ao vivo)
   return (
     <div className="space-y-6">
       <Thresholds rec={rec} />
       {a && a.n_markets > 0 ? (
         <>
           <div className="rounded-xl bg-sky-500/10 px-3 py-1.5 text-xs font-semibold text-sky-400">
-            Apostas ao vivo · {a.live_settled} liquidada(s)
+            Total: CSV + ao vivo
+            {a.live_settled != null && ` · ${a.live_settled} ao vivo liquidada(s)`}
             {!!a.live_open && ` · ${a.live_open} em aberto`}
           </div>
           <KpiCards overall={a.overall} nMarkets={a.n_markets} nTrades={a.n_trades} />
@@ -64,13 +65,16 @@ function WalletAnalysis({ rec }: { rec: WalletRecord }) {
           <CategoryBreakdown
             categories={a.by_category}
             renderBets={(cat) => (
-              <DashBetList fetchKey={["wallet-bets", rec.id, cat]} fetcher={(p) => wallets.bets(rec.id, cat, p)} />
+              // The total aggregates CSV + live, but only LIVE bets are stored row-by-row, so the
+              // drill lists the live bets (unfiltered) of this category; CSV bets stay in the totals.
+              <DashBetList fetchKey={["wallet-bets-total", rec.id, cat]}
+                fetcher={(p) => wallets.bets(rec.id, cat, p, 20, false)} />
             )}
           />
         </>
       ) : (
         <Card className="p-6 text-center text-sm text-muted-foreground">
-          Ainda sem apostas liquidadas desde a adição.
+          Sem resultados ainda.
           {!!a?.live_open && <div className="mt-1 text-xs">{a.live_open} aposta(s) em aberto.</div>}
         </Card>
       )}
@@ -357,6 +361,19 @@ export function CarteirasTab() {
               <span className="font-mono text-[11px] text-muted-foreground">
                 {w.address.slice(0, 6)}…{w.address.slice(-4)}
               </span>
+              {!!w.n_markets && (
+                <span className="flex items-center gap-1.5 text-[11px] font-semibold">
+                  <span className="text-muted-foreground">{w.n_markets} ap.</span>
+                  {w.win_rate != null && (
+                    <span className="text-muted-foreground">{Math.round(w.win_rate * 100)}%</span>
+                  )}
+                  {w.total_pnl != null && (
+                    <span className={w.total_pnl >= 0 ? "text-emerald-500" : "text-rose-500"}>
+                      {w.total_pnl >= 0 ? "+" : "−"}{usd0(Math.abs(w.total_pnl))}
+                    </span>
+                  )}
+                </span>
+              )}
             </button>
             {w.filters && (
               <span title="Filtro de envio ativo" className="rounded-full bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-bold text-sky-400">

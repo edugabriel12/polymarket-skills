@@ -43,3 +43,12 @@ def live_results(live_bets: list[dict], filters: dict | None = None) -> dict:
     rep["live_settled"] = len(settled)
     rep["live_open"] = sum(1 for b in kept if b.get("status") == "OPEN")
     return rep
+
+
+def total_results(csv_report: dict | None, live_bets: list[dict] | None) -> dict:
+    """The wallet's TOTAL = its attached-CSV rollup + ALL live bets (filtered or not), merged by
+    category/subcategory/confidence. Used by the Carteiras tab (the full wallet picture), as opposed
+    to the Resultados tab which shows only the filtered live bets. The filter is intentionally NOT
+    applied here — every live bet counts."""
+    live_all = live_results(live_bets or [], None)        # None = no filter: every live bet counts
+    return wr.merge_reports(csv_report or {}, live_all)

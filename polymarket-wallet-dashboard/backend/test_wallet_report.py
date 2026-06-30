@@ -112,6 +112,64 @@ class TestAttachSubcategories(unittest.TestCase):
         self.assertEqual(records[0]["subcategory"], "Ambas Marcam")
 
 
+class TestMergeReports(unittest.TestCase):
+    """merge_reports sums two rollups (e.g. stored CSV + live) by name at every level and
+    recomputes win_rate/roi — the basis for the wallet TOTAL view."""
+
+    def test_sums_and_recomputes(self):
+        a = wr.rollup_csv([
+            _rec("Soccer", "Over/Under gols", 100.0, 100.0, 50.0, True),
+            _rec("Soccer", "Over/Under gols", -50.0, -50.0, 50.0, False),
+            _rec("Tennis", "Vencedor da partida", 10.0, 10.0, 20.0, True),
+        ])
+        b = wr.rollup_csv([
+            _rec("Soccer", "Over/Under gols", 30.0, 30.0, 30.0, True),
+            _rec("Baseball", "Moneyline", 5.0, 5.0, 10.0, True),
+        ])
+        m = wr.merge_reports(a, b)
+        self.assertEqual(m["source"], "combined")
+        self.assertEqual(m["n_markets"], 5)
+        ov = m["overall"]
+        self.assertEqual((ov["markets"], ov["wins"], ov["losses"], ov["resolved"]), (5, 4, 1, 5))
+        self.assertAlmostEqual(ov["total_pnl"], 95.0)
+        self.assertAlmostEqual(ov["invested"], 160.0)
+        self.assertAlmostEqual(ov["win_rate"], 0.8, places=4)            # 4/5 recomputed
+        self.assertAlmostEqual(ov["roi"], round(95.0 / 160.0, 4), places=4)
+        # categories aligned by name, sorted by P&L desc: Soccer(80) > Tennis(10) > Baseball(5)
+        self.assertEqual([c["category"] for c in m["by_category"]], ["Soccer", "Tennis", "Baseball"])
+        soccer = m["by_category"][0]
+        self.assertAlmostEqual(soccer["total_pnl"], 80.0)
+        self.assertEqual((soccer["wins"], soccer["losses"]), (2, 1))
+        sub = next(s for s in soccer["subcategories"] if s["subcategory"] == "Over/Under gols")
+        self.assertAlmostEqual(sub["total_pnl"], 80.0)
+        self.assertTrue(sub["by_confidence"])
+
+    def test_by_confidence_aligns_and_orders(self):
+        a = wr.rollup_csv([_rec_conf("Soccer", "Over/Under gols", "Alta"),
+                           _rec_conf("Soccer", "Over/Under gols", "Baixa")])
+        b = wr.rollup_csv([_rec_conf("Soccer", "Over/Under gols", "Alta"),
+                           _rec_conf("Soccer", "Over/Under gols", "Média")])
+        m = wr.merge_reports(a, b)
+        self.assertEqual([x["confidence"] for x in m["by_confidence"]], ["Alta", "Média", "Baixa"])
+        alta = next(x for x in m["by_confidence"] if x["confidence"] == "Alta")
+        self.assertEqual(alta["markets"], 2)                              # one from each side
+
+    def test_merge_with_empty_returns_other(self):
+        a = wr.rollup_csv([_rec("Soccer", "Over/Under gols", 10.0, 10.0, 20.0, True)])
+        self.assertEqual(wr.merge_reports(a, {})["overall"]["markets"], 1)
+        self.assertEqual(wr.merge_reports({}, a)["overall"]["markets"], 1)
+        empty = wr.merge_reports({}, {})
+        self.assertEqual(empty["overall"]["markets"], 0)
+        self.assertEqual(empty["by_category"], [])
+
+    def test_live_counts_carried(self):
+        a = wr.rollup_csv([_rec("Soccer", "Over/Under gols", 10.0, 10.0, 20.0, True)])
+        b = wr.rollup_csv([_rec("Tennis", "Vencedor da partida", 5.0, 5.0, 10.0, True)])
+        b["live_settled"], b["live_open"] = 1, 2
+        m = wr.merge_reports(a, b)
+        self.assertEqual((m["live_settled"], m["live_open"]), (1, 2))
+
+
 class TestDemoReport(unittest.TestCase):
     def test_demo_report_shape(self):
         rep = demo_mod.demo_report()
