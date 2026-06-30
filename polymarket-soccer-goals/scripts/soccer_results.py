@@ -99,15 +99,26 @@ def fetch_finished(date_from: str, date_to: str, token: str | None,
 
 
 def parse_finished(data: dict) -> dict[tuple, tuple]:
-    """Pure: normalize a football-data.org /matches payload into the pair lookup."""
+    """Pure: normalize a football-data.org /matches payload into the pair lookup.
+
+    ONLY regular-time results are returned. Polymarket's goals O/U + BTTS markets settle on the
+    90-minute (regulation) score, but football-data.org's ``score.fullTime`` INCLUDES extra-time
+    goals for knockout games — so a game decided in extra time over-counts goals (e.g. a 1-1 at
+    90' that becomes 2-1 in ET would wrongly LOSE an UNDER 2.5). The feed doesn't expose the 90'
+    score for those, so EXTRA_TIME / PENALTY_SHOOTOUT games are skipped (predictions stay PENDENTE
+    for manual settlement) rather than mis-settled. Missing/REGULAR ``duration`` settles normally.
+    """
     out: dict[tuple, tuple] = {}
     for m in (data or {}).get("matches", []):
         if (m.get("status") or "").upper() not in ("FINISHED", "AWARDED"):
             continue
+        score = m.get("score", {}) or {}
+        if str(score.get("duration") or "REGULAR").upper() != "REGULAR":
+            continue                       # ET/penalties: fullTime includes ET goals -> don't settle
         home, away = m.get("homeTeam", {}), m.get("awayTeam", {})
         ha = home.get("tla") or home.get("shortName") or home.get("name")
         aa = away.get("tla") or away.get("shortName") or away.get("name")
-        ft = (m.get("score", {}) or {}).get("fullTime", {}) or {}
+        ft = score.get("fullTime", {}) or {}
         hg, ag = ft.get("home"), ft.get("away")
         date = (m.get("utcDate") or "")[:10]
         if ha is None or aa is None or hg is None or ag is None or not date:
