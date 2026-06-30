@@ -166,6 +166,20 @@ class TestTelegramFormat(unittest.TestCase):
         self.assertIn("🔴 <b>LIVE</b>", msg)
         self.assertNotIn("Confiança", msg)                # confidence removed from the card
 
+    def test_format_link_only_for_absolute_url(self):
+        # An absolute URL → clickable <a>; a relative/garbage one must NOT emit an <a href> (it
+        # would make Telegram reject the whole HTML message), so it's shown as plain text.
+        ok = tg.format_entry(_entry("k"))                          # market_url = https://...
+        self.assertIn('<a href="https://polymarket.com/x">', ok)
+        bad = tg.format_entry({**_entry("k"), "market_url": "polymarket.com/x"})  # no scheme
+        self.assertNotIn("<a ", bad)
+        self.assertIn("polymarket.com/x", bad)                    # shown as text instead
+
+    def test_format_never_raises_on_bad_numbers(self):
+        # A non-numeric price/odds must not raise (a raise aborts the whole ingest fan-out).
+        msg = tg.format_entry({**_entry("k"), "entry_price": "n/a", "odds": None})
+        self.assertIn("Cotação:", msg)
+
     def test_send_uses_bot_api(self):
         class _Resp:
             def raise_for_status(self): pass
@@ -182,6 +196,50 @@ class TestTelegramFormat(unittest.TestCase):
 
     def test_send_unconfigured_skips(self):
         self.assertFalse(tg.send("hi", token="", chat_id=""))
+
+    def test_to_plain_keeps_link_url(self):
+        # The plain fallback must keep the market URL (Telegram auto-links it) and drop the tags.
+        p = tg._to_plain('<b>LIVE</b>\nLado: <b>OVER</b>\n'
+                         '<a href="https://polymarket.com/event/x?a=1&amp;b=2">🔗 Ver mercado</a>')
+        self.assertNotIn("<", p)
+        self.assertIn("LIVE", p)
+        self.assertIn("🔗 Ver mercado", p)
+        self.assertIn("https://polymarket.com/event/x?a=1&b=2", p)   # unescaped, intact
+
+    def test_send_falls_back_to_plain_when_parse_mode_rejected(self):
+        # Telegram rejecting the HTML (parse_mode) must NOT drop the entry: retry as plain text.
+        class _Ok:
+            def raise_for_status(self): pass
+
+        class _Bad:
+            def raise_for_status(self): raise RuntimeError("400: can't parse entities")
+
+        class _Fake:
+            def __init__(self): self.calls = []
+            def post(self, url, json=None, timeout=None):
+                self.calls.append(json)
+                return _Bad() if json.get("parse_mode") else _Ok()   # HTML fails, plain succeeds
+        c = _Fake()
+        ok = tg.send('<b>X</b>\n<a href="https://e.com/m">🔗 Ver mercado</a>',
+                     token="T", chat_id="C", parse_mode="HTML", client=c)
+        self.assertTrue(ok)                                   # delivered despite the HTML rejection
+        self.assertEqual(len(c.calls), 2)                     # HTML attempt, then plain retry
+        self.assertEqual(c.calls[0].get("parse_mode"), "HTML")
+        self.assertNotIn("parse_mode", c.calls[1])            # retry is plain text
+        self.assertNotIn("<b>", c.calls[1]["text"])           # tags stripped
+        self.assertIn("https://e.com/m", c.calls[1]["text"])  # URL preserved for clickability
+
+    def test_send_failure_without_parse_mode_does_not_loop(self):
+        class _Bad:
+            def raise_for_status(self): raise RuntimeError("boom")
+
+        class _Fake:
+            def __init__(self): self.calls = 0
+            def post(self, url, json=None, timeout=None):
+                self.calls += 1; return _Bad()
+        c = _Fake()
+        self.assertFalse(tg.send("plain", token="T", chat_id="C", client=c))
+        self.assertEqual(c.calls, 1)                          # no retry when there was no parse_mode
 
 
 class TestTelegramConfig(unittest.TestCase):

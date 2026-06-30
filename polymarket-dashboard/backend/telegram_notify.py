@@ -11,14 +11,27 @@ so the link renders as clickable text. Config: per-user bot token + chat id.
 from __future__ import annotations
 
 import html
+import re
 import sys
 
 _LIVE_ICON = {"LIVE": "🔴", "PRÉ-LIVE": "⏳"}
 
+_TAG_A = re.compile(r'<a href="([^"]*)">(.*?)</a>', re.S)
+_TAGS = re.compile(r"<[^>]+>")
+
+
+def _num(v) -> float:
+    """Best-effort float (0.0 on anything non-numeric) so a malformed field never crashes the
+    card build — a raise here would abort the whole ingest batch's fan-out."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
 
 def _fmt_unit(u) -> str:
     """1.0 -> '1.0', 0.5 -> '0.5', 0.25 -> '0.25' (keeps at least one decimal)."""
-    s = f"{float(u or 0):.2f}".rstrip("0").rstrip(".")
+    s = f"{_num(u):.2f}".rstrip("0").rstrip(".")
     return s if "." in s else f"{s}.0"
 
 
@@ -27,12 +40,19 @@ def _fmt_date(s) -> str:
     return str(s)[:10] if s else ""
 
 
+def _to_plain(text: str) -> str:
+    """Strip the HTML card to plain text for the no-parse-mode fallback, keeping each link's URL
+    (Telegram auto-links bare URLs) so the entry still arrives if the HTML is ever rejected."""
+    t = _TAG_A.sub(lambda m: f"{m.group(2)} {html.unescape(m.group(1))}".strip(), text)
+    return html.unescape(_TAGS.sub("", t))
+
+
 def format_entry(e: dict) -> str:
     """Build the Telegram card (HTML). Header = LIVE/PRÉ-LIVE flag; no wallet, no position size."""
     live = e.get("live") or "PRÉ-LIVE"
     icon = _LIVE_ICON.get(live, "")
-    price = float(e.get("entry_price") or 0)
-    odds = float(e.get("odds") or 0)
+    price = _num(e.get("entry_price"))
+    odds = _num(e.get("odds"))
     lines = [
         f"{icon} <b>{html.escape(live)}</b>",
         f"<b>{html.escape(str(e.get('event', '')))}</b>",
@@ -44,8 +64,13 @@ def format_entry(e: dict) -> str:
     date = _fmt_date(e.get("game_start"))
     if date:
         lines.append(f"⏰ Encerra: {date}")
-    if e.get("market_url"):
-        lines.append(f'<a href="{html.escape(str(e["market_url"]), quote=True)}">🔗 Ver mercado</a>')
+    url = str(e.get("market_url") or "").strip()
+    if url.startswith(("http://", "https://")):
+        lines.append(f'<a href="{html.escape(url, quote=True)}">🔗 Ver mercado</a>')
+    elif url:
+        # Not an absolute URL — an <a href> with a relative/garbage target makes Telegram reject
+        # the whole HTML message ("can't parse entities"). Show it as plain text instead.
+        lines.append(f"🔗 {html.escape(url)}")
     return "\n".join(lines)
 
 
@@ -73,14 +98,31 @@ def send(text: str, *, token: str | None = None, chat_id: str | None = None,
     if client is None:
         import requests
         client = requests
-    payload = {"chat_id": chat, "text": text, "disable_web_page_preview": True}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    try:
-        r = client.post(f"https://api.telegram.org/bot{tok}/sendMessage", json=payload, timeout=8)
+    url = f"https://api.telegram.org/bot{tok}/sendMessage"
+
+    def _post(body: str, mode: str | None) -> None:
+        payload = {"chat_id": chat, "text": body, "disable_web_page_preview": True}
+        if mode:
+            payload["parse_mode"] = mode
+        r = client.post(url, json=payload, timeout=8)
         r.raise_for_status()
+
+    try:
+        _post(text, parse_mode)
         return True
     except Exception as e:  # noqa: BLE001 - never break ingest on a Telegram failure
+        # A parse_mode payload Telegram won't accept (e.g. "can't parse entities") would silently
+        # drop the entry. Retry once as PLAIN text so it still arrives, and log the original error.
+        if parse_mode:
+            try:
+                _post(_to_plain(text), None)
+                print(f"[telegram] {parse_mode} rejected ({e}); delivered as plain text",
+                      file=sys.stderr, flush=True)
+                return True
+            except Exception as e2:  # noqa: BLE001
+                print(f"[telegram] send failed (parse_mode + plain): {e2}",
+                      file=sys.stderr, flush=True)
+                return False
         print(f"[telegram] send failed: {e}", file=sys.stderr, flush=True)
         return False
 
