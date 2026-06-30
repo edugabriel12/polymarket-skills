@@ -96,6 +96,25 @@ class TestDecide(unittest.TestCase):
         self.assertEqual(out[0]["actual_total"], 3.0)
         self.assertTrue(out[0]["actual_btts"])
 
+    def test_dr_congo_slug_cdr_matches_feed_cod(self):
+        # Reported bug: Polymarket slugs DR Congo as 'cdr' (idiosyncratic, like 'cvi' for Cape
+        # Verde); the feed tags it FIFA/ISO 'COD'. Before the map entry cdr/uzb never matched
+        # cod/uzb, so "DR Congo vs. Uzbekistan: O/U 2.5" stayed PENDENTE though it finished in 90'.
+        payload = {"matches": [
+            {"status": "FINISHED", "utcDate": "2026-06-27T18:00:00Z",
+             "homeTeam": {"tla": "COD"}, "awayTeam": {"tla": "UZB"},
+             "score": {"fullTime": {"home": 1, "away": 2}}}]}  # total 3 > 2.5 -> OVER wins
+        lk = sr.parse_finished(payload)
+        pending = [{"game_slug": "fifwc-cdr-uzb-2026-06-27-total-2pt5", "game_date": "2026-06-27",
+                    "home": "cdr", "away": "uzb"}]
+        out = sr.decide_settlements(pending, lk)
+        self.assertEqual(len(out), 1)              # cdr/uzb now reconciles with feed cod/uzb
+        self.assertEqual(out[0]["actual_total"], 3.0)
+        self.assertTrue(out[0]["actual_btts"])
+        # Guard: the Republic of Congo (FIFA 'cgo' / ISO 'cog') must NOT collapse onto DR Congo.
+        self.assertNotEqual(sr.norm_code("cdr"), sr.norm_code("cgo"))
+        self.assertNotEqual(sr.norm_code("cdr"), sr.norm_code("cog"))
+
 
 class TestSettlePending(unittest.TestCase):
     def _seed(self, db):
