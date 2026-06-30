@@ -41,6 +41,7 @@ TLA_TO_CODE: dict[str, str] = {
     # --- CAF ---
     "rsa": "zaf", "alg": "dza", "mar": "mar", "civ": "civ", "zam": "zmb",
     "cvi": "cpv",   # Polymarket slug 'cvi' (Cape Verde) -> ISO/FIFA 'cpv' (as the feed lists it)
+    "cdr": "cod",   # Polymarket slug 'cdr' (DR Congo) -> FIFA/ISO 'cod' (feed); NOT Rep. of Congo (cgo/cog)
     # --- AFC ---
     "kor": "kor", "uae": "are", "ksa": "sau", "iri": "irn",
 }
