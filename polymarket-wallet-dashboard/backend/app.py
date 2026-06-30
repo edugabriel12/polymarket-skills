@@ -63,6 +63,7 @@ import demo as demo_mod  # noqa: E402
 import csv_parser  # noqa: E402
 import confidence_model as cm  # noqa: E402
 import wallets_store as ws  # noqa: E402
+import wallet_filters as wf  # noqa: E402
 import brain  # noqa: E402
 
 # Scheduler config. The brain runs the models at the top of every hour (Brasília by
@@ -256,7 +257,9 @@ def _wallet_with_live(wallet_id: int) -> dict:
     if not w:
         return {"error": "carteira não encontrada"}
     w["filter_tree"] = _filter_tree_from_analysis(w.get("analysis") or {})
-    w["analysis"] = wres.live_results(ws.list_bets(wallet_id))
+    # Results count ONLY what passes the wallet's filter (same predicate as forwarding); the
+    # filter_tree above stays the FULL option set so the edit UI can still offer every combo.
+    w["analysis"] = wres.live_results(ws.list_bets(wallet_id), w.get("filters"))
     return w
 
 
@@ -293,14 +296,26 @@ def model_results_route() -> dict:
     return model_results.model_results()
 
 
+def _wallet_bets_page(wallet_id: int, statuses: tuple, category: str | None,
+                      page: int, page_size: int) -> dict:
+    """Paginated wallet bets of the given statuses, honoring the wallet's forwarding filter (so
+    the lists match the filtered Resultados) plus an optional category. wallet_bets is tiny (one
+    row per market), so we filter/sort/paginate in Python on the same `passes_filter` predicate."""
+    w = ws.get_wallet(wallet_id)
+    rows = [b for b in ws.list_bets(wallet_id)
+            if b.get("status") in statuses and (not category or b.get("category") == category)]
+    rows = wf.filter_bets(w.get("filters") if w else None, rows)
+    rows.sort(key=lambda b: b.get("updated_at") or "", reverse=True)
+    offset = (page - 1) * page_size
+    return {"total": len(rows), "page": page, "page_size": page_size,
+            "bets": rows[offset:offset + page_size]}
+
+
 @app.get("/api/wallets/{wallet_id}/bets")
 def wallet_bets_route(wallet_id: int, category: str | None = Query(None),
                       page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)) -> dict:
-    """Paginated settled live bets of a wallet (optionally by category)."""
-    offset = (page - 1) * page_size
-    return {"total": ws.count_settled_bets(wallet_id, category), "page": page,
-            "page_size": page_size,
-            "bets": ws.list_settled_bets(wallet_id, category, offset, page_size)}
+    """Paginated SETTLED live bets of a wallet — honors the wallet's filter (+ optional category)."""
+    return _wallet_bets_page(wallet_id, ("WON", "LOST", "VOID"), category, page, page_size)
 
 
 @app.get("/api/model-bets")
@@ -317,11 +332,8 @@ def model_bets_route(category: str = Query(...), page: int = Query(1, ge=1),
 def wallet_open_bets_route(wallet_id: int, category: str | None = Query(None),
                            page: int = Query(1, ge=1),
                            page_size: int = Query(20, ge=1, le=100)) -> dict:
-    """Paginated OPEN (unsettled) live bets of a wallet — the pending tab."""
-    offset = (page - 1) * page_size
-    return {"total": ws.count_open_bets(wallet_id, category), "page": page,
-            "page_size": page_size,
-            "bets": ws.list_open_bets(wallet_id, category, offset, page_size)}
+    """Paginated OPEN (unsettled) live bets of a wallet — the pending tab; honors the filter."""
+    return _wallet_bets_page(wallet_id, ("OPEN",), category, page, page_size)
 
 
 @app.get("/api/model-open-bets")

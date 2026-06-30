@@ -11,6 +11,7 @@ the Sports side.
 from __future__ import annotations
 
 import wallet_report as wr
+from wallet_filters import filter_bets
 
 
 def bet_to_record(bet: dict) -> dict:
@@ -29,11 +30,16 @@ def bet_to_record(bet: dict) -> dict:
     }
 
 
-def live_results(live_bets: list[dict]) -> dict:
-    """rollup_csv over the wallet's SETTLED live bets only (no CSV). Same analysis shape."""
-    live_bets = live_bets or []
-    settled = [b for b in live_bets if b.get("status") in ("WON", "LOST", "VOID")]
+def live_results(live_bets: list[dict], filters: dict | None = None) -> dict:
+    """rollup_csv over the wallet's SETTLED live bets only (no CSV). Same analysis shape.
+
+    `filters` is the wallet's forwarding filter ({category:{subcategory:[confidences]}}). When
+    set, only bets whose (category, subcategory, confidence) pass it count — so Resultados show
+    exactly what the wallet forwards. `None` (no filter) keeps every bet (unchanged behavior).
+    """
+    kept = filter_bets(filters, live_bets or [])
+    settled = [b for b in kept if b.get("status") in ("WON", "LOST", "VOID")]
     rep = wr.rollup_csv([bet_to_record(b) for b in settled])
     rep["live_settled"] = len(settled)
-    rep["live_open"] = sum(1 for b in live_bets if b.get("status") == "OPEN")
+    rep["live_open"] = sum(1 for b in kept if b.get("status") == "OPEN")
     return rep
