@@ -24,6 +24,14 @@ LLM, where its independent cross-check earns its cost. Set JUDGE_AUTOROUTE=0 to
 restore the universal-LLM behavior. Every routed decision still flows through
 apply_verdict(), so Rule 6 / proximity / range-calibration guards all still run.
 
+v13.2 option-1 (anomaly scan): the ensemble prices in synoptic weather but is
+blind to NON-meteorological catalysts (breaking news, resolution ambiguity).
+So an auto-approve isn't a blind pass — it first runs a CHEAP web-search-only
+scan (_anomaly_scan, no NWS/VC, no full judge reasoning) asking "is there an
+active catalyst for this city/date?". Clean → auto-approve (full judge skipped);
+catalyst found or scan unavailable → escalate to the full judge (fail-safe).
+Set JUDGE_ANOMALY_SCAN=0 to auto-approve directly without the scan.
+
 Required env vars:
   ANTHROPIC_API_KEY
   VISUAL_CROSSING_API_KEY  (free tier: visualcrossing.com)
@@ -142,6 +150,20 @@ JUDGE_AUTOROUTE = os.environ.get("JUDGE_AUTOROUTE", "1").strip().lower() not in 
 # the LLM. Kept == RANGE_NEAR_MAE_MULT so an auto-approved case is, by
 # construction, never one the range calibration would flag as "near".
 AUTOAPPROVE_MAE_MULT = float(os.environ.get("JUDGE_AUTOAPPROVE_MAE_MULT", "2.0"))
+
+# v13.2 option-1 (2026-07-01): a CHEAP web-search-only catalyst scan on the
+# cases the auto-router would otherwise APPROVE with no LLM at all. The
+# calibrated ensemble already prices in synoptic weather (fronts, heat domes) —
+# but it is blind to NON-meteorological anomalies (breaking news after the
+# model run, resolution-source ambiguity, event-day stories). This scan runs
+# ONE narrow LLM call with web search only (no NWS/VC, no full judge reasoning)
+# asking "is there an active catalyst for this city/date?". Clean → auto-approve
+# as before; catalyst found (or scan unavailable) → escalate to the full judge.
+# Set JUDGE_ANOMALY_SCAN=0 to auto-approve directly (pure v13.2 behavior).
+JUDGE_ANOMALY_SCAN = os.environ.get("JUDGE_ANOMALY_SCAN", "1").strip().lower() not in (
+    "0", "false", "no", "off", "")
+ANOMALY_SCAN_MAX_USES = int(os.environ.get("JUDGE_ANOMALY_SCAN_MAX_USES", "3"))
+ANOMALY_SCAN_MAX_TOKENS = int(os.environ.get("JUDGE_ANOMALY_SCAN_MAX_TOKENS", "1500"))
 
 # Pricing per 1M tokens (Sonnet 4.6 / Opus 4.7 — adjust if model changed)
 PRICING = {
@@ -756,6 +778,143 @@ def _synthesize_route_verdict(entry_row, route: dict) -> dict:
     }
 
 
+_ANOMALY_SCAN_SYSTEM = (
+    "You are a weather-market anomaly scanner. A calibrated 3-model temperature "
+    "ensemble (ICON+GFS+ECMWF) already covers routine synoptic weather, so you "
+    "are NOT re-forecasting the temperature. Your ONLY job is to web-search for "
+    "an ACTIVE, SPECIFIC catalyst for the given city and date that the ensemble "
+    "could miss — an incoming heat dome / cold front / atmospheric river / storm "
+    "/ hurricane, wildfire smoke, or a resolution-relevant news/event story "
+    "(e.g. a station change, a data correction, an event-day factor). "
+    "Do 1-3 focused searches, then answer with a SINGLE JSON object and nothing "
+    "else, in a ```json fenced block:\n"
+    '{"catalyst_found": <true|false>, "summary": "<one sentence>"}\n'
+    "Set catalyst_found=true ONLY when you find a specific, active catalyst that "
+    "could plausibly move the outcome or affect resolution. Routine seasonal "
+    "weather with no incoming system is catalyst_found=false."
+)
+
+
+def _parse_scan_json(text: str) -> Optional[dict]:
+    """Extract the {catalyst_found, summary} object from the scan's final text.
+    Tolerates ```json fences and surrounding prose. Returns None if unparseable.
+    """
+    if not text:
+        return None
+    import re
+    # Prefer a fenced block; fall back to the last {...} span.
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    blob = m.group(1) if m else None
+    if blob is None:
+        m = re.search(r"(\{[^{}]*\"catalyst_found\"[^{}]*\})", text, re.DOTALL)
+        blob = m.group(1) if m else None
+    if blob is None:
+        return None
+    try:
+        obj = json.loads(blob)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict) or "catalyst_found" not in obj:
+        return None
+    return {"catalyst_found": bool(obj.get("catalyst_found")),
+            "summary": str(obj.get("summary") or "")[:500]}
+
+
+def _anomaly_scan(entry_row) -> Optional[dict]:
+    """v13.2 option-1: a CHEAP web-search-only catalyst check for a proposal the
+    auto-router would otherwise approve without any LLM. See ANOMALY_SCAN notes
+    above.
+
+    Returns {"catalyst_found": bool, "summary": str, "_meta": {...}} on success,
+    or None on ANY failure (missing key/SDK, API error, pause, unparseable) —
+    the caller escalates to the full judge on None (fail-safe).
+    """
+    try:
+        import anthropic
+    except ImportError:
+        return None
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return None
+
+    user_content = json.dumps({
+        "city": entry_row.get("city_resolved"),
+        "date": (entry_row.get("end_date") or "")[:10],
+        "threshold_value": entry_row.get("threshold_value"),
+        "threshold_unit": entry_row.get("threshold_unit"),
+        "comparison": entry_row.get("comparison"),
+        "bot_side": entry_row.get("side"),
+        "note": ("The ensemble is confident the temperature will NOT land in "
+                 "the bin (bot is betting accordingly). Look only for a catalyst "
+                 "that would upset that, or affect how the market resolves."),
+    }, ensure_ascii=False)
+
+    # Basic web-search variant — supported on every model (incl. Haiku 4.5);
+    # the _20260209 dynamic-filtering variant is Opus/Sonnet-4.6+ only.
+    tools = [{"type": "web_search_20250305", "name": "web_search",
+              "max_uses": ANOMALY_SCAN_MAX_USES}]
+    is_haiku = "haiku" in DEFAULT_MODEL.lower()
+    request_kwargs = {
+        "model": DEFAULT_MODEL,
+        "max_tokens": ANOMALY_SCAN_MAX_TOKENS,
+        "system": _ANOMALY_SCAN_SYSTEM,
+        "messages": [{"role": "user", "content": user_content}],
+        "tools": tools,
+    }
+    if not is_haiku:
+        request_kwargs["thinking"] = {"type": "adaptive"}
+        request_kwargs["output_config"] = {"effort": "low"}
+
+    client = anthropic.Anthropic()
+    t0 = time.monotonic()
+    try:
+        response = client.messages.create(**request_kwargs)
+    except Exception as e:
+        log_event("anomaly_scan_error", {"entry_id": entry_row.get("entry_id"),
+                                         "err": str(e),
+                                         "type": type(e).__name__}, level="WARN")
+        return None
+    duration_ms = int((time.monotonic() - t0) * 1000)
+
+    # A server-tool loop that ran out of iterations returns pause_turn — treat
+    # as inconclusive and escalate (don't try to resume in the cheap path).
+    if getattr(response, "stop_reason", None) == "pause_turn":
+        log_event("anomaly_scan_paused", {"entry_id": entry_row.get("entry_id")},
+                  level="WARN")
+        return None
+
+    text = "".join(b.text for b in response.content
+                   if getattr(b, "type", None) == "text")
+    parsed = _parse_scan_json(text)
+    if parsed is None:
+        log_event("anomaly_scan_unparseable",
+                  {"entry_id": entry_row.get("entry_id"), "text": text[:300]},
+                  level="WARN")
+        return None
+
+    usage = response.usage
+    pricing = PRICING.get(DEFAULT_MODEL, PRICING["claude-haiku-4-5"])
+    # Token-based cost only (web-search per-query billing is extra and not
+    # captured here — a small, deliberate undercount for budget tracking).
+    cost = (usage.input_tokens * pricing["input"] / 1_000_000 +
+            usage.output_tokens * pricing["output"] / 1_000_000 +
+            (usage.cache_read_input_tokens or 0) * pricing["cache_read"] / 1_000_000)
+    parsed["_meta"] = {"cost_usd": cost, "duration_ms": duration_ms,
+                       "model": DEFAULT_MODEL, "tokens_in": usage.input_tokens,
+                       "tokens_out": usage.output_tokens}
+    return parsed
+
+
+def _scan_outcome(scan: Optional[dict]) -> str:
+    """Decide the auto-approve path from an _anomaly_scan result:
+      'approve'    — scan clean (no catalyst) → auto-approve, LLM judge skipped
+      'escalate'   — catalyst found → send to the full LLM judge
+      'unavailable'— scan failed (None) → escalate to the full judge (fail-safe)
+    """
+    if scan is None:
+        return "unavailable"
+    return "escalate" if scan.get("catalyst_found") else "approve"
+
+
 def apply_verdict(conn, entry_row, verdict: dict) -> None:
     """Persist the verdict to judge_reviews and update entry status."""
     meta = verdict.pop("_meta", {})
@@ -1032,28 +1191,65 @@ def main():
 
                 # v13.2 (option B): conditional gate. Resolve the decisive
                 # cases (deterministic proximity coin-flip → REJECT; tight
-                # ensemble far from bin → APPROVE) WITHOUT spending the LLM.
-                # Only genuinely uncertain / non-ensemble / non-temp cases
-                # fall through to review_proposal(). Synthesized verdicts
+                # ensemble far from bin → APPROVE) WITHOUT spending the full
+                # LLM judge. Only genuinely uncertain / non-ensemble / non-temp
+                # cases fall through to review_proposal(). Synthesized verdicts
                 # still flow through apply_verdict() → all code guards run.
                 route = _judge_route(row_dict)
-                if route is not None:
+
+                # Deterministic proximity coin-flip → REJECT, no LLM at all.
+                if route is not None and route["action"] == "auto_reject":
                     verdict = _synthesize_route_verdict(row_dict, route)
                     with db.connect() as conn:
                         apply_verdict(conn, row_dict, verdict)
-                    log_event(
-                        "judge_autoreject_proximity"
-                        if route["action"] == "auto_reject"
-                        else "judge_autoapprove_ensemble", {
+                    log_event("judge_autoreject_proximity", {
+                        "entry_id": row_dict["entry_id"],
+                        "final_verdict": verdict["verdict"],
+                        "reason": route["reason"],
+                        "bot_prob": float(row_dict["forecast_prob_at_entry"] or 0),
+                        "cost_usd": 0.0, "llm_skipped": True,
+                    })
+                    continue
+
+                # Tight-ensemble-far-from-bin: run the CHEAP web-search-only
+                # anomaly scan (option-1). Clean → auto-approve (full judge
+                # skipped); catalyst found or scan unavailable → fall through to
+                # the full judge. This closes the auto-approve blind spot for
+                # non-meteorological catalysts the ensemble can't see.
+                if route is not None and route["action"] == "auto_approve":
+                    scan = _anomaly_scan(row_dict) if JUDGE_ANOMALY_SCAN else {
+                        "catalyst_found": False, "summary": "scan disabled",
+                        "_meta": {}}
+                    scan_cost = (scan or {}).get("_meta", {}).get("cost_usd", 0.0)
+                    if scan_cost:
+                        _record_spend(scan_cost)
+                    outcome = _scan_outcome(scan)
+                    if outcome == "approve":
+                        verdict = _synthesize_route_verdict(row_dict, route)
+                        verdict["rationale"] += (
+                            f"\n[anomaly scan: no catalyst — "
+                            f"{scan.get('summary', '')}]")
+                        with db.connect() as conn:
+                            apply_verdict(conn, row_dict, verdict)
+                        log_event("judge_autoapprove_ensemble", {
                             "entry_id": row_dict["entry_id"],
                             "final_verdict": verdict["verdict"],
                             "reason": route["reason"],
+                            "scan_summary": scan.get("summary", ""),
                             "bot_prob": float(
                                 row_dict["forecast_prob_at_entry"] or 0),
-                            "cost_usd": 0.0,
+                            "cost_usd": round(scan_cost, 4),
                             "llm_skipped": True,
                         })
-                    continue
+                        continue
+                    # escalate or unavailable → full judge (fall through)
+                    log_event("judge_autoapprove_escalated", {
+                        "entry_id": row_dict["entry_id"],
+                        "outcome": outcome,
+                        "reason": route["reason"],
+                        "scan_summary": (scan or {}).get("summary", ""),
+                        "scan_cost_usd": round(scan_cost, 4),
+                    }, level="WARN")
 
                 t0 = time.monotonic()
                 verdict = review_proposal(row_dict, system_prompt)
@@ -1445,6 +1641,46 @@ def _test_autoroute():
         mod.AUTOAPPROVE_MAE_MULT = saved["mult"]
 
 
+# ---------------------------------------------------------------------------
+# Inline tests for the v13.2 option-1 anomaly scan (parse + outcome)
+# Run: python weather_edge_judge.py --test-anomaly
+# ---------------------------------------------------------------------------
+
+def _test_anomaly():
+    """Hermetic tests for _parse_scan_json and _scan_outcome — no API calls."""
+
+    # --- _parse_scan_json ---
+    r = _parse_scan_json('```json\n{"catalyst_found": true, "summary": "heat dome inbound"}\n```')
+    assert r == {"catalyst_found": True, "summary": "heat dome inbound"}, r
+    print("Test 1 PASS: fenced json block parsed")
+
+    r = _parse_scan_json('Here is my finding:\n{"catalyst_found": false, "summary": "routine"}')
+    assert r == {"catalyst_found": False, "summary": "routine"}, r
+    print("Test 2 PASS: bare object after prose parsed")
+
+    r = _parse_scan_json('```\n{"catalyst_found": false, "summary": "no fence lang"}\n```')
+    assert r == {"catalyst_found": False, "summary": "no fence lang"}, r
+    print("Test 3 PASS: unlabelled fence parsed")
+
+    assert _parse_scan_json("") is None
+    assert _parse_scan_json("no json here at all") is None
+    assert _parse_scan_json('{"summary": "missing the key"}') is None
+    print("Test 4 PASS: empty / no-json / missing-key → None")
+
+    # truthiness coercion (string "true" is truthy → True; but json bool stays)
+    r = _parse_scan_json('{"catalyst_found": 1, "summary": "coerced"}')
+    assert r["catalyst_found"] is True, r
+    print("Test 5 PASS: non-bool catalyst_found coerced to bool")
+
+    # --- _scan_outcome ---
+    assert _scan_outcome(None) == "unavailable"
+    assert _scan_outcome({"catalyst_found": True, "summary": "x"}) == "escalate"
+    assert _scan_outcome({"catalyst_found": False, "summary": "x"}) == "approve"
+    print("Test 6 PASS: outcome None→unavailable, True→escalate, False→approve")
+
+    print("\nAll anomaly-scan tests PASS (6/6)")
+
+
 if __name__ == "__main__":
     import sys
     if "--test-rule6" in sys.argv:
@@ -1453,5 +1689,7 @@ if __name__ == "__main__":
         _test_prejudge_recheck()
     elif "--test-autoroute" in sys.argv:
         _test_autoroute()
+    elif "--test-anomaly" in sys.argv:
+        _test_anomaly()
     else:
         main()
