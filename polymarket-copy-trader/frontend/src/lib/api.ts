@@ -112,6 +112,7 @@ export interface Config {
   max_usd: number;
   min_usd: number;
   starting_balance: number;
+  weather_only: boolean;
   disclaimer: string;
 }
 

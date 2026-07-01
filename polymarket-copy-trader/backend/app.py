@@ -166,6 +166,7 @@ def config_route() -> dict:
         "max_usd": ce.MAX_USD,
         "min_usd": ce.MIN_USD,
         "starting_balance": db.STARTING_BALANCE,
+        "weather_only": poller.WEATHER_ONLY,
         "disclaimer": "Paper trading simulation — not financial advice. "
                       "Real trading involves risk of loss.",
     }

@@ -3,9 +3,10 @@ name: polymarket-copy-trader
 description: >-
   Use this skill to run a separate paper copy-trade flow that follows public Polymarket
   wallets. Save wallets by name+address, continuously track their BUYS and SELLS via the
-  Data API /trades endpoint, and mirror them into a $10k fake-USD paper portfolio. Buys copy the
-  same USD value the wallet spent, clamped to [$5, $100], with a 20% slippage guard; sells are
-  skipped if they would exceed 20% slippage. Includes a FastAPI backend + React dashboard (Carteiras,
+  Data API /trades endpoint, and mirror them into a $10k fake-USD paper portfolio. By default only
+  weather markets are copied (COPY_WEATHER_ONLY=0 to copy all). Buys copy the same USD value the
+  wallet spent, clamped to [$5, $100], with a 20% slippage guard; sells are skipped if they would
+  exceed 20% slippage. Includes a FastAPI backend + React dashboard (Carteiras,
   Entradas, Resultados). Read-only, no private key. Trigger on: copy trade, copy trading,
   follow a wallet, mirror a wallet, track wallet buys and sells, paper copy portfolio,
   slippage-bounded copy, wallet entries dashboard.
@@ -32,6 +33,8 @@ This is distinct from `polymarket-wallet-analyzer` (one-shot analysis of a walle
 
 ## Rules enforced
 
+- **Weather markets only** (default) — non-weather trades are ignored (keyword set from the weather
+  edge bot + Gamma `weather` tag). `COPY_WEATHER_ONLY=0` copies all markets.
 - **BUY** copies the **same USD value the wallet spent**, clamped to **[$5, $100]**. A **20%
   slippage guard** (`compute_max_size_for_slippage`, reused) may reduce the size; if it drops below
   the $5 floor, or the portfolio is out of cash → skipped (logged, never silently dropped).

@@ -84,6 +84,38 @@ def test_buy_then_partial_sell_then_settle():
             setattr(deps, k, v)
 
 
+def test_non_weather_trade_ignored():
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    os.unlink(path)
+    db.init_db(path)
+    wid = db.add_wallet("Whale", "0x" + "e" * 40, baseline_ts=0.0, db_path=path)["id"]
+    wallet = db.get_wallet(wid, path)
+
+    soccer = [{"conditionId": "0xsoccer", "asset": TOKEN, "side": "BUY", "price": 0.50,
+               "size": 200.0, "title": "Arsenal vs Chelsea", "eventSlug": "epl-ars-che",
+               "outcome": "YES", "timestamp": 100}]
+    saved = {k: getattr(deps, k) for k in
+             ("fetch_trades", "fetch_orderbook", "market_volume", "fetch_event_tags")}
+    deps.fetch_trades = lambda api, addr, n: soccer
+    deps.fetch_orderbook = lambda token, depth=100: BOOK
+    deps.market_volume = lambda token: 25000.0
+    deps.fetch_event_tags = lambda api, slug: ["soccer", "epl"]  # not weather
+    try:
+        recorded = poller.poll_wallet(wallet, api=object(), db_path=path)
+        assert recorded == 0, recorded
+        assert db.list_entries(wallet_id=wid, db_path=path)["total"] == 0
+        assert db.get_paper_position(wid, "0xsoccer", path) is None
+        assert db.get_cash(path) == db.STARTING_BALANCE  # untouched
+        # Cursor still advances so the ignored trade isn't reprocessed forever.
+        assert db.get_wallet(wid, path)["cursor_ts"] >= 100
+        print("ok test_non_weather_trade_ignored")
+    finally:
+        for k, v in saved.items():
+            setattr(deps, k, v)
+
+
 if __name__ == "__main__":
     test_buy_then_partial_sell_then_settle()
-    print("\nPOLLER INTEGRATION TEST PASSED")
+    test_non_weather_trade_ignored()
+    print("\nPOLLER INTEGRATION TESTS PASSED")
