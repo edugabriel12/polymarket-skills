@@ -5,8 +5,9 @@ so the whole module is unit-testable offline with synthetic books. It reuses the
 in-repo slippage sizer and book-walk fill simulator via `deps`.
 
 Rules (from the plan / CLAUDE.md constraints):
-  BUY  — size so weighted-avg fill slippage <= 20%, capped at $100, floored at $5.
-         Below the floor (book too thin) or out of cash -> SKIPPED, logged.
+  BUY  — mirror the USD value the wallet bought, clamped to [$5, $100]. A 20%
+         weighted-avg slippage guard may reduce the size; if the guard falls below
+         the $5 floor (book too thin) or the portfolio is out of cash -> SKIPPED.
   SELL — mirror the fraction the tracked wallet sold; if that paper sell would
          exceed 20% slippage -> SKIPPED (do not execute).
 """
@@ -103,27 +104,35 @@ def process_buy(wallet_id: int, trade: dict, orderbook: dict, volume_24h: float,
     best_ask = to_float(orderbook.get("best_ask"))
     entry["best_price"] = best_ask
 
+    # Mirror the USD value the wallet spent, clamped to [MIN_USD, MAX_USD].
+    src_price = to_float(trade.get("price"))
+    src_size = to_float(trade.get("size"))
+    wallet_usd = src_price * src_size
+    desired = min(max(wallet_usd, MIN_USD), MAX_USD)
+
     # 1) ENTRADA DA CARTEIRA — the tracked wallet's raw BUY.
     clog.dbg(f"1) ENTRADA DA CARTEIRA: BUY '{entry['market_question'] or entry['condition_id']}' "
-             f"@ {to_float(trade.get('price')):.4f} × {clog.money_shares(to_float(trade.get('size')))} "
+             f"@ {src_price:.4f} × {clog.money_shares(src_size)} = {clog.usd(wallet_usd)} "
              f"(cond={entry['condition_id'][:10]}…)")
 
+    # 20% slippage guard — may shrink the target, never grow it.
     sz = compute_max_size_for_slippage(orderbook, "BUY", SLIPPAGE_CAP)
-    max_usd = to_float(sz.get("max_usd"))
-    target = min(max_usd, MAX_USD)
+    max_within_slip = to_float(sz.get("max_usd"))
+    target = min(desired, max_within_slip)
     entry["requested_usd"] = round(target, 4)
     cash = db.get_cash(db_path)
 
-    # 2) ANÁLISE DE VOLUME/CAP — book slippage sizing and the paper cap decision.
-    clog.dbg(f"2) ANÁLISE DE VOLUME/CAP: best_ask={best_ask:.4f} vol24h={clog.usd(volume_24h)}")
-    clog.dbg(f"   slippage-max ≤{SLIPPAGE_CAP * 100:.0f}% = {clog.usd(max_usd)} "
-             f"(avg {to_float(sz.get('avg_fill')):.4f}, slip {to_float(sz.get('slippage_pct')) * 100:.2f}%)")
-    clog.dbg(f"   alvo = min({clog.usd(max_usd)}, teto {clog.usd(MAX_USD)}) = {clog.usd(target)} "
-             f"| piso {clog.usd(MIN_USD)} | caixa {clog.usd(cash)}")
+    # 2) ANÁLISE DE VOLUME/CAP — clamp to [$5,$100] then the slippage guard.
+    clog.dbg(f"2) ANÁLISE DE VOLUME/CAP: valor carteira={clog.usd(wallet_usd)} "
+             f"→ alvo [{clog.usd(MIN_USD)},{clog.usd(MAX_USD)}]={clog.usd(desired)} "
+             f"| best_ask={best_ask:.4f} vol24h={clog.usd(volume_24h)}")
+    clog.dbg(f"   guarda slippage ≤{SLIPPAGE_CAP * 100:.0f}%: max {clog.usd(max_within_slip)} "
+             f"(avg {to_float(sz.get('avg_fill')):.4f}, slip {to_float(sz.get('slippage_pct')) * 100:.2f}%) "
+             f"→ alvo final {clog.usd(target)} | piso {clog.usd(MIN_USD)} | caixa {clog.usd(cash)}")
 
     if target < MIN_USD:
         entry["skip_reason"] = (
-            f"slippage: max ${max_usd:.2f} within 20% < ${MIN_USD:.0f} floor"
+            f"slippage: max ${max_within_slip:.2f} within 20% < ${MIN_USD:.0f} floor"
         )
     elif cash < MIN_USD:
         entry["skip_reason"] = f"insufficient paper cash (${cash:.2f})"

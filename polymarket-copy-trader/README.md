@@ -13,9 +13,10 @@ at risk**.
 - **Track every buy/sell** of each saved wallet by polling the Data API `/trades` endpoint
   (`side=BUY/SELL`). Only trades made *after* you save a wallet are copied (baseline snapshot).
 - **Copy into a paper portfolio**, automatically:
-  - **BUY** — size the copy so weighted-avg fill **slippage stays ≤ 20%**, using the live order
-    book and market volume. Capped at **$100**, floored at **$5**. Too thin / out of cash → the
-    attempt is logged as **skipped** (never silently dropped).
+  - **BUY** — copy the **same USD value the wallet bought**, clamped to **[$5, $100]** (below $5 →
+    $5; above $100 → $100). A **20% slippage guard** may reduce the size using the live order book;
+    if that falls below the $5 floor (book too thin) or the portfolio is out of cash → logged as
+    **skipped** (never silently dropped).
   - **SELL** — mirror the **same fraction** the wallet sold. If that paper sell would breach
     **20% slippage**, it is **not executed** (logged as skipped).
   - **Settlement** — when a market resolves, open paper positions are closed and marked
