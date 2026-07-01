@@ -271,6 +271,7 @@ Scanner ──→ Analyzer ──→ Strategy Advisor ──→ Paper Trader ─
 | Simulate trades | polymarket-paper-trader | `paper_engine.py`, `execute_paper.py`, `portfolio_report.py` |
 | Execute real trades | polymarket-live-executor | `execute_live.py`, `check_positions.py` |
 | Analyze any public wallet | polymarket-wallet-analyzer | `analyze_wallet.py` |
+| Paper copy-trade public wallets (buys+sells, slippage-bounded) | polymarket-copy-trader | `backend/poller.py`, `backend/copy_engine.py`, `backend/app.py` |
 | Weekly self-tuning meta-agent (suggestion-only) | polymarket-analyzer | `weather_strategy_advisor.py` |
 
 **Note on the strategy advisor (`weather_strategy_advisor.py`)**: this is a
