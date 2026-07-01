@@ -137,12 +137,35 @@ def poll_wallet(wallet: dict, api=None, db_path: str = db.DEFAULT_DB) -> int:
     return recorded
 
 
+def _market_resolved(token: str) -> bool:
+    """True only when a market has GENUINELY resolved — not merely trading at an
+    extreme price. A heavy favorite quoted at 0.98, or a weather market pinned
+    late in the day, is not resolved and must not pay out $1/share.
+
+    Best-effort via Gamma metadata (`closed` flag or a past end date). Returns
+    False when the metadata is unavailable, so an unresolved/unknown market is
+    held OPEN (marked to market) rather than settled prematurely."""
+    try:
+        m = deps.lookup_market(token)
+    except Exception:  # noqa: BLE001 — metadata unavailable; treat as unresolved
+        return False
+    if not m:
+        return False
+    if str(m.get("closed")).lower() == "true":
+        return True
+    for k in ("endDate", "endDateIso", "end_date_iso", "end_date"):
+        if deps._end_in_past(m.get(k)):
+            return True
+    return False
+
+
 def settle_wallet(wallet_id: int, db_path: str = db.DEFAULT_DB) -> None:
     """Refresh live prices on open BUY entries and settle resolved markets.
 
     Settlement realizes the position's REMAINING shares once (attributed to the
     oldest open buy entry) so it never double-counts P&L already realized by a
-    copied sell."""
+    copied sell. A market pays out ONLY once genuinely resolved (see
+    `_market_resolved`) — an extreme live price alone never triggers a payout."""
     open_entries = db.open_buy_entries(wallet_id, db_path)
     by_cond: dict[str, list] = defaultdict(list)
     for e in open_entries:
@@ -157,7 +180,13 @@ def settle_wallet(wallet_id: int, db_path: str = db.DEFAULT_DB) -> None:
         except Exception:  # noqa: BLE001 — price unavailable; leave OPEN
             continue
 
-        if _SETTLE_EPS < current < 1 - _SETTLE_EPS:
+        extreme = current <= _SETTLE_EPS or current >= 1 - _SETTLE_EPS
+        # Settle ONLY when the price is pinned AND the market has actually
+        # resolved. Otherwise just mark the open position to the live price.
+        if not extreme or not _market_resolved(token):
+            if extreme:
+                clog.dbg(f"· mantém ABERTA (preço {current:.4f} extremo mas mercado "
+                         f"não resolvido): '{elist[0].get('market_question') or cond[:10]}'")
             for e in elist:  # still open — just refresh the live price
                 db.update_entry_result(e["id"], "OPEN", round(current, 6), None,
                                        db_path=db_path)
