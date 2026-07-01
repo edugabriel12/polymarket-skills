@@ -14,6 +14,16 @@ Override via CLAUDE_JUDGE_MODEL env var.
 Daily budget cap: JUDGE_DAILY_BUDGET_USD (default $15). When exceeded, judge
 marks remaining proposals as SKIPPED with reason=judge_budget_exceeded.
 
+v13.2 (option B, conditional gate): the LLM is no longer a universal per-trade
+gate. `_judge_route()` resolves the decisive cases WITHOUT an LLM call —
+deterministic threshold/range proximity coin-flips are AUTO-REJECTED, and
+tight-ensemble bets whose bin sits ≥ AUTOAPPROVE_MAE_MULT×σ away are
+AUTO-APPROVED. Only the genuinely uncertain cases (non-ensemble single-source
+fallback, ensemble with the bin near the forecast, non-temp markets) reach the
+LLM, where its independent cross-check earns its cost. Set JUDGE_AUTOROUTE=0 to
+restore the universal-LLM behavior. Every routed decision still flows through
+apply_verdict(), so Rule 6 / proximity / range-calibration guards all still run.
+
 Required env vars:
   ANTHROPIC_API_KEY
   VISUAL_CROSSING_API_KEY  (free tier: visualcrossing.com)
@@ -111,6 +121,27 @@ RANGE_ADJUST_SIZE_USD = float(os.environ.get("JUDGE_RANGE_ADJUST_SIZE_USD", "20.
 # disagrees). A trade the judge itself sees as -EV (judge_prob <= the side's
 # price) is still REJECTed — never trade without a quantifiable edge.
 RULE6_DOWNSIZE_USD = float(os.environ.get("JUDGE_RULE6_DOWNSIZE_USD", "10.0"))
+
+# v13.2 (option B, 2026-07-01): CONDITIONAL judge gating. The LLM judge was a
+# universal per-trade gate, but forensics showed it is a *worse* forecaster
+# than the calibrated 3-model ensemble it second-guesses (judge Brier 0.41,
+# FPR 68%, the 0.8-0.9 judge bucket won only 17% on ranges) — and ~$5-9/day
+# was being spent mostly to REJECT trades the deterministic guards already
+# handle. So we fire the LLM ONLY where the cheap ensemble is weak or blind:
+#   - non-ensemble (single-source fallback) entries,
+#   - ensemble entries where the bin is NEAR the forecast (< mult × sigma),
+#   - non-temp markets (rain, etc.) the ensemble doesn't cover.
+# Tight-ensemble, far-from-bin bets are AUTO-APPROVED on the code guards
+# (no LLM spend); deterministic threshold-proximity coin-flips are
+# AUTO-REJECTED (no LLM spend). Every routed decision still flows through
+# apply_verdict(), so Rule 6 / proximity / range-calibration all still run.
+# Set JUDGE_AUTOROUTE=0 to restore the universal-LLM behavior.
+JUDGE_AUTOROUTE = os.environ.get("JUDGE_AUTOROUTE", "1").strip().lower() not in (
+    "0", "false", "no", "off", "")
+# Bin must sit at least this many ensemble-sigmas from the forecast to skip
+# the LLM. Kept == RANGE_NEAR_MAE_MULT so an auto-approved case is, by
+# construction, never one the range calibration would flag as "near".
+AUTOAPPROVE_MAE_MULT = float(os.environ.get("JUDGE_AUTOAPPROVE_MAE_MULT", "2.0"))
 
 # Pricing per 1M tokens (Sonnet 4.6 / Opus 4.7 — adjust if model changed)
 PRICING = {
@@ -599,6 +630,132 @@ def _range_calibration(entry_row) -> Optional[dict]:
             "ensemble": ensemble_sigma is not None}
 
 
+def _judge_route(entry_row) -> Optional[dict]:
+    """v13.2 (option B): decide whether this proposal needs the LLM judge at
+    all, or can be resolved by the deterministic code guards alone — saving
+    the ~$0.04-0.08 LLM spend on cases where the cheap calibrated ensemble is
+    already decisive.
+
+    Returns:
+      {"action": "auto_reject", "reason": str}
+          deterministic threshold/range proximity coin-flip → REJECT, no LLM.
+      {"action": "auto_approve", "reason": str, "dist": float, "sigma": float}
+          calibrated ensemble, bin ≥ AUTOAPPROVE_MAE_MULT × sigma away → the
+          bot's high P(side) is well-founded → APPROVE, no LLM.
+      None
+          send to the LLM: non-ensemble fallback, ensemble with the bin NEAR
+          the forecast (models effectively disagree relative to the bin), or a
+          non-temp market — the cases where the LLM earns its cost.
+
+    Routing decides ONLY whether to spend the LLM. Both actions are still
+    funneled through apply_verdict(), so every code guard (Rule 6,
+    threshold-proximity, range calibration) still runs. Fail-open: any parse
+    failure returns None (→ LLM), never a silent auto-approve.
+    """
+    if not JUDGE_AUTOROUTE:
+        return None
+
+    # (1) Deterministic proximity coin-flip → auto-reject regardless of
+    # source. This is a hard code guard in apply_verdict anyway; here we just
+    # avoid paying the LLM to reach the same REJECT.
+    prox = _threshold_proximity_reason(entry_row)
+    if prox:
+        return {"action": "auto_reject", "reason": prox}
+
+    # (2) Auto-approve only tight-ensemble, far-from-bin temp bets.
+    try:
+        from weather_edge_helpers import (parse_market, forecast_ref_value,
+                                          load_cities)
+    except Exception:
+        return None
+    try:
+        spec = parse_market(entry_row["market_question"], entry_row["end_date"],
+                            load_cities())
+    except Exception:
+        return None
+    if not spec or spec.metric != "temp":
+        return None  # non-temp (rain, etc.): the ensemble doesn't cover it.
+
+    # Ensemble sigma is the confidence scale; without a calibrated ensemble
+    # (single-source fallback) the LLM cross-check earns its cost.
+    ensemble_sigma = None
+    try:
+        dm = json.loads(entry_row["discovery_meta_json"] or "{}")
+        if dm.get("ensemble_calibrated") and dm.get("mae_dynamic"):
+            ensemble_sigma = float(dm["mae_dynamic"])
+    except (TypeError, json.JSONDecodeError):
+        pass
+    if not ensemble_sigma or ensemble_sigma <= 0:
+        return None
+
+    try:
+        forecast = json.loads(entry_row["forecast_snapshot_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    ref = forecast_ref_value(spec, forecast)
+    if ref is None:
+        return None
+
+    # Distance from the forecast to the bin/threshold it must clear.
+    if spec.comparison == "range" and spec.threshold_value_high is not None:
+        lo, hi = float(spec.threshold_value), float(spec.threshold_value_high)
+        if ref < lo:
+            dist = lo - ref
+        elif ref > hi:
+            dist = ref - hi
+        else:
+            dist = 0.0  # forecast inside the bin → risky YES → send to LLM.
+    else:
+        dist = abs(ref - float(spec.threshold_value))
+
+    if dist >= AUTOAPPROVE_MAE_MULT * ensemble_sigma:
+        return {"action": "auto_approve",
+                "reason": (f"tight ensemble (σ={ensemble_sigma:.2f}), bin "
+                           f"{dist:.2f}° away ≥ {AUTOAPPROVE_MAE_MULT:.1f}σ — "
+                           f"deterministic guards decisive, LLM skipped"),
+                "dist": dist, "sigma": ensemble_sigma}
+    # Bin is within the band: models effectively disagree relative to the bin
+    # → this is exactly where the LLM's cross-check adds value.
+    return None
+
+
+def _synthesize_route_verdict(entry_row, route: dict) -> dict:
+    """Build a verdict dict (matching the LLM's shape) for an auto-routed
+    proposal so it can flow through apply_verdict() unchanged. No LLM was
+    called, so _meta carries zero cost/tokens."""
+    bot_prob = float(entry_row["forecast_prob_at_entry"] or 0.0)
+    if route["action"] == "auto_reject":
+        return {
+            "verdict": "REJECT",
+            "confidence": 0.9,
+            # judge_prob == bot_prob → no spurious Rule-6 divergence; the
+            # REJECT stands on the proximity reason, not a prob disagreement.
+            "judge_prob": bot_prob,
+            "rationale": f"[AUTO-ROUTE REJECT: {route['reason']}]",
+            "evidence_summary": json.dumps({"auto_route": "reject",
+                                            "reason": route["reason"]}),
+            "adjusted_side": None,
+            "adjusted_size_usd": None,
+            "_meta": {},
+        }
+    # auto_approve: judge_prob = bot_prob so divergence = 0 (Rule 6 passes);
+    # apply_verdict's range-calibration then caps the stored prob if needed.
+    return {
+        "verdict": "APPROVE",
+        "confidence": 0.8,
+        "judge_prob": bot_prob,
+        "rationale": f"[AUTO-ROUTE APPROVE: {route['reason']}]",
+        "evidence_summary": json.dumps({
+            "auto_route": "approve", "reason": route["reason"],
+            "dist_to_bin": round(route.get("dist", 0.0), 3),
+            "ensemble_sigma": round(route.get("sigma", 0.0), 3),
+        }),
+        "adjusted_side": None,
+        "adjusted_size_usd": None,
+        "_meta": {},
+    }
+
+
 def apply_verdict(conn, entry_row, verdict: dict) -> None:
     """Persist the verdict to judge_reviews and update entry status."""
     meta = verdict.pop("_meta", {})
@@ -871,6 +1028,31 @@ def main():
                             conn, row_dict["entry_id"], "SKIPPED",
                             judge_skipped_reason="edge_decay_prejudge",
                             skip_reason="edge_decay_prejudge")
+                    continue
+
+                # v13.2 (option B): conditional gate. Resolve the decisive
+                # cases (deterministic proximity coin-flip → REJECT; tight
+                # ensemble far from bin → APPROVE) WITHOUT spending the LLM.
+                # Only genuinely uncertain / non-ensemble / non-temp cases
+                # fall through to review_proposal(). Synthesized verdicts
+                # still flow through apply_verdict() → all code guards run.
+                route = _judge_route(row_dict)
+                if route is not None:
+                    verdict = _synthesize_route_verdict(row_dict, route)
+                    with db.connect() as conn:
+                        apply_verdict(conn, row_dict, verdict)
+                    log_event(
+                        "judge_autoreject_proximity"
+                        if route["action"] == "auto_reject"
+                        else "judge_autoapprove_ensemble", {
+                            "entry_id": row_dict["entry_id"],
+                            "final_verdict": verdict["verdict"],
+                            "reason": route["reason"],
+                            "bot_prob": float(
+                                row_dict["forecast_prob_at_entry"] or 0),
+                            "cost_usd": 0.0,
+                            "llm_skipped": True,
+                        })
                     continue
 
                 t0 = time.monotonic()
@@ -1151,11 +1333,125 @@ def _test_prejudge_recheck():
         mod.PREJUDGE_MIN_EDGE_PP = saved_threshold
 
 
+# ---------------------------------------------------------------------------
+# Inline tests for the v13.2 conditional-gate routing (_judge_route)
+# Run: python weather_edge_judge.py --test-autoroute
+# ---------------------------------------------------------------------------
+
+def _test_autoroute():
+    """Hermetic tests for _judge_route by monkey-patching the helper imports
+    (parse_market/forecast_ref_value/load_cities) and the module-level
+    _threshold_proximity_reason. Verifies the routing decision only — the
+    downstream apply_verdict guards have their own tests."""
+    import types
+    import weather_edge_judge as mod
+    import weather_edge_helpers as helpers
+
+    saved = {
+        "prox": mod._threshold_proximity_reason,
+        "parse": helpers.parse_market,
+        "ref": helpers.forecast_ref_value,
+        "cities": helpers.load_cities,
+        "autoroute": mod.JUDGE_AUTOROUTE,
+        "mult": mod.AUTOAPPROVE_MAE_MULT,
+    }
+
+    def _spec(metric="temp", comparison="range", lo=20.0, hi=21.0, unit="C"):
+        return types.SimpleNamespace(
+            metric=metric, comparison=comparison,
+            threshold_value=lo, threshold_value_high=hi, threshold_unit=unit)
+
+    def _row(ref, sigma, ensemble=True, question="temp?", side="NO"):
+        dm = {"ensemble_calibrated": ensemble, "mae_dynamic": sigma} if ensemble else {}
+        return {
+            "entry_id": 1, "market_question": question, "end_date": "2026-07-02",
+            "side": side, "forecast_prob_at_entry": 0.85,
+            "forecast_snapshot_json": json.dumps({"ref": ref}),
+            "discovery_meta_json": json.dumps(dm),
+        }
+
+    try:
+        mod.JUDGE_AUTOROUTE = True
+        mod.AUTOAPPROVE_MAE_MULT = 2.0
+        helpers.load_cities = lambda: {}
+        # ref is read straight out of the fake snapshot for determinism.
+        helpers.forecast_ref_value = lambda spec, fc: fc.get("ref")
+
+        # Test 1: proximity fires → auto_reject, no LLM (regardless of ensemble)
+        mod._threshold_proximity_reason = lambda row: "within 1° of range"
+        helpers.parse_market = lambda q, e, c: _spec()
+        r = mod._judge_route(_row(ref=25.0, sigma=1.0))
+        assert r and r["action"] == "auto_reject", r
+        print("Test 1 PASS: proximity → auto_reject (LLM skipped)")
+
+        # From here on, proximity never fires.
+        mod._threshold_proximity_reason = lambda row: None
+
+        # Test 2: tight ensemble, bin far (dist=4°, σ=1 → 4σ ≥ 2σ) → auto_approve
+        helpers.parse_market = lambda q, e, c: _spec(lo=20.0, hi=21.0)
+        r = mod._judge_route(_row(ref=25.0, sigma=1.0))  # ref 25 > hi 21 → dist=4
+        assert r and r["action"] == "auto_approve", r
+        assert abs(r["dist"] - 4.0) < 1e-9, r
+        print("Test 2 PASS: tight ensemble far from bin → auto_approve (LLM skipped)")
+
+        # Test 3: ensemble but bin NEAR (dist=1.5°, σ=1 → 1.5σ < 2σ) → LLM
+        r = mod._judge_route(_row(ref=22.5, sigma=1.0))  # dist = 22.5-21 = 1.5
+        assert r is None, r
+        print("Test 3 PASS: ensemble near-edge → None (routed to LLM)")
+
+        # Test 4: forecast INSIDE the bin (risky YES) → dist 0 → LLM
+        r = mod._judge_route(_row(ref=20.5, sigma=1.0))
+        assert r is None, r
+        print("Test 4 PASS: forecast inside bin → None (routed to LLM)")
+
+        # Test 5: non-ensemble (single-source fallback) far from bin → LLM
+        r = mod._judge_route(_row(ref=25.0, sigma=1.0, ensemble=False))
+        assert r is None, r
+        print("Test 5 PASS: non-ensemble fallback → None (LLM earns its cost)")
+
+        # Test 6: non-temp market → LLM (ensemble doesn't cover it)
+        helpers.parse_market = lambda q, e, c: _spec(metric="rain")
+        r = mod._judge_route(_row(ref=25.0, sigma=1.0))
+        assert r is None, r
+        print("Test 6 PASS: non-temp market → None (routed to LLM)")
+
+        # Test 7: boundary dist == 2σ exactly → auto_approve (>= threshold)
+        helpers.parse_market = lambda q, e, c: _spec(lo=20.0, hi=21.0)
+        r = mod._judge_route(_row(ref=23.0, sigma=1.0))  # dist = 2.0 = 2σ
+        assert r and r["action"] == "auto_approve", f"dist==2σ should approve: {r}"
+        print("Test 7 PASS: dist == 2σ exactly → auto_approve (>=)")
+
+        # Test 8: threshold (non-range) market far → auto_approve
+        helpers.parse_market = lambda q, e, c: _spec(
+            comparison="above", lo=30.0, hi=None)
+        r = mod._judge_route(_row(ref=25.0, sigma=1.0))  # |25-30| = 5 ≥ 2
+        assert r and r["action"] == "auto_approve", r
+        print("Test 8 PASS: threshold market far from cutoff → auto_approve")
+
+        # Test 9: JUDGE_AUTOROUTE off → always None (universal-LLM restored)
+        mod.JUDGE_AUTOROUTE = False
+        helpers.parse_market = lambda q, e, c: _spec(lo=20.0, hi=21.0)
+        r = mod._judge_route(_row(ref=25.0, sigma=1.0))
+        assert r is None, r
+        print("Test 9 PASS: JUDGE_AUTOROUTE=0 disables routing (always LLM)")
+
+        print("\nAll auto-route tests PASS (9/9)")
+    finally:
+        mod._threshold_proximity_reason = saved["prox"]
+        helpers.parse_market = saved["parse"]
+        helpers.forecast_ref_value = saved["ref"]
+        helpers.load_cities = saved["cities"]
+        mod.JUDGE_AUTOROUTE = saved["autoroute"]
+        mod.AUTOAPPROVE_MAE_MULT = saved["mult"]
+
+
 if __name__ == "__main__":
     import sys
     if "--test-rule6" in sys.argv:
         _test_rule6_enforce()
     elif "--test-prejudge" in sys.argv:
         _test_prejudge_recheck()
+    elif "--test-autoroute" in sys.argv:
+        _test_autoroute()
     else:
         main()
