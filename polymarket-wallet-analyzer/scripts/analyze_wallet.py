@@ -243,8 +243,53 @@ def fetch_positions(api: APIClient, address: str) -> list[dict]:
     return out
 
 
+# Candidate keys carrying the trading wallet's address on a /trades record.
+# `proxyWallet` is Polymarket's canonical field (confirmed by /holders shape);
+# the rest are tolerant fallbacks for shape drift.
+_TRADE_OWNER_KEYS = (
+    "proxyWallet", "proxy_wallet", "user", "wallet", "owner", "account",
+    "address", "maker",
+)
+
+
+def trade_owner(trade: dict) -> str | None:
+    """Lowercased owner address of a /trades record, or None if unrecognizable."""
+    for key in _TRADE_OWNER_KEYS:
+        v = trade.get(key)
+        if isinstance(v, str) and v.lower().startswith("0x") and len(v) >= 10:
+            return v.lower()
+    return None
+
+
+def owned_trades(trades: list[dict], address: str) -> list[dict]:
+    """Keep only trades that provably belong to `address`.
+
+    The Data API `/trades` endpoint has been observed returning trades that are
+    NOT the requested wallet's (an unfiltered / counterparty feed): the query
+    param filtering was inferred from the public frontend, never verified
+    (see references/data-api.md). So we attribute each record to its owner
+    address client-side and drop anything we cannot tie to `address` — a wallet
+    must never be credited with, or have copied, another wallet's trades.
+
+    If NOT A SINGLE record carries a recognizable owner field, the response
+    shape is entirely unknown; rather than silently return nothing we fall back
+    to the raw feed (old behavior) and leave a warning to stderr.
+    """
+    addr = address.lower()
+    owned = [t for t in trades if trade_owner(t) == addr]
+    if trades and not owned and all(trade_owner(t) is None for t in trades):
+        log(f"WARNING: /trades records for {address} carry no recognizable owner "
+            f"field; cannot verify ownership — returning unfiltered feed.")
+        return trades
+    return owned
+
+
 def fetch_trades(api: APIClient, address: str, max_trades: int) -> list[dict]:
-    """Full trade history for a wallet, paginated up to max_trades."""
+    """Full trade history for a wallet, paginated up to max_trades.
+
+    Only trades that provably belong to `address` are returned (see
+    `owned_trades`) — the endpoint's wallet filter is not trusted blindly.
+    """
     out: list[dict] = []
     offset = 0
     page_size = 500
@@ -269,7 +314,7 @@ def fetch_trades(api: APIClient, address: str, max_trades: int) -> list[dict]:
         if len(page) < page_size:
             break
         offset += page_size
-    return out[:max_trades]
+    return owned_trades(out, address)[:max_trades]
 
 
 def fetch_event_tags(api: APIClient, event_slug: str) -> list[str]:

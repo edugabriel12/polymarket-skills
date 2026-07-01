@@ -89,6 +89,14 @@ def poll_wallet(wallet: dict, api=None, db_path: str = db.DEFAULT_DB) -> int:
         if not cond or side not in ("BUY", "SELL"):
             clog.dbg(f"· ignorado (sem cond ou side desconhecido: '{side}') ts={ts:.0f}")
             continue
+        # Belt-and-suspenders: never copy a trade that isn't provably this
+        # wallet's. The Data API /trades feed can return other wallets' trades;
+        # fetch_trades already filters, this guards against any that slip through.
+        owner = deps.trade_owner(trade)
+        if owner is not None and owner != address.lower():
+            clog.dbg(f"· ignorado (trade não pertence à carteira: dono={owner[:6]}…{owner[-4:]} "
+                     f"≠ {address[:6]}…{address[-4:]})")
+            continue
         # Restrict to weather markets (skip before any order-book fetch).
         if WEATHER_ONLY and not _is_weather(trade, api, tag_cache):
             clog.dbg(f"· ignorado (não é mercado de weather): "

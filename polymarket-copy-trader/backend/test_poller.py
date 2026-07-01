@@ -115,7 +115,39 @@ def test_non_weather_trade_ignored():
             setattr(deps, k, v)
 
 
+def test_foreign_trade_not_copied():
+    """A trade owned by a DIFFERENT wallet must never be copied (the FuuUuUu bug)."""
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    os.unlink(path)
+    db.init_db(path)
+    addr = "0x" + "a" * 40
+    wid = db.add_wallet("Weather", addr, baseline_ts=0.0, db_path=path)["id"]
+    wallet = db.get_wallet(wid, path)
+
+    # Feed carries a weather trade that belongs to ANOTHER wallet (proxyWallet).
+    foreign = [{"conditionId": COND, "asset": TOKEN, "side": "BUY", "price": 0.50,
+                "size": 200.0, "title": "Rain in NYC", "eventSlug": "rain-nyc",
+                "outcome": "YES", "timestamp": 100, "proxyWallet": "0x" + "b" * 40}]
+    saved = {k: getattr(deps, k) for k in
+             ("fetch_trades", "fetch_orderbook", "market_volume")}
+    deps.fetch_trades = lambda api, a, n: foreign
+    deps.fetch_orderbook = lambda token, depth=100: BOOK
+    deps.market_volume = lambda token: 25000.0
+    try:
+        recorded = poller.poll_wallet(wallet, api=object(), db_path=path)
+        assert recorded == 0, recorded
+        assert db.list_entries(wallet_id=wid, db_path=path)["total"] == 0
+        assert db.get_cash(path) == db.STARTING_BALANCE  # untouched
+        assert db.get_wallet(wid, path)["cursor_ts"] >= 100  # cursor still advances
+        print("ok test_foreign_trade_not_copied")
+    finally:
+        for k, v in saved.items():
+            setattr(deps, k, v)
+
+
 if __name__ == "__main__":
     test_buy_then_partial_sell_then_settle()
     test_non_weather_trade_ignored()
+    test_foreign_trade_not_copied()
     print("\nPOLLER INTEGRATION TESTS PASSED")
