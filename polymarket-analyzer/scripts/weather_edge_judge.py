@@ -6,12 +6,12 @@ forecast sources (NWS, Visual Crossing, web search), calls Claude with the
 versioned judge prompt + structured output schema, and records APPROVE /
 REJECT / ADJUST verdict back to the DB.
 
-Default model: claude-opus-4-8. The v13.2 conditional gate (option B) plus the
-option-1 anomaly scan mean the full judge now runs on only the genuinely hard,
-low-volume cases — so we spend Opus-tier quality where it matters instead of
-rubber-stamping every trade with a cheap model. The cheap web-search anomaly
-scan stays on claude-haiku-4-5 (JUDGE_ANOMALY_SCAN_MODEL) so gating remains
-cheap. Override the judge model via CLAUDE_JUDGE_MODEL env var.
+Default model: claude-sonnet-5 for both the full judge (CLAUDE_JUDGE_MODEL) and
+the web-search anomaly scan (JUDGE_ANOMALY_SCAN_MODEL). The v13.2 conditional
+gate (option B) plus the option-1 anomaly scan mean the full judge runs on only
+the genuinely hard, low-volume cases. Point JUDGE_ANOMALY_SCAN_MODEL at a
+cheaper model (e.g. claude-haiku-4-5) if you want the gating scan to cost less
+than the escalated full-judge calls.
 
 Daily budget cap: JUDGE_DAILY_BUDGET_USD (default $15). When exceeded, judge
 marks remaining proposals as SKIPPED with reason=judge_budget_exceeded.
@@ -40,8 +40,8 @@ Required env vars:
   NWS_USER_AGENT           (per NWS policy: "<app> <contact email>")
 
 Optional:
-  CLAUDE_JUDGE_MODEL         (default claude-opus-4-8)
-  JUDGE_ANOMALY_SCAN_MODEL   (default claude-haiku-4-5)
+  CLAUDE_JUDGE_MODEL         (default claude-sonnet-5)
+  JUDGE_ANOMALY_SCAN_MODEL   (default claude-sonnet-5)
   JUDGE_POLL_INTERVAL_SEC    (default 120)
   JUDGE_DAILY_BUDGET_USD     (default 15)
 """
@@ -99,11 +99,11 @@ LOG_DIR = Path.home() / ".polymarket-paper"
 LOG_FILE = LOG_DIR / "weather_edge.jsonl"
 PROMPT_PATH = REPO_ROOT / "polymarket-analyzer" / "references" / "weather-judge-prompt.md"
 
-DEFAULT_MODEL = os.environ.get("CLAUDE_JUDGE_MODEL", "claude-opus-4-8")
-# The anomaly scan (v13.2 option-1) is a cost optimization — keep it on a cheap
-# model even when the full judge runs on Opus, so gating stays cheap and only
-# the escalated full-judge calls pay the Opus rate. Override via env if needed.
-ANOMALY_SCAN_MODEL = os.environ.get("JUDGE_ANOMALY_SCAN_MODEL", "claude-haiku-4-5")
+DEFAULT_MODEL = os.environ.get("CLAUDE_JUDGE_MODEL", "claude-sonnet-5")
+# The anomaly scan (v13.2 option-1) runs on its own model — see
+# JUDGE_ANOMALY_SCAN_MODEL. It can be pointed at a cheaper model than the full
+# judge to keep gating cheap, but currently tracks the judge at Sonnet 5.
+ANOMALY_SCAN_MODEL = os.environ.get("JUDGE_ANOMALY_SCAN_MODEL", "claude-sonnet-5")
 POLL_INTERVAL = int(os.environ.get("JUDGE_POLL_INTERVAL_SEC", "120"))
 DAILY_BUDGET_USD = float(os.environ.get("JUDGE_DAILY_BUDGET_USD", "15.0"))
 # Pre-judge edge re-check threshold (pp). If the entry's current
