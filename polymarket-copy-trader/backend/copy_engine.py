@@ -12,6 +12,7 @@ Rules (from the plan / CLAUDE.md constraints):
 """
 from __future__ import annotations
 
+import clog
 import db
 from deps import compute_max_size_for_slippage, sanitize_text, simulate_fill, to_float
 
@@ -102,12 +103,24 @@ def process_buy(wallet_id: int, trade: dict, orderbook: dict, volume_24h: float,
     best_ask = to_float(orderbook.get("best_ask"))
     entry["best_price"] = best_ask
 
+    # 1) ENTRADA DA CARTEIRA — the tracked wallet's raw BUY.
+    clog.dbg(f"1) ENTRADA DA CARTEIRA: BUY '{entry['market_question'] or entry['condition_id']}' "
+             f"@ {to_float(trade.get('price')):.4f} × {clog.money_shares(to_float(trade.get('size')))} "
+             f"(cond={entry['condition_id'][:10]}…)")
+
     sz = compute_max_size_for_slippage(orderbook, "BUY", SLIPPAGE_CAP)
     max_usd = to_float(sz.get("max_usd"))
     target = min(max_usd, MAX_USD)
     entry["requested_usd"] = round(target, 4)
-
     cash = db.get_cash(db_path)
+
+    # 2) ANÁLISE DE VOLUME/CAP — book slippage sizing and the paper cap decision.
+    clog.dbg(f"2) ANÁLISE DE VOLUME/CAP: best_ask={best_ask:.4f} vol24h={clog.usd(volume_24h)}")
+    clog.dbg(f"   slippage-max ≤{SLIPPAGE_CAP * 100:.0f}% = {clog.usd(max_usd)} "
+             f"(avg {to_float(sz.get('avg_fill')):.4f}, slip {to_float(sz.get('slippage_pct')) * 100:.2f}%)")
+    clog.dbg(f"   alvo = min({clog.usd(max_usd)}, teto {clog.usd(MAX_USD)}) = {clog.usd(target)} "
+             f"| piso {clog.usd(MIN_USD)} | caixa {clog.usd(cash)}")
+
     if target < MIN_USD:
         entry["skip_reason"] = (
             f"slippage: max ${max_usd:.2f} within 20% < ${MIN_USD:.0f} floor"
@@ -148,6 +161,14 @@ def process_buy(wallet_id: int, trade: dict, orderbook: dict, volume_24h: float,
             "current_price": round(avg, 6),
         })
 
+    # 3) ENTRADA DO PAPER — what the paper portfolio actually did.
+    if entry["status"] == "EXECUTED":
+        clog.dbg(f"3) ENTRADA DO PAPER: EXECUTED — {clog.usd(entry['executed_usd'])} → "
+                 f"{clog.money_shares(entry['shares'])} @ {entry['avg_fill_price']:.4f} "
+                 f"(slip {entry['slippage_pct'] * 100:.2f}%) | caixa→{clog.usd(db.get_cash(db_path))}")
+    else:
+        clog.dbg(f"3) ENTRADA DO PAPER: SKIPPED — {entry['skip_reason']}")
+
     entry["id"] = db.insert_entry(entry, db_path)
     return entry
 
@@ -166,10 +187,16 @@ def process_sell(wallet_id: int, trade: dict, orderbook: dict,
     best_bid = to_float(orderbook.get("best_bid"))
     entry["best_price"] = best_bid
 
+    # 1) ENTRADA DA CARTEIRA — the tracked wallet's raw SELL.
+    clog.dbg(f"1) ENTRADA DA CARTEIRA: SELL '{entry['market_question'] or entry['condition_id']}' "
+             f"× {clog.money_shares(sold_shares)} (carteira tinha {clog.money_shares(holder_shares_before)}, "
+             f"cond={entry['condition_id'][:10]}…)")
+
     pos = db.get_paper_position(wallet_id, entry["condition_id"], db_path)
     pos_shares = to_float(pos.get("shares")) if pos else 0.0
     if not pos or pos_shares <= 0 or int(pos.get("closed") or 0) == 1:
         entry["skip_reason"] = "no paper position to sell"
+        clog.dbg(f"3) ENTRADA DO PAPER: SKIPPED — {entry['skip_reason']}")
         entry["id"] = db.insert_entry(entry, db_path)
         return entry
 
@@ -181,6 +208,7 @@ def process_sell(wallet_id: int, trade: dict, orderbook: dict,
 
     if best_bid <= 0 or sell_shares <= 0:
         entry["skip_reason"] = "no bid / nothing to sell"
+        clog.dbg(f"3) ENTRADA DO PAPER: SKIPPED — {entry['skip_reason']}")
         entry["id"] = db.insert_entry(entry, db_path)
         return entry
 
@@ -189,10 +217,17 @@ def process_sell(wallet_id: int, trade: dict, orderbook: dict,
     sz = compute_max_size_for_slippage(orderbook, "SELL", SLIPPAGE_CAP)
     max_usd = to_float(sz.get("max_usd"))
 
+    # 2) ANÁLISE DE VOLUME/CAP — proportional size and the 20% slippage gate.
+    clog.dbg(f"2) ANÁLISE DE VOLUME/CAP: best_bid={best_bid:.4f} fração={frac * 100:.1f}% "
+             f"→ vender {clog.money_shares(sell_shares)} (posição {clog.money_shares(pos_shares)})")
+    clog.dbg(f"   intended={clog.usd(intended_usd)} | max vendável ≤{SLIPPAGE_CAP * 100:.0f}% "
+             f"= {clog.usd(max_usd)}")
+
     if intended_usd > max_usd + 1e-9:
         entry["skip_reason"] = (
             f"sell slippage > 20% (intended ${intended_usd:.2f} > max ${max_usd:.2f})"
         )
+        clog.dbg(f"3) ENTRADA DO PAPER: SKIPPED — {entry['skip_reason']}")
         entry["id"] = db.insert_entry(entry, db_path)
         return entry
 
@@ -227,5 +262,9 @@ def process_sell(wallet_id: int, trade: dict, orderbook: dict,
         "current_price": round(avg_sell, 6),
         "realized_pnl": round(realized, 4),
     })
+    # 3) ENTRADA DO PAPER — realized sell.
+    clog.dbg(f"3) ENTRADA DO PAPER: EXECUTED {result} — vendeu {clog.money_shares(entry['shares'])} "
+             f"@ {avg_sell:.4f} → {clog.usd(proceeds)} (slip {entry['slippage_pct'] * 100:.2f}%), "
+             f"realizado {clog.usd(realized)} | caixa→{clog.usd(db.get_cash(db_path))}")
     entry["id"] = db.insert_entry(entry, db_path)
     return entry

@@ -67,6 +67,23 @@ cd frontend && npm install && npm run dev
 | `COPYTRADE_DB` | `~/.polymarket-copy-trader/copytrade.db` | SQLite path |
 | `COPY_POLL_SEC` | `60` | Background poll interval (seconds) |
 | `AUTO_POLL` | `1` | Set `0` to disable the background loop (poll via `POST /api/poll`) |
+| `COPY_DEBUG` | `1` | Detailed per-operation debug logs to stderr. Set `0` to silence. |
+
+### Debug logs
+
+With `COPY_DEBUG=1` (default), every copied operation is traced to stderr in three steps —
+`1) ENTRADA DA CARTEIRA` (the tracked wallet's raw trade) → `2) ANÁLISE DE VOLUME/CAP`
+(order-book slippage sizing + the paper cap decision) → `3) ENTRADA DO PAPER` (what the paper
+portfolio did, or why it skipped) — plus a `LIQUIDAÇÃO` line when a market resolves. Example:
+
+```
+[copy-trader] ── carteira 'Whale' (0xffff…ffff) — 2 novo(s) trade(s) desde ts=0 ──
+[copy-trader] 1) ENTRADA DA CARTEIRA: BUY 'Rain in NYC' @ 0.5000 × 200.00 sh (cond=0xcond1…)
+[copy-trader] 2) ANÁLISE DE VOLUME/CAP: best_ask=0.5000 vol24h=$25,000.00
+[copy-trader]    slippage-max ≤20% = $1,050.00 (avg 0.5250, slip 5.00%)
+[copy-trader]    alvo = min($1,050.00, teto $100.00) = $100.00 | piso $5.00 | caixa $10,000.00
+[copy-trader] 3) ENTRADA DO PAPER: EXECUTED — $100.00 → 200.00 sh @ 0.5000 (slip 0.00%) | caixa→$9,900.00
+```
 
 ## Tests (offline, no network)
 
