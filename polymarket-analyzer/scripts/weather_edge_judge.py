@@ -6,13 +6,33 @@ forecast sources (NWS, Visual Crossing, web search), calls Claude with the
 versioned judge prompt + structured output schema, and records APPROVE /
 REJECT / ADJUST verdict back to the DB.
 
-Default model: claude-haiku-4-5 (3x cheaper than Sonnet for 24/7 use;
-Rule 6 hard-enforce in apply_verdict catches the higher rubber-stamping
-risk of the smaller model).
-Override via CLAUDE_JUDGE_MODEL env var.
+Default model: claude-sonnet-5 for both the full judge (CLAUDE_JUDGE_MODEL) and
+the web-search anomaly scan (JUDGE_ANOMALY_SCAN_MODEL). The v13.2 conditional
+gate (option B) plus the option-1 anomaly scan mean the full judge runs on only
+the genuinely hard, low-volume cases. Point JUDGE_ANOMALY_SCAN_MODEL at a
+cheaper model (e.g. claude-haiku-4-5) if you want the gating scan to cost less
+than the escalated full-judge calls.
 
 Daily budget cap: JUDGE_DAILY_BUDGET_USD (default $15). When exceeded, judge
 marks remaining proposals as SKIPPED with reason=judge_budget_exceeded.
+
+v13.2 (option B, conditional gate): the LLM is no longer a universal per-trade
+gate. `_judge_route()` resolves the decisive cases WITHOUT an LLM call —
+deterministic threshold/range proximity coin-flips are AUTO-REJECTED, and
+tight-ensemble bets whose bin sits ≥ AUTOAPPROVE_MAE_MULT×σ away are
+AUTO-APPROVED. Only the genuinely uncertain cases (non-ensemble single-source
+fallback, ensemble with the bin near the forecast, non-temp markets) reach the
+LLM, where its independent cross-check earns its cost. Set JUDGE_AUTOROUTE=0 to
+restore the universal-LLM behavior. Every routed decision still flows through
+apply_verdict(), so Rule 6 / proximity / range-calibration guards all still run.
+
+v13.2 option-1 (anomaly scan): the ensemble prices in synoptic weather but is
+blind to NON-meteorological catalysts (breaking news, resolution ambiguity).
+So an auto-approve isn't a blind pass — it first runs a CHEAP web-search-only
+scan (_anomaly_scan, no NWS/VC, no full judge reasoning) asking "is there an
+active catalyst for this city/date?". Clean → auto-approve (full judge skipped);
+catalyst found or scan unavailable → escalate to the full judge (fail-safe).
+Set JUDGE_ANOMALY_SCAN=0 to auto-approve directly without the scan.
 
 Required env vars:
   ANTHROPIC_API_KEY
@@ -20,9 +40,10 @@ Required env vars:
   NWS_USER_AGENT           (per NWS policy: "<app> <contact email>")
 
 Optional:
-  CLAUDE_JUDGE_MODEL       (default claude-haiku-4-5)
-  JUDGE_POLL_INTERVAL_SEC  (default 120)
-  JUDGE_DAILY_BUDGET_USD   (default 15)
+  CLAUDE_JUDGE_MODEL         (default claude-sonnet-5)
+  JUDGE_ANOMALY_SCAN_MODEL   (default claude-sonnet-5)
+  JUDGE_POLL_INTERVAL_SEC    (default 120)
+  JUDGE_DAILY_BUDGET_USD     (default 15)
 """
 from __future__ import annotations
 
@@ -78,7 +99,11 @@ LOG_DIR = Path.home() / ".polymarket-paper"
 LOG_FILE = LOG_DIR / "weather_edge.jsonl"
 PROMPT_PATH = REPO_ROOT / "polymarket-analyzer" / "references" / "weather-judge-prompt.md"
 
-DEFAULT_MODEL = os.environ.get("CLAUDE_JUDGE_MODEL", "claude-haiku-4-5")
+DEFAULT_MODEL = os.environ.get("CLAUDE_JUDGE_MODEL", "claude-sonnet-5")
+# The anomaly scan (v13.2 option-1) runs on its own model — see
+# JUDGE_ANOMALY_SCAN_MODEL. It can be pointed at a cheaper model than the full
+# judge to keep gating cheap, but currently tracks the judge at Sonnet 5.
+ANOMALY_SCAN_MODEL = os.environ.get("JUDGE_ANOMALY_SCAN_MODEL", "claude-sonnet-5")
 POLL_INTERVAL = int(os.environ.get("JUDGE_POLL_INTERVAL_SEC", "120"))
 DAILY_BUDGET_USD = float(os.environ.get("JUDGE_DAILY_BUDGET_USD", "15.0"))
 # Pre-judge edge re-check threshold (pp). If the entry's current
@@ -112,8 +137,45 @@ RANGE_ADJUST_SIZE_USD = float(os.environ.get("JUDGE_RANGE_ADJUST_SIZE_USD", "20.
 # price) is still REJECTed — never trade without a quantifiable edge.
 RULE6_DOWNSIZE_USD = float(os.environ.get("JUDGE_RULE6_DOWNSIZE_USD", "10.0"))
 
-# Pricing per 1M tokens (Sonnet 4.6 / Opus 4.7 — adjust if model changed)
+# v13.2 (option B, 2026-07-01): CONDITIONAL judge gating. The LLM judge was a
+# universal per-trade gate, but forensics showed it is a *worse* forecaster
+# than the calibrated 3-model ensemble it second-guesses (judge Brier 0.41,
+# FPR 68%, the 0.8-0.9 judge bucket won only 17% on ranges) — and ~$5-9/day
+# was being spent mostly to REJECT trades the deterministic guards already
+# handle. So we fire the LLM ONLY where the cheap ensemble is weak or blind:
+#   - non-ensemble (single-source fallback) entries,
+#   - ensemble entries where the bin is NEAR the forecast (< mult × sigma),
+#   - non-temp markets (rain, etc.) the ensemble doesn't cover.
+# Tight-ensemble, far-from-bin bets are AUTO-APPROVED on the code guards
+# (no LLM spend); deterministic threshold-proximity coin-flips are
+# AUTO-REJECTED (no LLM spend). Every routed decision still flows through
+# apply_verdict(), so Rule 6 / proximity / range-calibration all still run.
+# Set JUDGE_AUTOROUTE=0 to restore the universal-LLM behavior.
+JUDGE_AUTOROUTE = os.environ.get("JUDGE_AUTOROUTE", "1").strip().lower() not in (
+    "0", "false", "no", "off", "")
+# Bin must sit at least this many ensemble-sigmas from the forecast to skip
+# the LLM. Kept == RANGE_NEAR_MAE_MULT so an auto-approved case is, by
+# construction, never one the range calibration would flag as "near".
+AUTOAPPROVE_MAE_MULT = float(os.environ.get("JUDGE_AUTOAPPROVE_MAE_MULT", "2.0"))
+
+# v13.2 option-1 (2026-07-01): a CHEAP web-search-only catalyst scan on the
+# cases the auto-router would otherwise APPROVE with no LLM at all. The
+# calibrated ensemble already prices in synoptic weather (fronts, heat domes) —
+# but it is blind to NON-meteorological anomalies (breaking news after the
+# model run, resolution-source ambiguity, event-day stories). This scan runs
+# ONE narrow LLM call with web search only (no NWS/VC, no full judge reasoning)
+# asking "is there an active catalyst for this city/date?". Clean → auto-approve
+# as before; catalyst found (or scan unavailable) → escalate to the full judge.
+# Set JUDGE_ANOMALY_SCAN=0 to auto-approve directly (pure v13.2 behavior).
+JUDGE_ANOMALY_SCAN = os.environ.get("JUDGE_ANOMALY_SCAN", "1").strip().lower() not in (
+    "0", "false", "no", "off", "")
+ANOMALY_SCAN_MAX_USES = int(os.environ.get("JUDGE_ANOMALY_SCAN_MAX_USES", "3"))
+ANOMALY_SCAN_MAX_TOKENS = int(os.environ.get("JUDGE_ANOMALY_SCAN_MAX_TOKENS", "1500"))
+
+# Pricing per 1M tokens (adjust if model changed)
 PRICING = {
+    "claude-opus-4-8": {"input": 5.00, "output": 25.00, "cache_read": 0.50},
+    "claude-sonnet-5": {"input": 3.00, "output": 15.00, "cache_read": 0.30},
     "claude-sonnet-4-6": {"input": 3.00, "output": 15.00, "cache_read": 0.30},
     "claude-opus-4-7": {"input": 5.00, "output": 25.00, "cache_read": 0.50},
     "claude-haiku-4-5": {"input": 1.00, "output": 5.00, "cache_read": 0.10},
@@ -599,6 +661,269 @@ def _range_calibration(entry_row) -> Optional[dict]:
             "ensemble": ensemble_sigma is not None}
 
 
+def _judge_route(entry_row) -> Optional[dict]:
+    """v13.2 (option B): decide whether this proposal needs the LLM judge at
+    all, or can be resolved by the deterministic code guards alone — saving
+    the ~$0.04-0.08 LLM spend on cases where the cheap calibrated ensemble is
+    already decisive.
+
+    Returns:
+      {"action": "auto_reject", "reason": str}
+          deterministic threshold/range proximity coin-flip → REJECT, no LLM.
+      {"action": "auto_approve", "reason": str, "dist": float, "sigma": float}
+          calibrated ensemble, bin ≥ AUTOAPPROVE_MAE_MULT × sigma away → the
+          bot's high P(side) is well-founded → APPROVE, no LLM.
+      None
+          send to the LLM: non-ensemble fallback, ensemble with the bin NEAR
+          the forecast (models effectively disagree relative to the bin), or a
+          non-temp market — the cases where the LLM earns its cost.
+
+    Routing decides ONLY whether to spend the LLM. Both actions are still
+    funneled through apply_verdict(), so every code guard (Rule 6,
+    threshold-proximity, range calibration) still runs. Fail-open: any parse
+    failure returns None (→ LLM), never a silent auto-approve.
+    """
+    if not JUDGE_AUTOROUTE:
+        return None
+
+    # (1) Deterministic proximity coin-flip → auto-reject regardless of
+    # source. This is a hard code guard in apply_verdict anyway; here we just
+    # avoid paying the LLM to reach the same REJECT.
+    prox = _threshold_proximity_reason(entry_row)
+    if prox:
+        return {"action": "auto_reject", "reason": prox}
+
+    # (2) Auto-approve only tight-ensemble, far-from-bin temp bets.
+    try:
+        from weather_edge_helpers import (parse_market, forecast_ref_value,
+                                          load_cities)
+    except Exception:
+        return None
+    try:
+        spec = parse_market(entry_row["market_question"], entry_row["end_date"],
+                            load_cities())
+    except Exception:
+        return None
+    if not spec or spec.metric != "temp":
+        return None  # non-temp (rain, etc.): the ensemble doesn't cover it.
+
+    # Ensemble sigma is the confidence scale; without a calibrated ensemble
+    # (single-source fallback) the LLM cross-check earns its cost.
+    ensemble_sigma = None
+    try:
+        dm = json.loads(entry_row["discovery_meta_json"] or "{}")
+        if dm.get("ensemble_calibrated") and dm.get("mae_dynamic"):
+            ensemble_sigma = float(dm["mae_dynamic"])
+    except (TypeError, json.JSONDecodeError):
+        pass
+    if not ensemble_sigma or ensemble_sigma <= 0:
+        return None
+
+    try:
+        forecast = json.loads(entry_row["forecast_snapshot_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    ref = forecast_ref_value(spec, forecast)
+    if ref is None:
+        return None
+
+    # Distance from the forecast to the bin/threshold it must clear.
+    if spec.comparison == "range" and spec.threshold_value_high is not None:
+        lo, hi = float(spec.threshold_value), float(spec.threshold_value_high)
+        if ref < lo:
+            dist = lo - ref
+        elif ref > hi:
+            dist = ref - hi
+        else:
+            dist = 0.0  # forecast inside the bin → risky YES → send to LLM.
+    else:
+        dist = abs(ref - float(spec.threshold_value))
+
+    if dist >= AUTOAPPROVE_MAE_MULT * ensemble_sigma:
+        return {"action": "auto_approve",
+                "reason": (f"tight ensemble (σ={ensemble_sigma:.2f}), bin "
+                           f"{dist:.2f}° away ≥ {AUTOAPPROVE_MAE_MULT:.1f}σ — "
+                           f"deterministic guards decisive, LLM skipped"),
+                "dist": dist, "sigma": ensemble_sigma}
+    # Bin is within the band: models effectively disagree relative to the bin
+    # → this is exactly where the LLM's cross-check adds value.
+    return None
+
+
+def _synthesize_route_verdict(entry_row, route: dict) -> dict:
+    """Build a verdict dict (matching the LLM's shape) for an auto-routed
+    proposal so it can flow through apply_verdict() unchanged. No LLM was
+    called, so _meta carries zero cost/tokens."""
+    bot_prob = float(entry_row["forecast_prob_at_entry"] or 0.0)
+    if route["action"] == "auto_reject":
+        return {
+            "verdict": "REJECT",
+            "confidence": 0.9,
+            # judge_prob == bot_prob → no spurious Rule-6 divergence; the
+            # REJECT stands on the proximity reason, not a prob disagreement.
+            "judge_prob": bot_prob,
+            "rationale": f"[AUTO-ROUTE REJECT: {route['reason']}]",
+            "evidence_summary": json.dumps({"auto_route": "reject",
+                                            "reason": route["reason"]}),
+            "adjusted_side": None,
+            "adjusted_size_usd": None,
+            "_meta": {},
+        }
+    # auto_approve: judge_prob = bot_prob so divergence = 0 (Rule 6 passes);
+    # apply_verdict's range-calibration then caps the stored prob if needed.
+    return {
+        "verdict": "APPROVE",
+        "confidence": 0.8,
+        "judge_prob": bot_prob,
+        "rationale": f"[AUTO-ROUTE APPROVE: {route['reason']}]",
+        "evidence_summary": json.dumps({
+            "auto_route": "approve", "reason": route["reason"],
+            "dist_to_bin": round(route.get("dist", 0.0), 3),
+            "ensemble_sigma": round(route.get("sigma", 0.0), 3),
+        }),
+        "adjusted_side": None,
+        "adjusted_size_usd": None,
+        "_meta": {},
+    }
+
+
+_ANOMALY_SCAN_SYSTEM = (
+    "You are a weather-market anomaly scanner. A calibrated 3-model temperature "
+    "ensemble (ICON+GFS+ECMWF) already covers routine synoptic weather, so you "
+    "are NOT re-forecasting the temperature. Your ONLY job is to web-search for "
+    "an ACTIVE, SPECIFIC catalyst for the given city and date that the ensemble "
+    "could miss — an incoming heat dome / cold front / atmospheric river / storm "
+    "/ hurricane, wildfire smoke, or a resolution-relevant news/event story "
+    "(e.g. a station change, a data correction, an event-day factor). "
+    "Do 1-3 focused searches, then answer with a SINGLE JSON object and nothing "
+    "else, in a ```json fenced block:\n"
+    '{"catalyst_found": <true|false>, "summary": "<one sentence>"}\n'
+    "Set catalyst_found=true ONLY when you find a specific, active catalyst that "
+    "could plausibly move the outcome or affect resolution. Routine seasonal "
+    "weather with no incoming system is catalyst_found=false."
+)
+
+
+def _parse_scan_json(text: str) -> Optional[dict]:
+    """Extract the {catalyst_found, summary} object from the scan's final text.
+    Tolerates ```json fences and surrounding prose. Returns None if unparseable.
+    """
+    if not text:
+        return None
+    import re
+    # Prefer a fenced block; fall back to the last {...} span.
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    blob = m.group(1) if m else None
+    if blob is None:
+        m = re.search(r"(\{[^{}]*\"catalyst_found\"[^{}]*\})", text, re.DOTALL)
+        blob = m.group(1) if m else None
+    if blob is None:
+        return None
+    try:
+        obj = json.loads(blob)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict) or "catalyst_found" not in obj:
+        return None
+    return {"catalyst_found": bool(obj.get("catalyst_found")),
+            "summary": str(obj.get("summary") or "")[:500]}
+
+
+def _anomaly_scan(entry_row) -> Optional[dict]:
+    """v13.2 option-1: a CHEAP web-search-only catalyst check for a proposal the
+    auto-router would otherwise approve without any LLM. See ANOMALY_SCAN notes
+    above.
+
+    Returns {"catalyst_found": bool, "summary": str, "_meta": {...}} on success,
+    or None on ANY failure (missing key/SDK, API error, pause, unparseable) —
+    the caller escalates to the full judge on None (fail-safe).
+    """
+    try:
+        import anthropic
+    except ImportError:
+        return None
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return None
+
+    user_content = json.dumps({
+        "city": entry_row.get("city_resolved"),
+        "date": (entry_row.get("end_date") or "")[:10],
+        "threshold_value": entry_row.get("threshold_value"),
+        "threshold_unit": entry_row.get("threshold_unit"),
+        "comparison": entry_row.get("comparison"),
+        "bot_side": entry_row.get("side"),
+        "note": ("The ensemble is confident the temperature will NOT land in "
+                 "the bin (bot is betting accordingly). Look only for a catalyst "
+                 "that would upset that, or affect how the market resolves."),
+    }, ensure_ascii=False)
+
+    # Basic web-search variant — supported on every model (incl. Haiku 4.5);
+    # the _20260209 dynamic-filtering variant is Opus/Sonnet-4.6+ only.
+    tools = [{"type": "web_search_20250305", "name": "web_search",
+              "max_uses": ANOMALY_SCAN_MAX_USES}]
+    is_haiku = "haiku" in ANOMALY_SCAN_MODEL.lower()
+    request_kwargs = {
+        "model": ANOMALY_SCAN_MODEL,
+        "max_tokens": ANOMALY_SCAN_MAX_TOKENS,
+        "system": _ANOMALY_SCAN_SYSTEM,
+        "messages": [{"role": "user", "content": user_content}],
+        "tools": tools,
+    }
+    if not is_haiku:
+        request_kwargs["thinking"] = {"type": "adaptive"}
+        request_kwargs["output_config"] = {"effort": "low"}
+
+    client = anthropic.Anthropic()
+    t0 = time.monotonic()
+    try:
+        response = client.messages.create(**request_kwargs)
+    except Exception as e:
+        log_event("anomaly_scan_error", {"entry_id": entry_row.get("entry_id"),
+                                         "err": str(e),
+                                         "type": type(e).__name__}, level="WARN")
+        return None
+    duration_ms = int((time.monotonic() - t0) * 1000)
+
+    # A server-tool loop that ran out of iterations returns pause_turn — treat
+    # as inconclusive and escalate (don't try to resume in the cheap path).
+    if getattr(response, "stop_reason", None) == "pause_turn":
+        log_event("anomaly_scan_paused", {"entry_id": entry_row.get("entry_id")},
+                  level="WARN")
+        return None
+
+    text = "".join(b.text for b in response.content
+                   if getattr(b, "type", None) == "text")
+    parsed = _parse_scan_json(text)
+    if parsed is None:
+        log_event("anomaly_scan_unparseable",
+                  {"entry_id": entry_row.get("entry_id"), "text": text[:300]},
+                  level="WARN")
+        return None
+
+    usage = response.usage
+    pricing = PRICING.get(ANOMALY_SCAN_MODEL, PRICING["claude-haiku-4-5"])
+    # Token-based cost only (web-search per-query billing is extra and not
+    # captured here — a small, deliberate undercount for budget tracking).
+    cost = (usage.input_tokens * pricing["input"] / 1_000_000 +
+            usage.output_tokens * pricing["output"] / 1_000_000 +
+            (usage.cache_read_input_tokens or 0) * pricing["cache_read"] / 1_000_000)
+    parsed["_meta"] = {"cost_usd": cost, "duration_ms": duration_ms,
+                       "model": ANOMALY_SCAN_MODEL, "tokens_in": usage.input_tokens,
+                       "tokens_out": usage.output_tokens}
+    return parsed
+
+
+def _scan_outcome(scan: Optional[dict]) -> str:
+    """Decide the auto-approve path from an _anomaly_scan result:
+      'approve'    — scan clean (no catalyst) → auto-approve, LLM judge skipped
+      'escalate'   — catalyst found → send to the full LLM judge
+      'unavailable'— scan failed (None) → escalate to the full judge (fail-safe)
+    """
+    if scan is None:
+        return "unavailable"
+    return "escalate" if scan.get("catalyst_found") else "approve"
+
+
 def apply_verdict(conn, entry_row, verdict: dict) -> None:
     """Persist the verdict to judge_reviews and update entry status."""
     meta = verdict.pop("_meta", {})
@@ -872,6 +1197,68 @@ def main():
                             judge_skipped_reason="edge_decay_prejudge",
                             skip_reason="edge_decay_prejudge")
                     continue
+
+                # v13.2 (option B): conditional gate. Resolve the decisive
+                # cases (deterministic proximity coin-flip → REJECT; tight
+                # ensemble far from bin → APPROVE) WITHOUT spending the full
+                # LLM judge. Only genuinely uncertain / non-ensemble / non-temp
+                # cases fall through to review_proposal(). Synthesized verdicts
+                # still flow through apply_verdict() → all code guards run.
+                route = _judge_route(row_dict)
+
+                # Deterministic proximity coin-flip → REJECT, no LLM at all.
+                if route is not None and route["action"] == "auto_reject":
+                    verdict = _synthesize_route_verdict(row_dict, route)
+                    with db.connect() as conn:
+                        apply_verdict(conn, row_dict, verdict)
+                    log_event("judge_autoreject_proximity", {
+                        "entry_id": row_dict["entry_id"],
+                        "final_verdict": verdict["verdict"],
+                        "reason": route["reason"],
+                        "bot_prob": float(row_dict["forecast_prob_at_entry"] or 0),
+                        "cost_usd": 0.0, "llm_skipped": True,
+                    })
+                    continue
+
+                # Tight-ensemble-far-from-bin: run the CHEAP web-search-only
+                # anomaly scan (option-1). Clean → auto-approve (full judge
+                # skipped); catalyst found or scan unavailable → fall through to
+                # the full judge. This closes the auto-approve blind spot for
+                # non-meteorological catalysts the ensemble can't see.
+                if route is not None and route["action"] == "auto_approve":
+                    scan = _anomaly_scan(row_dict) if JUDGE_ANOMALY_SCAN else {
+                        "catalyst_found": False, "summary": "scan disabled",
+                        "_meta": {}}
+                    scan_cost = (scan or {}).get("_meta", {}).get("cost_usd", 0.0)
+                    if scan_cost:
+                        _record_spend(scan_cost)
+                    outcome = _scan_outcome(scan)
+                    if outcome == "approve":
+                        verdict = _synthesize_route_verdict(row_dict, route)
+                        verdict["rationale"] += (
+                            f"\n[anomaly scan: no catalyst — "
+                            f"{scan.get('summary', '')}]")
+                        with db.connect() as conn:
+                            apply_verdict(conn, row_dict, verdict)
+                        log_event("judge_autoapprove_ensemble", {
+                            "entry_id": row_dict["entry_id"],
+                            "final_verdict": verdict["verdict"],
+                            "reason": route["reason"],
+                            "scan_summary": scan.get("summary", ""),
+                            "bot_prob": float(
+                                row_dict["forecast_prob_at_entry"] or 0),
+                            "cost_usd": round(scan_cost, 4),
+                            "llm_skipped": True,
+                        })
+                        continue
+                    # escalate or unavailable → full judge (fall through)
+                    log_event("judge_autoapprove_escalated", {
+                        "entry_id": row_dict["entry_id"],
+                        "outcome": outcome,
+                        "reason": route["reason"],
+                        "scan_summary": (scan or {}).get("summary", ""),
+                        "scan_cost_usd": round(scan_cost, 4),
+                    }, level="WARN")
 
                 t0 = time.monotonic()
                 verdict = review_proposal(row_dict, system_prompt)
@@ -1151,11 +1538,167 @@ def _test_prejudge_recheck():
         mod.PREJUDGE_MIN_EDGE_PP = saved_threshold
 
 
+# ---------------------------------------------------------------------------
+# Inline tests for the v13.2 conditional-gate routing (_judge_route)
+# Run: python weather_edge_judge.py --test-autoroute
+# ---------------------------------------------------------------------------
+
+def _test_autoroute():
+    """Hermetic tests for _judge_route by monkey-patching the helper imports
+    (parse_market/forecast_ref_value/load_cities) and the module-level
+    _threshold_proximity_reason. Verifies the routing decision only — the
+    downstream apply_verdict guards have their own tests."""
+    import types
+    import weather_edge_judge as mod
+    import weather_edge_helpers as helpers
+
+    saved = {
+        "prox": mod._threshold_proximity_reason,
+        "parse": helpers.parse_market,
+        "ref": helpers.forecast_ref_value,
+        "cities": helpers.load_cities,
+        "autoroute": mod.JUDGE_AUTOROUTE,
+        "mult": mod.AUTOAPPROVE_MAE_MULT,
+    }
+
+    def _spec(metric="temp", comparison="range", lo=20.0, hi=21.0, unit="C"):
+        return types.SimpleNamespace(
+            metric=metric, comparison=comparison,
+            threshold_value=lo, threshold_value_high=hi, threshold_unit=unit)
+
+    def _row(ref, sigma, ensemble=True, question="temp?", side="NO"):
+        dm = {"ensemble_calibrated": ensemble, "mae_dynamic": sigma} if ensemble else {}
+        return {
+            "entry_id": 1, "market_question": question, "end_date": "2026-07-02",
+            "side": side, "forecast_prob_at_entry": 0.85,
+            "forecast_snapshot_json": json.dumps({"ref": ref}),
+            "discovery_meta_json": json.dumps(dm),
+        }
+
+    try:
+        mod.JUDGE_AUTOROUTE = True
+        mod.AUTOAPPROVE_MAE_MULT = 2.0
+        helpers.load_cities = lambda: {}
+        # ref is read straight out of the fake snapshot for determinism.
+        helpers.forecast_ref_value = lambda spec, fc: fc.get("ref")
+
+        # Test 1: proximity fires → auto_reject, no LLM (regardless of ensemble)
+        mod._threshold_proximity_reason = lambda row: "within 1° of range"
+        helpers.parse_market = lambda q, e, c: _spec()
+        r = mod._judge_route(_row(ref=25.0, sigma=1.0))
+        assert r and r["action"] == "auto_reject", r
+        print("Test 1 PASS: proximity → auto_reject (LLM skipped)")
+
+        # From here on, proximity never fires.
+        mod._threshold_proximity_reason = lambda row: None
+
+        # Test 2: tight ensemble, bin far (dist=4°, σ=1 → 4σ ≥ 2σ) → auto_approve
+        helpers.parse_market = lambda q, e, c: _spec(lo=20.0, hi=21.0)
+        r = mod._judge_route(_row(ref=25.0, sigma=1.0))  # ref 25 > hi 21 → dist=4
+        assert r and r["action"] == "auto_approve", r
+        assert abs(r["dist"] - 4.0) < 1e-9, r
+        print("Test 2 PASS: tight ensemble far from bin → auto_approve (LLM skipped)")
+
+        # Test 3: ensemble but bin NEAR (dist=1.5°, σ=1 → 1.5σ < 2σ) → LLM
+        r = mod._judge_route(_row(ref=22.5, sigma=1.0))  # dist = 22.5-21 = 1.5
+        assert r is None, r
+        print("Test 3 PASS: ensemble near-edge → None (routed to LLM)")
+
+        # Test 4: forecast INSIDE the bin (risky YES) → dist 0 → LLM
+        r = mod._judge_route(_row(ref=20.5, sigma=1.0))
+        assert r is None, r
+        print("Test 4 PASS: forecast inside bin → None (routed to LLM)")
+
+        # Test 5: non-ensemble (single-source fallback) far from bin → LLM
+        r = mod._judge_route(_row(ref=25.0, sigma=1.0, ensemble=False))
+        assert r is None, r
+        print("Test 5 PASS: non-ensemble fallback → None (LLM earns its cost)")
+
+        # Test 6: non-temp market → LLM (ensemble doesn't cover it)
+        helpers.parse_market = lambda q, e, c: _spec(metric="rain")
+        r = mod._judge_route(_row(ref=25.0, sigma=1.0))
+        assert r is None, r
+        print("Test 6 PASS: non-temp market → None (routed to LLM)")
+
+        # Test 7: boundary dist == 2σ exactly → auto_approve (>= threshold)
+        helpers.parse_market = lambda q, e, c: _spec(lo=20.0, hi=21.0)
+        r = mod._judge_route(_row(ref=23.0, sigma=1.0))  # dist = 2.0 = 2σ
+        assert r and r["action"] == "auto_approve", f"dist==2σ should approve: {r}"
+        print("Test 7 PASS: dist == 2σ exactly → auto_approve (>=)")
+
+        # Test 8: threshold (non-range) market far → auto_approve
+        helpers.parse_market = lambda q, e, c: _spec(
+            comparison="above", lo=30.0, hi=None)
+        r = mod._judge_route(_row(ref=25.0, sigma=1.0))  # |25-30| = 5 ≥ 2
+        assert r and r["action"] == "auto_approve", r
+        print("Test 8 PASS: threshold market far from cutoff → auto_approve")
+
+        # Test 9: JUDGE_AUTOROUTE off → always None (universal-LLM restored)
+        mod.JUDGE_AUTOROUTE = False
+        helpers.parse_market = lambda q, e, c: _spec(lo=20.0, hi=21.0)
+        r = mod._judge_route(_row(ref=25.0, sigma=1.0))
+        assert r is None, r
+        print("Test 9 PASS: JUDGE_AUTOROUTE=0 disables routing (always LLM)")
+
+        print("\nAll auto-route tests PASS (9/9)")
+    finally:
+        mod._threshold_proximity_reason = saved["prox"]
+        helpers.parse_market = saved["parse"]
+        helpers.forecast_ref_value = saved["ref"]
+        helpers.load_cities = saved["cities"]
+        mod.JUDGE_AUTOROUTE = saved["autoroute"]
+        mod.AUTOAPPROVE_MAE_MULT = saved["mult"]
+
+
+# ---------------------------------------------------------------------------
+# Inline tests for the v13.2 option-1 anomaly scan (parse + outcome)
+# Run: python weather_edge_judge.py --test-anomaly
+# ---------------------------------------------------------------------------
+
+def _test_anomaly():
+    """Hermetic tests for _parse_scan_json and _scan_outcome — no API calls."""
+
+    # --- _parse_scan_json ---
+    r = _parse_scan_json('```json\n{"catalyst_found": true, "summary": "heat dome inbound"}\n```')
+    assert r == {"catalyst_found": True, "summary": "heat dome inbound"}, r
+    print("Test 1 PASS: fenced json block parsed")
+
+    r = _parse_scan_json('Here is my finding:\n{"catalyst_found": false, "summary": "routine"}')
+    assert r == {"catalyst_found": False, "summary": "routine"}, r
+    print("Test 2 PASS: bare object after prose parsed")
+
+    r = _parse_scan_json('```\n{"catalyst_found": false, "summary": "no fence lang"}\n```')
+    assert r == {"catalyst_found": False, "summary": "no fence lang"}, r
+    print("Test 3 PASS: unlabelled fence parsed")
+
+    assert _parse_scan_json("") is None
+    assert _parse_scan_json("no json here at all") is None
+    assert _parse_scan_json('{"summary": "missing the key"}') is None
+    print("Test 4 PASS: empty / no-json / missing-key → None")
+
+    # truthiness coercion (string "true" is truthy → True; but json bool stays)
+    r = _parse_scan_json('{"catalyst_found": 1, "summary": "coerced"}')
+    assert r["catalyst_found"] is True, r
+    print("Test 5 PASS: non-bool catalyst_found coerced to bool")
+
+    # --- _scan_outcome ---
+    assert _scan_outcome(None) == "unavailable"
+    assert _scan_outcome({"catalyst_found": True, "summary": "x"}) == "escalate"
+    assert _scan_outcome({"catalyst_found": False, "summary": "x"}) == "approve"
+    print("Test 6 PASS: outcome None→unavailable, True→escalate, False→approve")
+
+    print("\nAll anomaly-scan tests PASS (6/6)")
+
+
 if __name__ == "__main__":
     import sys
     if "--test-rule6" in sys.argv:
         _test_rule6_enforce()
     elif "--test-prejudge" in sys.argv:
         _test_prejudge_recheck()
+    elif "--test-autoroute" in sys.argv:
+        _test_autoroute()
+    elif "--test-anomaly" in sys.argv:
+        _test_anomaly()
     else:
         main()
