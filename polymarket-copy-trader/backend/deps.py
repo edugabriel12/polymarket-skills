@@ -42,6 +42,7 @@ APIClient = _aw.APIClient
 is_address = _aw.is_address
 fetch_trades = _aw.fetch_trades
 fetch_positions = _aw.fetch_positions
+fetch_event_tags = _aw.fetch_event_tags
 sanitize_text = _aw.sanitize_text
 to_float = _aw.to_float
 _end_in_past = _aw._end_in_past

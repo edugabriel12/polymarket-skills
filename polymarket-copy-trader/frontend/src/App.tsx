@@ -25,7 +25,8 @@ export default function App() {
               <div>
                 <h1 className="text-xl font-extrabold tracking-tight">Copy-Trade · Paper</h1>
                 <p className="text-xs text-muted-foreground">
-                  Copia compras e vendas de carteiras públicas · slippage ≤{" "}
+                  Copia compras e vendas de carteiras públicas
+                  {cfg?.weather_only !== false ? " · apenas weather" : ""} · slippage ≤{" "}
                   {cfg ? `${(cfg.slippage_cap * 100).toFixed(0)}%` : "20%"} · teto $
                   {cfg?.max_usd ?? 100} / piso ${cfg?.min_usd ?? 5}
                 </p>

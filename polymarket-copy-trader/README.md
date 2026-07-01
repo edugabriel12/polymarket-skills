@@ -12,6 +12,9 @@ at risk**.
 - **Save wallets** by name + address (`wallets` table).
 - **Track every buy/sell** of each saved wallet by polling the Data API `/trades` endpoint
   (`side=BUY/SELL`). Only trades made *after* you save a wallet are copied (baseline snapshot).
+- **Weather markets only** (default) — non-weather trades are ignored, detected by the same
+  keyword set as the weather edge bot plus the Gamma `weather` tag. Set `COPY_WEATHER_ONLY=0` to
+  copy all markets.
 - **Copy into a paper portfolio**, automatically:
   - **BUY** — copy the **same USD value the wallet bought**, clamped to **[$5, $100]** (below $5 →
     $5; above $100 → $100). A **20% slippage guard** may reduce the size using the live order book;
@@ -69,6 +72,7 @@ cd frontend && npm install && npm run dev
 | `COPY_POLL_SEC` | `60` | Background poll interval (seconds) |
 | `AUTO_POLL` | `1` | Set `0` to disable the background loop (poll via `POST /api/poll`) |
 | `COPY_DEBUG` | `1` | Detailed per-operation debug logs to stderr. Set `0` to silence. |
+| `COPY_WEATHER_ONLY` | `1` | Copy only weather markets. Set `0` to copy all markets. |
 
 ### Debug logs
 

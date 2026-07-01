@@ -12,6 +12,7 @@ mirroring the wallet-dashboard watcher).
 """
 from __future__ import annotations
 
+import os
 import sys
 from collections import defaultdict
 
@@ -19,9 +20,28 @@ import clog
 import copy_engine as ce
 import db
 import deps
+import weather_filter as wf
 
 _SETTLE_EPS = 0.02  # midpoint within this of 0/1 => market treated as resolved
 _MAX_TRADES = 2000
+
+# Only copy weather markets by default. Set COPY_WEATHER_ONLY=0 to copy all markets.
+WEATHER_ONLY = os.environ.get("COPY_WEATHER_ONLY", "1") not in ("0", "", "false", "False")
+
+
+def _is_weather(trade: dict, api, tag_cache: dict) -> bool:
+    """Weather-market check with a keyword fast-path and a cached Gamma-tag fallback."""
+    if wf.matches_keywords(wf.market_text(trade)):
+        return True
+    slug = trade.get("eventSlug") or ""
+    if not slug:
+        return False
+    if slug not in tag_cache:
+        try:
+            tag_cache[slug] = deps.fetch_event_tags(api, slug)
+        except Exception:  # noqa: BLE001 — tag lookup is best-effort
+            tag_cache[slug] = []
+    return wf.is_weather(trade, tag_cache[slug])
 
 
 def _log(msg: str) -> None:
@@ -60,6 +80,7 @@ def poll_wallet(wallet: dict, api=None, db_path: str = db.DEFAULT_DB) -> int:
 
     recorded = 0
     max_ts = floor_ts
+    tag_cache: dict[str, list] = {}
     for ts, trade in fresh:
         max_ts = max(max_ts, ts)
         side = ce.trade_side(trade)
@@ -67,6 +88,11 @@ def poll_wallet(wallet: dict, api=None, db_path: str = db.DEFAULT_DB) -> int:
         token = ce.token_id(trade)
         if not cond or side not in ("BUY", "SELL"):
             clog.dbg(f"· ignorado (sem cond ou side desconhecido: '{side}') ts={ts:.0f}")
+            continue
+        # Restrict to weather markets (skip before any order-book fetch).
+        if WEATHER_ONLY and not _is_weather(trade, api, tag_cache):
+            clog.dbg(f"· ignorado (não é mercado de weather): "
+                     f"'{deps.sanitize_text(trade.get('title')) or cond[:10]}'")
             continue
         try:
             ob = deps.fetch_orderbook(token)
