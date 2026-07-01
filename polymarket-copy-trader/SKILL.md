@@ -3,9 +3,9 @@ name: polymarket-copy-trader
 description: >-
   Use this skill to run a separate paper copy-trade flow that follows public Polymarket
   wallets. Save wallets by name+address, continuously track their BUYS and SELLS via the
-  Data API /trades endpoint, and mirror them into a $10k fake-USD paper portfolio. Buys are
-  sized so weighted-avg fill slippage stays <= 20% (cap $100, floor $5); sells are skipped if
-  they would exceed 20% slippage. Includes a FastAPI backend + React dashboard (Carteiras,
+  Data API /trades endpoint, and mirror them into a $10k fake-USD paper portfolio. Buys copy the
+  same USD value the wallet spent, clamped to [$5, $100], with a 20% slippage guard; sells are
+  skipped if they would exceed 20% slippage. Includes a FastAPI backend + React dashboard (Carteiras,
   Entradas, Resultados). Read-only, no private key. Trigger on: copy trade, copy trading,
   follow a wallet, mirror a wallet, track wallet buys and sells, paper copy portfolio,
   slippage-bounded copy, wallet entries dashboard.
@@ -32,9 +32,9 @@ This is distinct from `polymarket-wallet-analyzer` (one-shot analysis of a walle
 
 ## Rules enforced
 
-- **Slippage cap 20%** on every copy, via `compute_max_size_for_slippage` (reused).
-- **BUY** size capped at **$100**, floored at **$5**; below the floor or out of cash → skipped
-  (logged, never silently dropped).
+- **BUY** copies the **same USD value the wallet spent**, clamped to **[$5, $100]**. A **20%
+  slippage guard** (`compute_max_size_for_slippage`, reused) may reduce the size; if it drops below
+  the $5 floor, or the portfolio is out of cash → skipped (logged, never silently dropped).
 - **SELL** mirrors the fraction the wallet sold; if it would exceed 20% slippage → not executed.
 - **Untrusted market text** (CLAUDE.md rule #5): all titles/slugs sanitized, only displayed.
 - **Paper only**: never touches live execution or private keys.

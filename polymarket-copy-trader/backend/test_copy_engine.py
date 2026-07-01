@@ -38,51 +38,74 @@ def _sell_trade(cond="0xc1", token="123", price=0.60, size=100.0):
 # ---------------------------------------------------------------------------
 # BUY sizing
 # ---------------------------------------------------------------------------
+# Deep book: sizing is never reduced by the slippage guard.
+_DEEP = {"best_ask": 0.50, "best_bid": 0.49,
+         "asks": [{"price": 0.50, "size": 100000}],
+         "bids": [{"price": 0.49, "size": 100000}]}
+
+
+def test_buy_mirrors_wallet_value():
+    path = _fresh_db()
+    wid = _wallet(path)
+    # Wallet spent 0.50 * 100 = $50 -> mirror $50 (inside [5,100]).
+    entry = ce.process_buy(wid, _buy_trade(price=0.50, size=100.0), _DEEP,
+                           volume_24h=50000.0, db_path=path)
+    assert entry["status"] == "EXECUTED", entry
+    assert abs(entry["executed_usd"] - 50.0) < 0.5, entry["executed_usd"]
+    assert abs(db.get_cash(path) - (db.STARTING_BALANCE - 50.0)) < 0.5
+    print("ok test_buy_mirrors_wallet_value")
+
+
 def test_buy_caps_at_100():
     path = _fresh_db()
     wid = _wallet(path)
-    # Deep book at/near best -> slippage-max would be >$100, so we cap at $100.
-    ob = {"best_ask": 0.50, "best_bid": 0.49,
-          "asks": [{"price": 0.50, "size": 1000}, {"price": 0.55, "size": 1000}],
-          "bids": [{"price": 0.49, "size": 1000}]}
-    entry = ce.process_buy(wid, _buy_trade(), ob, volume_24h=50000.0, db_path=path)
+    # Wallet spent 0.50 * 1000 = $500 -> capped at $100.
+    entry = ce.process_buy(wid, _buy_trade(price=0.50, size=1000.0), _DEEP,
+                           volume_24h=50000.0, db_path=path)
     assert entry["status"] == "EXECUTED", entry
-    assert entry["executed_usd"] <= ce.MAX_USD + 1e-6, entry["executed_usd"]
-    assert entry["executed_usd"] >= ce.MAX_USD - 0.5, entry["executed_usd"]
-    assert entry["slippage_pct"] <= ce.SLIPPAGE_CAP + 1e-9
-    # cash reduced from 10k by ~cost
-    assert db.get_cash(path) < db.STARTING_BALANCE
-    pos = db.get_paper_position(wid, "0xc1", path)
-    assert pos and pos["shares"] > 0
+    assert abs(entry["executed_usd"] - ce.MAX_USD) < 0.5, entry["executed_usd"]
     print("ok test_buy_caps_at_100")
 
 
-def test_buy_below_floor_skips():
+def test_buy_floors_at_5():
     path = _fresh_db()
     wid = _wallet(path)
-    # Tiny top level then a jump beyond the 20% cap -> max sizable < $5.
+    # Wallet spent 0.50 * 4 = $2 -> floored up to $5.
+    entry = ce.process_buy(wid, _buy_trade(price=0.50, size=4.0), _DEEP,
+                           volume_24h=50000.0, db_path=path)
+    assert entry["status"] == "EXECUTED", entry
+    assert abs(entry["executed_usd"] - ce.MIN_USD) < 0.2, entry["executed_usd"]
+    print("ok test_buy_floors_at_5")
+
+
+def test_buy_slippage_guard_reduces():
+    path = _fresh_db()
+    wid = _wallet(path)
+    # Wallet spent $50, but only ~$20 fits within 20% slippage -> reduce to ~$20.
     ob = {"best_ask": 0.50, "best_bid": 0.49,
-          "asks": [{"price": 0.50, "size": 5}, {"price": 0.90, "size": 1000}],
+          "asks": [{"price": 0.50, "size": 40}, {"price": 0.90, "size": 100000}],
           "bids": [{"price": 0.49, "size": 1000}]}
-    entry = ce.process_buy(wid, _buy_trade(), ob, volume_24h=100.0, db_path=path)
+    entry = ce.process_buy(wid, _buy_trade(price=0.50, size=100.0), ob,
+                           volume_24h=100.0, db_path=path)
+    assert entry["status"] == "EXECUTED", entry
+    assert abs(entry["executed_usd"] - 20.0) < 0.5, entry["executed_usd"]
+    assert entry["slippage_pct"] <= ce.SLIPPAGE_CAP + 1e-9, entry["slippage_pct"]
+    print("ok test_buy_slippage_guard_reduces")
+
+
+def test_buy_slippage_guard_skips_below_floor():
+    path = _fresh_db()
+    wid = _wallet(path)
+    # Only ~$4 fits within 20% slippage -> below the $5 floor -> SKIPPED.
+    ob = {"best_ask": 0.50, "best_bid": 0.49,
+          "asks": [{"price": 0.50, "size": 8}, {"price": 0.90, "size": 100000}],
+          "bids": [{"price": 0.49, "size": 1000}]}
+    entry = ce.process_buy(wid, _buy_trade(price=0.50, size=100.0), ob,
+                           volume_24h=100.0, db_path=path)
     assert entry["status"] == "SKIPPED", entry
     assert "floor" in entry["skip_reason"], entry["skip_reason"]
     assert db.get_cash(path) == db.STARTING_BALANCE  # untouched
-    print("ok test_buy_below_floor_skips")
-
-
-def test_buy_respects_slippage_cap_size():
-    path = _fresh_db()
-    wid = _wallet(path)
-    # best 0.50, cap 0.60. Second level 0.70 is beyond cap; only ~ first levels fill.
-    ob = {"best_ask": 0.50, "best_bid": 0.49,
-          "asks": [{"price": 0.50, "size": 100}, {"price": 0.55, "size": 100},
-                   {"price": 0.70, "size": 1000}],
-          "bids": [{"price": 0.49, "size": 1000}]}
-    entry = ce.process_buy(wid, _buy_trade(), ob, volume_24h=100.0, db_path=path)
-    assert entry["status"] == "EXECUTED", entry
-    assert entry["slippage_pct"] <= ce.SLIPPAGE_CAP + 1e-9, entry["slippage_pct"]
-    print("ok test_buy_respects_slippage_cap_size")
+    print("ok test_buy_slippage_guard_skips_below_floor")
 
 
 # ---------------------------------------------------------------------------
