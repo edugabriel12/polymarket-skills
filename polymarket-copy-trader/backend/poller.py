@@ -15,6 +15,7 @@ from __future__ import annotations
 import sys
 from collections import defaultdict
 
+import clog
 import copy_engine as ce
 import db
 import deps
@@ -53,6 +54,10 @@ def poll_wallet(wallet: dict, api=None, db_path: str = db.DEFAULT_DB) -> int:
     fresh = [(ts, t) for ts, t in fresh if ts > floor_ts]
     fresh.sort(key=lambda x: x[0])
 
+    if fresh:
+        clog.section(f"carteira '{wallet['name']}' ({address[:6]}…{address[-4:]}) "
+                     f"— {len(fresh)} novo(s) trade(s) desde ts={floor_ts:.0f}")
+
     recorded = 0
     max_ts = floor_ts
     for ts, trade in fresh:
@@ -61,6 +66,7 @@ def poll_wallet(wallet: dict, api=None, db_path: str = db.DEFAULT_DB) -> int:
         cond = ce.cond_id(trade)
         token = ce.token_id(trade)
         if not cond or side not in ("BUY", "SELL"):
+            clog.dbg(f"· ignorado (sem cond ou side desconhecido: '{side}') ts={ts:.0f}")
             continue
         try:
             ob = deps.fetch_orderbook(token)
@@ -128,6 +134,10 @@ def settle_wallet(wallet_id: int, db_path: str = db.DEFAULT_DB) -> None:
         pos = db.get_paper_position(wallet_id, cond, db_path)
         rem = deps.to_float(pos.get("shares")) if pos else 0.0
         avg_entry = deps.to_float(pos.get("avg_entry")) if pos else 0.0
+
+        clog.dbg(f"LIQUIDAÇÃO: {result} '{elist[0].get('market_question') or cond[:10]}' "
+                 f"midpoint={current:.4f} → fecha {clog.money_shares(rem)} @ entry {avg_entry:.4f} "
+                 f"(payout {clog.usd(rem if final == 1.0 else 0.0)})")
 
         if pos and rem > 0:
             if final == 1.0:
