@@ -6,10 +6,12 @@ forecast sources (NWS, Visual Crossing, web search), calls Claude with the
 versioned judge prompt + structured output schema, and records APPROVE /
 REJECT / ADJUST verdict back to the DB.
 
-Default model: claude-haiku-4-5 (3x cheaper than Sonnet for 24/7 use;
-Rule 6 hard-enforce in apply_verdict catches the higher rubber-stamping
-risk of the smaller model).
-Override via CLAUDE_JUDGE_MODEL env var.
+Default model: claude-opus-4-8. The v13.2 conditional gate (option B) plus the
+option-1 anomaly scan mean the full judge now runs on only the genuinely hard,
+low-volume cases — so we spend Opus-tier quality where it matters instead of
+rubber-stamping every trade with a cheap model. The cheap web-search anomaly
+scan stays on claude-haiku-4-5 (JUDGE_ANOMALY_SCAN_MODEL) so gating remains
+cheap. Override the judge model via CLAUDE_JUDGE_MODEL env var.
 
 Daily budget cap: JUDGE_DAILY_BUDGET_USD (default $15). When exceeded, judge
 marks remaining proposals as SKIPPED with reason=judge_budget_exceeded.
@@ -38,9 +40,10 @@ Required env vars:
   NWS_USER_AGENT           (per NWS policy: "<app> <contact email>")
 
 Optional:
-  CLAUDE_JUDGE_MODEL       (default claude-haiku-4-5)
-  JUDGE_POLL_INTERVAL_SEC  (default 120)
-  JUDGE_DAILY_BUDGET_USD   (default 15)
+  CLAUDE_JUDGE_MODEL         (default claude-opus-4-8)
+  JUDGE_ANOMALY_SCAN_MODEL   (default claude-haiku-4-5)
+  JUDGE_POLL_INTERVAL_SEC    (default 120)
+  JUDGE_DAILY_BUDGET_USD     (default 15)
 """
 from __future__ import annotations
 
@@ -96,7 +99,11 @@ LOG_DIR = Path.home() / ".polymarket-paper"
 LOG_FILE = LOG_DIR / "weather_edge.jsonl"
 PROMPT_PATH = REPO_ROOT / "polymarket-analyzer" / "references" / "weather-judge-prompt.md"
 
-DEFAULT_MODEL = os.environ.get("CLAUDE_JUDGE_MODEL", "claude-haiku-4-5")
+DEFAULT_MODEL = os.environ.get("CLAUDE_JUDGE_MODEL", "claude-opus-4-8")
+# The anomaly scan (v13.2 option-1) is a cost optimization — keep it on a cheap
+# model even when the full judge runs on Opus, so gating stays cheap and only
+# the escalated full-judge calls pay the Opus rate. Override via env if needed.
+ANOMALY_SCAN_MODEL = os.environ.get("JUDGE_ANOMALY_SCAN_MODEL", "claude-haiku-4-5")
 POLL_INTERVAL = int(os.environ.get("JUDGE_POLL_INTERVAL_SEC", "120"))
 DAILY_BUDGET_USD = float(os.environ.get("JUDGE_DAILY_BUDGET_USD", "15.0"))
 # Pre-judge edge re-check threshold (pp). If the entry's current
@@ -165,8 +172,10 @@ JUDGE_ANOMALY_SCAN = os.environ.get("JUDGE_ANOMALY_SCAN", "1").strip().lower() n
 ANOMALY_SCAN_MAX_USES = int(os.environ.get("JUDGE_ANOMALY_SCAN_MAX_USES", "3"))
 ANOMALY_SCAN_MAX_TOKENS = int(os.environ.get("JUDGE_ANOMALY_SCAN_MAX_TOKENS", "1500"))
 
-# Pricing per 1M tokens (Sonnet 4.6 / Opus 4.7 — adjust if model changed)
+# Pricing per 1M tokens (adjust if model changed)
 PRICING = {
+    "claude-opus-4-8": {"input": 5.00, "output": 25.00, "cache_read": 0.50},
+    "claude-sonnet-5": {"input": 3.00, "output": 15.00, "cache_read": 0.30},
     "claude-sonnet-4-6": {"input": 3.00, "output": 15.00, "cache_read": 0.30},
     "claude-opus-4-7": {"input": 5.00, "output": 25.00, "cache_read": 0.50},
     "claude-haiku-4-5": {"input": 1.00, "output": 5.00, "cache_read": 0.10},
@@ -852,9 +861,9 @@ def _anomaly_scan(entry_row) -> Optional[dict]:
     # the _20260209 dynamic-filtering variant is Opus/Sonnet-4.6+ only.
     tools = [{"type": "web_search_20250305", "name": "web_search",
               "max_uses": ANOMALY_SCAN_MAX_USES}]
-    is_haiku = "haiku" in DEFAULT_MODEL.lower()
+    is_haiku = "haiku" in ANOMALY_SCAN_MODEL.lower()
     request_kwargs = {
-        "model": DEFAULT_MODEL,
+        "model": ANOMALY_SCAN_MODEL,
         "max_tokens": ANOMALY_SCAN_MAX_TOKENS,
         "system": _ANOMALY_SCAN_SYSTEM,
         "messages": [{"role": "user", "content": user_content}],
@@ -892,14 +901,14 @@ def _anomaly_scan(entry_row) -> Optional[dict]:
         return None
 
     usage = response.usage
-    pricing = PRICING.get(DEFAULT_MODEL, PRICING["claude-haiku-4-5"])
+    pricing = PRICING.get(ANOMALY_SCAN_MODEL, PRICING["claude-haiku-4-5"])
     # Token-based cost only (web-search per-query billing is extra and not
     # captured here — a small, deliberate undercount for budget tracking).
     cost = (usage.input_tokens * pricing["input"] / 1_000_000 +
             usage.output_tokens * pricing["output"] / 1_000_000 +
             (usage.cache_read_input_tokens or 0) * pricing["cache_read"] / 1_000_000)
     parsed["_meta"] = {"cost_usd": cost, "duration_ms": duration_ms,
-                       "model": DEFAULT_MODEL, "tokens_in": usage.input_tokens,
+                       "model": ANOMALY_SCAN_MODEL, "tokens_in": usage.input_tokens,
                        "tokens_out": usage.output_tokens}
     return parsed
 
