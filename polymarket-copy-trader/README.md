@@ -22,8 +22,11 @@ at risk**.
     **skipped** (never silently dropped).
   - **SELL** — mirror the **same fraction** the wallet sold. If that paper sell would breach
     **20% slippage**, it is **not executed** (logged as skipped).
-  - **Settlement** — when a market resolves, open paper positions are closed and marked
-    Acerto/Erro with realized P&L.
+  - **Settlement** — a position pays out ($1 per winning share) **only when the market has
+    genuinely resolved** (Gamma `closed` flag or a past end date), never merely because the
+    live price is pinned near 0/1. This prevents a heavy favorite that is only *trading* at
+    0.98 from paying out prematurely and inflating the paper cash. Until resolution, open
+    positions are marked to the live price.
 - Every attempt (executed or skipped) is a row in the `entries` table, linked to its wallet.
 
 ## Tabs

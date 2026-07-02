@@ -59,11 +59,22 @@ Full trade history for a wallet, across all markets.
 
 | Field | Used for |
 |---|---|
+| `proxyWallet` (or `user`/`address`/`maker`) | **owner attribution — ownership filter** |
 | `conditionId` (or `market`) | market identity |
 | `asset` / `tokenId` / `token_id` | per-outcome cost basis |
 | `side` (`BUY`/`SELL`, also `BID`/`ASK`) | direction |
 | `price`, `size` | average-cost P&L reconstruction |
 | `title`, `slug`, `eventSlug` | display + category for exited markets |
+
+> **Ownership is verified client-side.** The wallet query param above was
+> inferred from the public frontend, never confirmed live — and it has been
+> observed returning trades that do **not** belong to the requested wallet (an
+> unfiltered / counterparty feed). `fetch_trades` therefore keeps only records
+> whose owner address (`proxyWallet`/`user`/`address`/`maker`) matches the
+> requested wallet (`owned_trades`), so a wallet is never credited with — nor
+> copied on — another wallet's activity. If no record carries a recognizable
+> owner field, the shape is unknown and the raw feed is returned with a stderr
+> warning. **When verifying shapes locally, confirm the owner field name.**
 
 ## `GET /events` (Gamma, only with `--enrich-tags`)
 
