@@ -101,4 +101,4 @@ if ($Reset) {
 Write-Host ""
 Write-Host "Backend  -> http://localhost:8002" -ForegroundColor Green
 Write-Host "Frontend -> http://localhost:5175" -ForegroundColor Green
-Write-Host "Each runs in its own window — close a window to stop that service." -ForegroundColor DarkGray
+Write-Host "Each runs in its own window - close a window to stop that service." -ForegroundColor DarkGray
