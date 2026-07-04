@@ -55,6 +55,19 @@ cd polymarket-copy-trader
 # Frontend -> http://localhost:5175
 ```
 
+**Windows (PowerShell):**
+
+```powershell
+cd polymarket-copy-trader
+.\dev.ps1                       # first run creates the venv + npm install
+.\dev.ps1 -Reset                # also reset the paper portfolio to $10,000
+.\dev.ps1 -WeatherOnly:$false   # copy all markets, not just weather
+```
+
+`dev.ps1` launches the backend (`COPY_WEATHER_ONLY=1`, `COPY_DEBUG=1`) and the
+frontend each in their own PowerShell window. If scripts are blocked, allow them
+for the session first: `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`.
+
 Or separately:
 
 ```bash
