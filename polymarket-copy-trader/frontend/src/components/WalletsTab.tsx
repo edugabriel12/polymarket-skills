@@ -12,6 +12,7 @@ export function WalletsTab() {
   const [name, setName] = useState("");
   const [address, setAddress] = useState("");
   const [err, setErr] = useState<string | null>(null);
+  const [confirmId, setConfirmId] = useState<number | null>(null);
 
   const { data } = useQuery({ queryKey: ["wallets"], queryFn: api.wallets });
 
@@ -39,7 +40,14 @@ export function WalletsTab() {
   });
   const remove = useMutation({
     mutationFn: (id: number) => api.removeWallet(id),
-    onSuccess: refresh,
+    onSuccess: () => {
+      setConfirmId(null);
+      refresh();
+    },
+    onError: (e: Error) => {
+      setConfirmId(null);
+      setErr(e.message);
+    },
   });
   const poll = useMutation({ mutationFn: () => api.poll(), onSuccess: refresh });
 
@@ -111,27 +119,45 @@ export function WalletsTab() {
                   value={signedUsd(w.total_pnl)}
                   tone={w.total_pnl >= 0 ? "text-emerald-400" : "text-rose-400"}
                 />
-                <div className="flex items-center gap-1.5">
-                  <Button
-                    variant="outline"
-                    size="icon"
-                    title={w.active ? "Pausar" : "Retomar"}
-                    onClick={() => toggle.mutate({ id: w.wallet_id, active: !w.active })}
-                  >
-                    {w.active ? <Pause size={15} /> : <Play size={15} />}
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="icon"
-                    title="Remover"
-                    onClick={() => {
-                      if (confirm(`Remover ${w.name}? Isso apaga suas entradas.`))
-                        remove.mutate(w.wallet_id);
-                    }}
-                  >
-                    <Trash2 size={15} />
-                  </Button>
-                </div>
+                {confirmId === w.wallet_id ? (
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs text-muted-foreground">Apagar (e suas entradas)?</span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="border-rose-500/60 text-rose-400 hover:bg-rose-500/10"
+                      disabled={remove.isPending}
+                      onClick={() => remove.mutate(w.wallet_id)}
+                    >
+                      Confirmar
+                    </Button>
+                    <Button variant="ghost" size="sm" onClick={() => setConfirmId(null)}>
+                      Cancelar
+                    </Button>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1.5">
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      title={w.active ? "Pausar" : "Retomar"}
+                      onClick={() => toggle.mutate({ id: w.wallet_id, active: !w.active })}
+                    >
+                      {w.active ? <Pause size={15} /> : <Play size={15} />}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      title="Remover"
+                      onClick={() => {
+                        setErr(null);
+                        setConfirmId(w.wallet_id);
+                      }}
+                    >
+                      <Trash2 size={15} />
+                    </Button>
+                  </div>
+                )}
               </div>
             </CardContent>
           </Card>
