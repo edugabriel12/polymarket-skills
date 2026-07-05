@@ -75,6 +75,8 @@ from weather_edge_helpers import (  # noqa: E402
     fetch_open_meteo_archive,
     # v13: NGR/EMOS-style ensemble calibration
     compute_ensemble_calibration,
+    # v14: temperature-only policy
+    is_tradeable_spec,
 )
 import weather_edge_db as db  # noqa: E402
 
@@ -851,6 +853,8 @@ def run_discovery(args, cities: dict) -> int:
         "extreme_disagreement": 0,    # v9: adverse selection guard
         "range_bin_gap_too_small": 0,  # v12: sug_005 source fix
         "range_edge_after_cap": 0,    # v12.1: edge gone after sizing-cap
+        "not_temperature": 0,         # v14: temperature-only policy
+        "entry_too_expensive": 0,     # v10 counter was never initialized → KeyError aborted discovery
     }
 
     # Phase 1: build candidate proposals using HTTP-only work (no DB lock held).
@@ -922,6 +926,30 @@ def run_discovery(args, cities: dict) -> int:
             log_event("market_skipped", {"slug": slug, "reason": "parser_failed",
                                           "question": question[:100]})
             continue
+
+        # v14 (2026-07-05): temperature-only policy. Never open positions on
+        # non-temp markets (rain/snow binaries, numeric precip) — their prob
+        # comes from an uncalibrated clipped POP (see is_tradeable_spec).
+        # parse_market still returns these specs so _do_monitor_check keeps
+        # managing positions opened before v14. Placed before any per-market
+        # HTTP (orderbook/forecast) so skipping costs nothing.
+        if not is_tradeable_spec(spec):
+            skipped["not_temperature"] += 1
+            log_event("market_skipped", {"slug": slug,
+                                          "reason": "not_temperature",
+                                          "metric": spec.metric,
+                                          "question": question[:100]})
+            try:
+                with db.connect() as _conn:
+                    db.insert_discovery_skip(_conn,
+                        ts=_now_iso(), slug=slug, city=spec.city,
+                        reason="not_temperature",
+                        meta_json={"metric": spec.metric})
+                    _conn.commit()
+            except Exception:
+                pass  # never block discovery on observability write
+            continue
+
         if spec.confidence < 0.5:
             skipped["parser_low_confidence"] += 1
             log_event("market_skipped", {"slug": slug,

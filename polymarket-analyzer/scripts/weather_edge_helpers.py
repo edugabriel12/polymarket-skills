@@ -881,6 +881,31 @@ def parse_market(question: str, end_date: Optional[str] = None,
 
 
 # ---------------------------------------------------------------------------
+# v14 (2026-07-05): temperature-only trading policy
+# ---------------------------------------------------------------------------
+
+
+def is_tradeable_spec(spec) -> bool:
+    """v14 (2026-07-05): the bot is STRICTLY a temperature bot.
+
+    Returns True only for a parsed spec with metric == "temp". Non-temp
+    markets (rain binaries like "will-it-rain-in-dallas-on-june-10",
+    numeric precip like "more than 5mm of rain", "will it snow") price off
+    a single-source POP clipped to [PROB_CLIP_LOW, PROB_CLIP_HIGH] with no
+    MAE calibration, no ensemble and no station bias — an uncalibrated
+    signal the bot must never OPEN a position on.
+
+    NOTE: parse_market() deliberately KEEPS parsing precip/snow — the
+    monitor/cashout path (weather_edge_bot._do_monitor_check) and the judge
+    re-parse entries that may already be open. This predicate gates NEW
+    entries only. Callers: weather_edge_bot.run_discovery (skip bucket
+    "not_temperature") and weather_edge_judge._judge_route (fail-closed
+    deterministic REJECT).
+    """
+    return spec is not None and getattr(spec, "metric", None) == "temp"
+
+
+# ---------------------------------------------------------------------------
 # Forecast → probability
 # ---------------------------------------------------------------------------
 
@@ -2118,5 +2143,45 @@ if __name__ == "__main__":
                       target_date=date(2026, 7, 3), confidence=1.0,
                       raw_question="q").temp_kind == "high"
     print("Test M6 PASS: temp_kind default = high (retrocompat)")
+
+    # ------------------------------------------------------------------
+    # v14: temperature-only policy — is_tradeable_spec
+    # ------------------------------------------------------------------
+    _cities_t = dict(cities_fixture)
+    _cities_t["world"] = ["Dallas", "London", "New York", "Manhattan"]
+
+    # T1: rain binário PARSEIA (monitor/cashout de posições existentes
+    # dependem disso) mas NÃO é tradeable
+    t1 = parse_market("Will it rain in Dallas on June 10?",
+                      "2026-06-10", _cities_t)
+    assert t1 is not None and t1.metric == "precip", t1
+    assert is_tradeable_spec(t1) is False
+    print("Test T1 PASS: rain binary parses (precip) but tradeable=False")
+
+    # T2: forma com slug anexado (discovery concatena event title + slug)
+    t2 = parse_market("Will it rain in Dallas on June 10? "
+                      "will-it-rain-in-dallas-on-june-10",
+                      "2026-06-10", _cities_t)
+    assert t2 is not None and t2.metric == "precip" and not is_tradeable_spec(t2)
+    print("Test T2 PASS: slug-appended rain binary → tradeable=False")
+
+    # T3: snow binário
+    t3 = parse_market("Will it snow in New York on December 25?",
+                      "2026-12-25", _cities_t)
+    assert t3 is not None and t3.metric == "snow" and not is_tradeable_spec(t3)
+    print("Test T3 PASS: snow binary → tradeable=False")
+
+    # T4: precip numérico (mesmo mercado do Test 2, que continua parseando)
+    t4 = parse_market("Will London get more than 5mm of rain on 2026-06-15?",
+                      cities=_cities_t)
+    assert t4 is not None and t4.metric == "precip" and not is_tradeable_spec(t4)
+    print("Test T4 PASS: numeric precip → tradeable=False")
+
+    # T5: temp normal é tradeable; None não é
+    t5 = parse_market("Will Manhattan exceed 75°F tomorrow?",
+                      "2026-05-11T23:59Z", cities=_cities_t)
+    assert is_tradeable_spec(t5) is True
+    assert is_tradeable_spec(None) is False
+    print("Test T5 PASS: temp market tradeable=True; None → False")
 
     print("\nAll helper tests PASS")
