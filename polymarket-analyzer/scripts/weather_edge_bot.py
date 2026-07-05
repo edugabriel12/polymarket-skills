@@ -483,7 +483,13 @@ def _compute_mae_for_market(spec: MarketSpec, ow_forecast: dict,
     if not spec.target_date:
         return None, None, None, {}
 
-    metric = "temp_high_f" if spec.threshold_unit == "F" else "temp_high_c"
+    # v13.4: resolve which daily extreme this market settles on. Lowest-
+    # temperature markets use the daily MIN everywhere below (OW reference,
+    # VC cross-check, ensemble members, calibration). The metric label also
+    # carries the kind so forecast_history keeps low/high series separate.
+    temp_kind = getattr(spec, "temp_kind", "high")
+    _ext = "low" if temp_kind == "low" else "high"
+    metric = f"temp_{_ext}_{'f' if spec.threshold_unit == 'F' else 'c'}"
     target_iso = spec.target_date.isoformat()
 
     # Extract OW high temp from forecast snapshot
@@ -519,7 +525,8 @@ def _compute_mae_for_market(spec: MarketSpec, ow_forecast: dict,
         if vc and vc.get("days"):
             vc_day = vc["days"][0]
             # VC always returns Fahrenheit when unitGroup="us"
-            vc_value_f = vc_day.get("tempmax")
+            vc_value_f = vc_day.get("tempmin" if temp_kind == "low"
+                                     else "tempmax")
             if vc_value_f is not None:
                 # Convert to spec.threshold_unit if needed
                 vc_value = (float(vc_value_f) if spec.threshold_unit == "F"
@@ -549,8 +556,9 @@ def _compute_mae_for_market(spec: MarketSpec, ow_forecast: dict,
                        level="WARN")
             om_data = None
         if om_data:
+            om_suffix = "_min_c" if temp_kind == "low" else "_max_c"
             for model in ("icon", "gfs", "ecmwf"):
-                val_c = om_data.get(f"{model}_max_c")
+                val_c = om_data.get(f"{model}{om_suffix}")
                 if val_c is None:
                     continue
                 # Convert to spec.threshold_unit if market is F
@@ -602,7 +610,8 @@ def _compute_mae_for_market(spec: MarketSpec, ow_forecast: dict,
     # 0.70 cap then ate down to zero edge (the 2026-06-14 zero-entry
     # run). Ensemble spread is the right uncertainty estimator — NGR
     # only inflates and floors it (Gneiting 2005 MWR 133).
-    cal = compute_ensemble_calibration(om_data, spec.threshold_unit)
+    cal = compute_ensemble_calibration(om_data, spec.threshold_unit,
+                                       temp_kind=temp_kind)
     if cal is not None:
         mae_out = float(cal["sigma"])
         mu_out = float(cal["mu"])
@@ -619,8 +628,12 @@ def _compute_mae_for_market(spec: MarketSpec, ow_forecast: dict,
             threshold = 3.6 if spec.threshold_unit == "F" else 2.0  # ~2C
             if disagreement > threshold:
                 mae_dyn *= 1.5
-        # om_spread_mult: graduated 1.0/1.3/2.0/3.0
-        if om_data and (om_spread_c := om_data.get("spread_c")) is not None:
+        # om_spread_mult: graduated 1.0/1.3/2.0/3.0 (v13.4: use the spread
+        # of the extreme the market resolves on; falls back to max-spread
+        # when min-spread is unavailable in older cached om_data)
+        _spread_key = "spread_min_c" if temp_kind == "low" else "spread_c"
+        if om_data and (om_spread_c := (om_data.get(_spread_key)
+                                        or om_data.get("spread_c"))) is not None:
             spread = float(om_spread_c)
             if spread > 5.0:
                 mae_dyn *= 3.0
@@ -649,6 +662,7 @@ def _compute_mae_for_market(spec: MarketSpec, ow_forecast: dict,
         "mu": (round(mu_out, 3) if mu_out is not None else None),
         "ensemble_calibrated": ensemble_calibrated,  # v13
         "ensemble_members": (cal or {}).get("members") if cal else None,
+        "temp_kind": temp_kind,  # v13.4: which extreme priced this market
         "bias": bias,
         "multi_source": multi_source,
         "open_meteo": om_enabled,
@@ -2190,15 +2204,19 @@ def _fetch_resolved_market(slug: str) -> Optional[dict]:
 
 
 def _observed_value_for(row, cities) -> Optional[float]:
-    """v11: realized high temp for this entry's target date, in the market's
-    unit, from the Open-Meteo archive. Returns None when the market isn't a
-    temp market, the station coords are unknown, or the archive has no data
-    yet (~1-2 day lag). Used to populate resolutions.observed_value so the
-    advisor can calibrate MAE against ground truth."""
+    """v11: realized temp extreme for this entry's target date, in the
+    market's unit, from the Open-Meteo archive. v13.4: lowest-temperature
+    markets record the observed MIN (was always the max — which made the
+    advisor's calibration data garbage for low markets). Returns None when
+    the market isn't a temp market, the station coords are unknown, or the
+    archive has no data yet (~1-2 day lag). Used to populate
+    resolutions.observed_value so the advisor can calibrate against truth."""
     try:
         city = row["city_resolved"]
         end_date = (row["end_date"] or "")[:10]
         unit = (row["threshold_unit"] or "").upper()
+        slug = (row["market_slug"] or "").lower()
+        question = (row["market_question"] or "").lower()
     except Exception:
         return None
     if not city or not end_date or unit not in ("C", "F"):
@@ -2209,7 +2227,9 @@ def _observed_value_for(row, cities) -> Optional[float]:
     arch = fetch_open_meteo_archive(station["lat"], station["lon"], end_date)
     if not arch:
         return None
-    return arch.get("observed_max_f") if unit == "F" else arch.get("observed_max_c")
+    is_low = slug.startswith("lowest") or "lowest temperature" in question
+    key = ("observed_min_" if is_low else "observed_max_") + unit.lower()
+    return arch.get(key)
 
 
 def _decide_final_outcome(prices: list, gamma_closed: bool) -> Optional[str]:

@@ -71,7 +71,12 @@ def _observed_value_for(row: dict) -> tuple:
     arch = weh.fetch_open_meteo_archive(station["lat"], station["lon"], end_date)
     if not arch:
         return None, "archive_unavailable"
-    val = arch.get("observed_max_f") if unit == "F" else arch.get("observed_max_c")
+    # v13.4: lowest-temperature markets record the observed MIN, not the max.
+    slug = (row.get("market_slug") or "").lower()
+    question = (row.get("market_question") or "").lower()
+    is_low = slug.startswith("lowest") or "lowest temperature" in question
+    key = ("observed_min_" if is_low else "observed_max_") + unit.lower()
+    val = arch.get(key)
     if val is None:
         return None, "archive_no_value"
     return float(val), "open-meteo-archive"
