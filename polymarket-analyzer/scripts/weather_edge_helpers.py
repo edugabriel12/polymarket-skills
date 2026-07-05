@@ -173,15 +173,21 @@ def fetch_open_meteo_ensemble(lat: float, lon: float,
                                 target_date,  # date or YYYY-MM-DD string
                                 force_refresh: bool = False
                                 ) -> Optional[dict]:
-    """Pull ICON+GFS+ECMWF max temp (C) for `target_date` at (lat, lon).
+    """Pull ICON+GFS+ECMWF daily max AND min temp (C) for `target_date`
+    at (lat, lon).
 
     Returns:
       {"icon_max_c": 25.3, "gfs_max_c": 24.8, "ecmwf_max_c": 26.1,
-       "spread_c": 1.3, "agree": True}
+       "icon_min_c": 14.2, "gfs_min_c": 13.8, "ecmwf_min_c": 14.9,
+       "spread_c": 1.3, "spread_min_c": 0.9, "agree": True}
     or None on HTTP failure / malformed response.
 
-    `agree=True` when max-min spread <= 3C (article rule). Cached 6h
-    per (lat, lon, target_iso).
+    v13.4: the *_min_c keys feed lowest-temperature markets — before this
+    the ensemble only knew the daily max, so low markets were priced off
+    the wrong extreme. `spread_c`/`agree` remain max-based (legacy
+    consumers); `spread_min_c` is the min-members spread.
+    `agree=True` when max spread <= 3C (article rule). Cached 6h per
+    (lat, lon, target_iso).
     """
     target_iso = (target_date.isoformat()
                    if hasattr(target_date, "isoformat") else str(target_date))
@@ -213,35 +219,41 @@ def fetch_open_meteo_ensemble(lat: float, lon: float,
     except Exception:
         return None
 
-    def _max_of(model_key: str) -> Optional[float]:
+    def _extreme_of(model_key: str, fn) -> Optional[float]:
         series = hourly.get(f"temperature_2m_{model_key}")
         if not series:
             return None
         clean = [v for v in series if v is not None]
-        return max(clean) if clean else None
+        return fn(clean) if clean else None
 
-    icon_v = _max_of("icon_seamless")
-    gfs_v = _max_of("gfs_seamless")
-    ecmwf_v = _max_of("ecmwf_ifs025")
-    present = [v for v in (icon_v, gfs_v, ecmwf_v) if v is not None]
-    if not present:
+    vals = {}
+    for name, key in (("icon", "icon_seamless"), ("gfs", "gfs_seamless"),
+                      ("ecmwf", "ecmwf_ifs025")):
+        vals[f"{name}_max_c"] = _extreme_of(key, max)
+        vals[f"{name}_min_c"] = _extreme_of(key, min)
+
+    present_max = [v for k, v in vals.items() if k.endswith("_max_c") and v is not None]
+    present_min = [v for k, v in vals.items() if k.endswith("_min_c") and v is not None]
+    if not present_max:
         return None
 
-    spread_c = max(present) - min(present)
+    spread_c = max(present_max) - min(present_max)
+    spread_min_c = (max(present_min) - min(present_min)) if present_min else None
     result = {
-        "icon_max_c": icon_v,
-        "gfs_max_c": gfs_v,
-        "ecmwf_max_c": ecmwf_v,
+        **vals,
         "spread_c": round(spread_c, 2),
+        "spread_min_c": (round(spread_min_c, 2)
+                         if spread_min_c is not None else None),
         "agree": spread_c <= 3.0,
-        "n_models": len(present),
+        "n_models": len(present_max),
     }
     _OM_CACHE[cache_key] = (now, result)
     return result
 
 
 def compute_ensemble_calibration(om_data: Optional[dict],
-                                  threshold_unit: str
+                                  threshold_unit: str,
+                                  temp_kind: str = "high"
                                   ) -> Optional[dict]:
     """v13: NGR-style calibration of the Open-Meteo ICON+GFS+ECMWF ensemble
     into a (μ, σ) Gaussian predictive distribution, in `threshold_unit`.
@@ -254,20 +266,27 @@ def compute_ensemble_calibration(om_data: Optional[dict],
 
     Args:
         om_data: dict returned by fetch_open_meteo_ensemble() — has
-                 {icon_max_c, gfs_max_c, ecmwf_max_c, spread_c, n_models}
+                 {icon_max_c, ..., icon_min_c, ..., spread_c, n_models}
                  or None.
         threshold_unit: 'C' or 'F'. The returned mu/sigma are in this unit.
+        temp_kind: 'high' (daily max — default) or 'low' (daily min, for
+                 lowest-temperature markets). v13.4: before this param the
+                 calibration always used the max members, so low markets
+                 got μ = daily high — the min/max post-mortem bug.
 
     Returns:
         {"mu": float, "sigma": float, "n_models": int, "members": [...]}
         in `threshold_unit`. Returns None when om_data is missing or has
-        fewer than 2 present members (a single member can't yield σ).
+        fewer than 2 present members for the requested kind (a single
+        member can't yield σ; older cached om_data lacks *_min_c keys and
+        safely falls back to the legacy MAE path for low markets).
     """
     if not om_data:
         return None
+    suffix = "_min_c" if temp_kind == "low" else "_max_c"
     members_c = []
-    for key in ("icon_max_c", "gfs_max_c", "ecmwf_max_c"):
-        v = om_data.get(key)
+    for model in ("icon", "gfs", "ecmwf"):
+        v = om_data.get(f"{model}{suffix}")
         if v is not None:
             members_c.append(float(v))
     if len(members_c) < 2:
@@ -384,6 +403,14 @@ class MarketSpec:
     confidence: float
     raw_question: str
     threshold_value_high: Optional[float] = None  # for "X-Y°F" range markets
+    # v13.4 (2026-07-05): which daily extreme the market resolves on.
+    # "high" (default) = daily maximum; "low" = daily minimum ("lowest
+    # temperature in ..." markets). Before this field the WHOLE pipeline
+    # (ensemble μ/σ, forecast ref, proximity guard, observed_value) used the
+    # daily MAX even for lowest-temperature markets — e.g. Paris July-3 low
+    # market evaluated with μ=28°C (the high) when the forecast low was
+    # 15.9°C, fabricating huge fake edges. See 2026-07-05 post-mortem.
+    temp_kind: str = "high"
 
 
 CITY_LOOKUP_PATH = Path(__file__).parent.parent / "references" / "weather-cities.json"
@@ -739,6 +766,16 @@ def parse_market(question: str, end_date: Optional[str] = None,
     target_date = _parse_target_date(question, end_date)
     confidence = 1.0 if target_date else 0.6
 
+    # v13.4: does this market resolve on the daily MIN instead of the MAX?
+    # Question text is "Lowest temperature in <city> ..."; the slug form
+    # ("lowest-temperature-in-...") is sometimes appended to the question,
+    # so normalize hyphens before matching.
+    q_norm = question.lower().replace("-", " ")
+    temp_kind = ("low" if ("lowest temperature" in q_norm
+                            or "minimum temperature" in q_norm
+                            or "low temperature" in q_norm)
+                 else "high")
+
     m = _TEMP_RE.search(question)
     if m:
         unit = m.group("unit")[0].upper()
@@ -751,6 +788,7 @@ def parse_market(question: str, end_date: Optional[str] = None,
             target_date=target_date,
             confidence=confidence,
             raw_question=question,
+            temp_kind=temp_kind,
         )
 
     # Range: "65-69°F" / "between 65 and 69°F" — try ALL matches and accept
@@ -772,7 +810,7 @@ def parse_market(question: str, end_date: Optional[str] = None,
                 city=city, threshold_value=low, threshold_value_high=high,
                 threshold_unit=unit, metric="temp", comparison="range",
                 target_date=target_date, confidence=confidence,
-                raw_question=question,
+                raw_question=question, temp_kind=temp_kind,
             )
 
     # "X°F or higher"
@@ -783,7 +821,7 @@ def parse_market(question: str, end_date: Optional[str] = None,
             city=city, threshold_value=float(m.group("val")),
             threshold_unit=unit, metric="temp", comparison="at_least",
             target_date=target_date, confidence=confidence,
-            raw_question=question,
+            raw_question=question, temp_kind=temp_kind,
         )
 
     # "X°F or lower"
@@ -794,7 +832,7 @@ def parse_market(question: str, end_date: Optional[str] = None,
             city=city, threshold_value=float(m.group("val")),
             threshold_unit=unit, metric="temp", comparison="at_most",
             target_date=target_date, confidence=confidence,
-            raw_question=question,
+            raw_question=question, temp_kind=temp_kind,
         )
 
     # Bare single-value bracket: "be 17°C on May 10" → 1-degree range [v, v+1)
@@ -810,7 +848,7 @@ def parse_market(question: str, end_date: Optional[str] = None,
             city=city, threshold_value=val, threshold_value_high=val + 1.0,
             threshold_unit=unit, metric="temp", comparison="range",
             target_date=target_date, confidence=confidence * 0.95,
-            raw_question=question,
+            raw_question=question, temp_kind=temp_kind,
         )
 
     m = _PRECIP_RE.search(question)
@@ -1006,11 +1044,14 @@ def _forecast_probability_raw(spec: MarketSpec, forecast: dict,
     if spec.metric == "temp":
         # v13: prefer the ensemble-mean μ when provided (Open-Meteo
         # ICON+GFS+ECMWF). Falls back to the OpenWeather single-source
-        # temp_high reference only when no ensemble was available.
+        # reference only when no ensemble was available.
+        # v13.4: the reference is the extreme the market resolves on —
+        # temp_low_* for lowest-temperature markets, temp_high_* otherwise.
         if mu_override is not None:
             ref = float(mu_override)
         else:
-            ref = day.get(f"temp_high_{spec.threshold_unit.lower()}")
+            kind = "low" if getattr(spec, "temp_kind", "high") == "low" else "high"
+            ref = day.get(f"temp_{kind}_{spec.threshold_unit.lower()}")
             if ref is None:
                 return None
         # v8: per-city systematic bias correction. Added to the forecast
@@ -1057,9 +1098,13 @@ def _forecast_probability_raw(spec: MarketSpec, forecast: dict,
 
 
 def forecast_ref_value(spec: MarketSpec, forecast: dict) -> Optional[float]:
-    """Return the scalar forecast reference value (high temp) for a temp
-    market's target date, in the market's threshold_unit. Mirrors the
-    date-matching + temp_high extraction used by _forecast_probability_raw.
+    """Return the scalar forecast reference value for a temp market's
+    target date, in the market's threshold_unit — the daily HIGH for
+    highest-temperature markets, the daily LOW for lowest-temperature
+    markets (v13.4; before, this always returned the high, which silenced
+    the proximity guard and inflated the auto-route distance on low
+    markets). Mirrors the date-matching + extraction used by
+    _forecast_probability_raw.
 
     Used by the range_cross cashout trigger and the judge's threshold-
     proximity override, which need the raw forecast value (not the
@@ -1082,7 +1127,8 @@ def forecast_ref_value(spec: MarketSpec, forecast: dict) -> Optional[float]:
                 break
     if not day:
         return None
-    ref = day.get(f"temp_high_{spec.threshold_unit.lower()}")
+    kind = "low" if getattr(spec, "temp_kind", "high") == "low" else "high"
+    ref = day.get(f"temp_{kind}_{spec.threshold_unit.lower()}")
     return float(ref) if ref is not None else None
 
 
@@ -2010,5 +2056,67 @@ if __name__ == "__main__":
         f"K8: stake sum must = total ({central_stake + below_stake})"
     print(f"Test K8 PASS: 2-bin YES+NO splits C=${central_stake:.2f} / "
           f"B=${below_stake:.2f} (sum=${central_stake+below_stake:.2f})")
+
+    # ------------------------------------------------------------------
+    # v13.4: min/max (temp_kind) tests — lowest-temperature markets must
+    # be priced/guarded on the daily MIN, not the MAX.
+    # ------------------------------------------------------------------
+    _cities = load_cities()
+
+    # M1: parser detecta lowest → temp_kind="low" (formato real das questions)
+    s = parse_market("Will the lowest temperature in Paris be 14°C on July 3?",
+                     "2026-07-03", _cities)
+    assert s is not None and s.temp_kind == "low", s
+    s2 = parse_market("Will the highest temperature in Paris be 29°C on July 3?",
+                      "2026-07-03", _cities)
+    assert s2 is not None and s2.temp_kind == "high", s2
+    # forma slug-appended (discovery às vezes anexa o slug à question)
+    s3 = parse_market("Will the temperature be 14°C on July 3? "
+                      "lowest-temperature-in-paris-on-july-3-2026-14c",
+                      "2026-07-03", _cities)
+    assert s3 is not None and s3.temp_kind == "low", s3
+    print("Test M1 PASS: parse temp_kind low/high (question + slug-appended)")
+
+    # M2: forecast_ref_value usa temp_low_* para mercado de mínima
+    fc = {"daily_forecast": [{"date": "2026-07-03",
+                               "temp_high_c": 29.0, "temp_low_c": 15.9,
+                               "temp_high_f": 84.3, "temp_low_f": 60.6}]}
+    assert forecast_ref_value(s, fc) == 15.9, forecast_ref_value(s, fc)
+    assert forecast_ref_value(s2, fc) == 29.0
+    print("Test M2 PASS: forecast_ref_value low=15.9 / high=29.0")
+
+    # M3: probabilidade raw do bin [14,15) com low 15.9 é MUITO maior do
+    # que a fabricada com high 29.0 (o bug dava P≈0 → NO com edge falso)
+    p_low = _forecast_probability_raw(s, fc, mae_override=1.5)
+    z_bug = (29.0 - 14.0) / 1.5  # o que o bug computava
+    from math import erf as _erf
+    assert p_low is not None and p_low > 0.05, f"P com low deveria ser material: {p_low}"
+    print(f"Test M3 PASS: P(bin) com mínima = {p_low:.3f} (bug dava ~0)")
+
+    # M4: compute_ensemble_calibration escolhe membros min/max por temp_kind
+    om = {"icon_max_c": 28.1, "gfs_max_c": 28.9, "ecmwf_max_c": 27.1,
+          "icon_min_c": 15.4, "gfs_min_c": 16.1, "ecmwf_min_c": 15.8,
+          "spread_c": 1.8, "spread_min_c": 0.7, "n_models": 3}
+    cal_hi = compute_ensemble_calibration(om, "C", temp_kind="high")
+    cal_lo = compute_ensemble_calibration(om, "C", temp_kind="low")
+    assert 27.0 < cal_hi["mu"] < 29.0, cal_hi
+    assert 15.0 < cal_lo["mu"] < 16.5, cal_lo
+    print(f"Test M4 PASS: ensemble μ high={cal_hi['mu']} / low={cal_lo['mu']}")
+
+    # M5: om_data antigo (sem *_min_c, cache velho) → low market cai no
+    # fallback MAE em vez de usar a máxima silenciosamente
+    om_old = {"icon_max_c": 28.1, "gfs_max_c": 28.9, "ecmwf_max_c": 27.1,
+              "spread_c": 1.8, "n_models": 3}
+    assert compute_ensemble_calibration(om_old, "C", temp_kind="low") is None
+    assert compute_ensemble_calibration(om_old, "C", temp_kind="high") is not None
+    print("Test M5 PASS: om_data legado sem mins → low usa fallback (None)")
+
+    # M6: default retrocompatível — spec antigo sem temp_kind se comporta
+    # como high (dataclass default)
+    assert MarketSpec(city="X", threshold_value=20.0, threshold_unit="C",
+                      metric="temp", comparison="range",
+                      target_date=date(2026, 7, 3), confidence=1.0,
+                      raw_question="q").temp_kind == "high"
+    print("Test M6 PASS: temp_kind default = high (retrocompat)")
 
     print("\nAll helper tests PASS")
