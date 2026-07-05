@@ -27,7 +27,7 @@ import deps  # noqa: E402
 import poller  # noqa: E402
 import results as res  # noqa: E402
 
-COPY_POLL_SEC = int(os.environ.get("COPY_POLL_SEC", "60"))
+COPY_POLL_SEC = int(os.environ.get("COPY_POLL_SEC", "15"))
 AUTO_POLL = os.environ.get("AUTO_POLL", "1") not in ("0", "", "false", "False")
 
 app = FastAPI(title="Polymarket Copy-Trader API", version="1.0.0")

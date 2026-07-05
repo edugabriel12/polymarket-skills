@@ -62,11 +62,12 @@ cd polymarket-copy-trader
 .\iniciar.ps1                       # first run creates the venv + npm install
 .\iniciar.ps1 -Reset                # also reset the paper portfolio to $10,000
 .\iniciar.ps1 -WeatherOnly:$false   # copy all markets, not just weather
+.\iniciar.ps1 -PollSeconds 5        # check saved wallets every 5s instead of 15s
 ```
 
 `iniciar.ps1` (same as `dev.ps1`) launches the backend (`COPY_WEATHER_ONLY=1`,
-`COPY_DEBUG=1`) and the frontend each in their own PowerShell window. If scripts
-are blocked, allow them for the session first:
+`COPY_DEBUG=1`, `COPY_POLL_SEC=15`) and the frontend each in their own PowerShell
+window. If scripts are blocked, allow them for the session first:
 `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`.
 
 Or separately:
@@ -86,7 +87,7 @@ cd frontend && npm install && npm run dev
 | Var | Default | Purpose |
 |---|---|---|
 | `COPYTRADE_DB` | `~/.polymarket-copy-trader/copytrade.db` | SQLite path |
-| `COPY_POLL_SEC` | `60` | Background poll interval (seconds) |
+| `COPY_POLL_SEC` | `15` | Background poll interval (seconds). Lower (e.g. `5`) to capture new bets faster; a manual check is also always available via `POST /api/poll`. |
 | `AUTO_POLL` | `1` | Set `0` to disable the background loop (poll via `POST /api/poll`) |
 | `COPY_DEBUG` | `1` | Detailed per-operation debug logs to stderr. Set `0` to silence. |
 | `COPY_WEATHER_ONLY` | `1` | Copy only weather markets. Set `0` to copy all markets. |
