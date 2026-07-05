@@ -94,8 +94,14 @@ def get_ladder_kpis(days: int = 7) -> dict:
 def get_open_ladder_groups() -> list[dict]:
     """List currently-open ladder groups with per-leg breakdown.
 
-    A group is "open" when at least one of its legs is EXECUTED and
-    has no cashout row yet.
+    A group is "open" when at least one of its legs is EXECUTED (or
+    FAST_PATH) and has no cashout row AND no resolution row yet.
+
+    v13.7 (2026-07-05): legs settled via `resolutions` (held to expiry,
+    payout_per_share) now count as closed — before, only cashouts closed a
+    leg, so resolution-settled groups (e.g. Los Angeles 2/jul) stayed
+    "open" forever, inflating the "Open groups now" KPI and total stake.
+    Mirrors query_open_positions (weather_edge_db.py).
     """
     try:
         conn = _ro_conn(S.WEATHER_EDGE_DB)
@@ -117,8 +123,11 @@ def get_open_ladder_groups() -> list[dict]:
                    c.cashout_id
             FROM entries e
             LEFT JOIN cashouts c ON c.entry_id = e.entry_id
+            LEFT JOIN resolutions r ON r.entry_id = e.entry_id
             WHERE e.ladder_group_id IS NOT NULL
-              AND e.status = 'EXECUTED' AND c.cashout_id IS NULL
+              AND e.status IN ('EXECUTED', 'FAST_PATH')
+              AND c.cashout_id IS NULL
+              AND r.resolution_id IS NULL
             ORDER BY e.ladder_group_id, e.ladder_position
         """).fetchall()
 
@@ -245,8 +254,17 @@ def get_atomic_trail(entry_id: int, max_events: int = 200) -> dict:
 
 
 def get_resolved_ladder_history(limit: int = 50) -> list[dict]:
-    """Closed ladder groups (all legs have a cashout row) with realized
-    P&L summed across legs. Most recent groups first.
+    """Settled ladder groups with realized P&L summed across settled legs.
+    Most recent groups first.
+
+    v13.7 (2026-07-05): legs settled via `resolutions` now count — before,
+    the inner JOIN on cashouts meant resolution-settled ladders never
+    reached the history and their payout P&L was ignored. Per-leg
+    precedence mirrors the v13.6 Win Rate by City semantics: cashout
+    (realized P&L governs; covers legs with cashout AND resolution without
+    double count) → resolution ((payout - entry) * shares). A group shows
+    here once it has >= 1 settled leg (partially-settled groups appear in
+    both Open and history — pre-existing behavior for cashouts).
     """
     try:
         conn = _ro_conn(S.WEATHER_EDGE_DB)
@@ -258,8 +276,8 @@ def get_resolved_ladder_history(limit: int = 50) -> list[dict]:
         except Exception:
             return []
 
-        # Aggregate by group: sum P&L, count legs, fetch a representative
-        # event metadata (use the central leg).
+        # Aggregate by group over SETTLED legs only: sum P&L (cashout
+        # precedence, else resolution payout), count legs, latest event ts.
         rows = conn.execute("""
             SELECT e.ladder_group_id,
                    e.ladder_event_slug,
@@ -267,13 +285,18 @@ def get_resolved_ladder_history(limit: int = 50) -> list[dict]:
                    e.end_date,
                    COUNT(*) n_legs,
                    SUM(e.size_usd) total_stake,
-                   SUM(c.realized_pnl_usd) total_pnl,
-                   MAX(c.ts) last_cashout_ts,
-                   MAX(c.reason) reason
+                   SUM(COALESCE(c.realized_pnl_usd,
+                                (r.payout_per_share - e.entry_price)
+                                  * e.size_shares)) total_pnl,
+                   MAX(COALESCE(c.ts, r.ts_resolved)) last_cashout_ts,
+                   MAX(COALESCE(c.reason,
+                                'resolution:' || r.final_outcome)) reason
             FROM entries e
-            JOIN cashouts c ON c.entry_id = e.entry_id
+            LEFT JOIN cashouts c ON c.entry_id = e.entry_id
+            LEFT JOIN resolutions r ON r.entry_id = e.entry_id
             WHERE e.ladder_group_id IS NOT NULL
-              AND e.status = 'EXECUTED'
+              AND e.status IN ('EXECUTED', 'FAST_PATH')
+              AND (c.cashout_id IS NOT NULL OR r.resolution_id IS NOT NULL)
             GROUP BY e.ladder_group_id
             HAVING COUNT(*) > 0
             ORDER BY last_cashout_ts DESC
@@ -300,3 +323,83 @@ def get_resolved_ladder_history(limit: int = 50) -> list[dict]:
         return out
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Inline tests (v13.7) — open/closed classification counts resolutions
+# Run: python -m dashboard.services.ladders
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import tempfile
+
+    tmp = Path(tempfile.mkdtemp()) / "ladders_test.db"
+    conn = sqlite3.connect(tmp)
+    conn.executescript("""
+        CREATE TABLE entries (entry_id INTEGER PRIMARY KEY, ts TEXT,
+            ladder_group_id TEXT, ladder_position TEXT,
+            ladder_event_slug TEXT, market_slug TEXT, market_question TEXT,
+            city_resolved TEXT, side TEXT, entry_price REAL, size_usd REAL,
+            size_shares REAL, threshold_value REAL, threshold_unit TEXT,
+            end_date TEXT, ladder_stake_usd REAL, status TEXT);
+        CREATE TABLE cashouts (cashout_id INTEGER PRIMARY KEY,
+            entry_id INTEGER, ts TEXT, realized_pnl_usd REAL, reason TEXT);
+        CREATE TABLE resolutions (resolution_id INTEGER PRIMARY KEY,
+            entry_id INTEGER, ts_resolved TEXT, final_outcome TEXT,
+            payout_per_share REAL);
+    """)
+
+    def leg(eid, gid, pos, price, shares, status='EXECUTED', city='X'):
+        conn.execute(
+            "INSERT INTO entries VALUES (?, '2026-07-01T00:00:00', ?, ?, "
+            "'ev-'||?, 's'||?, 'q', ?, 'NO', ?, ?, ?, 20.0, 'C', "
+            "'2026-07-02', ?, ?)",
+            (eid, gid, pos, gid, eid, city, price, price * shares, shares,
+             price * shares, status))
+
+    # Grupo A: 2 legs abertos (sem cashout/resolução) → OPEN, fora do histórico
+    leg(1, 'gA', 'central', 0.50, 100, city='Aberta')
+    leg(2, 'gA', 'below', 0.60, 50, city='Aberta')
+
+    # Grupo B (caso LA): todos os legs resolvidos, sem cashout → FECHADO,
+    # no histórico com P&L de payout. pnl = (1-0.5)*100 + (0-0.6)*50 = 50-30 = +20
+    leg(3, 'gB', 'central', 0.50, 100, city='Los Angeles')
+    leg(4, 'gB', 'below', 0.60, 50, status='FAST_PATH', city='Los Angeles')
+    conn.execute("INSERT INTO resolutions VALUES (1, 3, '2026-07-05T02:12:00', 'NO', 1.0)")
+    conn.execute("INSERT INTO resolutions VALUES (2, 4, '2026-07-05T02:12:00', 'YES', 0.0)")
+
+    # Grupo C: 1 leg com cashout (+7) + 1 leg aberto → em OPEN (leg restante)
+    # e no histórico (P&L parcial +7, precedência do cashout mesmo com resolução)
+    leg(5, 'gC', 'central', 0.40, 50, city='Parcial')
+    leg(6, 'gC', 'below', 0.55, 50, city='Parcial')
+    conn.execute("INSERT INTO cashouts VALUES (1, 5, '2026-07-03T10:00:00', 7.0, 'convergence: x')")
+    conn.execute("INSERT INTO resolutions VALUES (3, 5, '2026-07-05T02:12:00', 'NO', 1.0)")
+    conn.commit()
+    conn.close()
+
+    S.WEATHER_EDGE_DB = tmp  # aponta os services para o DB de teste
+
+    open_groups = get_open_ladder_groups()
+    gids = {g["ladder_group_id"] for g in open_groups}
+    assert gids == {"gA", "gC"}, gids
+    print("Test 1 PASS: open = {gA, gC} — gB (resolvido) saiu de Open")
+
+    ga = next(g for g in open_groups if g["ladder_group_id"] == "gA")
+    gc = next(g for g in open_groups if g["ladder_group_id"] == "gC")
+    assert ga["n_legs"] == 2 and gc["n_legs"] == 1, (ga["n_legs"], gc["n_legs"])
+    print("Test 2 PASS: gA com 2 legs abertos; gC só com o leg não liquidado")
+
+    hist = get_resolved_ladder_history()
+    h = {r["ladder_group_id"]: r for r in hist}
+    assert set(h) == {"gB", "gC"}, set(h)
+    assert abs(h["gB"]["total_pnl_usd"] - 20.0) < 1e-6, h["gB"]
+    assert h["gB"]["reason"] == "resolution", h["gB"]
+    assert h["gB"]["won"] is True
+    assert h["gB"]["n_legs"] == 2  # inclui o leg FAST_PATH
+    print(f"Test 3 PASS: gB no histórico via resolução — pnl ${h['gB']['total_pnl_usd']} (FAST_PATH contado)")
+
+    assert abs(h["gC"]["total_pnl_usd"] - 7.0) < 1e-6, h["gC"]  # cashout precede resolução
+    assert h["gC"]["reason"] == "convergence", h["gC"]
+    print(f"Test 4 PASS: gC histórico parcial — pnl ${h['gC']['total_pnl_usd']} (precedência do cashout, sem dupla contagem)")
+
+    print("\nAll ladders tests PASS (4/4)")
