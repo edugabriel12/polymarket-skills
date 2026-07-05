@@ -36,7 +36,8 @@ def get_all_analytics(days: int = 14) -> dict:
     since = since_iso(days)
     if not S.WEATHER_EDGE_DB.exists():
         return {"buckets": {}, "judge": {}, "triggers": {},
-                "cities": {}, "counterfactual_series": [],
+                "cities": {}, "cities_sorted": [],
+                "counterfactual_series": [],
                 "since_iso": since, "days": days}
     conn = _ro_conn(S.WEATHER_EDGE_DB)
     try:
@@ -48,9 +49,13 @@ def get_all_analytics(days: int = 14) -> dict:
         triggers = aggregate_cashout_triggers(conn, since)
         cities = _city_performance(conn, since)
         cf_series = _counterfactual_series(conn, since)
+        # v13.6: Win Rate by City renders as a table — pre-sort by sample
+        # size desc so the template stays dumb.
+        cities_sorted = sorted(cities.items(), key=lambda kv: -kv[1]["n"])
         return {
             "buckets": buckets, "judge": judge, "triggers": triggers,
-            "cities": cities, "counterfactual_series": cf_series,
+            "cities": cities, "cities_sorted": cities_sorted,
+            "counterfactual_series": cf_series,
             "since_iso": since, "days": days,
         }
     finally:

@@ -1,11 +1,8 @@
-{# Performance tab body — 4 charts + 3 tables. Expects `data`, `charts`, `days`. #}
+{# Performance tab body — 3 charts + 4 tables. Expects `data`, `charts`, `days`. #}
 
 <section class="chart-grid">
   <div class="card chart-card">
     {{ charts.pnl_by_trigger(data.triggers)|safe }}
-  </div>
-  <div class="card chart-card">
-    {{ charts.win_rate_by_city(data.cities)|safe }}
   </div>
   <div class="card chart-card">
     {{ charts.judge_calibration(data.judge)|safe }}
@@ -13,6 +10,42 @@
   <div class="card chart-card">
     {{ charts.counterfactual_cumulative(data.counterfactual_series)|safe }}
   </div>
+</section>
+
+<section class="card">
+  <h2>Win Rate by City</h2>
+  <p class="muted small">Todas as apostas liquidadas — cashouts e resoluções.
+    Win rate = wins / (wins + losses); apostas abertas ou VOID contam só em N.</p>
+  {% if not data.cities_sorted %}
+    <div class="muted">No settled positions in this window.</div>
+  {% else %}
+  <div class="table-filter">
+    <input type="text" data-filter-target="city-winrate-table"
+           placeholder="Filter by city…">
+    <span class="filter-count" id="city-winrate-table-filter-count"></span>
+  </div>
+  <table class="data-table" id="city-winrate-table">
+    <thead>
+      <tr><th>City</th><th>N</th><th>Wins</th><th>Losses</th>
+          <th>Win rate</th><th>P&amp;L ($)</th></tr>
+    </thead>
+    <tbody>
+      {% for city, v in data.cities_sorted %}
+      <tr>
+        <td>{{ city }}</td>
+        <td class="mono">{{ v.n }}</td>
+        <td class="mono">{{ v.wins }}</td>
+        <td class="mono">{{ v.losses }}</td>
+        <td class="mono {% if v.win_rate is not none %}{% if v.win_rate >= 0.5 %}up{% else %}down{% endif %}{% endif %}">
+          {%- if v.win_rate is not none %}{{ "%.0f"|format(v.win_rate * 100) }}%{% else %}—{% endif -%}
+        </td>
+        <td class="mono {% if (v.total_pnl_usd or 0) > 0 %}up{% elif (v.total_pnl_usd or 0) < 0 %}down{% endif %}">
+          ${{ "%.2f"|format(v.total_pnl_usd or 0) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
 </section>
 
 <section class="card">
