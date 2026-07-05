@@ -2,7 +2,18 @@
 {% block content %}
 
 <section class="card">
-  <h2>Open positions</h2>
+  <div class="positions-header">
+    <h2>Open positions</h2>
+    <button class="btn" id="settle-btn"
+            hx-post="/api/positions/settle"
+            hx-target="#positions-full"
+            hx-swap="innerHTML"
+            hx-disabled-elt="this"
+            title="Liquida as apostas com mercado já encerrado (resolution sweep sob demanda) e recarrega a tabela">
+      <span class="settle-label">🔄 Atualizar liquidações</span>
+      <span class="settle-loading">⏳ Liquidando…</span>
+    </button>
+  </div>
   <p class="muted small">Click a position row to see its replay (judge verdict, forecast, history, counterfactual).</p>
   <div id="positions-full"
        hx-get="/api/positions?refresh=1"

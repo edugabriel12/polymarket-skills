@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -590,6 +591,54 @@ def _humanize_duration(seconds: int) -> str:
         return f"{hours}h{m}m"
     days, h = divmod(hours, 24)
     return f"{days}d{h}h"
+
+
+# ---------------------------------------------------------------------------
+# On-demand settlement sweep (Positions tab "Atualizar liquidações" button)
+# ---------------------------------------------------------------------------
+
+# Prevents a double-click (or two browser tabs) from running two concurrent
+# sweeps. The sweep itself is idempotent — query_unresolved_past_end excludes
+# already-resolved entries — so the lock is about wasted API calls, not
+# correctness.
+_SETTLE_LOCK = threading.Lock()
+
+
+def run_settlement_sweep() -> dict:
+    """Run the bot's resolution sweep on demand.
+
+    Settlement normally happens once per bot cycle (~hourly) inside the
+    daemon; if the bot is down when markets end, positions stay "open" in
+    the dashboard indefinitely. This lets the operator trigger the exact
+    same sweep from the Positions tab.
+
+    Reuses weather_edge_bot.run_resolution_sweep() verbatim (single source
+    of truth): fetches outcomePrices from Gamma, writes `resolutions`,
+    closes the paper-portfolio position at payout, and logs to the shared
+    jsonl (so the sweep shows up in the Events tab).
+
+    Returns {"ok": True, "pending": N, "resolved": N, "remaining": N}
+    or {"ok": False, "error": str}. Never raises.
+    """
+    if not _SETTLE_LOCK.acquire(blocking=False):
+        return {"ok": False, "error": "Liquidação já em andamento — aguarde."}
+    try:
+        # Lazy imports: weather_edge_bot is a heavy module (requests, full
+        # helper stack) and is only needed here, never at dashboard startup.
+        import weather_edge_bot as bot  # noqa: E402
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with wdb.connect() as conn:
+            pending = len(wdb.query_unresolved_past_end(conn, now_iso))
+        if pending == 0:
+            return {"ok": True, "pending": 0, "resolved": 0, "remaining": 0}
+        resolved = bot.run_resolution_sweep()
+        return {"ok": True, "pending": pending, "resolved": resolved,
+                "remaining": max(0, pending - resolved)}
+    except Exception as e:  # surface as a friendly banner, never a 500
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        _SETTLE_LOCK.release()
 
 
 # ---------------------------------------------------------------------------
