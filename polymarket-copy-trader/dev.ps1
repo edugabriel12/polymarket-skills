@@ -15,15 +15,23 @@
     Reset the paper portfolio to $10,000 (clears entries/positions) once the
     backend is up, then continues running.
 
+.PARAMETER PollSeconds
+    How often (seconds) the background loop checks saved wallets for new
+    trades. Default 15. Lower it (e.g. 5) to capture new bets faster; keep it
+    a few seconds at minimum so the public API isn't hammered.
+
 .EXAMPLE
     .\dev.ps1
 .EXAMPLE
     .\dev.ps1 -WeatherOnly:$false -Reset
+.EXAMPLE
+    .\dev.ps1 -PollSeconds 5
 #>
 [CmdletBinding()]
 param(
     [bool]$WeatherOnly = $true,
-    [switch]$Reset
+    [switch]$Reset,
+    [int]$PollSeconds = 15
 )
 
 $ErrorActionPreference = "Stop"
@@ -71,7 +79,8 @@ $backendCmd = @"
 Set-Location '$backend'
 `$env:COPY_WEATHER_ONLY = '$weatherFlag'
 `$env:COPY_DEBUG = '1'
-Write-Host 'Backend -> http://localhost:8002  (COPY_WEATHER_ONLY=$weatherFlag)' -ForegroundColor Green
+`$env:COPY_POLL_SEC = '$PollSeconds'
+Write-Host 'Backend -> http://localhost:8002  (COPY_WEATHER_ONLY=$weatherFlag, COPY_POLL_SEC=$PollSeconds)' -ForegroundColor Green
 & '$venvPython' -m uvicorn app:app --port 8002 --reload
 "@
 Start-Process powershell -ArgumentList "-NoExit", "-Command", $backendCmd
