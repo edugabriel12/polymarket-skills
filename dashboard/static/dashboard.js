@@ -46,6 +46,14 @@
         showToast('Advisor job started — polling for results…', 'info');
       }
     }
+    // Settle expired positions on demand (Positions tab)
+    if (verb === 'post' && path === '/api/positions/settle') {
+      if (status >= 200 && status < 300) {
+        showToast('Liquidação concluída — tabela atualizada', 'success');
+      } else {
+        showToast('Falha na liquidação (HTTP ' + status + ')', 'error');
+      }
+    }
   });
 
   // Also expose response errors as toasts (HTMX swaps error responses too)

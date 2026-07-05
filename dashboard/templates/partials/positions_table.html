@@ -1,3 +1,16 @@
+{% if settle_result %}
+  {% if settle_result.ok %}
+    <div class="settle-banner ok">
+      ✅ {{ settle_result.resolved }} aposta(s) liquidada(s)
+      {%- if settle_result.pending == 0 %} — nenhuma aposta vencida pendente
+      {%- elif settle_result.remaining %} — {{ settle_result.remaining }} vencida(s)
+      ainda sem resolução na Polymarket (tente novamente mais tarde)
+      {%- endif %}
+    </div>
+  {% else %}
+    <div class="settle-banner err">⚠️ Falha na liquidação: {{ settle_result.error }}</div>
+  {% endif %}
+{% endif %}
 {% if not positions %}
   <div class="empty-state">
     <div class="empty-icon">○</div>

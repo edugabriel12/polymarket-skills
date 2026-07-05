@@ -766,3 +766,21 @@ footer {
 }
 .exit-kind-cashout    { background: rgba(59,130,246,0.15); color: #3b82f6; }
 .exit-kind-resolution { background: rgba(168,85,247,0.15); color: #a855f7; }
+
+/* Positions tab — "Atualizar liquidações" button + result banner */
+.positions-header {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; flex-wrap: wrap;
+}
+.positions-header h2 { margin: 0; }
+#settle-btn .settle-loading { display: none; }
+#settle-btn.htmx-request { opacity: 0.6; cursor: wait; }
+#settle-btn.htmx-request .settle-label { display: none; }
+#settle-btn.htmx-request .settle-loading { display: inline; }
+.settle-banner {
+  border: 1px solid var(--border); border-left-width: 4px;
+  border-radius: 6px; padding: 8px 12px; margin-bottom: 10px;
+  font-size: 13px;
+}
+.settle-banner.ok  { border-left-color: var(--up); }
+.settle-banner.err { border-left-color: var(--err); }

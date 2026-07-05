@@ -570,6 +570,22 @@ def api_positions(request: Request, top: int = 0, sort: str = "entry_id",
         {"positions": pos, "show_full": top == 0})
 
 
+@app.post("/api/positions/settle", response_class=HTMLResponse)
+def api_positions_settle(request: Request):
+    """Positions tab "Atualizar liquidações" button: run the bot's
+    resolution sweep on demand (settle expired bets without waiting for
+    the bot cycle), then return the refreshed positions table with a
+    result banner. Sync def → FastAPI threadpool, so the ~5-30s of
+    Gamma/Open-Meteo calls don't block the event loop.
+    """
+    result = positions.run_settlement_sweep()
+    pos = positions.get_open_positions(sort_by="entry_id",
+                                       refresh_prices=True)
+    return templates.TemplateResponse(
+        request, "partials/positions_table.html",
+        {"positions": pos, "show_full": True, "settle_result": result})
+
+
 @app.get("/api/cumulative-pnl-chart", response_class=HTMLResponse)
 def api_cum_pnl_chart(days: int = 30):
     series = analytics.get_cumulative_pnl_series(days=days)
