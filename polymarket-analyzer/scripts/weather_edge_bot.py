@@ -2212,6 +2212,37 @@ def _observed_value_for(row, cities) -> Optional[float]:
     return arch.get("observed_max_f") if unit == "F" else arch.get("observed_max_c")
 
 
+def _decide_final_outcome(prices: list, gamma_closed: bool) -> Optional[str]:
+    """Decide YES/NO/VOID from Gamma outcomePrices + the closed flag.
+
+    v13.3 (2026-07-05): the previous inline logic was
+        if gamma_closed or prices[0] >= 0.95: final = "YES"
+        elif gamma_closed or prices[1] >= 0.95: final = "NO"
+    — when Polymarket marks the market `closed`, the FIRST branch is always
+    true, so EVERY officially-closed market resolved as "YES" regardless of
+    prices. All 17 positions settled by the 2026-07-05 on-demand sweep were
+    recorded as losses, including NO bets the operator verifiably WON (e.g.
+    Paris July-3 14°C bracket resolved "No" on Polymarket). The daemon only
+    got outcomes right when it swept BEFORE Gamma flipped `closed` (deciding
+    purely by price). Correct order — prices first, `closed` only as the
+    VOID/not-settled discriminator (same logic force_resolution_sweep.py
+    already had):
+
+    Returns "YES" / "NO" / "VOID" (closed but no winner price — inconclusive)
+    or None (not closed and prices inconclusive — try next sweep).
+    YES is index 0, NO is index 1 (Polymarket convention). Threshold 0.95:
+    markets often settle at 0.97/0.03 before the official closed flag flips.
+    """
+    price_threshold = 0.95
+    if prices[0] >= price_threshold:
+        return "YES"
+    if prices[1] >= price_threshold:
+        return "NO"
+    if gamma_closed:
+        return "VOID"
+    return None  # not yet settled
+
+
 def run_resolution_sweep() -> int:
     """For each EXECUTED position past end_date, fetch outcomePrices and persist.
     On resolution, also close the paper-portfolio position at payout so the
@@ -2247,29 +2278,14 @@ def run_resolution_sweep() -> int:
                         "entry_id": row["entry_id"], "slug": slug,
                         "reason": "no_outcomes_or_prices"})
                     continue
-                # v9.9 (2026-05-24): the prior `prices[N] >= 0.99` threshold
-                # was too strict — Polymarket markets often settle with
-                # 0.97/0.03 final prices well before the official `closed`
-                # flag flips, and our sweep silently held positions open
-                # for hours after resolution. Accept either:
-                #   a) Polymarket marked `closed=True` (authoritative)
-                #   b) winning outcome price >= 0.95 (near-settled)
-                # YES is index 0, NO is index 1 (Polymarket convention).
+                # v13.3 (2026-07-05): outcome decision extracted to
+                # _decide_final_outcome. The v9.9 inline version had
+                # `gamma_closed OR price` in BOTH branches, so every
+                # officially-closed market resolved "YES" — see the
+                # post-mortem in _decide_final_outcome's docstring.
                 gamma_closed = bool(m.get("closed"))
-                price_threshold = 0.95
-                if gamma_closed or prices[0] >= price_threshold:
-                    final_outcome = "YES"
-                elif gamma_closed or prices[1] >= price_threshold:
-                    final_outcome = "NO"
-                else:
-                    final_outcome = "VOID"
-                # Re-check: if Gamma says closed but neither price clears
-                # 0.95, it's truly VOID/inconclusive.
-                if (final_outcome != "VOID"
-                        and prices[0] < price_threshold
-                        and prices[1] < price_threshold):
-                    final_outcome = "VOID"
-                if final_outcome == "VOID" and not gamma_closed:
+                final_outcome = _decide_final_outcome(prices, gamma_closed)
+                if final_outcome is None:
                     # Not yet resolved — try again next sweep cycle.
                     log_event("resolution_skipped", {
                         "entry_id": row["entry_id"], "slug": slug,
@@ -2905,11 +2921,50 @@ def _test_ladder_orphan_floor():
     print("\nAll ladder orphan-floor tests PASS (8/8)")
 
 
+# ---------------------------------------------------------------------------
+# Inline tests for _decide_final_outcome (v13.3 settlement-outcome fix)
+# Run: python weather_edge_bot.py --test-outcome
+# ---------------------------------------------------------------------------
+
+def _test_decide_outcome():
+    """Hermetic tests for the resolution outcome decision. The v9.9 bug made
+    every gamma_closed market resolve YES — these lock in the correct
+    behavior (Paris July-3 14°C case: closed, prices [0, 1] → NO)."""
+    # 1. THE bug case: closed market where NO won → must be NO, not YES
+    assert _decide_final_outcome([0.0, 1.0], gamma_closed=True) == "NO"
+    print("Test R1 PASS: closed + prices [0,1] → NO (era YES no bug v9.9)")
+
+    # 2. closed market where YES won
+    assert _decide_final_outcome([1.0, 0.0], gamma_closed=True) == "YES"
+    print("Test R2 PASS: closed + prices [1,0] → YES")
+
+    # 3. settled by price before official close (v9.9 motivation preserved)
+    assert _decide_final_outcome([0.03, 0.97], gamma_closed=False) == "NO"
+    assert _decide_final_outcome([0.97, 0.03], gamma_closed=False) == "YES"
+    print("Test R3 PASS: 0.97/0.03 antes do closed → decide por preço")
+
+    # 4. not closed, prices inconclusive → None (retry next sweep)
+    assert _decide_final_outcome([0.60, 0.40], gamma_closed=False) is None
+    print("Test R4 PASS: aberto + preços inconclusivos → None (retry)")
+
+    # 5. closed but no winner price → VOID
+    assert _decide_final_outcome([0.50, 0.50], gamma_closed=True) == "VOID"
+    print("Test R5 PASS: closed + 50/50 → VOID")
+
+    # 6. boundary: exactly at threshold counts as settled
+    assert _decide_final_outcome([0.95, 0.05], gamma_closed=False) == "YES"
+    print("Test R6 PASS: preço exatamente 0.95 → settled (>=)")
+
+    print("\nAll resolution-outcome tests PASS (6/6)")
+
+
 if __name__ == "__main__":
     import sys
     if "--test-atomic" in sys.argv:
         _test_atomic_execution()
     elif "--test-orphan" in sys.argv:
         _test_ladder_orphan_floor()
+    elif "--test-outcome" in sys.argv:
+        _test_decide_outcome()
     else:
         main()
