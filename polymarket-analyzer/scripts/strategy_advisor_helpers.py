@@ -134,9 +134,26 @@ def _extract_forecast_value(snap: dict, unit: str) -> Optional[float]:
 
 
 def _city_performance(conn, since_iso: str) -> dict:
+    """Win/loss/P&L per city over EVERY settled bet.
+
+    v13.6 (2026-07-05): resolution-settled bets now count. The old version
+    LEFT JOINed resolutions but its branch was a literal `pass` — only
+    cashout P&L fed wins/losses, so bets held to expiry (the majority)
+    inflated `n` while contributing nothing to win_rate.
+
+    Per-entry precedence:
+      1. cashout present  → win/loss by realized_pnl sign (also covers
+         entries with cashout AND resolution — the resolution close was
+         skipped for those, so no double count);
+      2. else resolution with final_outcome YES/NO → won when the outcome
+         matches the side bought (weather_edge_analyzer.py convention);
+         P&L = (payout_per_share - entry_price) * size_shares;
+      3. VOID / still open → counts in n, excluded from wins/losses.
+    """
     rows = conn.execute(
         "SELECT e.city_resolved, e.entry_id, e.parser_confidence, "
-        "       r.final_outcome, c.realized_pnl_usd "
+        "       r.final_outcome, c.realized_pnl_usd, "
+        "       e.side, e.entry_price, e.size_shares, r.payout_per_share "
         "FROM entries e "
         "LEFT JOIN resolutions r ON r.entry_id = e.entry_id "
         "LEFT JOIN cashouts c ON c.entry_id = e.entry_id "
@@ -156,17 +173,24 @@ def _city_performance(conn, since_iso: str) -> dict:
         if r[2] is not None:
             a["parser_conf_sum"] += float(r[2])
             a["parser_conf_n"] += 1
-        if r[3] == "YES" or r[3] == "NO":
-            # Won if outcome matches the side they bought
-            # Without side info here we approximate: any cashout pnl > 0 is win
-            pass
         if r[4] is not None:
+            # Cashout: realized P&L governs (precedence over resolution).
             pnl = float(r[4])
             a["pnl_usd"] += pnl
             if pnl > 0:
                 a["wins"] += 1
             elif pnl < 0:
                 a["losses"] += 1
+        elif r[3] in ("YES", "NO"):
+            # Resolution-settled: won when the outcome matches the side.
+            won = (r[3] == r[5])
+            if won:
+                a["wins"] += 1
+            else:
+                a["losses"] += 1
+            if r[8] is not None and r[6] is not None and r[7]:
+                a["pnl_usd"] += (float(r[8]) - float(r[6])) * float(r[7])
+        # VOID / still open: counted in n only.
 
     out = {}
     for city, v in agg.items():
@@ -1049,10 +1073,11 @@ if __name__ == "__main__":
     conn.executescript("""
         CREATE TABLE entries (entry_id INTEGER PRIMARY KEY, ts TEXT,
             parser_confidence REAL, city_resolved TEXT, threshold_unit TEXT,
-            forecast_snapshot_json TEXT, status TEXT, end_date TEXT);
+            forecast_snapshot_json TEXT, status TEXT, end_date TEXT,
+            side TEXT, entry_price REAL, size_shares REAL);
         CREATE TABLE resolutions (resolution_id INTEGER PRIMARY KEY,
             entry_id INTEGER, ts_resolved TEXT, final_outcome TEXT,
-            observed_value REAL);
+            observed_value REAL, payout_per_share REAL);
         CREATE TABLE cashouts (cashout_id INTEGER PRIMARY KEY,
             entry_id INTEGER, ts TEXT, realized_pnl_usd REAL);
         CREATE TABLE advisor_runs (run_id INTEGER PRIMARY KEY, ts TEXT,
@@ -1062,19 +1087,19 @@ if __name__ == "__main__":
     conn.execute(
         "INSERT INTO entries VALUES (1, '2026-05-01T00:00:00Z', 0.95, "
         "'São Paulo', 'C', '{\"daily\":[{\"temp\":{\"max\":24.0}}]}', "
-        "'EXECUTED', '2026-05-02T00:00:00Z')")
+        "'EXECUTED', '2026-05-02T00:00:00Z', 'YES', 0.5, 10)")
     conn.execute(
         "INSERT INTO entries VALUES (2, '2026-05-02T00:00:00Z', 0.80, "
         "'São Paulo', 'C', '{\"daily\":[{\"temp\":{\"max\":18.0}}]}', "
-        "'EXECUTED', '2026-05-03T00:00:00Z')")
+        "'EXECUTED', '2026-05-03T00:00:00Z', 'YES', 0.5, 10)")
     conn.execute(
         "INSERT INTO entries VALUES (3, '2026-05-03T00:00:00Z', 0.60, "
         "'São Paulo', 'C', '{\"daily\":[{\"temp\":{\"max\":22.0}}]}', "
-        "'EXECUTED', '2026-05-05T00:00:00Z')")
+        "'EXECUTED', '2026-05-05T00:00:00Z', 'YES', 0.5, 10)")
     conn.execute("INSERT INTO resolutions VALUES (1, 1, '2026-05-02T12:00:00Z', "
-                 "'YES', 23.0)")
+                 "'YES', 23.0, 1.0)")
     conn.execute("INSERT INTO resolutions VALUES (2, 2, '2026-05-03T12:00:00Z', "
-                 "'NO', 20.0)")
+                 "'NO', 20.0, 0.0)")
     conn.execute("INSERT INTO cashouts VALUES (1, 1, '2026-05-02T13:00:00Z', 5.0)")
     conn.execute("INSERT INTO cashouts VALUES (2, 2, '2026-05-03T13:00:00Z', -3.0)")
     conn.commit()
@@ -1093,6 +1118,35 @@ if __name__ == "__main__":
     print(f"Test 2 PASS: collect_extras — São Paulo {sp}, MAE_C "
           f"{extras['observed_mae_per_unit']['C']}")
 
+    # Test 2b (v13.6): _city_performance conta apostas liquidadas por
+    # RESOLUÇÃO (não só cashouts). Recife: 4 entradas —
+    #   #10 NO @0.60, resolução NO (payout 1.0)  → win,  pnl +20.00
+    #   #11 NO @0.40, resolução YES (payout 0.0) → loss, pnl -20.00
+    #   #12 YES, resolução VOID                  → só conta em n
+    #   #13 NO com cashout +7 E resolução NO     → precedência do cashout
+    #        (win +7, sem contagem dupla)
+    for eid, side, price, shares in ((10, 'NO', 0.60, 50.0),
+                                      (11, 'NO', 0.40, 50.0),
+                                      (12, 'YES', 0.30, 50.0),
+                                      (13, 'NO', 0.50, 50.0)):
+        conn.execute(
+            "INSERT INTO entries VALUES (?, '2026-05-01T00:00:00Z', 0.9, "
+            "'Recife', 'C', '{}', 'EXECUTED', '2026-05-02T00:00:00Z', ?, ?, ?)",
+            (eid, side, price, shares))
+    conn.execute("INSERT INTO resolutions VALUES (10, 10, '2026-05-02T12:00:00Z', 'NO', 25.0, 1.0)")
+    conn.execute("INSERT INTO resolutions VALUES (11, 11, '2026-05-02T12:00:00Z', 'YES', 25.0, 0.0)")
+    conn.execute("INSERT INTO resolutions VALUES (12, 12, '2026-05-02T12:00:00Z', 'VOID', NULL, 0.30)")
+    conn.execute("INSERT INTO resolutions VALUES (13, 13, '2026-05-02T12:00:00Z', 'NO', 25.0, 1.0)")
+    conn.execute("INSERT INTO cashouts VALUES (13, 13, '2026-05-02T11:00:00Z', 7.0)")
+    conn.commit()
+    rc = _city_performance(conn, "2026-04-01T00:00:00Z")["Recife"]
+    assert rc["n"] == 4, rc
+    assert rc["wins"] == 2 and rc["losses"] == 1, rc   # VOID fora de W/L
+    # pnl: +20 (res win) -20 (res loss) +7 (cashout) = +7.00
+    assert abs(rc["total_pnl_usd"] - 7.0) < 1e-6, rc
+    assert abs(rc["win_rate"] - 0.667) < 0.001, rc
+    print(f"Test 2b PASS: _city_performance conta resoluções — Recife {rc}")
+
     # has_new_data_since_last_run: no prior run → True
     assert has_new_data_since_last_run(conn) is True
     print("Test 3 PASS: has_new_data — True when no prior run")
@@ -1106,7 +1160,7 @@ if __name__ == "__main__":
     # Insert a new entry and verify True again
     conn.execute(
         "INSERT INTO entries VALUES (4, '2027-01-01T00:00:00Z', 0.95, 'X', 'C', "
-        "'{}', 'EXECUTED', '2027-01-02T00:00:00Z')")
+        "'{}', 'EXECUTED', '2027-01-02T00:00:00Z', 'YES', 0.5, 10)")
     conn.commit()
     assert has_new_data_since_last_run(conn) is True
     print("Test 5 PASS: has_new_data — True after new entry inserted")

@@ -55,31 +55,6 @@ def pnl_by_trigger(triggers: dict, div_id: str = "chart_pnl_trigger") -> str:
     return _to_html(data, layout, div_id)
 
 
-def win_rate_by_city(cities: dict, div_id: str = "chart_city_winrate") -> str:
-    """Bar chart — win rate per city, top 10 by sample size."""
-    if not cities:
-        return '<div class="empty-chart">No closed positions yet.</div>'
-    items = [(c, v) for c, v in cities.items() if v["n"] >= 2]
-    items.sort(key=lambda kv: kv[1]["n"], reverse=True)
-    items = items[:15]
-    if not items:
-        return '<div class="empty-chart">Not enough samples per city yet.</div>'
-    labels = [c for c, _ in items]
-    win_rates = [(v["win_rate"] or 0) * 100 for _, v in items]
-    n_samples = [v["n"] for _, v in items]
-    colors = ["#4ade80" if r >= 50 else "#f87171" for r in win_rates]
-    data = [{
-        "type": "bar", "x": labels, "y": win_rates,
-        "marker": {"color": colors},
-        "text": [f"{r:.0f}% (n={n})" for r, n in zip(win_rates, n_samples)],
-        "textposition": "auto",
-    }]
-    layout = {"title": "Win Rate by City (n ≥ 2)",
-              "yaxis": {"title": "Win rate %", "range": [0, 100]},
-              "xaxis": {"title": ""}}
-    return _to_html(data, layout, div_id)
-
-
 def judge_calibration(judge: dict,
                       div_id: str = "chart_judge_cal") -> str:
     """Scatter or bar showing judge_prob bucket vs realized win rate."""
@@ -199,7 +174,6 @@ if __name__ == "__main__":
     # Empty cases
     for fn, args in [
         (pnl_by_trigger, ({},)),
-        (win_rate_by_city, ({},)),
         (judge_calibration, ({},)),
         (counterfactual_cumulative, ([],)),
         (cumulative_pnl, ([],)),
@@ -219,13 +193,7 @@ if __name__ == "__main__":
     assert "profit_lock" in html and "Plotly.newPlot" in html
     print(f"Test 2 PASS: pnl_by_trigger renders Plotly call ({len(html)} chars)")
 
-    cities = {"Tokyo": {"n": 12, "win_rate": 0.75},
-              "Manhattan": {"n": 10, "win_rate": 0.20},
-              "SmallCity": {"n": 1, "win_rate": 1.0}}
-    html = win_rate_by_city(cities)
-    assert "Tokyo" in html and "Manhattan" in html
-    assert "SmallCity" not in html  # filtered by n>=2
-    print("Test 3 PASS: win_rate_by_city filters n<2")
+    # (v13.6: win_rate_by_city virou tabela no template — chart removido)
 
     judge = {"calibration": {
         "0.0-0.2": {"mean_judge_prob": 0.10, "actual_win_rate": 0.15, "n": 12},
