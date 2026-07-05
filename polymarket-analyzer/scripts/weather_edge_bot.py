@@ -1442,6 +1442,27 @@ def _execute_ladder_group_atomic(group_id: str, args, engine,
         target_usd = float(leg["ladder_stake_usd"] or sizing["max_usd"])
         target_usd = min(target_usd, float(sizing["max_usd"]))
 
+        # v13.5 (2026-07-05): honor the judge's ADJUST size cap — mirrors
+        # the single-entry path (see judge_size_cap below in
+        # execute_approved). The ladder path only clamped to the Kelly
+        # split, so an ADJUSTED leg executed at full Kelly size: Seoul #10
+        # (2026-07-01) had judge cap $15 but executed $29.32 and lost 2x
+        # what the judge authorized. The judge's conviction, not the Kelly
+        # split, governs exposure on ADJUSTED legs.
+        judge_size_cap = (leg["judge_adjusted_size_usd"]
+                          if status == "ADJUSTED" else None)
+        if judge_size_cap is not None and float(judge_size_cap) > 0:
+            capped = min(target_usd, float(judge_size_cap))
+            if capped < target_usd:
+                log_event("ladder_size_judge_capped", {
+                    "entry_id": entry_id,
+                    "ladder_group_id": group_id,
+                    "kelly_target_usd": round(target_usd, 2),
+                    "judge_size_cap_usd": float(judge_size_cap),
+                    "applied_target_usd": round(capped, 2),
+                })
+            target_usd = capped
+
         market_slug = leg["market_slug"]
         with db.connect() as conn2:
             cur_exp = db.current_market_exposure_usd(conn2, market_slug)
@@ -2942,6 +2963,98 @@ def _test_ladder_orphan_floor():
 
 
 # ---------------------------------------------------------------------------
+# Inline tests for the v13.5 ladder judge-size-cap fix
+# Run: python weather_edge_bot.py --test-ladder-cap
+# ---------------------------------------------------------------------------
+
+def _test_ladder_judge_cap():
+    """Hermetic E2E of _execute_ladder_group_atomic (dry-run) proving the
+    judge's ADJUST size cap is honored on ladder legs. Regression for Seoul
+    #10 (2026-07-01): judge ADJUST $15, ladder executed the $29.32 Kelly
+    split. Monkeypatches orderbook/slippage/exposure; uses a temp DB."""
+    import tempfile
+    import types
+    from pathlib import Path as P
+    import weather_edge_bot as mod
+
+    tmp = P(tempfile.mkdtemp()) / "ladder_cap_test.db"
+    db.init_db(tmp)
+    gid = "test-group-cap"
+    with db.connect(tmp) as conn:
+        ts = "2026-07-01T04:00:00+00:00"
+        # Leg 1: ADJUSTED com cap do judge $15, Kelly split $29.32 (o caso Seoul)
+        conn.execute(
+            "INSERT INTO entries (ts, market_slug, market_question, side, "
+            "status, ladder_group_id, ladder_position, entry_price, "
+            "ladder_stake_usd, forecast_prob_at_entry, token_id_yes, token_id_no) "
+            "VALUES (?, 's30c', 'q', 'NO', 'ADJUSTED', ?, 'central', 0.48, "
+            "29.3243, 0.8, 'tY1', 'tN1')", (ts, gid))
+        e1 = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "INSERT INTO judge_reviews (entry_id, ts, verdict, confidence, "
+            "judge_prob, bot_prob, rationale, adjusted_size_usd) "
+            "VALUES (?, ?, 'ADJUST', 0.6, 0.65, 0.8, '', 15.0)", (e1, ts))
+        # Leg 2: APPROVED sem cap — mantém o Kelly split
+        conn.execute(
+            "INSERT INTO entries (ts, market_slug, market_question, side, "
+            "status, ladder_group_id, ladder_position, entry_price, "
+            "ladder_stake_usd, forecast_prob_at_entry, token_id_yes, token_id_no) "
+            "VALUES (?, 's31c', 'q', 'NO', 'APPROVED', ?, 'below', 0.65, "
+            "20.6757, 0.9, 'tY2', 'tN2')", (ts, gid))
+        e2 = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+
+    saved = (mod.fetch_orderbook, mod.compute_max_size_for_slippage,
+             db.connect, db.current_market_exposure_usd)
+    try:
+        mod.fetch_orderbook = lambda tid: {"asks": [{"price": 0.48, "size": 500}]}
+        mod.compute_max_size_for_slippage = lambda book, side, max_slippage: {
+            "max_usd": 100.0, "max_shares": 200.0, "avg_fill": 0.48}
+        _orig_connect = saved[2]
+        db.connect = lambda path=None: _orig_connect(tmp)
+        db.current_market_exposure_usd = lambda conn, slug: 0.0
+
+        args = types.SimpleNamespace(
+            max_slippage=0.2, ladder_execute_min_leg_edge_pp=5.0,
+            execute_min_edge_pp=8.0, min_edge_pp=20.0,
+            max_market_exposure_usd=50.0, dry_run=True)
+        n = mod._execute_ladder_group_atomic(gid, args, engine=None,
+                                             default_fee_rate=0.0)
+        assert n == 2, f"esperava 2 pernas executadas, obtive {n}"
+
+        with db.connect() as conn:
+            s1 = conn.execute("SELECT size_usd FROM entries WHERE entry_id=?",
+                              (e1,)).fetchone()[0]
+            s2 = conn.execute("SELECT size_usd FROM entries WHERE entry_id=?",
+                              (e2,)).fetchone()[0]
+        assert abs(s1 - 15.0) < 1e-6, \
+            f"perna ADJUSTED deveria executar $15 (cap do judge), executou ${s1}"
+        print(f"Test L1 PASS: perna ADJUSTED capada em ${s1} (Kelly era $29.32)")
+        assert abs(s2 - 20.6757) < 1e-4, \
+            f"perna APPROVED deveria manter Kelly $20.68, executou ${s2}"
+        print(f"Test L2 PASS: perna APPROVED mantém Kelly ${s2:.2f} (sem cap)")
+
+        # L3: cap do judge abaixo do mínimo $10 → grupo inteiro aborta
+        with db.connect() as conn:
+            conn.execute("UPDATE judge_reviews SET adjusted_size_usd = 8.0 "
+                         "WHERE entry_id = ?", (e1,))
+            conn.execute("UPDATE entries SET status='ADJUSTED', size_usd=NULL "
+                         "WHERE entry_id = ?", (e1,))
+            conn.execute("UPDATE entries SET status='APPROVED', size_usd=NULL "
+                         "WHERE entry_id = ?", (e2,))
+            conn.commit()
+        n = mod._execute_ladder_group_atomic(gid, args, engine=None,
+                                             default_fee_rate=0.0)
+        assert n == 0, f"cap $8 < min $10 deveria abortar o grupo, obtive {n}"
+        print("Test L3 PASS: cap do judge < $10 → grupo aborta (size_below_min)")
+
+        print("\nAll ladder judge-cap tests PASS (3/3)")
+    finally:
+        (mod.fetch_orderbook, mod.compute_max_size_for_slippage,
+         db.connect, db.current_market_exposure_usd) = saved
+
+
+# ---------------------------------------------------------------------------
 # Inline tests for _decide_final_outcome (v13.3 settlement-outcome fix)
 # Run: python weather_edge_bot.py --test-outcome
 # ---------------------------------------------------------------------------
@@ -2986,5 +3099,7 @@ if __name__ == "__main__":
         _test_ladder_orphan_floor()
     elif "--test-outcome" in sys.argv:
         _test_decide_outcome()
+    elif "--test-ladder-cap" in sys.argv:
+        _test_ladder_judge_cap()
     else:
         main()
