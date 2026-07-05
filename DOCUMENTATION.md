@@ -11,7 +11,16 @@ Scanner ──→ Analyzer ──→ Strategy Advisor ──→ Paper Trader ─
 (find)      (evaluate)    (recommend)          (simulate)       (execute)
 ```
 
-Seis skills compõem o pipeline completo: descoberta de mercado → detecção de edge → recomendação → simulação → execução real. Todas as APIs usadas são `gamma-api.polymarket.com` (metadata, sem auth) e `clob.polymarket.com` (preços/orderbook sem auth, trading com L2 auth via wallet).
+Seis skills compõem o **pipeline base** de trading: descoberta de mercado → detecção de edge → recomendação → simulação → execução real. Todas as APIs usadas são `gamma-api.polymarket.com` (metadata, sem auth), `clob.polymarket.com` (preços/orderbook sem auth, trading com L2 auth via wallet) e `data-api.polymarket.com` (posições/trades de wallets, sem auth).
+
+Em torno desse pipeline o repositório cresceu para um **sistema completo** (versão atual v13.x) que inclui, além das 6 skills base:
+
+- **Skills componíveis adicionais** — `polymarket-category-watcher`, `polymarket-wallet-analyzer`, `polymarket-soccer-goals`, `polymarket-forecast-skill` e o core compartilhado `polymarket-forecasting`.
+- **Subsistema Weather Edge Bot** — um bot autônomo de paper trading em mercados de clima (bot + judge de IA + advisor semanal), vivendo dentro de `polymarket-analyzer/scripts/`.
+- **Agente autônomo** (`agent/`) — loop Python dirigido pelo Anthropic SDK que executa o workflow do `CLAUDE.md` em ciclos.
+- **Quatro web apps** — `dashboard/` (monitor do weather bot), `polymarket-dashboard/` (modelo de futebol), `polymarket-wallet-dashboard/` (análise de CSV de histórico), `polymarket-copy-trader/` (copy-trade em paper).
+
+As seções "Skill 1" a "Skill 6" abaixo cobrem o pipeline base; as seções "Componente 7" em diante cobrem tudo que foi somado depois.
 
 ---
 
@@ -35,7 +44,13 @@ Relatório formal de auditoria de segurança (688 linhas, 14 findings: 2 High, 3
 Ignora `__pycache__/`, `*.pyc`, dados locais (`.polymarket-paper/`, `.polymarket-live/`), arquivos `.env*` (mantendo apenas `.env.example`) e `*.key`.
 
 ### `.well-known/skills/index.json`
-**Manifesto de skills** seguindo a especificação Agent Skills. Lista as 6 skills com `name`, `description` (gatilhos em linguagem natural) e a lista exata de arquivos que pertencem a cada skill — usado por agentes/instaladores para descoberta automática.
+**Manifesto de skills** seguindo a especificação Agent Skills. Lista as skills com `name`, `description` (gatilhos em linguagem natural) e a lista exata de arquivos que pertencem a cada skill — usado por agentes/instaladores para descoberta automática.
+
+### `.run/`
+Run configurations do IntelliJ IDEA (para os dashboards): configs de frontend (`npm dev`), backend (`uvicorn`) e a config combinada que roda ambos. Detectadas ao abrir o projeto na raiz do repositório.
+
+### `research/soccer-goals-btts-deep-research.md`
+Nota de pesquisa que fundamenta a skill `polymarket-soccer-goals`: modelagem de gols com Dixon-Coles, mercados Over/Under e BTTS, fontes de dados (Elo, xG) e a filosofia de edge calibrado. É o documento que a skill "operacionaliza".
 
 ---
 
@@ -201,9 +216,98 @@ Checklist pré-flight a ser percorrido antes do primeiro trade real: setup de wa
 
 ---
 
+## Componente 7 — Subsistema Weather Edge Bot (dentro de `polymarket-analyzer/scripts/`)
+
+Um bot autônomo de **paper trading em mercados de clima** (temperatura máxima/mínima por cidade) construído em cima do analyzer. Descobre mercados de clima que resolvem nas próximas 48h, calcula P(YES) a partir de forecasts (OpenWeather + fontes de consenso), mede o edge contra o preço implícito, e — após um **judge de IA** aprovar — executa via paper trader e monitora até cashout ou resolução. Toda decisão é persistida em SQLite (`~/.polymarket-paper/weather_edge.db`) e num log append-only (`weather_edge.jsonl`).
+
+### `weather_edge_bot.py`
+**Daemon principal.** Loop de 60s que agenda tarefas por timestamp de último-run: **Discovery** (a cada 10 min — varre mercados de clima, faz parse, busca forecast, calcula edge, insere entradas `PROPOSED`), **Execute** (a cada 60s — pega entradas `APPROVED` pelo judge, revalida orderbook + risco, executa via `paper_engine`), **Monitor** (a cada 60s — cadência adaptativa por TTR; faz cashout só quando `forecast_prob_now < entry_implied` E `best_bid >= entry_price`), **Resolution** (a cada 1h — consulta Gamma por `outcomePrices` de posições vencidas) e **Heartbeat** (a cada 5 min). Paper-only por default.
+
+### `weather_edge_judge.py`
+**Gatekeeper de IA (daemon Claude).** Faz poll de entradas `PROPOSED`, reúne fontes extra (NWS, Visual Crossing, web search) e emite verdict `APPROVE` / `REJECT` / `ADJUST`. A partir da v13.2 usa um **gate condicional**: `_judge_route()` resolve os casos decisivos SEM chamar o LLM (coin-flips deterministas → AUTO-REJECT; apostas de ensemble apertado longe do bin → AUTO-APPROVE); só os casos genuinamente incertos escalam para o LLM. Cap de budget diário `JUDGE_DAILY_BUDGET_USD` (default $15) — excedido, marca o resto como `SKIPPED`. Modelo default `claude-sonnet-5`.
+
+### `weather_edge_db.py`
+Camada de persistência SQLite do bot: schema das tabelas (`entries`, `monitor_checks`, `cashouts`, `resolutions`, `counterfactuals`, `judge_reviews`, `forecast_history`, `advisor_runs`) e helpers de acesso.
+
+### `weather_edge_helpers.py`
+Funções puras do bot: parsing de mercado (cidade/threshold/comparação/data), cálculo de P(YES) via CDF normal com MAE dinâmico, sizing por slippage (`compute_max_size_for_slippage`, reusado pelo copy-trader), lógica de cashout. Sem I/O — testável isoladamente.
+
+### `weather_edge_analyzer.py`
+Análise **contrafactual** + sugestão de thresholds. Agrega o histórico do bot (`aggregate_by_bucket`, `aggregate_judge`, `aggregate_cashout_triggers`, `compute_counterfactuals`, `replay_entry`) — as mesmas funções que o `dashboard/` consome — respondendo "as posições que fiz cashout teriam valido mais se eu tivesse segurado?".
+
+### `weather_edge_backtest.py`
+Backtester do subsistema: replay de trades passados com parâmetros alternativos de política de cashout (`profit_lock_pp`, etc.) e relatório de qual P&L cada configuração teria produzido.
+
+### `weather_strategy_advisor.py`
+**Meta-agente semanal (Claude Opus, read-only).** Lê a performance agregada do bot e propõe ajustes de tuning para revisão do operador. Escreve um relatório markdown em `~/.polymarket-paper/advisor_reports/` — **nunca modifica código ou config**. Os limites de risco do `CLAUDE.md` permanecem constitucionais: o advisor pode sugerir apertá-los, nunca afrouxá-los.
+
+### `strategy_advisor_helpers.py`
+Helpers compartilhados de agregação (ex.: `_city_performance` — win rate/P&L por cidade), consumidos pelo advisor e pelo dashboard.
+
+### `force_resolution_sweep.py` / `repair_resolutions.py` / `snapshot_split.py`
+Utilitários operacionais one-shot: varredura manual de resolução (limpa posições que o daemon deixou abertas), reparo de resoluções corrompidas por um bug antigo de settlement, e split do snapshot `weather_edge.db` em arquivos menores para download.
+
+### Referências novas do analyzer
+`weather-edge-strategy.md` (fórmula de edge, MAE dinâmico, consenso multi-source, versionamento v7→v13), `weather-judge-prompt.md` e `strategy-advisor-prompt.md` (prompts versionados), `weather-cities.json` (estações de resolução + bias por cidade), `applying-advisor-suggestions.md`, `deferred-tunings.md` e `data-api.md`.
+
+---
+
+## Componente 8 — `agent/` (Agente Autônomo de Paper Trading)
+
+Loop Python que roda o workflow do `CLAUDE.md` em ciclos periódicos, dirigido pelo Anthropic SDK. **Só opera em paper mode** — a `polymarket-live-executor` não é exposta como ferramenta ao agente.
+
+### `agent/run.py`
+O loop principal: a cada `AGENT_INTERVAL` segundos chama Claude (Sonnet default) com o `SYSTEM_PROMPT` cacheado e um kickoff (session-start ou daily review conforme a hora UTC). Expõe duas ferramentas ao modelo — `run_script` (valida path e roda `python script.py` das 5 skills base) e `read_file`. Logs vão para stdout → journald; persistência no SQLite paper trader.
+
+### `agent/reset_dbs.py`
+Utilitário para resetar os bancos SQLite (portfolio + weather edge) a um estado limpo.
+
+### Unidades systemd
+`polymarket-agent.service` (o agente), `weather-edge-bot.service` + `weather-edge-judge.service` (o subsistema de clima), e `weather-strategy-advisor.service` + `.timer` (o advisor semanal). `agent/.env.example` documenta as env vars (`ANTHROPIC_API_KEY`, `POLYMARKET_SKILLS_ROOT`, intervalos).
+
+---
+
+## Componente 9 — Skills componíveis adicionais
+
+### `polymarket-category-watcher/` (Descoberta por categoria, read-only)
+Preenche a lacuna onde o scanner base retorna uma única categoria hard-coded: aqui você dá uma **categoria/esporte** (basketball, tennis, soccer, baseball, hockey, esports…) e recebe **todos** os mercados live (paginado, não limitado a uma página), com stream opcional de preços. Scripts: `list_category_markets.py` (descoberta one-shot), `list_games_today.py` (jogos do dia), `watch_category.py` (stream com re-scan de mercados novos) e `category_common.py` (helpers compartilhados). Aliases em português funcionam (basquete, tênis, futebol…). Referência: `category-tags.md`.
+
+### `polymarket-wallet-analyzer/` (Análise de wallet pública, read-only)
+Analisa **qualquer** wallet pública pelo endereço via **Data API** (`data-api.polymarket.com`): posições, P&L realizado/não-realizado, ROI, win rate geral e breakdown **por categoria** (Tennis, Soccer, LoL, CS, Baseball…). Sem private key. Distinto de `live-executor/check_positions.py` (que inspeciona a *sua* wallet autenticada). Script: `analyze_wallet.py` (flag `--enrich-tags` usa tags da Gamma para categorização mais precisa). Referência: `data-api.md`.
+
+### `polymarket-soccer-goals/` (Over/Under de gols + BTTS)
+Operacionaliza `research/soccer-goals-btts-deep-research.md`: descobre os jogos de futebol do dia, modela a distribuição de gols com **Dixon-Coles** (Poisson + correção de baixos placares `τ`), calcula `P(Over)` / `P(BTTS)`, e sugere entradas com edge quantificado — sizing por half-Kelly sob os caps da constitution, filtrado a payout 1.50×–3.0×. λ resolvido automaticamente por dados (baseline de liga auto-calibrado via football-data.org / API-Football, força via ratings CSV → xG → API-Football → Elo). Read/análise apenas — nunca opera live. Scripts principais: `suggest_soccer.py`, `dixon_coles.py`, `forecast_soccer.py`, `backtest_soccer.py`, `soccer_predictions.py`, fontes de rating (`ratings_sources.py`, `apifootball_source.py`, `baselines_source.py`, `sharp_odds_soccer.py`), com suíte de testes offline. Referências: `model.md`, `data-sources.md`, `calibrated-forecasting-research.md`.
+
+### `polymarket-forecasting/` (Cores de forecasting compartilhados)
+Bibliotecas **sport-agnostic, pure stdlib, sem imports de skill**, reusadas pelos modelos de previsão (soccer) e pelos dashboards. Módulos: `run_distribution.py` (Negative-Binomial/totais, P(Over), μ implícito), `forecast.py` (pmf→cdf/quantil/intervalo/entropia + confiança), `scoring.py` (CRPS, Brier, log-loss), `calibration_core.py` + `calibration.py` (ECE/reliability/decomposição de Brier), `congruence.py` (concordância entre fontes) e `audit_log.py` (dump da auditoria de math). Todos os testes são offline.
+
+### `polymarket-forecast-skill/` (Previsão do tempo via OpenWeather)
+Skill standalone que fornece forecasts de clima em tempo real via **OpenWeather API** (chave em `config.json`). Comandos: `current`, `forecast <dias 1-5>`, `compare <loc1> <loc2>`. Script: `scripts/get_weather.py`. É a base de dados de clima que alimenta o raciocínio de mercados de temperatura. Referências: `setup.md`, `prompt_templates.md`.
+
+---
+
+## Componente 10 — Web apps (dashboards)
+
+Quatro aplicações web independentes, todas paper-first / read-only e rodando em portas distintas para coexistirem.
+
+### `dashboard/` (Weather Edge Dashboard — FastAPI + HTMX + Plotly + SSE, porta 8765)
+Monitor read-only do stack bot/judge/advisor. Quatro abas: **Overview** (KPIs, P&L cumulativo, eventos recentes, top posições), **Positions** (posições abertas com barras de progresso de trigger P/T/C + modal de `replay_entry`), **Performance** (seletor de período → gráficos Plotly de P&L por trigger, win rate por cidade, calibração do judge, delta contrafactual + tabelas de detalhe) e **Live Events** (stream SSE do `weather_edge.jsonl`). Lê os SQLite do bot em modo `?mode=ro` (zero risco de corromper o estado enquanto o bot roda). Estrutura: `main.py`, `settings.py`, `services/` (portfolio, positions, analytics, charts, ladders, advisor, costs, live_trading…), `templates/` (Jinja + partials), `static/`. Cada service tem testes inline.
+
+### `polymarket-dashboard/` (Modelo de Futebol — FastAPI + React, portas 8000/5173)
+UI colorida para o modelo `polymarket-soccer-goals` (total-goals + BTTS), rodado via subprocess. Duas abas: **Análises** (sugestões do dia com toda a math do modelo — λ_home/λ_away, P(Over)/P(Under)/P(BTTS), edge, payout, Kelly; scheduler in-process recalcula no topo de cada hora em fuso configurável) e **Resultados** (ROI/P&L/win rate diário/semanal/mensal; cada visita dispara settlement via feed da football-data.org). Backend `backend/app.py`; frontend React + Vite + Tailwind + Recharts. Env vars de modelo: `FOOTBALL_DATA_TOKEN`, `APIFOOTBALL_KEY`, `ODDS_API_KEY`, etc. Suporta notificações Telegram/email e auth de usuários.
+
+### `polymarket-wallet-dashboard/` (Análise de CSV de histórico — FastAPI + React, portas 8001/5174)
+Você **faz upload de um CSV** (`*_historico.csv`, `;`-delimitado, decimais BR) em vez de digitar um endereço. Reporta win rate, nº de apostas, P&L e ROI — geral, **por nível de confiança** (Alta/Média/Baixa), **por categoria** (Futebol, Baseball, Basquete, Combat Sports, Hockey, Tênis…) e **por sub-categoria** (Ambas Marcam, Over/Under, Moneyline, Run line, Spread…). Backend: `csv_parser.py` (classifica evento em categoria via dicionários de times + sinais), `subcategory.py` (classificador em camadas), `wallet_report.py` (`rollup_csv`). Um endpoint on-chain `GET /api/wallet?address=…` também está disponível. Texto de evento é untrusted (só pattern-matched).
+
+### `polymarket-copy-trader/` (Copy-trade em paper — FastAPI + React, portas 8002/5175)
+Fluxo separado de copy-trade: salva wallets públicas por nome+endereço, acompanha continuamente seus **buys e sells** via Data API `/trades`, e espelha num **paper portfolio de $10.000 fake-USD**. Por default só copia mercados de **clima** (`COPY_WEATHER_ONLY=0` copia todos). BUY copia o mesmo valor USD gasto, clampado a [$5, $100], com guarda de 20% de slippage; SELL espelha a fração vendida, pulado se exceder 20% de slippage; settlement só quando o mercado **resolve de fato** (não meramente porque o preço live está perto de 0/1). Read-only, **sem private key**. Reusa (sem reimplementar): o sizer de slippage do analyzer, o book-walk fill do paper trader e o feed de trades do wallet-analyzer — fiação em `backend/deps.py`. Abas: **Carteiras**, **Entradas**, **Resultados**.
+
+---
+
 ## Convenções e Pontos Importantes
 
-- **Storage:** dados paper em `~/.polymarket-paper/portfolio.db` (SQLite), logs live em `~/.polymarket-live/trades.log`.
+- **Storage:** dados paper em `~/.polymarket-paper/portfolio.db` (SQLite); estado do weather bot em `~/.polymarket-paper/weather_edge.db` + log append-only `weather_edge.jsonl`; relatórios do advisor em `~/.polymarket-paper/advisor_reports/`; logs live em `~/.polymarket-live/trades.log`. Cada web app usa seu próprio SQLite.
+- **Portas dos web apps** (distintas para coexistirem): `dashboard/` 8765; `polymarket-dashboard/` 8000 (back) / 5173 (front); `polymarket-wallet-dashboard/` 8001 / 5174; `polymarket-copy-trader/` 8002 / 5175.
 - **Dependências:** `pip install py-clob-client requests eth-account` (live só precisa de eth-account).
 - **Venv:** todos os exemplos assumem `source ~/.venv/bin/activate` (ou `/home/verticalclaw/.venv` em alguns SKILL.md).
 - **Sem testnet:** o paper engine simula contra preços live reais — é o substituto do testnet ausente.
