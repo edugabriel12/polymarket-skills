@@ -21,10 +21,16 @@ gate. `_judge_route()` resolves the decisive cases WITHOUT an LLM call —
 deterministic threshold/range proximity coin-flips are AUTO-REJECTED, and
 tight-ensemble bets whose bin sits ≥ AUTOAPPROVE_MAE_MULT×σ away are
 AUTO-APPROVED. Only the genuinely uncertain cases (non-ensemble single-source
-fallback, ensemble with the bin near the forecast, non-temp markets) reach the
-LLM, where its independent cross-check earns its cost. Set JUDGE_AUTOROUTE=0 to
-restore the universal-LLM behavior. Every routed decision still flows through
+fallback, ensemble with the bin near the forecast) reach the LLM, where its
+independent cross-check earns its cost. Set JUDGE_AUTOROUTE=0 to restore the
+universal-LLM behavior. Every routed decision still flows through
 apply_verdict(), so Rule 6 / proximity / range-calibration guards all still run.
+
+v14 (2026-07-05, temperature-only policy): non-temp proposals (rain/snow
+binaries, numeric precip) are deterministically AUTO-REJECTED before any
+routing — fail-closed, active even with JUDGE_AUTOROUTE=0. The bot prices
+those off an uncalibrated clipped POP, so they must never reach a gate that
+could approve them (see weather_edge_helpers.is_tradeable_spec).
 
 v13.2 option-1 (anomaly scan): the ensemble prices in synoptic weather but is
 blind to NON-meteorological catalysts (breaking news, resolution ambiguity).
@@ -144,8 +150,10 @@ RULE6_DOWNSIZE_USD = float(os.environ.get("JUDGE_RULE6_DOWNSIZE_USD", "10.0"))
 # was being spent mostly to REJECT trades the deterministic guards already
 # handle. So we fire the LLM ONLY where the cheap ensemble is weak or blind:
 #   - non-ensemble (single-source fallback) entries,
-#   - ensemble entries where the bin is NEAR the forecast (< mult × sigma),
-#   - non-temp markets (rain, etc.) the ensemble doesn't cover.
+#   - ensemble entries where the bin is NEAR the forecast (< mult × sigma).
+# (v14: non-temp markets — rain/snow — no longer go to the LLM: they are
+# deterministically auto-rejected by the temperature-only policy, which
+# runs before this gate and ignores JUDGE_AUTOROUTE.)
 # Tight-ensemble, far-from-bin bets are AUTO-APPROVED on the code guards
 # (no LLM spend); deterministic threshold-proximity coin-flips are
 # AUTO-REJECTED (no LLM spend). Every routed decision still flows through
@@ -668,21 +676,45 @@ def _judge_route(entry_row) -> Optional[dict]:
     already decisive.
 
     Returns:
+      {"action": "auto_reject", "kind": "non_temperature", "reason": str}
+          v14 temperature-only policy: non-temp proposal (rain/snow) →
+          deterministic REJECT, no LLM, even with JUDGE_AUTOROUTE=0.
       {"action": "auto_reject", "reason": str}
           deterministic threshold/range proximity coin-flip → REJECT, no LLM.
       {"action": "auto_approve", "reason": str, "dist": float, "sigma": float}
           calibrated ensemble, bin ≥ AUTOAPPROVE_MAE_MULT × sigma away → the
           bot's high P(side) is well-founded → APPROVE, no LLM.
       None
-          send to the LLM: non-ensemble fallback, ensemble with the bin NEAR
-          the forecast (models effectively disagree relative to the bin), or a
-          non-temp market — the cases where the LLM earns its cost.
+          send to the LLM: non-ensemble fallback, or ensemble with the bin
+          NEAR the forecast (models effectively disagree relative to the
+          bin) — the cases where the LLM earns its cost.
 
     Routing decides ONLY whether to spend the LLM. Both actions are still
     funneled through apply_verdict(), so every code guard (Rule 6,
     threshold-proximity, range calibration) still runs. Fail-open: any parse
-    failure returns None (→ LLM), never a silent auto-approve.
+    failure returns None (→ LLM), never a silent auto-approve. The one
+    fail-CLOSED case is the v14 non-temp reject above — a market the bot
+    cannot price must never reach a gate that could approve it.
     """
+    # (0) v14 (2026-07-05): temperature-only policy — FAIL-CLOSED. A non-temp
+    # proposal (rain/snow binaries, numeric precip) must never reach the LLM
+    # (which can APPROVE it): deterministic REJECT. Runs even with
+    # JUDGE_AUTOROUTE=0 because this is policy, not a routing optimization.
+    # An unparseable spec (None) keeps the legacy behavior (fall through →
+    # LLM). Import stays lazy so _test_autoroute's monkey-patching of
+    # helpers.parse_market/load_cities is picked up at call time.
+    try:
+        from weather_edge_helpers import (parse_market, load_cities,
+                                          is_tradeable_spec)
+        spec0 = parse_market(entry_row["market_question"],
+                             entry_row["end_date"], load_cities())
+    except Exception:
+        spec0 = None
+    if spec0 is not None and not is_tradeable_spec(spec0):
+        return {"action": "auto_reject", "kind": "non_temperature",
+                "reason": (f"non_temperature_market: metric={spec0.metric} — "
+                           f"bot is temperature-only (policy 2026-07-05)")}
+
     if not JUDGE_AUTOROUTE:
         return None
 
@@ -705,7 +737,9 @@ def _judge_route(entry_row) -> Optional[dict]:
     except Exception:
         return None
     if not spec or spec.metric != "temp":
-        return None  # non-temp (rain, etc.): the ensemble doesn't cover it.
+        # Unreachable for non-temp since the v14 step (0) fail-closed reject;
+        # kept as a belt so auto-approve can never fire on a non-temp spec.
+        return None
 
     # Ensemble sigma is the confidence scale; without a calibrated ensemble
     # (single-source fallback) the LLM cross-check earns its cost.
@@ -1211,7 +1245,12 @@ def main():
                     verdict = _synthesize_route_verdict(row_dict, route)
                     with db.connect() as conn:
                         apply_verdict(conn, row_dict, verdict)
-                    log_event("judge_autoreject_proximity", {
+                    # v14: distinguish the temperature-only policy reject from
+                    # the proximity coin-flip reject in the event stream.
+                    _ev = ("judge_autoreject_nontemp"
+                           if route.get("kind") == "non_temperature"
+                           else "judge_autoreject_proximity")
+                    log_event(_ev, {
                         "entry_id": row_dict["entry_id"],
                         "final_verdict": verdict["verdict"],
                         "reason": route["reason"],
@@ -1614,11 +1653,13 @@ def _test_autoroute():
         assert r is None, r
         print("Test 5 PASS: non-ensemble fallback → None (LLM earns its cost)")
 
-        # Test 6: non-temp market → LLM (ensemble doesn't cover it)
+        # Test 6 (v14): non-temp market → fail-closed deterministic REJECT
+        # (never reaches the LLM, which could approve it)
         helpers.parse_market = lambda q, e, c: _spec(metric="rain")
         r = mod._judge_route(_row(ref=25.0, sigma=1.0))
-        assert r is None, r
-        print("Test 6 PASS: non-temp market → None (routed to LLM)")
+        assert r and r["action"] == "auto_reject", r
+        assert r.get("kind") == "non_temperature", r
+        print("Test 6 PASS: non-temp market → auto_reject (fail-closed)")
 
         # Test 7: boundary dist == 2σ exactly → auto_approve (>= threshold)
         helpers.parse_market = lambda q, e, c: _spec(lo=20.0, hi=21.0)
@@ -1640,7 +1681,17 @@ def _test_autoroute():
         assert r is None, r
         print("Test 9 PASS: JUDGE_AUTOROUTE=0 disables routing (always LLM)")
 
-        print("\nAll auto-route tests PASS (9/9)")
+        # Test 10 (v14): temperature-only policy survives JUDGE_AUTOROUTE=0 —
+        # a non-temp proposal is still deterministically rejected (fail-closed
+        # policy, not a routing optimization). JUDGE_AUTOROUTE is still False
+        # here from Test 9.
+        helpers.parse_market = lambda q, e, c: _spec(metric="precip")
+        r = mod._judge_route(_row(ref=25.0, sigma=1.0))
+        assert r and r["action"] == "auto_reject", r
+        assert r.get("kind") == "non_temperature", r
+        print("Test 10 PASS: JUDGE_AUTOROUTE=0 still auto-rejects non-temp")
+
+        print("\nAll auto-route tests PASS (10/10)")
     finally:
         mod._threshold_proximity_reason = saved["prox"]
         helpers.parse_market = saved["parse"]
