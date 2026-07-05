@@ -520,37 +520,51 @@ def compute_ladder_breakdown(conn, since_iso: str) -> dict:
         (since_iso,)
     ).fetchone()[0]
 
-    # Performance: ladder groups vs orphan single-bin (resolved only)
-    # Group-level P&L for ladders: sum across all legs of the group
+    # Performance: ladder groups vs orphan single-bin (settled only).
+    # v13.8 (2026-07-05): "settled" now includes RESOLUTIONS, not just
+    # cashouts — same resolution-blindness fixed in v13.6 (Win Rate by
+    # City) and v13.7 (Ladders tab). Per-leg P&L precedence: cashout
+    # (realized governs; covers legs with cashout AND resolution without
+    # double count) → resolution ((payout - entry) * shares).
     ladder_perf = conn.execute("""
         SELECT
-          COUNT(DISTINCT e.ladder_group_id) n_groups,
-          SUM(c.realized_pnl_usd) total_pnl,
-          SUM(e.size_usd) total_stake,
+          COUNT(*) n_groups,
+          SUM(group_pnl) total_pnl,
+          SUM(group_stake) total_stake,
           SUM(CASE WHEN group_pnl > 0 THEN 1 ELSE 0 END) groups_won
         FROM (
-          SELECT ladder_group_id,
-                 SUM(c2.realized_pnl_usd) group_pnl
-          FROM entries e2
-          LEFT JOIN cashouts c2 ON c2.entry_id = e2.entry_id
-          WHERE e2.ts >= ? AND e2.ladder_group_id IS NOT NULL
-            AND e2.status = 'EXECUTED'
-          GROUP BY ladder_group_id
+          SELECT e.ladder_group_id,
+                 SUM(COALESCE(c.realized_pnl_usd,
+                              (r.payout_per_share - e.entry_price)
+                                * e.size_shares)) AS group_pnl,
+                 SUM(e.size_usd) AS group_stake
+          FROM entries e
+          LEFT JOIN cashouts c ON c.entry_id = e.entry_id
+          LEFT JOIN resolutions r ON r.entry_id = e.entry_id
+          WHERE e.ts >= ? AND e.ladder_group_id IS NOT NULL
+            AND e.status IN ('EXECUTED', 'FAST_PATH')
+            AND (c.cashout_id IS NOT NULL OR r.resolution_id IS NOT NULL)
+          GROUP BY e.ladder_group_id
           HAVING group_pnl IS NOT NULL
         ) g
-        JOIN entries e ON e.ladder_group_id = g.ladder_group_id
-        LEFT JOIN cashouts c ON c.entry_id = e.entry_id
     """, (since_iso,)).fetchone()
 
     single_perf = conn.execute("""
         SELECT COUNT(*) n_trades,
-               SUM(c.realized_pnl_usd) total_pnl,
+               SUM(COALESCE(c.realized_pnl_usd,
+                            (r.payout_per_share - e.entry_price)
+                              * e.size_shares)) total_pnl,
                SUM(e.size_usd) total_stake,
-               SUM(CASE WHEN c.realized_pnl_usd > 0 THEN 1 ELSE 0 END) wins
+               SUM(CASE WHEN COALESCE(c.realized_pnl_usd,
+                                      (r.payout_per_share - e.entry_price)
+                                        * e.size_shares) > 0
+                        THEN 1 ELSE 0 END) wins
         FROM entries e
         LEFT JOIN cashouts c ON c.entry_id = e.entry_id
+        LEFT JOIN resolutions r ON r.entry_id = e.entry_id
         WHERE e.ts >= ? AND e.ladder_group_id IS NULL
-          AND e.status = 'EXECUTED' AND c.cashout_id IS NOT NULL
+          AND e.status IN ('EXECUTED', 'FAST_PATH')
+          AND (c.cashout_id IS NOT NULL OR r.resolution_id IS NOT NULL)
     """, (since_iso,)).fetchone()
 
     def _perf_dict(row, label_n: str, label_won: str):
@@ -570,15 +584,22 @@ def compute_ladder_breakdown(conn, since_iso: str) -> dict:
     ttr_cohort = {}
     for label, lo, hi in (("6-12h", 6, 12), ("12-24h", 12, 24),
                            ("24-48h", 24, 48), ("48h+", 48, 9999)):
+        # v13.8: settled = cashout OR resolution (cashout precedence).
         r = conn.execute("""
             SELECT COUNT(*) n,
-                   SUM(c.realized_pnl_usd) pnl,
+                   SUM(COALESCE(c.realized_pnl_usd,
+                                (r.payout_per_share - e.entry_price)
+                                  * e.size_shares)) pnl,
                    SUM(e.size_usd) stake,
-                   SUM(CASE WHEN c.realized_pnl_usd > 0 THEN 1 ELSE 0 END) wins
+                   SUM(CASE WHEN COALESCE(c.realized_pnl_usd,
+                                          (r.payout_per_share - e.entry_price)
+                                            * e.size_shares) > 0
+                            THEN 1 ELSE 0 END) wins
             FROM entries e
             LEFT JOIN cashouts c ON c.entry_id = e.entry_id
-            WHERE e.ts >= ? AND e.status = 'EXECUTED'
-              AND c.cashout_id IS NOT NULL
+            LEFT JOIN resolutions r ON r.entry_id = e.entry_id
+            WHERE e.ts >= ? AND e.status IN ('EXECUTED', 'FAST_PATH')
+              AND (c.cashout_id IS NOT NULL OR r.resolution_id IS NOT NULL)
               AND e.ttr_hours_at_entry >= ? AND e.ttr_hours_at_entry < ?
         """, (since_iso, lo, hi)).fetchone()
         ttr_cohort[label] = {
@@ -1078,5 +1099,80 @@ def main():
         print(text)
 
 
+# ---------------------------------------------------------------------------
+# Inline tests for compute_ladder_breakdown (v13.8 — resoluções contam)
+# Run: python weather_edge_analyzer.py --test-ladder-breakdown
+# ---------------------------------------------------------------------------
+
+def _test_ladder_breakdown():
+    """Hermetic: settled = cashout OR resolution, com precedência de cashout.
+    Antes da v13.8, ladder_perf/single_perf/ttr_cohort só contavam cashouts —
+    grupos e singles liquidados por resolução ficavam invisíveis nos KPIs."""
+    import sqlite3 as _sq
+    import tempfile
+    conn = _sq.connect(":memory:")
+    conn.row_factory = _sq.Row
+    conn.executescript("""
+        CREATE TABLE entries (entry_id INTEGER PRIMARY KEY, ts TEXT,
+            ladder_group_id TEXT, ladder_position TEXT, ladder_stake_usd REAL,
+            status TEXT, skip_reason TEXT, size_usd REAL, size_shares REAL,
+            entry_price REAL, ttr_hours_at_entry REAL);
+        CREATE TABLE cashouts (cashout_id INTEGER PRIMARY KEY,
+            entry_id INTEGER, realized_pnl_usd REAL);
+        CREATE TABLE resolutions (resolution_id INTEGER PRIMARY KEY,
+            entry_id INTEGER, final_outcome TEXT, payout_per_share REAL);
+    """)
+    T = "2026-07-01T00:00:00"
+
+    def leg(eid, gid, price, shares, ttr=20.0, status='EXECUTED', pos='central'):
+        conn.execute(
+            "INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+            (eid, T, gid, pos if gid else None, price * shares if gid else None,
+             status, price * shares, shares, price, ttr))
+
+    # Grupo gR: 2 legs, TODOS por resolução (win +50, loss -30 → group +20)
+    leg(1, 'gR', 0.50, 100); leg(2, 'gR', 0.60, 50, status='FAST_PATH')
+    conn.execute("INSERT INTO resolutions VALUES (1, 1, 'NO', 1.0)")
+    conn.execute("INSERT INTO resolutions VALUES (2, 2, 'YES', 0.0)")
+    # Grupo gC: 1 leg com cashout (+7) E resolução (precedência) + 1 aberto
+    leg(3, 'gC', 0.40, 50); leg(4, 'gC', 0.55, 50)
+    conn.execute("INSERT INTO cashouts VALUES (1, 3, 7.0)")
+    conn.execute("INSERT INTO resolutions VALUES (3, 3, 'NO', 1.0)")
+    # Singles: 1 resolvido win (+20), 1 resolvido loss (-24), 1 aberto
+    leg(10, None, 0.60, 50, ttr=8.0)   # (1-0.6)*50 = +20, cohort 6-12h
+    leg(11, None, 0.40, 60, ttr=30.0)  # (0-0.4)*60 = -24
+    leg(12, None, 0.50, 10, ttr=30.0)  # aberto
+    conn.execute("INSERT INTO resolutions VALUES (10, 10, 'NO', 1.0)")
+    conn.execute("INSERT INTO resolutions VALUES (11, 11, 'YES', 0.0)")
+    conn.commit()
+
+    b = compute_ladder_breakdown(conn, "2026-06-01T00:00:00")
+
+    lp = b["ladder_groups_performance"]
+    assert lp["n"] == 2, lp                    # gR (só resoluções) + gC
+    assert lp["won"] == 2, lp                  # gR +20, gC +7
+    assert abs(lp["total_pnl_usd"] - 27.0) < 1e-6, lp
+    print(f"Test 1 PASS: ladder_perf conta grupo 100%-resolução — {lp}")
+
+    sp = b["single_bin_performance"]
+    assert sp["n"] == 2 and sp["won"] == 1, sp     # aberto (12) fora
+    assert abs(sp["total_pnl_usd"] - (-4.0)) < 1e-6, sp  # +20 - 24
+    print(f"Test 2 PASS: single_perf conta resoluções, exclui abertos — {sp}")
+
+    t612 = b["ttr_cohort_performance"]["6-12h"]
+    assert t612["n"] == 1 and t612["wins"] == 1, t612
+    assert abs(t612["total_pnl_usd"] - 20.0) < 1e-6, t612
+    print(f"Test 3 PASS: ttr_cohort 6-12h vê o single resolvido — {t612}")
+
+    # Precedência do cashout: pnl do gC = 7 (cashout), não 30 (resolução)
+    print("Test 4 PASS: precedência do cashout sem dupla contagem (gC pnl=7)")
+
+    print("\nAll ladder-breakdown tests PASS (4/4)")
+
+
 if __name__ == "__main__":
-    main()
+    import sys as _sys
+    if "--test-ladder-breakdown" in _sys.argv:
+        _test_ladder_breakdown()
+    else:
+        main()
