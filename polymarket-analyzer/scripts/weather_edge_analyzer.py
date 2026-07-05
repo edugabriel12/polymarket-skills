@@ -909,11 +909,20 @@ def replay_entry(conn, entry_id: int) -> str:
     j = conn.execute("SELECT * FROM judge_reviews WHERE entry_id = ?",
                      (entry_id,)).fetchone()
     if j:
-        out.append(f"\n## Judge verdict: {j['verdict']} (confidence {j['confidence']:.2f})")
-        out.append(f"- judge_prob: {j['judge_prob']:.3f} (vs bot {j['bot_prob']:.3f}, "
-                   f"delta {j['prob_delta']:.3f})")
+        # v13.2: auto-routed verdicts (auto_reject/auto_approve) are persisted
+        # without an LLM call, so cost_usd — and, defensively, the other numeric
+        # fields — can be NULL. Format each None-safe so replay never 500s.
+        def _f(v, spec, na="n/a"):
+            return format(v, spec) if v is not None else na
+        out.append(f"\n## Judge verdict: {j['verdict']} "
+                   f"(confidence {_f(j['confidence'], '.2f')})")
+        out.append(f"- judge_prob: {_f(j['judge_prob'], '.3f')} "
+                   f"(vs bot {_f(j['bot_prob'], '.3f')}, "
+                   f"delta {_f(j['prob_delta'], '.3f')})")
         out.append(f"- Rationale: {j['rationale']}")
-        out.append(f"- Cost: ${j['cost_usd']:.4f}")
+        cost = j['cost_usd']
+        out.append(f"- Cost: ${cost:.4f}" if cost is not None
+                   else "- Cost: $0.0000 (auto-routed, no LLM)")
 
     co = conn.execute("SELECT * FROM cashouts WHERE entry_id = ?",
                       (entry_id,)).fetchone()
