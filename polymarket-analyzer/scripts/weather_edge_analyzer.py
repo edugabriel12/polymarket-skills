@@ -21,7 +21,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "polymarket-analyzer" / "scripts"))
@@ -93,20 +93,29 @@ def _prob_bucket(p: float) -> str:
     return "70-100%"
 
 
-def aggregate_by_bucket(conn, since_iso: str) -> dict:
-    """Compute aggregations for the report."""
+def aggregate_by_bucket(conn, since_iso: str,
+                        strategy: Optional[str] = None) -> dict:
+    """Compute aggregations for the report.
+
+    v11: `strategy` is an OPTIONAL filter. Default None aggregates ALL
+    strategies (unchanged behavior). Pass 'weather_edge' to exclude the
+    cheap_convexity strategy from the tuned bot's KPIs, or 'cheap_convexity'
+    to isolate it for separate analysis. NULL strategy counts as
+    'weather_edge'."""
     # 1. Trade outcomes
-    rows = conn.execute(
-        "SELECT e.entry_id, e.edge_pp_at_entry, e.ttr_hours_at_entry, "
-        "       e.forecast_prob_at_entry, e.side, e.entry_price, "
-        "       cf.realized_pnl, cf.hypothetical_hold_pnl, cf.delta, "
-        "       r.payout_per_share, r.final_outcome "
-        "FROM entries e "
-        "LEFT JOIN counterfactuals cf ON cf.entry_id = e.entry_id "
-        "LEFT JOIN resolutions r ON r.entry_id = e.entry_id "
-        "WHERE e.ts >= ? AND e.status IN ('EXECUTED','FAST_PATH')",
-        (since_iso,),
-    ).fetchall()
+    q = ("SELECT e.entry_id, e.edge_pp_at_entry, e.ttr_hours_at_entry, "
+         "       e.forecast_prob_at_entry, e.side, e.entry_price, "
+         "       cf.realized_pnl, cf.hypothetical_hold_pnl, cf.delta, "
+         "       r.payout_per_share, r.final_outcome "
+         "FROM entries e "
+         "LEFT JOIN counterfactuals cf ON cf.entry_id = e.entry_id "
+         "LEFT JOIN resolutions r ON r.entry_id = e.entry_id "
+         "WHERE e.ts >= ? AND e.status IN ('EXECUTED','FAST_PATH')")
+    params: tuple = (since_iso,)
+    if strategy is not None:
+        q += " AND COALESCE(e.strategy, 'weather_edge') = ?"
+        params = (since_iso, strategy)
+    rows = conn.execute(q, params).fetchall()
 
     by_edge: dict[str, list[dict]] = defaultdict(list)
     by_ttr: dict[str, list[dict]] = defaultdict(list)

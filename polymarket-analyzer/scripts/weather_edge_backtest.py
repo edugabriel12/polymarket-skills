@@ -39,6 +39,10 @@ class BacktestParams:
     # Friction model (v5). Defaults 0/0 preserve old behavior.
     bid_slippage_pct: float = 0.0    # haircut on bid at cashout exits
     fee_rate: float = 0.0            # deducted from gross proceeds
+    # v11 cheap_convexity: exit margin for the fair_target trigger. Only used
+    # for entries tagged strategy='cheap_convexity' (fair read from their
+    # discovery_meta_json.fair_yes_raw).
+    fair_target_margin_pp: float = 1.0
 
 
 def replay_entry(entry: dict, monitor_checks: list[dict],
@@ -57,6 +61,21 @@ def replay_entry(entry: dict, monitor_checks: list[dict],
     shares = float(entry.get("size_shares") or 0)
     size_usd = float(entry.get("size_usd") or 0)
     peak = 0.0
+
+    # v11 cheap_convexity: replay the fair_target exit using the raw fair
+    # captured at entry time (discovery_meta_json.fair_yes_raw). The live
+    # monitor recomputes fair each cycle, but for replay the entry-time raw
+    # fair is the available anchor.
+    is_cc = (entry.get("strategy") == "cheap_convexity")
+    cc_fair_yes_raw = None
+    if is_cc:
+        dm = entry.get("discovery_meta_json")
+        if dm:
+            try:
+                meta = json.loads(dm) if isinstance(dm, str) else dm
+                cc_fair_yes_raw = meta.get("fair_yes_raw")
+            except (TypeError, ValueError):
+                cc_fair_yes_raw = None
 
     for check in monitor_checks:  # already sorted by ts ASC
         bid = float(check.get("market_best_bid") or 0)
@@ -78,6 +97,9 @@ def replay_entry(entry: dict, monitor_checks: list[dict],
             trailing_drawdown_pct=params.trailing_drawdown_pct,
             trailing_min_gain_pp=params.trailing_min_gain_pp,
             convergence_pp=params.convergence_pp,
+            enable_fair_target=is_cc and cc_fair_yes_raw is not None,
+            fair_uncapped_yes=cc_fair_yes_raw,
+            fair_target_margin_pp=params.fair_target_margin_pp,
         )
         if verdict["decision"] == "CASHOUT":
             # Apply friction: bid haircut (slippage) + fee deduction on

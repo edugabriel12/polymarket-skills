@@ -653,17 +653,26 @@ def query_approved_unexecuted(conn) -> list[sqlite3.Row]:
     ).fetchall()
 
 
-def query_open_positions(conn) -> list[sqlite3.Row]:
+def query_open_positions(conn, strategy: Optional[str] = None) -> list[sqlite3.Row]:
     """Entries that were executed and are still open: no cashout, no resolution.
-    Resolved positions are excluded so the slot is freed for new bets."""
-    return conn.execute(
-        "SELECT e.* FROM entries e "
-        "LEFT JOIN cashouts c ON c.entry_id = e.entry_id "
-        "LEFT JOIN resolutions r ON r.entry_id = e.entry_id "
-        "WHERE e.status IN ('EXECUTED','FAST_PATH') "
-        "AND c.cashout_id IS NULL "
-        "AND r.resolution_id IS NULL"
-    ).fetchall()
+    Resolved positions are excluded so the slot is freed for new bets.
+
+    v11: `strategy` is an OPTIONAL filter. Default None returns ALL strategies
+    (the monitor MUST see cheap_convexity positions to cash them out, so it
+    calls with no filter). A dashboard/analysis caller can pass
+    strategy='weather_edge' to exclude cheap_convexity, or 'cheap_convexity'
+    to isolate it. NULL strategy rows count as 'weather_edge'."""
+    q = ("SELECT e.* FROM entries e "
+         "LEFT JOIN cashouts c ON c.entry_id = e.entry_id "
+         "LEFT JOIN resolutions r ON r.entry_id = e.entry_id "
+         "WHERE e.status IN ('EXECUTED','FAST_PATH') "
+         "AND c.cashout_id IS NULL "
+         "AND r.resolution_id IS NULL")
+    params: tuple = ()
+    if strategy is not None:
+        q += " AND COALESCE(e.strategy, 'weather_edge') = ?"
+        params = (strategy,)
+    return conn.execute(q, params).fetchall()
 
 
 def query_unresolved_past_end(conn, now_iso: str) -> list[sqlite3.Row]:
@@ -855,6 +864,30 @@ def _test_migration_v11_strategy():
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 11
     print("Test PASS: v11 migration adds strategy col + index, backfills "
           "'weather_edge', bumps user_version, idempotent")
+
+    # Isolation: query_open_positions filter must separate cheap_convexity
+    # from weather_edge (the operator's "identify entries for analysis" ask),
+    # while default (None) still returns both (so the monitor sees all).
+    with connect(tmp) as conn:
+        ts = "2026-07-06T01:00:00+00:00"
+        for strat in ("weather_edge", "cheap_convexity"):
+            conn.execute(
+                "INSERT INTO entries (ts, market_slug, market_question, side, "
+                "status, entry_price, strategy) VALUES "
+                "(?, ?, 'q', 'YES', 'EXECUTED', 0.10, ?)",
+                (ts, f"slug-{strat}", strat))
+        conn.commit()
+        all_open = query_open_positions(conn)
+        we_open = query_open_positions(conn, strategy="weather_edge")
+        cc_open = query_open_positions(conn, strategy="cheap_convexity")
+        # the legacy backfilled EXECUTED row (weather_edge) + 2 inserted = 3
+        assert len(all_open) == 3, len(all_open)
+        assert len(cc_open) == 1, len(cc_open)
+        assert all(r["strategy"] == "cheap_convexity" for r in cc_open)
+        assert len(we_open) == 2, len(we_open)  # backfilled + inserted
+        assert all(r["strategy"] == "weather_edge" for r in we_open)
+    print("Test PASS: query_open_positions isolates cheap_convexity "
+          "(all=3, weather_edge=2, cheap_convexity=1)")
     tmp.unlink()
 
 
