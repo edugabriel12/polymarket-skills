@@ -77,19 +77,37 @@ def ladders_view(request: Request):
          "history": history})
 
 
+# v11: strategy segregation. The UI selector offers weather_edge (default —
+# keeps the tuned bot's KPIs unpolluted), cheap_convexity, and all.
+_STRATEGIES = ("weather_edge", "cheap_convexity", "all")
+
+
+def _norm_strategy(s: str) -> Optional[str]:
+    """Map the UI selector value to the service filter: 'all' → None (no
+    filter); unknown → 'weather_edge' (safe default)."""
+    if s == "all":
+        return None
+    return s if s in _STRATEGIES else "weather_edge"
+
+
 @app.get("/positions/history", response_class=HTMLResponse)
-def positions_history_view(request: Request, outcome: str = "all", limit: int = 200):
+def positions_history_view(request: Request, outcome: str = "all",
+                           limit: int = 200, strategy: str = "weather_edge"):
     """v9.10: positions history — all resolved (cashed out or settled)
     entries with realized P&L, exit reason, and Polymarket link."""
     filt = outcome if outcome in ("winner", "loser") else None
-    history = positions.get_positions_history(limit=limit, filter_outcome=filt)
-    summary = positions.get_history_summary()
+    strat = _norm_strategy(strategy)
+    history = positions.get_positions_history(limit=limit, filter_outcome=filt,
+                                              strategy=strat)
+    summary = positions.get_history_summary(strategy=strat)
     return templates.TemplateResponse(
         request, "positions_history.html",
         {"active_tab": "history",
          "history": history,
          "summary": summary,
          "filter_outcome": outcome,
+         "strategy": strategy if strategy in _STRATEGIES else "weather_edge",
+         "strategies": _STRATEGIES,
          "limit": limit})
 
 
@@ -555,14 +573,17 @@ def api_recent_events(request: Request, limit: int = 10):
 
 @app.get("/api/positions", response_class=HTMLResponse)
 def api_positions(request: Request, top: int = 0, sort: str = "entry_id",
-                   refresh: int = 0):
+                   refresh: int = 0, strategy: str = "weather_edge"):
     # Overview's mini-table uses sort=size to show the biggest stakes first;
     # the full Positions page sticks with entry_id (newest first).
     # v9.7: refresh=1 hits CLOB live for each open position (Positions
     # page passes this on load + every 30s). Overview mini-table omits
     # it to keep that page cheap.
+    # v11: strategy filter (default weather_edge). Overview mini-table passes
+    # strategy=all to stay account-wide.
     pos = positions.get_open_positions(
-        sort_by=sort, refresh_prices=bool(refresh))
+        sort_by=sort, refresh_prices=bool(refresh),
+        strategy=_norm_strategy(strategy))
     if top > 0:
         pos = pos[:top]
     return templates.TemplateResponse(
@@ -611,8 +632,10 @@ def api_replay(request: Request, entry_id: int):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/performance", response_class=HTMLResponse)
-def api_performance(request: Request, days: int = 14):
-    data = analytics.get_all_analytics(days=days)
+def api_performance(request: Request, days: int = 14,
+                    strategy: str = "weather_edge"):
+    data = analytics.get_all_analytics(days=days,
+                                       strategy=_norm_strategy(strategy))
     return templates.TemplateResponse(
         request, "partials/performance_body.html",
         {"data": data, "charts": charts, "days": days})

@@ -133,7 +133,8 @@ def _extract_forecast_value(snap: dict, unit: str) -> Optional[float]:
     return None
 
 
-def _city_performance(conn, since_iso: str) -> dict:
+def _city_performance(conn, since_iso: str,
+                      strategy: Optional[str] = None) -> dict:
     """Win/loss/P&L per city over EVERY settled bet.
 
     v13.6 (2026-07-05): resolution-settled bets now count. The old version
@@ -150,17 +151,19 @@ def _city_performance(conn, since_iso: str) -> dict:
          P&L = (payout_per_share - entry_price) * size_shares;
       3. VOID / still open → counts in n, excluded from wins/losses.
     """
-    rows = conn.execute(
-        "SELECT e.city_resolved, e.entry_id, e.parser_confidence, "
-        "       r.final_outcome, c.realized_pnl_usd, "
-        "       e.side, e.entry_price, e.size_shares, r.payout_per_share "
-        "FROM entries e "
-        "LEFT JOIN resolutions r ON r.entry_id = e.entry_id "
-        "LEFT JOIN cashouts c ON c.entry_id = e.entry_id "
-        "WHERE e.ts >= ? AND e.city_resolved IS NOT NULL "
-        "  AND e.status IN ('EXECUTED', 'FAST_PATH')",
-        (since_iso,),
-    ).fetchall()
+    q = ("SELECT e.city_resolved, e.entry_id, e.parser_confidence, "
+         "       r.final_outcome, c.realized_pnl_usd, "
+         "       e.side, e.entry_price, e.size_shares, r.payout_per_share "
+         "FROM entries e "
+         "LEFT JOIN resolutions r ON r.entry_id = e.entry_id "
+         "LEFT JOIN cashouts c ON c.entry_id = e.entry_id "
+         "WHERE e.ts >= ? AND e.city_resolved IS NOT NULL "
+         "  AND e.status IN ('EXECUTED', 'FAST_PATH')")
+    params: tuple = (since_iso,)
+    if strategy is not None:
+        q += " AND COALESCE(e.strategy,'weather_edge') = ?"
+        params = (since_iso, strategy)
+    rows = conn.execute(q, params).fetchall()
 
     agg: dict[str, dict] = defaultdict(
         lambda: {"n": 0, "wins": 0, "losses": 0,

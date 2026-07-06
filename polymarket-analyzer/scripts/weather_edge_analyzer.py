@@ -169,22 +169,29 @@ def _summarize(rows: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def aggregate_cashout_triggers(conn, since_iso: str) -> dict:
+def aggregate_cashout_triggers(conn, since_iso: str,
+                               strategy: Optional[str] = None) -> dict:
     """Group cashouts by which trigger fired (parsed from decision_reason of
     the monitor_check that immediately preceded the cashout). Returns per-
     trigger counts + mean realized PnL.
 
     Trigger name is the prefix of monitor_check.decision_reason before ':'
     (set by the bot as f'{trigger}: {reason}').
-    """
-    rows = conn.execute(
-        "SELECT c.cashout_id, c.realized_pnl_usd, c.ts, c.entry_id, "
-        "       (SELECT decision_reason FROM monitor_checks m "
-        "        WHERE m.entry_id = c.entry_id AND m.decision = 'CASHOUT' "
-        "        ORDER BY m.ts DESC LIMIT 1) AS reason "
-        "FROM cashouts c WHERE c.ts >= ?",
-        (since_iso,),
-    ).fetchall()
+
+    v11: optional `strategy` filter (default None = all). cashouts has no
+    strategy column, so it JOINs entries to filter (NULL strategy counts as
+    'weather_edge')."""
+    q = ("SELECT c.cashout_id, c.realized_pnl_usd, c.ts, c.entry_id, "
+         "       (SELECT decision_reason FROM monitor_checks m "
+         "        WHERE m.entry_id = c.entry_id AND m.decision = 'CASHOUT' "
+         "        ORDER BY m.ts DESC LIMIT 1) AS reason "
+         "FROM cashouts c WHERE c.ts >= ?")
+    params: tuple = (since_iso,)
+    if strategy is not None:
+        q += (" AND EXISTS (SELECT 1 FROM entries e WHERE e.entry_id = "
+              "c.entry_id AND COALESCE(e.strategy,'weather_edge') = ?)")
+        params = (since_iso, strategy)
+    rows = conn.execute(q, params).fetchall()
 
     by_trigger: dict[str, list[float]] = defaultdict(list)
     for r in rows:
@@ -213,18 +220,24 @@ def aggregate_cashout_triggers(conn, since_iso: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def aggregate_judge(conn, since_iso: str) -> dict:
-    """Aggregate judge verdicts and reject-counterfactual."""
-    rows = conn.execute(
-        "SELECT j.verdict, j.judge_prob, j.bot_prob, j.cost_usd, "
-        "       e.entry_id, e.status, e.entry_price, e.side, "
-        "       r.final_outcome, r.payout_per_share "
-        "FROM judge_reviews j "
-        "JOIN entries e ON e.entry_id = j.entry_id "
-        "LEFT JOIN resolutions r ON r.entry_id = e.entry_id "
-        "WHERE j.ts >= ?",
-        (since_iso,),
-    ).fetchall()
+def aggregate_judge(conn, since_iso: str,
+                    strategy: Optional[str] = None) -> dict:
+    """Aggregate judge verdicts and reject-counterfactual.
+
+    v11: optional `strategy` filter (default None = all). entries is already
+    in the JOIN, so it just adds a predicate (NULL counts as 'weather_edge')."""
+    q = ("SELECT j.verdict, j.judge_prob, j.bot_prob, j.cost_usd, "
+         "       e.entry_id, e.status, e.entry_price, e.side, "
+         "       r.final_outcome, r.payout_per_share "
+         "FROM judge_reviews j "
+         "JOIN entries e ON e.entry_id = j.entry_id "
+         "LEFT JOIN resolutions r ON r.entry_id = e.entry_id "
+         "WHERE j.ts >= ?")
+    params: tuple = (since_iso,)
+    if strategy is not None:
+        q += " AND COALESCE(e.strategy,'weather_edge') = ?"
+        params = (since_iso, strategy)
+    rows = conn.execute(q, params).fetchall()
 
     n_total = len(rows)
     by_verdict = defaultdict(int)
