@@ -1,0 +1,16 @@
+[Unit]
+Description=Backup consistente do estado paper (~/.polymarket-paper)
+Documentation=file:%h/polymarket-skills/agent/deploy/DEPLOY.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env bash %h/polymarket-skills/agent/deploy/backup.sh
+Nice=10
+IOSchedulingClass=idle
+
+# Hardening: só precisa ler o estado e gravar no diretório de backups.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/polymarket-backups

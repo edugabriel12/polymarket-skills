@@ -168,20 +168,13 @@ ssh -N -L 8765:127.0.0.1:8765 polymarket@SEU_IP
 # abra http://127.0.0.1:8765
 ```
 
-Para deixá-lo sempre no ar, crie um user service (mesmo diretório):
-`~/.config/systemd/user/weather-dashboard.service`
-```ini
-[Unit]
-Description=Weather edge dashboard (read-only, localhost)
-After=network-online.target
-[Service]
-WorkingDirectory=%h/polymarket-skills
-ExecStart=%h/.venv/bin/uvicorn dashboard.main:app --host 127.0.0.1 --port 8765
-Restart=on-failure
-[Install]
-WantedBy=default.target
+Para deixá-lo sempre no ar, use a unit pronta (o `bootstrap.sh` já a instala em
+`~/.config/systemd/user/weather-dashboard.service`, ligada a `127.0.0.1:8765`):
+```bash
+systemctl --user enable --now weather-dashboard
 ```
-`systemctl --user daemon-reload && systemctl --user enable --now weather-dashboard`.
+Requer as deps do dashboard no venv (`WITH_DASHBOARD=1 bash bootstrap.sh`, ou
+`~/.venv/bin/pip install -r ~/polymarket-skills/dashboard/requirements.txt`).
 
 ---
 
@@ -196,12 +189,32 @@ WantedBy=default.target
 | Zerar gasto do judge | `echo "JUDGE_DAILY_BUDGET_USD=0" >> ~/polymarket-skills/agent/.env && systemctl --user restart weather-edge-judge` |
 | Análise | `~/.venv/bin/python ~/polymarket-skills/polymarket-analyzer/scripts/weather_edge_analyzer.py --since 2026-07-01` |
 
-**Backup do que importa** (todo o estado é SQLite em `~/.polymarket-paper/`):
+### Backup automático (recomendado — a VPS pode morrer)
+
+Todo o estado é SQLite em `~/.polymarket-paper/`. Como os `.db` estão em modo
+WAL sendo escritos ao vivo, um `tar` cru pode sair inconsistente — por isso o
+`agent/deploy/backup.sh` usa a **API de backup online do SQLite** (snapshot
+consistente sem parar os serviços), inclui os `.jsonl`/`advisor_reports`/gate, e
+rotaciona mantendo os últimos `KEEP` (default 8) em `~/polymarket-backups/`.
+
+O `bootstrap.sh` instala o timer semanal (domingo 05:00 UTC, `Persistent=true` —
+roda no boot se a VPS estava desligada). Habilite:
 ```bash
-tar czf ~/polymarket-paper-$(date -u +%Y%m%d).tgz -C ~ .polymarket-paper
-# copie para fora da VPS: scp polymarket@SEU_IP:~/polymarket-paper-*.tgz .
+systemctl --user enable --now weather-edge-backup.timer
+systemctl --user start weather-edge-backup.service   # roda um agora, p/ testar
+systemctl --user list-timers | grep backup
 ```
-Um cron/timer semanal de backup é recomendado — a VPS pode morrer.
+Rodada manual: `bash ~/polymarket-skills/agent/deploy/backup.sh`
+(ajuste retenção com `KEEP=12 bash ...`).
+
+**Leve os snapshots para fora da VPS** — um backup local não protege contra a
+perda da máquina:
+```bash
+# do seu laptop, periodicamente:
+scp polymarket@SEU_IP:~/polymarket-backups/polymarket-paper-*.tgz ./backups/
+```
+Restaurar: `tar xzf polymarket-paper-<UTC>.tgz -C ~/.polymarket-paper` com os
+serviços parados.
 
 **Custo estimado:** VPS ~US$5/mês + Anthropic ~US$15-50/mês (judge, Sonnet +
 cache) + OpenWeather/Visual Crossing no free tier.
@@ -232,4 +245,4 @@ systemctl --user start weather-edge-bot weather-edge-judge
 - [ ] `.env` preenchido (chmod 600), variáveis de live **vazias**
 - [ ] smoke test `--once --dry-run` OK
 - [ ] serviços `active`; sobrevivem a `reboot`
-- [ ] backup de `~/.polymarket-paper/` agendado
+- [ ] `weather-edge-backup.timer` habilitado; snapshots copiados para fora da VPS

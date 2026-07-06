@@ -146,6 +146,11 @@ install_unit "${REPO_DIR}/agent/weather-edge-bot.service"
 install_unit "${REPO_DIR}/agent/weather-edge-judge.service"
 install_unit "${REPO_DIR}/agent/weather-strategy-advisor.service"
 cp "${REPO_DIR}/agent/weather-strategy-advisor.timer" "${UNIT_DIR}/"
+# Backup semanal (bash, sem sed) + dashboard (já usa venv uvicorn, sem sed).
+cp "${REPO_DIR}/agent/weather-edge-backup.service" "${UNIT_DIR}/"
+cp "${REPO_DIR}/agent/weather-edge-backup.timer" "${UNIT_DIR}/"
+cp "${REPO_DIR}/agent/weather-dashboard.service" "${UNIT_DIR}/"
+mkdir -p "${HOME}/polymarket-backups"
 systemctl --user daemon-reload
 
 # --------------------------------------------------------------------------
@@ -165,7 +170,9 @@ Próximos passos:
   2) Smoke test (offline):    ${VENV_DIR}/bin/python ${REPO_LINK}/polymarket-analyzer/scripts/weather_edge_bot.py --once --dry-run --judge-mode=off --debug
   3) Habilite os serviços:    systemctl --user enable --now weather-edge-bot weather-edge-judge
   4) Advisor semanal (opc.):  systemctl --user enable --now weather-strategy-advisor.timer
-  5) Acompanhe:               journalctl --user -u weather-edge-bot -u weather-edge-judge -f
+  5) Backup semanal (rec.):   systemctl --user enable --now weather-edge-backup.timer
+  6) Dashboard (opc., túnel): systemctl --user enable --now weather-dashboard   # 127.0.0.1:8765
+  7) Acompanhe:               journalctl --user -u weather-edge-bot -u weather-edge-judge -f
 
 Estratégia cheap_convexity (nova, gated):
   - Rode o gate de calibração: ${VENV_DIR}/bin/python ${REPO_LINK}/polymarket-analyzer/scripts/cheap_convexity_calibration.py --write

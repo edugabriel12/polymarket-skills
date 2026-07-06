@@ -1,0 +1,27 @@
+[Unit]
+Description=Weather edge dashboard (read-only, localhost only)
+Documentation=file:%h/polymarket-skills/dashboard/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/polymarket-skills/agent/.env
+WorkingDirectory=%h/polymarket-skills
+# Bind APENAS em 127.0.0.1 — acesse via túnel SSH, nunca exponha a porta.
+ExecStart=%h/.venv/bin/uvicorn dashboard.main:app --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+MemoryMax=256M
+CPUQuota=25%
+
+# Hardening: o dashboard é read-only sobre os SQLite/JSONL do paper.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=default.target
