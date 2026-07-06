@@ -715,6 +715,35 @@ def _judge_route(entry_row) -> Optional[dict]:
                 "reason": (f"non_temperature_market: metric={spec0.metric} — "
                            f"bot is temperature-only (policy 2026-07-05)")}
 
+    # (0.5) v11 cheap_convexity: skip the LLM entirely (operator decision).
+    # These entries already cleared (i) the tail-calibration gate at
+    # discovery, (ii) raw fair > price, (iii) an exit-liquidity gate. The LLM
+    # judge is calibrated for normal temperature near the forecast and adds
+    # nothing to a pure-convexity tail bet, so it is auto-approved on the
+    # deterministic guards. Fail-safe: any missing/corrupt field falls through
+    # to None → LLM (never a blind approve). Runs before JUDGE_AUTOROUTE so
+    # policy is independent of the routing kill-switch.
+    try:
+        strat = entry_row["strategy"] if "strategy" in entry_row.keys() else None
+    except Exception:
+        strat = None
+    if strat == "cheap_convexity":
+        try:
+            dm = json.loads(entry_row["discovery_meta_json"] or "{}")
+            price = float(entry_row["entry_price"] or 0)
+            if float(dm.get("fair_target", 0)) <= price:
+                return {"action": "auto_reject", "kind": "cheap_convexity",
+                        "reason": "cc_fair_not_above_price"}
+            if float(dm.get("exit_liquidity_shares", 0)) <= 0:
+                return {"action": "auto_reject", "kind": "cheap_convexity",
+                        "reason": "cc_no_exit_liquidity"}
+            return {"action": "auto_approve", "kind": "cheap_convexity",
+                    "reason": (f"cheap_convexity guards ok: fair "
+                               f"{dm.get('fair_target')} > price {price}, "
+                               f"exit liquidity {dm.get('exit_liquidity_shares')}")}
+        except Exception:
+            return None  # fail-safe → LLM
+
     if not JUDGE_AUTOROUTE:
         return None
 
@@ -1265,6 +1294,20 @@ def main():
                 # the full judge. This closes the auto-approve blind spot for
                 # non-meteorological catalysts the ensemble can't see.
                 if route is not None and route["action"] == "auto_approve":
+                    # v11 cheap_convexity: skip the web-search anomaly scan too
+                    # (operator chose "no LLM" for this strategy). Approve
+                    # directly on the deterministic guards.
+                    if route.get("kind") == "cheap_convexity":
+                        verdict = _synthesize_route_verdict(row_dict, route)
+                        with db.connect() as conn:
+                            apply_verdict(conn, row_dict, verdict)
+                        log_event("judge_autoapprove_cheap_convexity", {
+                            "entry_id": row_dict["entry_id"],
+                            "final_verdict": verdict["verdict"],
+                            "reason": route["reason"],
+                            "cost_usd": 0.0, "llm_skipped": True,
+                        })
+                        continue
                     scan = _anomaly_scan(row_dict) if JUDGE_ANOMALY_SCAN else {
                         "catalyst_found": False, "summary": "scan disabled",
                         "_meta": {}}
@@ -1741,6 +1784,83 @@ def _test_anomaly():
     print("\nAll anomaly-scan tests PASS (6/6)")
 
 
+def _test_cc_route():
+    """v11: _judge_route must auto-approve cheap_convexity on deterministic
+    guards WITHOUT the LLM, auto-reject bad ones, fail-safe on corrupt meta,
+    and leave legacy (non-cc) rows on their normal routing path. The policy
+    runs even with JUDGE_AUTOROUTE=0."""
+    import types
+    import weather_edge_judge as mod
+    import weather_edge_helpers as helpers
+
+    saved = (helpers.parse_market, helpers.load_cities,
+             helpers.is_tradeable_spec, mod.JUDGE_AUTOROUTE)
+
+    def _temp_spec():
+        return types.SimpleNamespace(
+            metric="temp", comparison="range", threshold_value=14.0,
+            threshold_value_high=15.0, threshold_unit="C")
+
+    def _row(strategy, meta, entry_price=0.02):
+        return {
+            "entry_id": 1, "market_question": "temp?", "end_date": "2026-07-09",
+            "side": "YES", "entry_price": entry_price,
+            "forecast_prob_at_entry": 0.07,
+            "forecast_snapshot_json": json.dumps({}),
+            "discovery_meta_json": meta,
+            "strategy": strategy,
+        }
+
+    try:
+        # (0) temp-only step must pass through so we reach (0.5).
+        helpers.parse_market = lambda q, e, c: _temp_spec()
+        helpers.load_cities = lambda: {}
+        helpers.is_tradeable_spec = lambda s: True
+
+        # CC-R1: valid cheap_convexity → auto_approve, no LLM.
+        r = mod._judge_route(_row("cheap_convexity", json.dumps(
+            {"fair_target": 0.07, "exit_liquidity_shares": 500})))
+        assert r and r["action"] == "auto_approve", r
+        assert r["kind"] == "cheap_convexity", r
+        print("Test CC-R1 PASS: valid cheap_convexity → auto_approve (no LLM)")
+
+        # CC-R2: fair <= price → auto_reject.
+        r = mod._judge_route(_row("cheap_convexity", json.dumps(
+            {"fair_target": 0.02, "exit_liquidity_shares": 500})))
+        assert r and r["action"] == "auto_reject" and "price" in r["reason"], r
+        print("Test CC-R2 PASS: fair <= price → auto_reject")
+
+        # CC-R3: no exit liquidity → auto_reject.
+        r = mod._judge_route(_row("cheap_convexity", json.dumps(
+            {"fair_target": 0.07, "exit_liquidity_shares": 0})))
+        assert r and r["action"] == "auto_reject" and "liquidity" in r["reason"], r
+        print("Test CC-R3 PASS: no exit liquidity → auto_reject")
+
+        # CC-R4: corrupt discovery_meta_json → None (fail-safe → LLM).
+        r = mod._judge_route(_row("cheap_convexity", "{bad json"))
+        assert r is None, r
+        print("Test CC-R4 PASS: corrupt meta → None (fail-safe to LLM)")
+
+        # CC-R5: legacy (strategy None) does NOT enter cc branch. With a temp
+        # spec, no proximity, non-ensemble → normal routing returns None (LLM).
+        mod._threshold_proximity_reason = lambda row: None
+        r = mod._judge_route(_row(None, json.dumps({})))
+        assert r is None or r.get("kind") != "cheap_convexity", r
+        print("Test CC-R5 PASS: legacy row not routed as cheap_convexity")
+
+        # CC-R6: policy survives JUDGE_AUTOROUTE=0 (runs before that gate).
+        mod.JUDGE_AUTOROUTE = False
+        r = mod._judge_route(_row("cheap_convexity", json.dumps(
+            {"fair_target": 0.07, "exit_liquidity_shares": 500})))
+        assert r and r["action"] == "auto_approve", r
+        print("Test CC-R6 PASS: cheap_convexity routes even with AUTOROUTE=0")
+
+        print("\nAll cheap_convexity route tests PASS")
+    finally:
+        (helpers.parse_market, helpers.load_cities,
+         helpers.is_tradeable_spec, mod.JUDGE_AUTOROUTE) = saved
+
+
 if __name__ == "__main__":
     import sys
     if "--test-rule6" in sys.argv:
@@ -1751,5 +1871,7 @@ if __name__ == "__main__":
         _test_autoroute()
     elif "--test-anomaly" in sys.argv:
         _test_anomaly()
+    elif "--test-cc-route" in sys.argv:
+        _test_cc_route()
     else:
         main()

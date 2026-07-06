@@ -1,0 +1,13 @@
+[Unit]
+Description=Backup semanal do estado paper do weather stack
+Documentation=file:%h/polymarket-skills/agent/weather-edge-backup.service
+
+[Timer]
+# Domingos 05:00 UTC (antes do advisor às 06:00). Persistent → se a VPS
+# estava desligada no horário, roda no próximo boot (não perde a semana).
+OnCalendar=Sun *-*-* 05:00:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

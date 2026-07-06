@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 DB_PATH = Path.home() / ".polymarket-paper" / "weather_edge.db"
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 SCHEMA_V1 = """
@@ -288,6 +288,18 @@ SCHEMA_V10_MIGRATIONS = [
 ]
 
 
+# v11 (2026-07-06): per-strategy tagging. The cheap_convexity strategy buys
+# 1-20c tail bins and exits on cashout at model fair; its entries must be
+# isolated in every KPI query so they don't contaminate the tuned
+# weather_edge P&L/win-rate. NULL == legacy 'weather_edge' (backfilled here;
+# all readers use COALESCE(strategy,'weather_edge') for residual NULLs).
+SCHEMA_V11_MIGRATIONS = [
+    "ALTER TABLE entries ADD COLUMN strategy TEXT",
+    "UPDATE entries SET strategy = 'weather_edge' WHERE strategy IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_entries_strategy ON entries(strategy)",
+]
+
+
 def init_db(path: Path = DB_PATH) -> None:
     """Create the DB and tables if missing. Idempotent. Bumps user_version.
     Enables WAL mode so readers + writers don't block each other."""
@@ -360,6 +372,14 @@ def init_db(path: Path = DB_PATH) -> None:
                     if "duplicate column name" not in str(e).lower():
                         raise
             current = 10
+        if current < 11:
+            for stmt in SCHEMA_V11_MIGRATIONS:
+                try:
+                    cur.execute(stmt)
+                except sqlite3.OperationalError as e:
+                    if "duplicate column name" not in str(e).lower():
+                        raise
+            current = 11
         cur.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
 
@@ -633,17 +653,26 @@ def query_approved_unexecuted(conn) -> list[sqlite3.Row]:
     ).fetchall()
 
 
-def query_open_positions(conn) -> list[sqlite3.Row]:
+def query_open_positions(conn, strategy: Optional[str] = None) -> list[sqlite3.Row]:
     """Entries that were executed and are still open: no cashout, no resolution.
-    Resolved positions are excluded so the slot is freed for new bets."""
-    return conn.execute(
-        "SELECT e.* FROM entries e "
-        "LEFT JOIN cashouts c ON c.entry_id = e.entry_id "
-        "LEFT JOIN resolutions r ON r.entry_id = e.entry_id "
-        "WHERE e.status IN ('EXECUTED','FAST_PATH') "
-        "AND c.cashout_id IS NULL "
-        "AND r.resolution_id IS NULL"
-    ).fetchall()
+    Resolved positions are excluded so the slot is freed for new bets.
+
+    v11: `strategy` is an OPTIONAL filter. Default None returns ALL strategies
+    (the monitor MUST see cheap_convexity positions to cash them out, so it
+    calls with no filter). A dashboard/analysis caller can pass
+    strategy='weather_edge' to exclude cheap_convexity, or 'cheap_convexity'
+    to isolate it. NULL strategy rows count as 'weather_edge'."""
+    q = ("SELECT e.* FROM entries e "
+         "LEFT JOIN cashouts c ON c.entry_id = e.entry_id "
+         "LEFT JOIN resolutions r ON r.entry_id = e.entry_id "
+         "WHERE e.status IN ('EXECUTED','FAST_PATH') "
+         "AND c.cashout_id IS NULL "
+         "AND r.resolution_id IS NULL")
+    params: tuple = ()
+    if strategy is not None:
+        q += " AND COALESCE(e.strategy, 'weather_edge') = ?"
+        params = (strategy,)
+    return conn.execute(q, params).fetchall()
 
 
 def query_unresolved_past_end(conn, now_iso: str) -> list[sqlite3.Row]:
@@ -785,10 +814,90 @@ def _test_query_ladder_group_judge_join():
     tmp.unlink()
 
 
+def _test_migration_v11_strategy():
+    """v11 regression: migrating a v10 DB must add the `strategy` column,
+    backfill legacy rows to 'weather_edge', create the index, bump
+    user_version to 11, and be idempotent on a second init_db()."""
+    import tempfile
+    from pathlib import Path as P
+    tmp = P(tempfile.mkdtemp()) / "migration_v11.db"
+
+    # Build a DB frozen at v10 (run every migration except v11), then insert a
+    # legacy entry with no strategy value — exactly the pre-v11 production shape.
+    with sqlite3.connect(tmp, timeout=5.0) as conn:
+        cur = conn.cursor()
+        cur.executescript(SCHEMA_V1)
+        for block in (SCHEMA_V2_MIGRATIONS, SCHEMA_V3_MIGRATIONS,
+                      SCHEMA_V4_MIGRATIONS, SCHEMA_V5_MIGRATIONS,
+                      SCHEMA_V6_MIGRATIONS, SCHEMA_V7_MIGRATIONS,
+                      SCHEMA_V8_MIGRATIONS, SCHEMA_V9_MIGRATIONS,
+                      SCHEMA_V10_MIGRATIONS):
+            for stmt in block:
+                try:
+                    cur.execute(stmt)
+                except sqlite3.OperationalError as e:
+                    if "duplicate column name" not in str(e).lower():
+                        raise
+        cur.execute("PRAGMA user_version = 10")
+        cur.execute(
+            "INSERT INTO entries (ts, market_slug, market_question, side, "
+            "status, entry_price) VALUES "
+            "('2026-07-06T00:00:00+00:00', 's', 'q', 'YES', 'EXECUTED', 0.45)")
+        conn.commit()
+
+    # Apply the real migration.
+    init_db(tmp)
+
+    with connect(tmp) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 11
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(entries)")}
+        assert "strategy" in cols, cols
+        idx = {r[1] for r in conn.execute("PRAGMA index_list(entries)")}
+        assert "idx_entries_strategy" in idx, idx
+        # legacy row backfilled
+        row = conn.execute("SELECT strategy FROM entries").fetchone()
+        assert row["strategy"] == "weather_edge", row["strategy"]
+
+    # Idempotent: a second init_db must not raise and must stay at v11.
+    init_db(tmp)
+    with connect(tmp) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 11
+    print("Test PASS: v11 migration adds strategy col + index, backfills "
+          "'weather_edge', bumps user_version, idempotent")
+
+    # Isolation: query_open_positions filter must separate cheap_convexity
+    # from weather_edge (the operator's "identify entries for analysis" ask),
+    # while default (None) still returns both (so the monitor sees all).
+    with connect(tmp) as conn:
+        ts = "2026-07-06T01:00:00+00:00"
+        for strat in ("weather_edge", "cheap_convexity"):
+            conn.execute(
+                "INSERT INTO entries (ts, market_slug, market_question, side, "
+                "status, entry_price, strategy) VALUES "
+                "(?, ?, 'q', 'YES', 'EXECUTED', 0.10, ?)",
+                (ts, f"slug-{strat}", strat))
+        conn.commit()
+        all_open = query_open_positions(conn)
+        we_open = query_open_positions(conn, strategy="weather_edge")
+        cc_open = query_open_positions(conn, strategy="cheap_convexity")
+        # the legacy backfilled EXECUTED row (weather_edge) + 2 inserted = 3
+        assert len(all_open) == 3, len(all_open)
+        assert len(cc_open) == 1, len(cc_open)
+        assert all(r["strategy"] == "cheap_convexity" for r in cc_open)
+        assert len(we_open) == 2, len(we_open)  # backfilled + inserted
+        assert all(r["strategy"] == "weather_edge" for r in we_open)
+    print("Test PASS: query_open_positions isolates cheap_convexity "
+          "(all=3, weather_edge=2, cheap_convexity=1)")
+    tmp.unlink()
+
+
 if __name__ == "__main__":
     import sys
     if "--test-judge-join" in sys.argv:
         _test_query_ladder_group_judge_join()
+        sys.exit(0)
+    if "--test-migration" in sys.argv:
+        _test_migration_v11_strategy()
         sys.exit(0)
     # Smoke test: init DB and print version
     init_db()

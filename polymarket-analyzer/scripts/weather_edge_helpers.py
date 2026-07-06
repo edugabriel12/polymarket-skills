@@ -1443,6 +1443,12 @@ def evaluate_cashout_triggers(
     range_low: Optional[float] = None,
     range_high: Optional[float] = None,
     range_cross_margin: float = 0.5,
+    # v11 cheap_convexity: exit when the bid converges to the RAW (uncapped)
+    # model fair. Distinct from trigger 3 (convergence), whose fair comes
+    # from forecast_prob_yes already capped by prob_yes_for_sizing.
+    enable_fair_target: bool = False,
+    fair_uncapped_yes: Optional[float] = None,
+    fair_target_margin_pp: float = 0.0,
 ) -> dict:
     """Decide whether to cash out an open position based on OR'd triggers.
 
@@ -1511,6 +1517,29 @@ def evaluate_cashout_triggers(
                 "trigger": "trailing_stop",
                 "reason": f"bid {current_bid:.3f} <= peak {peak:.3f} * "
                           f"(1 - {trailing_drawdown_pct:.0f}%); reversal from peak",
+            }
+
+    # Trigger 2.5 (v11 cheap_convexity): bid converged to the RAW model fair.
+    # The cheap_convexity strategy buys a 1-20c tail bin and sells into the
+    # winner as the price rises toward the model's fair value (e.g. bought at
+    # 0.01, raw fair 0.07, exit ~0.06). Distinct from trigger 3 (convergence),
+    # whose `fair_value` comes from forecast_prob_yes AFTER prob_yes_for_sizing
+    # caps it to 0.70/0.95 — here the fair is the uncapped raw so a 7c bin
+    # exits at 7c, not at a capped 30c. Requires in_profit so it never sells
+    # at a loss (with entry >= 0.01, a bid of 0 can never satisfy this).
+    if (enable_fair_target and in_profit
+            and fair_uncapped_yes is not None):
+        fair_side = (float(fair_uncapped_yes) if side == "YES"
+                     else 1.0 - float(fair_uncapped_yes))
+        # 1e-9 epsilon so a cent-granular bid exactly at the threshold
+        # (e.g. bid 0.06 vs fair 0.07 - 1pp) fires despite float rounding.
+        if current_bid >= fair_side - fair_target_margin_pp / 100.0 - 1e-9:
+            return {
+                "decision": "CASHOUT",
+                "trigger": "fair_target",
+                "reason": f"bid {current_bid:.3f} within "
+                          f"{fair_target_margin_pp:.0f}pp of raw fair "
+                          f"{fair_side:.3f}; convexity converged",
             }
 
     # Trigger 3: convergence
@@ -2183,5 +2212,52 @@ if __name__ == "__main__":
     assert is_tradeable_spec(t5) is True
     assert is_tradeable_spec(None) is False
     print("Test T5 PASS: temp market tradeable=True; None → False")
+
+    # ------------------------------------------------------------------
+    # v11: cheap_convexity fair_target cashout trigger
+    # ------------------------------------------------------------------
+    # CC1: bought YES @ 0.01, raw fair 0.07, bid 0.06, margin 1pp → fires
+    # (0.06 >= 0.07 - 0.01).
+    v = evaluate_cashout_triggers(
+        side="YES", entry_price=0.01, current_bid=0.06, peak_bid_seen=0.06,
+        forecast_prob_yes=None, enable_fair_target=True,
+        fair_uncapped_yes=0.07, fair_target_margin_pp=1.0)
+    assert v["decision"] == "CASHOUT" and v["trigger"] == "fair_target", v
+    print("Test CC1 PASS: bid 0.06 within 1pp of raw fair 0.07 → fair_target")
+
+    # CC2: bid below entry (loss) → in_profit guard suppresses it → HOLD.
+    v = evaluate_cashout_triggers(
+        side="YES", entry_price=0.05, current_bid=0.03, peak_bid_seen=0.05,
+        forecast_prob_yes=None, enable_fair_target=True,
+        fair_uncapped_yes=0.07, fair_target_margin_pp=1.0)
+    assert v["decision"] == "HOLD", v
+    print("Test CC2 PASS: bid < entry → in_profit guard holds (no loss sale)")
+
+    # CC3: enable_fair_target=False → new trigger silent (legacy callers
+    # unaffected even with fair_uncapped_yes present).
+    v = evaluate_cashout_triggers(
+        side="YES", entry_price=0.01, current_bid=0.06, peak_bid_seen=0.06,
+        forecast_prob_yes=None, enable_fair_target=False,
+        fair_uncapped_yes=0.07, fair_target_margin_pp=1.0)
+    assert v["trigger"] != "fair_target", v
+    print("Test CC3 PASS: enable_fair_target=False → trigger silent")
+
+    # CC4: bid 0 (no bids in book) never fires (in_profit false since
+    # 0 < entry 0.01).
+    v = evaluate_cashout_triggers(
+        side="YES", entry_price=0.01, current_bid=0.0, peak_bid_seen=0.0,
+        forecast_prob_yes=None, enable_fair_target=True,
+        fair_uncapped_yes=0.07, fair_target_margin_pp=1.0)
+    assert v["decision"] == "HOLD", v
+    print("Test CC4 PASS: bid 0.0 → HOLD (no phantom sale at zero)")
+
+    # CC5: NO side — bought NO @ 0.02, raw P(YES)=0.90 → fair P(NO)=0.10,
+    # bid 0.09 within 1pp → fires.
+    v = evaluate_cashout_triggers(
+        side="NO", entry_price=0.02, current_bid=0.09, peak_bid_seen=0.09,
+        forecast_prob_yes=None, enable_fair_target=True,
+        fair_uncapped_yes=0.90, fair_target_margin_pp=1.0)
+    assert v["decision"] == "CASHOUT" and v["trigger"] == "fair_target", v
+    print("Test CC5 PASS: NO side fair P(NO)=0.10, bid 0.09 → fair_target")
 
     print("\nAll helper tests PASS")

@@ -77,6 +77,8 @@ from weather_edge_helpers import (  # noqa: E402
     compute_ensemble_calibration,
     # v14: temperature-only policy
     is_tradeable_spec,
+    # v11 cheap_convexity: raw (unclipped) fair for 1-20c tail bins
+    _forecast_probability_raw,
 )
 import weather_edge_db as db  # noqa: E402
 
@@ -1344,6 +1346,11 @@ def run_discovery(args, cities: dict) -> int:
                 comparison=spec.comparison,
                 ttr_hours_at_entry=c["ttr_hours"],
                 status="PROPOSED",
+                # v11: tag the tuned pipeline explicitly so cheap_convexity
+                # entries (which use their own discovery path) stay isolated
+                # in every KPI query. NULL would also be treated as legacy,
+                # but tagging new rows avoids relying on the backfill.
+                strategy="weather_edge",
                 # v8 observability: stash mae_meta dict (mae_dynamic,
                 # bias, station, OW/VC/Open-Meteo values, penalties)
                 # so the advisor can cohort-analyze trades.
@@ -1678,6 +1685,224 @@ def _risk_block_reason(engine, args) -> Optional[str]:
     return None
 
 
+CC_GATE_PATH = Path.home() / ".polymarket-paper" / "cheap_convexity_gate.json"
+
+
+def _load_cc_gate() -> dict:
+    """Read the tail-calibration gate artifact produced by
+    cheap_convexity_calibration.py. Missing/unreadable → {} (treated as not
+    passed, so the strategy stays a no-op — fail-closed)."""
+    try:
+        return json.loads(CC_GATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _cheap_convexity_target_usd(portfolio_value: float, p_side: float,
+                                fill_price: float, args) -> float:
+    """half-Kelly stake for a cheap_convexity bet, capped at
+    --cc-max-size-pct of portfolio (hard ceiling 5%). Tail bets mostly expire
+    at zero, so sizing is deliberately small (CLAUDE.md §2: first trade with a
+    new strategy = 1%). Returns 0 if the edge is non-positive."""
+    if portfolio_value <= 0 or not (0.0 < fill_price < 1.0):
+        return 0.0
+    p = max(0.0, min(1.0, float(p_side)))
+    q = 1.0 - p
+    b = (1.0 - fill_price) / fill_price          # net odds for the bought side
+    full_kelly = (p * b - q) / b if b > 0 else 0.0
+    if full_kelly <= 0:
+        return 0.0
+    half_kelly_frac = full_kelly / 2.0
+    cap_pct = min(float(getattr(args, "cc_max_size_pct", 1.0)), 5.0) / 100.0
+    frac = min(half_kelly_frac, cap_pct)
+    return portfolio_value * frac
+
+
+def run_discovery_cheap_convexity(args, cities: dict) -> int:
+    """v11 cheap_convexity discovery — a SEPARATE path from run_discovery.
+
+    Buys 1-20c temperature tail bins whose market price sits below the RAW
+    (unclipped) model fair, to later exit on cashout at convergence. It never
+    calls forecast_probability (whose [0.30,0.70] clip destroys the tail and
+    manufactures phantom edge on at_least/at_most bins) — it uses
+    _forecast_probability_raw directly. Entries are tagged
+    strategy='cheap_convexity', forced single-bin (ladder_group_id=None), and
+    only proposed when both an entry-slippage AND an exit-liquidity (bid-side)
+    gate pass at <= --max-slippage. PAPER only.
+
+    No-op unless --cheap-convexity is set AND the tail-calibration gate
+    (cheap_convexity_gate.json) reports tail_calibration_pass. This is the
+    Phase-1 → Phase-2 unlock: the gate is data, not a code branch.
+    """
+    if not getattr(args, "cheap_convexity", False):
+        return 0
+    gate = _load_cc_gate()
+    if not gate.get("tail_calibration_pass"):
+        log_event("cheap_convexity_gated", {
+            "reason": "tail_calibration_not_passed",
+            "gate_n": gate.get("n"), "gate_ece": gate.get("ece")})
+        return 0
+
+    log_event("cheap_convexity_discovery_start", {
+        "cc_min_entry_price": args.cc_min_entry_price,
+        "cc_max_entry_price": args.cc_max_entry_price,
+        "cc_min_edge_pp": args.cc_min_edge_pp})
+    raw_markets = fetch_weather_markets(min_volume=args.min_volume)
+    if not raw_markets:
+        return 0
+
+    now = datetime.now(timezone.utc)
+    cutoff = now + timedelta(hours=args.window_hours)
+    proposed = 0
+
+    def _cc_skip(slug, city, reason, meta=None):
+        log_event("cheap_convexity_skipped",
+                  {"slug": slug, "reason": reason, **(meta or {})})
+        try:
+            with db.connect() as _conn:
+                db.insert_discovery_skip(_conn, ts=_now_iso(), slug=slug,
+                    city=city, reason=f"cc_{reason}", meta_json=meta or {})
+                _conn.commit()
+        except Exception:
+            pass
+
+    for m in raw_markets:
+        slug = m.get("slug", "")
+        question = m.get("question", "")
+        end_date_str = m.get("endDate", "")
+        try:
+            end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            continue
+        if end_date < now or end_date > cutoff:
+            continue
+        ttr_hours = (end_date - now).total_seconds() / 3600.0
+        if args.min_ttr_hours > 0 and ttr_hours < args.min_ttr_hours:
+            continue
+        if m.get("acceptingOrders") is False:
+            continue
+
+        spec = parse_market(m.get("_combined_text") or question,
+                            end_date_str, cities)
+        if not spec or not is_tradeable_spec(spec):
+            continue  # temp-only (v14); rain/snow already excluded
+        if spec.confidence < 0.5:
+            continue
+
+        try:
+            token_ids = json.loads(m.get("clobTokenIds", "[]"))
+            if len(token_ids) < 2:
+                continue
+            token_id_yes, token_id_no = str(token_ids[0]), str(token_ids[1])
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        book_yes = fetch_orderbook(token_id_yes)
+        book_no = fetch_orderbook(token_id_no)
+        if not book_yes or not book_no:
+            continue
+        implied = implied_probabilities(book_yes, book_no)
+        if implied["yes_ask"] is None or implied["no_ask"] is None:
+            continue
+
+        station = resolve_station(spec.city, cities)
+        if not station and m.get("description"):
+            station = auto_extract_station(spec.city, cities, m.get("description"))
+        if station:
+            forecast = fetch_forecast(spec.city, days=5,
+                                       lat=station["lat"], lon=station["lon"])
+        else:
+            forecast = fetch_forecast(spec.city, days=5)
+        if not forecast:
+            continue
+
+        mae_dynamic, bias, mu_override, mae_meta = _compute_mae_for_market(
+            spec, forecast, args, station=station)
+        # RAW fair — never the clipped forecast_probability. This is the whole
+        # point of the strategy: represent a 1-20% tail fair honestly.
+        fair_yes_raw = _forecast_probability_raw(
+            spec, forecast, mae_override=mae_dynamic,
+            bias_override=bias, mu_override=mu_override)
+        if fair_yes_raw is None:
+            continue
+        fair_yes_raw = max(0.0, min(1.0, float(fair_yes_raw)))
+
+        edge = compute_edge(fair_yes_raw, implied)
+        side = edge["best_side"]
+        if side is None or edge["edge_pp_at_best"] < args.cc_min_edge_pp:
+            continue
+        entry_price = (implied["yes_ask"] if side == "YES"
+                       else implied["no_ask"])
+        if not (args.cc_min_entry_price <= entry_price <= args.cc_max_entry_price):
+            continue
+
+        # Gate A: entry-side slippage (BUY) must fit under --max-slippage.
+        book_side = book_yes if side == "YES" else book_no
+        buy = compute_max_size_for_slippage(book_side, "BUY", args.max_slippage)
+        if buy["max_shares"] == 0:
+            _cc_skip(slug, spec.city, "entry_slippage_infeasible",
+                     {"side": side, "entry_price": entry_price})
+            continue
+        # Gate B: exit liquidity — the cashout must be feasible on the BID at
+        # <= --max-slippage, checked BEFORE proposing. Cheap tail bins are
+        # thin; no exit book means no strategy.
+        sell = compute_max_size_for_slippage(book_side, "SELL", args.max_slippage)
+        if sell["max_shares"] == 0:
+            _cc_skip(slug, spec.city, "no_exit_liquidity",
+                     {"side": side, "entry_price": entry_price})
+            continue
+
+        fair_target = fair_yes_raw if side == "YES" else 1.0 - fair_yes_raw
+        best_bid = (book_side.get("bids") or [{}])[0].get("price", 0.0)
+        with db.connect() as conn:
+            # Duplicate/opposite guard: skip if any live entry on this slug.
+            existing = conn.execute(
+                "SELECT side, status FROM entries e "
+                "LEFT JOIN cashouts c ON c.entry_id = e.entry_id "
+                "WHERE e.market_slug = ? AND c.cashout_id IS NULL "
+                "  AND e.status IN ('PROPOSED','APPROVED','ADJUSTED',"
+                "'EXECUTED','FAST_PATH')",
+                (slug,)).fetchall()
+            if existing:
+                continue
+            entry_id = db.insert_entry(
+                conn, ts=_now_iso(), market_slug=slug,
+                market_question=question,
+                condition_id=m.get("conditionId", ""),
+                token_id_yes=token_id_yes, token_id_no=token_id_no,
+                end_date=end_date_str, side=side, entry_price=entry_price,
+                forecast_prob_at_entry=(fair_yes_raw if side == "YES"
+                                        else 1.0 - fair_yes_raw),
+                implied_prob_at_entry=entry_price,
+                edge_pp_at_entry=edge["edge_pp_at_best"],
+                forecast_snapshot_json=forecast,
+                parser_confidence=spec.confidence, city_resolved=spec.city,
+                threshold_value=spec.threshold_value,
+                threshold_unit=spec.threshold_unit,
+                comparison=spec.comparison, ttr_hours_at_entry=ttr_hours,
+                status="PROPOSED", strategy="cheap_convexity",
+                ladder_group_id=None, ladder_position=None,
+                discovery_meta_json={
+                    **mae_meta,
+                    "ask_at_entry": entry_price,
+                    "bid_at_entry": best_bid,
+                    "fair_yes_raw": round(fair_yes_raw, 4),
+                    "fair_target": round(fair_target, 4),
+                    "entry_slippage_pct": buy.get("slippage_pct"),
+                    "exit_liquidity_shares": sell.get("max_shares"),
+                })
+            conn.commit()
+        proposed += 1
+        log_event("cheap_convexity_proposed", {
+            "entry_id": entry_id, "slug": slug, "side": side,
+            "entry_price": entry_price, "fair_target": round(fair_target, 4),
+            "edge_pp": edge["edge_pp_at_best"],
+            "exit_liquidity_shares": sell.get("max_shares")})
+
+    log_event("cheap_convexity_discovery_end", {"proposed": proposed})
+    return proposed
+
+
 def run_execute(args) -> int:
     """Pick up APPROVED entries and execute them via paper_engine.
 
@@ -1810,6 +2035,24 @@ def run_execute(args) -> int:
         # removed at operator request — only paper-engine's internal risk
         # checks (insufficient balance) still gate at the engine layer.
         target_usd = float(sizing["max_usd"])
+        # v11 cheap_convexity: tail bets mostly expire at zero, so cap the
+        # depth-driven size with half-Kelly ∩ --cc-max-size-pct of portfolio
+        # (CLAUDE.md §2). forecast_prob_at_entry stores P(side) = the raw fair.
+        row_strategy = row["strategy"] if "strategy" in row.keys() else None
+        if row_strategy == "cheap_convexity":
+            try:
+                pv = float(engine.get_portfolio().get("total_value") or 0.0)
+            except Exception:
+                pv = 0.0
+            p_side = row["forecast_prob_at_entry"]
+            cc_usd = _cheap_convexity_target_usd(
+                pv, float(p_side or 0.0), fill_price, args)
+            log_event("cheap_convexity_sizing", {
+                "entry_id": entry_id, "portfolio_value": round(pv, 2),
+                "p_side": float(p_side or 0.0), "fill_price": round(fill_price, 4),
+                "depth_max_usd": round(target_usd, 2),
+                "cc_target_usd": round(cc_usd, 2)})
+            target_usd = min(target_usd, cc_usd)
         # Honor judge's size cap for ADJUSTED entries — usually half or a
         # third of the full size when judge has medium confidence.
         judge_size_cap = row["judge_adjusted_size_usd"] if status == "ADJUSTED" else None
@@ -1983,6 +2226,16 @@ def _do_monitor_check(conn, row, cities: dict, args) -> None:
                                             spec.comparison,
                                             ensemble_calibrated=ens_cal)
 
+    # v11 cheap_convexity: exit on the RAW fair (never the capped value the
+    # legacy triggers use). Recompute the raw P(YES) with the same overrides.
+    row_strategy = row["strategy"] if "strategy" in row.keys() else None
+    is_cc = row_strategy == "cheap_convexity"
+    cc_fair_yes_raw = None
+    if is_cc:
+        cc_fair_yes_raw = _forecast_probability_raw(
+            spec, forecast, mae_override=mae_dyn,
+            bias_override=bias, mu_override=mu_over)
+
     token_id = row["token_id_yes"] if side == "YES" else row["token_id_no"]
     book = fetch_orderbook(token_id)  # HTTP
     if not book:
@@ -2009,11 +2262,31 @@ def _do_monitor_check(conn, row, cities: dict, args) -> None:
         forecast_value=forecast_ref,
         range_low=spec.threshold_value,
         range_high=spec.threshold_value_high,
+        enable_fair_target=is_cc and cc_fair_yes_raw is not None,
+        fair_uncapped_yes=cc_fair_yes_raw,
+        fair_target_margin_pp=getattr(args, "cc_exit_margin_pp", 1.0),
     )
     decision = verdict["decision"]
     trigger = verdict["trigger"]
     reason = f"{trigger}: {verdict['reason']}"
     forecast_prob_now = forecast_prob_yes if side == "YES" else 1.0 - forecast_prob_yes
+
+    # v11 cheap_convexity: a cashout is only real if the bid book can absorb
+    # the position at <= --max-slippage. Cheap tail bins are thin, so re-check
+    # exit liquidity right before selling; if the bid can't take it, record
+    # TRY_CASHOUT_BLOCKED and hold (do not dump into an empty book).
+    if decision == "CASHOUT" and is_cc:
+        sell = compute_max_size_for_slippage(book, "SELL", args.max_slippage)
+        held_shares = float(row["size_shares"] or 0.0)
+        if sell["max_shares"] <= 0 or (held_shares > 0
+                                       and sell["max_shares"] < held_shares):
+            decision = "TRY_CASHOUT_BLOCKED"
+            reason = (f"exit_liquidity_insufficient: sell_max "
+                      f"{sell['max_shares']:.1f} < held {held_shares:.1f} "
+                      f"at <= {args.max_slippage:.0%} slippage")
+            log_event("cheap_convexity_cashout_blocked", {
+                "entry_id": entry_id, "held_shares": held_shares,
+                "sell_max_shares": sell["max_shares"], "bid": bid})
 
     # Brief write-only connection
     with db.connect() as conn2:
@@ -2593,6 +2866,29 @@ def main():
                         "rate eats the edge. 0.85 keeps payoff floor at "
                         "+18%% per ticket while still preferring high-prob "
                         "outcomes.).")
+    # v11 cheap_convexity: separate discovery path for 1-20c tail bins.
+    # OFF by default and additionally gated by cheap_convexity_gate.json
+    # (produced by cheap_convexity_calibration.py). Uses the RAW model fair
+    # (never the [0.30,0.70] clip) and its own price/edge floors.
+    p.add_argument("--cheap-convexity", action="store_true", default=False,
+                   help="Enable the cheap_convexity discovery path (buy 1-20c "
+                        "tail bins below raw model fair, exit on cashout at "
+                        "convergence). Still gated by the tail-calibration "
+                        "gate artifact; no-op until that passes. PAPER only.")
+    p.add_argument("--cc-min-entry-price", type=float, default=0.01,
+                   help="cheap_convexity: min entry price (default 0.01).")
+    p.add_argument("--cc-max-entry-price", type=float, default=0.20,
+                   help="cheap_convexity: max entry price (default 0.20).")
+    p.add_argument("--cc-min-edge-pp", type=float, default=3.0,
+                   help="cheap_convexity: min edge (raw fair - price) in pp "
+                        "(default 3.0).")
+    p.add_argument("--cc-exit-margin-pp", type=float, default=1.0,
+                   help="cheap_convexity: cash out when best_bid reaches "
+                        "raw_fair - X pp (default 1.0).")
+    p.add_argument("--cc-max-size-pct", type=float, default=1.0,
+                   help="cheap_convexity: max position as %% of portfolio "
+                        "(default 1.0; hard-capped at 5.0). half-Kelly is "
+                        "applied under this cap.")
     p.add_argument("--max-disagreement-pp", type=float, default=0.0,
                    help="Skip trades where |bot_prob - market_implied| > X pp. "
                         "Adverse selection guard. Loss analysis 2026-05-15 "
@@ -2754,6 +3050,7 @@ def main():
 
     if args.once:
         run_discovery(args, cities)
+        run_discovery_cheap_convexity(args, cities)  # v11, no-op unless gated flag on
         if args.judge_mode == "off":
             run_execute(args)
         run_monitor_tick(args, cities)
@@ -2776,6 +3073,7 @@ def main():
         try:
             if now_mono - last_discovery >= discovery_int:
                 run_discovery(args, cities)
+                run_discovery_cheap_convexity(args, cities)  # v11, gated
                 last_discovery = now_mono
             if now_mono - last_execute >= EXECUTE_INTERVAL:
                 # Bot only auto-executes if judge is off OR judge already approved.
@@ -3119,6 +3417,127 @@ def _test_decide_outcome():
     print("\nAll resolution-outcome tests PASS (6/6)")
 
 
+def _test_cheap_convexity_discovery():
+    """Hermetic E2E of run_discovery_cheap_convexity (no network). Proves:
+      - a 1-20c tail bin is proposed with strategy='cheap_convexity',
+        ladder_group_id NULL, and fair/ask/bid stashed in discovery_meta;
+      - the RAW fair (0.07) is used, NOT the clipped forecast_probability
+        (0.30) — the whole point of the strategy;
+      - the gate blocks everything when tail_calibration_pass is false;
+      - a market with no exit-side bids is skipped (no_exit_liquidity)."""
+    import tempfile
+    import types
+    from pathlib import Path as P
+    import weather_edge_bot as mod
+
+    tmp = P(tempfile.mkdtemp()) / "cc_discovery.db"
+    db.init_db(tmp)
+
+    future = (datetime.now(timezone.utc) + timedelta(hours=24)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    market = {
+        "slug": "highest-temp-in-paris-14c-on-july-9",
+        "question": "Will the highest temperature in Paris be 14°C on July 9?",
+        "endDate": future, "acceptingOrders": True,
+        "clobTokenIds": json.dumps(["tY", "tN"]),
+        "conditionId": "0xcc",
+    }
+    spec = types.SimpleNamespace(
+        city="Paris", confidence=0.9, metric="temp", comparison="range",
+        threshold_value=14.0, threshold_value_high=15.0, threshold_unit="C")
+
+    saved = (mod.fetch_weather_markets, mod.parse_market, mod.fetch_orderbook,
+             mod.implied_probabilities, mod.resolve_station,
+             mod.auto_extract_station, mod.fetch_forecast,
+             mod._compute_mae_for_market, mod._forecast_probability_raw,
+             mod.forecast_probability, mod.compute_edge,
+             mod.compute_max_size_for_slippage, mod._load_cc_gate, db.connect)
+    _orig_connect = db.connect
+    try:
+        mod.fetch_weather_markets = lambda min_volume=0: [market]
+        mod.parse_market = lambda q, e, c: spec
+        mod.resolve_station = lambda city, cities: None
+        mod.auto_extract_station = lambda *a, **k: None
+        mod.fetch_forecast = lambda *a, **k: {"daily_forecast": [{}]}
+        mod._compute_mae_for_market = lambda s, f, a, station=None: (
+            2.0, None, None, {"station": "LFPG", "mae_dynamic": 2.0})
+        # RAW fair 0.07 (tradeable tail). Clipped path would say 0.30.
+        mod._forecast_probability_raw = lambda s, f, **k: 0.07
+        mod.forecast_probability = lambda s, f, **k: 0.30  # must NOT be used
+        mod.implied_probabilities = lambda by, bn: {"yes_ask": 0.02,
+                                                    "no_ask": 0.97}
+        mod.compute_edge = lambda fair, imp: {
+            "best_side": "YES",
+            "edge_pp_at_best": round((fair - imp["yes_ask"]) * 100, 2)}
+        book_ok = {"asks": [{"price": 0.02, "size": 1000}],
+                   "bids": [{"price": 0.015, "size": 1000}]}
+        mod.fetch_orderbook = lambda tid: book_ok
+        mod.compute_max_size_for_slippage = lambda book, side, max_slippage: {
+            "max_shares": 500.0, "max_usd": 10.0, "slippage_pct": 0.05}
+        mod._load_cc_gate = lambda: {"tail_calibration_pass": True}
+        db.connect = lambda path=None: _orig_connect(tmp)
+
+        args = types.SimpleNamespace(
+            cheap_convexity=True, cc_min_entry_price=0.01,
+            cc_max_entry_price=0.20, cc_min_edge_pp=3.0, cc_exit_margin_pp=1.0,
+            min_volume=100, window_hours=48, min_ttr_hours=0.0,
+            max_slippage=0.2, debug=False)
+
+        n = mod.run_discovery_cheap_convexity(args, cities={})
+        assert n == 1, f"expected 1 proposal, got {n}"
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT strategy, side, entry_price, forecast_prob_at_entry, "
+                "ladder_group_id, discovery_meta_json, status "
+                "FROM entries").fetchone()
+        assert row["strategy"] == "cheap_convexity", row["strategy"]
+        assert row["side"] == "YES" and row["status"] == "PROPOSED"
+        assert row["ladder_group_id"] is None, row["ladder_group_id"]
+        assert abs(row["entry_price"] - 0.02) < 1e-9, row["entry_price"]
+        # RAW fair used, NOT the clip: P(side=YES) ≈ 0.07, not 0.30.
+        assert abs(row["forecast_prob_at_entry"] - 0.07) < 1e-9, (
+            f"expected raw fair 0.07, got {row['forecast_prob_at_entry']} "
+            "(0.30 would mean the clip leaked in)")
+        meta = json.loads(row["discovery_meta_json"])
+        assert abs(meta["fair_target"] - 0.07) < 1e-9, meta
+        assert "ask_at_entry" in meta and "bid_at_entry" in meta, meta
+        print("Test CC-D1 PASS: cheap_convexity proposed with raw fair 0.07 "
+              "(clip 0.30 not used), single-bin, meta stashed")
+
+        # CC-D2: gate not passed → no proposals.
+        mod._load_cc_gate = lambda: {"tail_calibration_pass": False}
+        n2 = mod.run_discovery_cheap_convexity(args, cities={})
+        assert n2 == 0, n2
+        print("Test CC-D2 PASS: gate not passed → 0 proposals (no-op)")
+
+        # CC-D3: exit book has no bids → no_exit_liquidity, nothing proposed.
+        mod._load_cc_gate = lambda: {"tail_calibration_pass": True}
+        mod.compute_max_size_for_slippage = (
+            lambda book, side, max_slippage:
+            {"max_shares": (500.0 if side == "BUY" else 0.0),
+             "max_usd": 10.0, "slippage_pct": 0.05})
+        # fresh DB so the duplicate guard doesn't fire on the CC-D1 row
+        tmp2 = P(tempfile.mkdtemp()) / "cc_discovery2.db"
+        db.init_db(tmp2)
+        db.connect = lambda path=None: _orig_connect(tmp2)
+        n3 = mod.run_discovery_cheap_convexity(args, cities={})
+        assert n3 == 0, n3
+        with db.connect() as conn:
+            skips = conn.execute("SELECT reason FROM discovery_skips").fetchall()
+        assert any(s["reason"] == "cc_no_exit_liquidity" for s in skips), skips
+        print("Test CC-D3 PASS: no exit bids → cc_no_exit_liquidity, 0 proposed")
+
+    finally:
+        (mod.fetch_weather_markets, mod.parse_market, mod.fetch_orderbook,
+         mod.implied_probabilities, mod.resolve_station,
+         mod.auto_extract_station, mod.fetch_forecast,
+         mod._compute_mae_for_market, mod._forecast_probability_raw,
+         mod.forecast_probability, mod.compute_edge,
+         mod.compute_max_size_for_slippage, mod._load_cc_gate,
+         db.connect) = saved
+    print("\nAll cheap_convexity discovery tests PASS")
+
+
 if __name__ == "__main__":
     import sys
     if "--test-atomic" in sys.argv:
@@ -3129,5 +3548,7 @@ if __name__ == "__main__":
         _test_decide_outcome()
     elif "--test-ladder-cap" in sys.argv:
         _test_ladder_judge_cap()
+    elif "--test-cc-discovery" in sys.argv:
+        _test_cheap_convexity_discovery()
     else:
         main()
