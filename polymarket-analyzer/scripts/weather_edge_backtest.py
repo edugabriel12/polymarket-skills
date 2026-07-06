@@ -116,18 +116,34 @@ def replay_entry(entry: dict, monitor_checks: list[dict],
     }
 
 
-def load_replay_data(conn, since_iso: str, limit: int = 200) -> list[dict]:
+def load_replay_data(conn, since_iso: str, limit: int = 200,
+                     strategy: Optional[str] = None,
+                     max_entry_price: Optional[float] = None) -> list[dict]:
     """Aggregate per-entry: entry row + ordered monitor_checks + resolution.
 
     Filters to EXECUTED/FAST_PATH entries since `since_iso`. Returns up to
     `limit` rows (most recent first). Each output dict:
       {"entry": {...}, "checks": [...], "resolution": {...|None}}
+
+    `strategy` (v11): if given, restrict to entries of that strategy, treating
+    a NULL strategy column as the legacy 'weather_edge'. Used by the
+    cheap_convexity price-band report, and to measure the sub-30c band over
+    the legacy history as a proxy before any cheap_convexity entry exists.
+    `max_entry_price`: if given, restrict to entries with entry_price below it.
     """
+    where = ["ts >= ?", "status IN ('EXECUTED', 'FAST_PATH')"]
+    params: list = [since_iso]
+    if strategy is not None:
+        where.append("COALESCE(strategy, 'weather_edge') = ?")
+        params.append(strategy)
+    if max_entry_price is not None:
+        where.append("entry_price < ?")
+        params.append(max_entry_price)
+    params.append(limit)
     entries = conn.execute(
-        "SELECT * FROM entries WHERE ts >= ? "
-        "  AND status IN ('EXECUTED', 'FAST_PATH') "
+        f"SELECT * FROM entries WHERE {' AND '.join(where)} "
         "ORDER BY ts DESC LIMIT ?",
-        (since_iso, limit),
+        params,
     ).fetchall()
 
     out = []
@@ -191,6 +207,83 @@ def grid_search(replay_data: list[dict],
     return results
 
 
+def _hold_pnl(entry: dict, resolution: Optional[dict],
+              params: BacktestParams) -> Optional[float]:
+    """P&L in USD if the entry were held to resolution (no cashout), with the
+    same fee model as replay_entry. None if unresolved. Computed directly from
+    the resolution payout rather than by coercing evaluate_cashout_triggers,
+    because trigger 4 (forecast_reversal) is not param-gated and would exit."""
+    if not resolution or resolution.get("payout_per_share") is None:
+        return None
+    shares = float(entry.get("size_shares") or 0)
+    size_usd = float(entry.get("size_usd") or 0)
+    gross = float(resolution["payout_per_share"]) * shares
+    net = gross - gross * params.fee_rate
+    return round(net - size_usd, 2)
+
+
+def segment_by_price_band(replay_data: list[dict], params: BacktestParams,
+                          band_width: float = 0.10) -> list[dict]:
+    """Segment replayed entries by entry-price band (tenths of [0,1] by
+    default) and report, per band, the realized return under the strategy
+    (cashout policy in `params`) and the delta vs holding to resolution.
+
+    This is the operational answer to the deep-research finding that on
+    Polymarket cheap tokens (price <= 0.30) have historically NEGATIVE
+    realized returns: it measures realized P&L / ROI by price band on our own
+    data, and whether cashing out beat holding for the cheap bands.
+
+    Per band: {band, price_lo, price_hi, n, total_pnl_usd, win_rate, mean_roi,
+               n_delta, mean_delta_cashout_vs_hold_usd}. mean_roi = mean of
+               (sim_pnl / entry cost). Delta is only over entries where both a
+               cashout-path P&L and a hold-path P&L are computable (resolved).
+    """
+    n_bands = int(round(1.0 / band_width))
+    agg: dict[int, dict] = {
+        b: {"pnls": [], "rois": [], "deltas": []} for b in range(n_bands)
+    }
+    for data in replay_data:
+        entry = data["entry"]
+        price = float(entry.get("entry_price") or 0)
+        # clamp into [0, n_bands-1]; price==1.0 lands in the top band
+        b = min(n_bands - 1, max(0, int(price / band_width)))
+        r = replay_entry(entry, data["checks"], data["resolution"], params)
+        pnl = r["sim_pnl_usd"]
+        if pnl is None:
+            continue  # still open — no realized return to attribute
+        agg[b]["pnls"].append(pnl)
+        cost = price * float(entry.get("size_shares") or 0)
+        if cost > 0:
+            agg[b]["rois"].append(pnl / cost)
+        hold = _hold_pnl(entry, data["resolution"], params)
+        if hold is not None:
+            agg[b]["deltas"].append(pnl - hold)
+
+    out = []
+    for b in range(n_bands):
+        pnls = agg[b]["pnls"]
+        if not pnls:
+            continue
+        wins = sum(1 for p in pnls if p > 0.001)
+        losses = sum(1 for p in pnls if p < -0.001)
+        resolved = wins + losses
+        rois = agg[b]["rois"]
+        deltas = agg[b]["deltas"]
+        out.append({
+            "band": b,
+            "price_lo": round(b * band_width, 2),
+            "price_hi": round((b + 1) * band_width, 2),
+            "n": len(pnls),
+            "total_pnl_usd": round(sum(pnls), 2),
+            "win_rate": round(wins / resolved, 3) if resolved else None,
+            "mean_roi": round(sum(rois) / len(rois), 4) if rois else None,
+            "n_delta": len(deltas),
+            "mean_delta_cashout_vs_hold_usd": (
+                round(sum(deltas) / len(deltas), 2) if deltas else None),
+        })
+    return out
+
+
 def default_param_grid(bid_slippage_pct: float = 0.0,
                         fee_rate: float = 0.0) -> list[BacktestParams]:
     """4 × 3 × 3 = 36 combos centered around current production defaults.
@@ -245,6 +338,16 @@ def main() -> int:
                         "e.g. 0.02 simulates a 2%% fee).")
     p.add_argument("--output", choices=("text", "json"), default="text",
                    help="Output format (default text).")
+    p.add_argument("--strategy", default=None,
+                   help="Restrict to entries of this strategy (v11), e.g. "
+                        "'cheap_convexity' or 'weather_edge'. NULL is treated "
+                        "as 'weather_edge'. Omit for all strategies.")
+    p.add_argument("--max-entry-price", type=float, default=None,
+                   help="Restrict to entries priced below this (e.g. 0.30 to "
+                        "measure realized return of the cheap band).")
+    p.add_argument("--price-band-report", action="store_true",
+                   help="Print realized return + cashout-vs-hold delta per "
+                        "0.10 price band (the FLB-by-price-decile view).")
     args = p.parse_args()
 
     db.init_db()
@@ -252,7 +355,9 @@ def main() -> int:
              - timedelta(days=args.since_days)).isoformat()
 
     with db.connect() as conn:
-        data = load_replay_data(conn, since, limit=args.limit)
+        data = load_replay_data(conn, since, limit=args.limit,
+                                strategy=args.strategy,
+                                max_entry_price=args.max_entry_price)
 
     if not data:
         print(f"No executed entries found since {since[:10]}.",
@@ -262,6 +367,35 @@ def main() -> int:
     grid = default_param_grid(bid_slippage_pct=args.slippage_pct,
                                 fee_rate=args.fee_rate)
     results = grid_search(data, grid)
+
+    if args.price_band_report:
+        # Use the best grid config's cashout policy for the band report.
+        best = results[0]["params"]
+        bp = BacktestParams(profit_lock_pp=best["profit_lock_pp"],
+                            trailing_drawdown_pct=best["trailing_drawdown_pct"],
+                            convergence_pp=best["convergence_pp"],
+                            bid_slippage_pct=args.slippage_pct,
+                            fee_rate=args.fee_rate)
+        bands = segment_by_price_band(data, bp)
+        if args.output == "json":
+            print(json.dumps({"since_iso": since, "n": len(data),
+                              "price_bands": bands}, indent=2, default=str))
+        else:
+            print(f"\nRealized return by price band "
+                  f"({len(data)} trades, best cashout policy):\n")
+            print(f"{'band':<12} {'n':<5} {'P&L $':<10} {'win':<7} "
+                  f"{'mean ROI':<10} {'Δ cashout-hold $':<16}")
+            print("-" * 62)
+            for bd in bands:
+                wr = f"{bd['win_rate']*100:.0f}%" if bd["win_rate"] is not None else "—"
+                roi = f"{bd['mean_roi']*100:.0f}%" if bd["mean_roi"] is not None else "—"
+                dl = ("—" if bd["mean_delta_cashout_vs_hold_usd"] is None
+                      else f"{bd['mean_delta_cashout_vs_hold_usd']:+.2f}")
+                print(f"{bd['price_lo']:.2f}-{bd['price_hi']:.2f}{'':<3} "
+                      f"{bd['n']:<5} ${bd['total_pnl_usd']:<9.2f} {wr:<7} "
+                      f"{roi:<10} {dl:<16}")
+            print()
+        return 0
 
     if args.output == "json":
         out = {
@@ -371,6 +505,41 @@ def _run_tests() -> int:
     assert r["sim_trigger"] == "hold_to_resolution", r
     assert abs(r["sim_pnl_usd"] - 85.0) < 0.01, r
     print(f"Test 7 PASS: fee=2% on hold → P&L ${r['sim_pnl_usd']} (was 87 w/o fee)")
+
+    # Test 8: segment_by_price_band — cheap NO @ 0.13 (band 1) that holds to a
+    # winning resolution, plus a pricier YES @ 0.55 (band 5) that loses at
+    # resolution. Verifies banding, per-band P&L, and cashout-vs-hold delta.
+    cheap = {"entry_id": 10, "side": "NO", "entry_price": 0.13,
+             "size_shares": 100, "size_usd": 13.0}
+    cheap_res = {"final_outcome": "NO", "payout_per_share": 1.0}
+    # bid climbs but never triggers cashout under a loose policy → holds
+    cheap_checks = [{"ts": f"2026-06-0{i}T00:00:00Z", "market_best_bid": bid,
+                     "forecast_prob_now": 0.95, "decision": "HOLD"}
+                    for i, bid in enumerate([0.20, 0.30, 0.40], start=1)]
+    pricey = {"entry_id": 11, "side": "YES", "entry_price": 0.55,
+              "size_shares": 100, "size_usd": 55.0}
+    pricey_res = {"final_outcome": "NO", "payout_per_share": 0.0}
+    pricey_checks = [{"ts": f"2026-06-0{i}T00:00:00Z", "market_best_bid": bid,
+                      "forecast_prob_now": 0.10, "decision": "HOLD"}
+                     for i, bid in enumerate([0.50, 0.45, 0.40], start=1)]
+    data8 = [
+        {"entry": cheap, "checks": cheap_checks, "resolution": cheap_res},
+        {"entry": pricey, "checks": pricey_checks, "resolution": pricey_res},
+    ]
+    # Loose policy so neither cashes out → both hold to resolution.
+    bands = segment_by_price_band(
+        data8, BacktestParams(profit_lock_pp=999, trailing_drawdown_pct=100,
+                              trailing_min_gain_pp=999, convergence_pp=0))
+    by_band = {b["band"]: b for b in bands}
+    assert set(by_band) == {1, 5}, by_band          # 0.13→band1, 0.55→band5
+    assert by_band[1]["n"] == 1 and by_band[5]["n"] == 1
+    # cheap held to win: payout 1.0*100 - 13 = +87; pricey held to loss: -55
+    assert by_band[1]["total_pnl_usd"] == 87.0, by_band[1]
+    assert by_band[5]["total_pnl_usd"] == -55.0, by_band[5]
+    # both paths held → cashout-vs-hold delta ~0
+    assert by_band[1]["mean_delta_cashout_vs_hold_usd"] == 0.0, by_band[1]
+    print("Test 8 PASS: segment_by_price_band → band1 $87 / band5 -$55, "
+          "delta 0 (both held)")
 
     print("\nAll backtest tests PASS")
     return 0

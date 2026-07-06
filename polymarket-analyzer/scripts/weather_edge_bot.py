@@ -1344,6 +1344,11 @@ def run_discovery(args, cities: dict) -> int:
                 comparison=spec.comparison,
                 ttr_hours_at_entry=c["ttr_hours"],
                 status="PROPOSED",
+                # v11: tag the tuned pipeline explicitly so cheap_convexity
+                # entries (which use their own discovery path) stay isolated
+                # in every KPI query. NULL would also be treated as legacy,
+                # but tagging new rows avoids relying on the backfill.
+                strategy="weather_edge",
                 # v8 observability: stash mae_meta dict (mae_dynamic,
                 # bias, station, OW/VC/Open-Meteo values, penalties)
                 # so the advisor can cohort-analyze trades.
