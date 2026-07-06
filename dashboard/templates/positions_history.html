@@ -42,13 +42,22 @@
 </div>
 {% endif %}
 
-{# --- Filter chips --- #}
+{# --- Strategy chips (v11) — preserve the current outcome filter --- #}
+<div class="table-filter" style="margin-bottom:8px;">
+  <span class="muted small" style="margin-right:6px;">Estratégia:</span>
+  {% for s in strategies %}
+  <a href="/positions/history?outcome={{ filter_outcome }}&strategy={{ s }}"
+     class="filter-chip {% if strategy == s %}active{% endif %}">{{ s }}</a>
+  {% endfor %}
+</div>
+
+{# --- Filter chips — preserve the current strategy --- #}
 <div class="table-filter" style="margin-bottom:12px;">
-  <a href="/positions/history?outcome=all"
+  <a href="/positions/history?outcome=all&strategy={{ strategy }}"
      class="filter-chip {% if filter_outcome == 'all' %}active{% endif %}">All ({{ history|length if filter_outcome == 'all' else '...' }})</a>
-  <a href="/positions/history?outcome=winner"
+  <a href="/positions/history?outcome=winner&strategy={{ strategy }}"
      class="filter-chip {% if filter_outcome == 'winner' %}active{% endif %}">Wins</a>
-  <a href="/positions/history?outcome=loser"
+  <a href="/positions/history?outcome=loser&strategy={{ strategy }}"
      class="filter-chip {% if filter_outcome == 'loser' %}active{% endif %}">Losses</a>
 </div>
 

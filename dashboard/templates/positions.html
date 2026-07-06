@@ -1,6 +1,16 @@
 {% extends "base.html" %}
 {% block content %}
 
+<section class="period-selector" id="strat-sel">
+  <span>Estratégia:</span>
+  <button class="period-btn active" data-strategy="weather_edge"
+          onclick="setStrat(this)">weather_edge</button>
+  <button class="period-btn" data-strategy="cheap_convexity"
+          onclick="setStrat(this)">cheap_convexity</button>
+  <button class="period-btn" data-strategy="all"
+          onclick="setStrat(this)">all</button>
+</section>
+
 <section class="card">
   <div class="positions-header">
     <h2>Open positions</h2>
@@ -16,8 +26,9 @@
   </div>
   <p class="muted small">Click a position row to see its replay (judge verdict, forecast, history, counterfactual).</p>
   <div id="positions-full"
-       hx-get="/api/positions?refresh=1"
-       hx-trigger="load, every {{ refresh_positions_sec }}s"
+       hx-get="/api/positions"
+       hx-vals='js:{refresh: 1, strategy: currentStrat()}'
+       hx-trigger="load, every {{ refresh_positions_sec }}s, stratchange"
        hx-swap="innerHTML">
     <div class="muted">Loading live positions…</div>
   </div>
@@ -39,6 +50,18 @@
 
 {% block scripts %}
 <script>
+  // v11: strategy selector. currentStrat() is read by the #positions-full
+  // hx-vals on every (auto-)refresh so the filter survives the 30s reload.
+  function currentStrat() {
+    const b = document.querySelector('#strat-sel .period-btn.active');
+    return b ? b.dataset.strategy : 'weather_edge';
+  }
+  function setStrat(btn) {
+    document.querySelectorAll('#strat-sel .period-btn')
+      .forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    htmx.trigger('#positions-full', 'stratchange');
+  }
   function openReplay(entryId) {
     const modal = document.getElementById('replay-modal');
     const body = document.getElementById('replay-body');

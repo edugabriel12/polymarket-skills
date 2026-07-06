@@ -252,7 +252,8 @@ def trigger_distances(
 
 
 def get_open_positions(sort_by: str = "entry_id",
-                        refresh_prices: bool = False) -> list[dict]:
+                        refresh_prices: bool = False,
+                        strategy: Optional[str] = None) -> list[dict]:
     """Return a list of open positions with bid, peak, P&L, trigger
     distances, and time held.
 
@@ -264,13 +265,16 @@ def get_open_positions(sort_by: str = "entry_id",
     the cached monitor_check value. Lets the operator see real-time P&L
     independent of the monitor cycle interval. Adds ~1-5s page load
     depending on position count (parallelized, 12 concurrent fetches).
+
+    v11: `strategy` filters to one strategy ('weather_edge' /
+    'cheap_convexity'); None = all (query_open_positions already supports it).
     """
     try:
         conn = _ro_conn(S.WEATHER_EDGE_DB)
     except FileNotFoundError:
         return []
     try:
-        rows = list(wdb.query_open_positions(conn))
+        rows = list(wdb.query_open_positions(conn, strategy=strategy))
         # v9.7: optional live CLOB refresh — done up-front, in parallel,
         # so each position uses the freshest possible bid instead of the
         # cached monitor_check.
@@ -410,7 +414,8 @@ def get_recent_skipped(limit: int = 20) -> list[dict]:
 
 
 def get_positions_history(limit: int = 200,
-                           filter_outcome: Optional[str] = None) -> list[dict]:
+                           filter_outcome: Optional[str] = None,
+                           strategy: Optional[str] = None) -> list[dict]:
     """v9.10: all resolved positions (cashed out via cashout policy OR
     settled via resolution sweep). Most recent first.
 
@@ -419,6 +424,8 @@ def get_positions_history(limit: int = 200,
       - resolutions row exists (market settled past end_date)
 
     filter_outcome: None (default — all), "winner", or "loser"
+    strategy (v11): None = all; 'weather_edge' / 'cheap_convexity' to isolate
+    (applied only if the strategy column exists — pre-v11 DBs ignore it).
     """
     try:
         conn = _ro_conn(S.WEATHER_EDGE_DB)
@@ -433,6 +440,13 @@ def get_positions_history(limit: int = 200,
             if has_ladder else
             "NULL AS ladder_group_id, NULL AS ladder_position, NULL AS ladder_event_slug,"
         )
+        # v11: strategy filter, defensive against pre-v11 DBs.
+        strat_clause = ""
+        params: list = []
+        if strategy is not None and "strategy" in entry_cols:
+            strat_clause = " AND COALESCE(e.strategy,'weather_edge') = ?"
+            params.append(strategy)
+        params.append(limit)
         rows = conn.execute(f"""
             SELECT
               e.entry_id, e.ts, e.market_slug, e.market_question,
@@ -450,9 +464,10 @@ def get_positions_history(limit: int = 200,
             LEFT JOIN resolutions r ON r.entry_id = e.entry_id
             WHERE e.status IN ('EXECUTED','FAST_PATH')
               AND (c.cashout_id IS NOT NULL OR r.resolution_id IS NOT NULL)
+              {strat_clause}
             ORDER BY COALESCE(r.ts_resolved, c.ts) DESC
             LIMIT ?
-        """, (limit,)).fetchall()
+        """, tuple(params)).fetchall()
 
         out = []
         for row in rows:
@@ -539,14 +554,23 @@ def get_positions_history(limit: int = 200,
         conn.close()
 
 
-def get_history_summary() -> dict:
-    """v9.10: aggregate metrics across all resolved positions."""
+def get_history_summary(strategy: Optional[str] = None) -> dict:
+    """v9.10: aggregate metrics across all resolved positions.
+
+    v11: optional `strategy` filter (None = all; applied only if the column
+    exists)."""
     try:
         conn = _ro_conn(S.WEATHER_EDGE_DB)
     except FileNotFoundError:
         return {"available": False}
     try:
-        row = conn.execute("""
+        entry_cols = [r[1] for r in conn.execute("PRAGMA table_info(entries)")]
+        strat_clause = ""
+        params: tuple = ()
+        if strategy is not None and "strategy" in entry_cols:
+            strat_clause = " AND COALESCE(e.strategy,'weather_edge') = ?"
+            params = (strategy,)
+        row = conn.execute(f"""
             SELECT
               COUNT(*) n_total,
               SUM(CASE WHEN COALESCE(c.realized_pnl_usd,
@@ -561,7 +585,8 @@ def get_history_summary() -> dict:
             LEFT JOIN resolutions r ON r.entry_id = e.entry_id
             WHERE e.status IN ('EXECUTED','FAST_PATH')
               AND (c.cashout_id IS NOT NULL OR r.resolution_id IS NOT NULL)
-        """).fetchone()
+              {strat_clause}
+        """, params).fetchone()
         n = row["n_total"] or 0
         wins = row["n_wins"] or 0
         pnl = float(row["total_pnl"] or 0)
@@ -700,5 +725,42 @@ if __name__ == "__main__":
     assert _humanize_duration(3700) == "1h1m"
     assert _humanize_duration(90000) == "1d1h"
     print("Test 6 PASS: _humanize_duration")
+
+    # Test 7 (v11): strategy segregation in history + summary.
+    import tempfile
+    import sys as _sys
+    _analyzer = Path(__file__).resolve().parent.parent.parent \
+        / "polymarket-analyzer" / "scripts"
+    if str(_analyzer) not in _sys.path:
+        _sys.path.insert(0, str(_analyzer))
+    import weather_edge_db as _wdb
+    _tmp = Path(tempfile.mkdtemp()) / "seg_positions.db"
+    _wdb.init_db(_tmp)
+    with _wdb.connect(_tmp) as _c:
+        for _eid, _strat in ((1, "weather_edge"), (2, "cheap_convexity")):
+            _c.execute(
+                "INSERT INTO entries (entry_id, ts, market_slug, "
+                "market_question, side, status, entry_price, size_shares, "
+                "size_usd, city_resolved, strategy) VALUES "
+                "(?, '2026-07-06T00:00:00+00:00','s','q','YES','EXECUTED',"
+                "0.5,10,5.0,'X',?)", (_eid, _strat))
+            # each resolved (won) so it lands in history
+            _c.execute(
+                "INSERT INTO resolutions (entry_id, ts_resolved, "
+                "final_outcome, payout_per_share) VALUES "
+                "(?, '2026-07-06T01:00:00+00:00','YES',1.0)", (_eid,))
+        _c.commit()
+    S.WEATHER_EDGE_DB = _tmp
+    _we_hist = get_positions_history(strategy="weather_edge")
+    _cc_hist = get_positions_history(strategy="cheap_convexity")
+    _all_hist = get_positions_history(strategy=None)
+    assert len(_we_hist) == 1 and _we_hist[0]["entry_id"] == 1, _we_hist
+    assert len(_cc_hist) == 1 and _cc_hist[0]["entry_id"] == 2, _cc_hist
+    assert len(_all_hist) == 2, _all_hist
+    _we_sum = get_history_summary(strategy="weather_edge")
+    _all_sum = get_history_summary(strategy=None)
+    assert _we_sum["n_total"] == 1 and _all_sum["n_total"] == 2, (_we_sum, _all_sum)
+    print("Test 7 PASS: history + summary segregate by strategy "
+          "(weather_edge=1, cheap_convexity=1, all=2)")
 
     print("\nAll positions tests PASS")

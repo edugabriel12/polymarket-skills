@@ -1,37 +1,32 @@
 {% extends "base.html" %}
 {% block content %}
 
-<section class="period-selector">
+<section class="period-selector" id="strat-sel">
+  <span>Estratégia:</span>
+  <button class="period-btn active" data-strategy="weather_edge"
+          onclick="setStrat(this)">weather_edge</button>
+  <button class="period-btn" data-strategy="cheap_convexity"
+          onclick="setStrat(this)">cheap_convexity</button>
+  <button class="period-btn" data-strategy="all"
+          onclick="setStrat(this)">all</button>
+</section>
+
+<section class="period-selector" id="period-sel">
   <span>Period:</span>
   <button class="period-btn {% if days == 7 %}active{% endif %}"
-          hx-get="/api/performance?days=7"
-          hx-target="#perf-body"
-          hx-swap="innerHTML"
-          onclick="setActive(this)">7d</button>
+          data-days="7" onclick="setPeriod(this)">7d</button>
   <button class="period-btn {% if days == 14 %}active{% endif %}"
-          hx-get="/api/performance?days=14"
-          hx-target="#perf-body"
-          hx-swap="innerHTML"
-          onclick="setActive(this)">14d</button>
+          data-days="14" onclick="setPeriod(this)">14d</button>
   <button class="period-btn {% if days == 30 %}active{% endif %}"
-          hx-get="/api/performance?days=30"
-          hx-target="#perf-body"
-          hx-swap="innerHTML"
-          onclick="setActive(this)">30d</button>
+          data-days="30" onclick="setPeriod(this)">30d</button>
   <button class="period-btn {% if days == 90 %}active{% endif %}"
-          hx-get="/api/performance?days=90"
-          hx-target="#perf-body"
-          hx-swap="innerHTML"
-          onclick="setActive(this)">90d</button>
+          data-days="90" onclick="setPeriod(this)">90d</button>
   <button class="period-btn {% if days == 3650 %}active{% endif %}"
-          hx-get="/api/performance?days=3650"
-          hx-target="#perf-body"
-          hx-swap="innerHTML"
-          onclick="setActive(this)">all</button>
+          data-days="3650" onclick="setPeriod(this)">all</button>
 </section>
 
 <div id="perf-body"
-     hx-get="/api/performance?days={{ days }}"
+     hx-get="/api/performance?days={{ days }}&strategy=weather_edge"
      hx-trigger="load"
      hx-swap="innerHTML">
   <div class="muted">Loading analytics…</div>
@@ -41,9 +36,33 @@
 
 {% block scripts %}
 <script>
-  function setActive(btn) {
-    document.querySelectorAll('.period-btn').forEach(b => b.classList.remove('active'));
+  // v11: two independent selectors (strategy × period). reloadPerf() reads the
+  // active button in each and fetches the performance body with both dims, so
+  // switching one preserves the other.
+  function currentDays() {
+    const b = document.querySelector('#period-sel .period-btn.active');
+    return b ? b.dataset.days : '14';
+  }
+  function currentStrat() {
+    const b = document.querySelector('#strat-sel .period-btn.active');
+    return b ? b.dataset.strategy : 'weather_edge';
+  }
+  function reloadPerf() {
+    htmx.ajax('GET',
+      `/api/performance?days=${currentDays()}&strategy=${currentStrat()}`,
+      '#perf-body');
+  }
+  function setPeriod(btn) {
+    document.querySelectorAll('#period-sel .period-btn')
+      .forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
+    reloadPerf();
+  }
+  function setStrat(btn) {
+    document.querySelectorAll('#strat-sel .period-btn')
+      .forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    reloadPerf();
   }
 </script>
 {% endblock %}
