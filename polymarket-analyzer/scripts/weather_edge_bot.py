@@ -828,6 +828,77 @@ def _build_ladder_candidates(candidates: list[dict], args) -> list[dict]:
     return out
 
 
+def _side_flip_extras(leg_row, executed_side: str,
+                      ladder_group_id: Optional[str] = None) -> dict:
+    """v13.6: extras for update_entry_status when the side actually executed
+    differs from the proposed one (judge ADJUST flipped the direction).
+
+    entries.side previously kept the PROPOSED side forever, so everything
+    downstream read the wrong token: the monitor evaluated triggers on the
+    wrong book, cashout tried to close the wrong position (post-v13.4 it
+    would even phantom-close the entry and strand the REAL position), and
+    the resolution sweep paid out the wrong side.
+
+    Persists the executed side AND the P(side) complement, keeping the DB
+    convention 'forecast_prob_at_entry stores P(entries.side)' true after
+    the flip (cc sizing, backtest replay and the monitor rely on it). The
+    original side stays auditable via judge_reviews.adjusted_side.
+    Returns {} when there is no flip.
+    """
+    row_side = leg_row["side"]
+    if executed_side == row_side:
+        return {}
+    extras: dict = {"side": executed_side}
+    p = leg_row["forecast_prob_at_entry"]
+    if p is not None:
+        extras["forecast_prob_at_entry"] = round(1.0 - float(p), 6)
+    payload = {"entry_id": leg_row["entry_id"],
+               "from_side": row_side, "to_side": executed_side}
+    if ladder_group_id:
+        payload["ladder_group_id"] = ladder_group_id
+    log_event("entry_side_adjusted", payload)
+    return extras
+
+
+def _filter_live_token_candidates(candidates: list[dict],
+                                  skipped: dict) -> list[dict]:
+    """v13.4: drop candidates whose chosen-side outcome token is already
+    occupied by a live entry (db.query_live_tokens — any strategy, any
+    ladder group). Prevents two entries from ever mapping onto the same
+    paper position (post-mortem 2026-07-06: merged positions made sibling
+    cashouts fail "No open position" forever).
+
+    Increments skipped["duplicate_token_open"] per drop — the counter MUST
+    be pre-initialized by the caller (v10 lesson: a missing key aborts the
+    whole discovery with KeyError)."""
+    if not candidates:
+        return candidates
+    with db.connect() as conn:
+        live_tokens = db.query_live_tokens(conn)
+    if not live_tokens:
+        return candidates
+    kept = []
+    for c in candidates:
+        tok = c["token_id_yes"] if c["side"] == "YES" else c["token_id_no"]
+        if tok and tok in live_tokens:
+            skipped["duplicate_token_open"] += 1
+            log_event("market_skipped", {
+                "slug": c["slug"], "reason": "duplicate_token_open",
+                "side": c["side"]})
+            try:
+                with db.connect() as _conn:
+                    db.insert_discovery_skip(_conn,
+                        ts=_now_iso(), slug=c["slug"],
+                        reason="duplicate_token_open",
+                        meta_json={"side": c["side"], "token": tok})
+                    _conn.commit()
+            except Exception:
+                pass
+            continue
+        kept.append(c)
+    return kept
+
+
 def run_discovery(args, cities: dict) -> int:
     """Run one discovery scan. Returns count of new proposals inserted."""
     log_event("discovery_start", {"min_edge_pp": args.min_edge_pp,
@@ -857,6 +928,7 @@ def run_discovery(args, cities: dict) -> int:
         "range_edge_after_cap": 0,    # v12.1: edge gone after sizing-cap
         "not_temperature": 0,         # v14: temperature-only policy
         "entry_too_expensive": 0,     # v10 counter was never initialized → KeyError aborted discovery
+        "duplicate_token_open": 0,    # v13.4: token already held by a live entry
     }
 
     # Phase 1: build candidate proposals using HTTP-only work (no DB lock held).
@@ -1252,6 +1324,15 @@ def run_discovery(args, cities: dict) -> int:
             "event_slug": m.get("event_slug") or "",
         })
 
+    # v13.4: token-level dedup BEFORE ladder building — a duplicate leg must
+    # not silently shrink a Kelly-split ladder after stakes were computed.
+    # The (slug, side) checks in Phase 2 below deliberately allow re-entry
+    # after execution; the paper engine, however, keys positions by
+    # (portfolio, token, side), so entries sharing an outcome token merge
+    # into ONE position and whichever closes first strands the siblings
+    # (post-mortem 2026-07-06: 74 failed ladder cashout retries).
+    candidates = _filter_live_token_candidates(candidates, skipped)
+
     # v9: 3-bin laddering — group surviving candidates by event_slug and
     # transform groups with >=2 siblings into coordinated ladders with
     # shared ladder_group_id. Candidates without event_slug or with only
@@ -1460,6 +1541,12 @@ def _execute_ladder_group_atomic(group_id: str, args, engine,
 
         fill_price = float(sizing["avg_fill"])
         forecast_prob = leg["forecast_prob_at_entry"]
+        # v13.6: forecast_prob_at_entry stores P(proposed side); when the
+        # judge flipped the side, the edge vs the NEW side's fill uses the
+        # complement — comparing P(old side) to the new token's price
+        # produced garbage edge_stale decisions.
+        if forecast_prob is not None and side != leg["side"]:
+            forecast_prob = 1.0 - float(forecast_prob)
         if forecast_prob is not None:
             current_edge_pp = round(
                 (float(forecast_prob) - fill_price) * 100.0, 4)
@@ -1518,13 +1605,20 @@ def _execute_ladder_group_atomic(group_id: str, args, engine,
         })
 
     # Phase 2: all pre-checks passed — execute every leg atomically
+    # v13.6: persist the side actually executed (judge ADJUST can flip it).
+    side_by_id = {pc["leg"]["entry_id"]: pc["side"] for pc in pre_checks}
+    leg_by_id = {pc["leg"]["entry_id"]: pc["leg"] for pc in pre_checks}
+
     if args.dry_run:
         with db.connect() as conn:
             for pc in pre_checks:
                 db.update_entry_status(conn, pc["leg"]["entry_id"], "EXECUTED",
                                        size_usd=pc["target_usd"],
                                        size_shares=pc["sizing"]["max_shares"],
-                                       entry_price=pc["sizing"]["avg_fill"])
+                                       entry_price=pc["sizing"]["avg_fill"],
+                                       **_side_flip_extras(pc["leg"],
+                                                           pc["side"],
+                                                           group_id))
             conn.commit()
         log_event("ladder_executed_dry", {
             "ladder_group_id": group_id,
@@ -1576,7 +1670,11 @@ def _execute_ladder_group_atomic(group_id: str, args, engine,
                         db.update_entry_status(conn, tried_leg["entry_id"], "EXECUTED",
                                                 size_usd=tried_result.get("cost_usd"),
                                                 size_shares=tried_result.get("shares_filled"),
-                                                entry_price=tried_result.get("avg_price"))
+                                                entry_price=tried_result.get("avg_price"),
+                                                **_side_flip_extras(
+                                                    leg_by_id[tried_leg["entry_id"]],
+                                                    side_by_id[tried_leg["entry_id"]],
+                                                    group_id))
                     else:
                         db.update_entry_status(conn, tried_leg["entry_id"], "SKIPPED",
                                                 skip_reason=str(tried_result.get("reason"))[:200])
@@ -1595,7 +1693,11 @@ def _execute_ladder_group_atomic(group_id: str, args, engine,
             db.update_entry_status(conn, leg["entry_id"], "EXECUTED",
                                     size_usd=result.get("cost_usd"),
                                     size_shares=result.get("shares_filled"),
-                                    entry_price=result.get("avg_price"))
+                                    entry_price=result.get("avg_price"),
+                                    **_side_flip_extras(
+                                        leg_by_id[leg["entry_id"]],
+                                        side_by_id[leg["entry_id"]],
+                                        group_id))
         conn.commit()
     log_event("ladder_executed", {
         "ladder_group_id": group_id,
@@ -1766,6 +1868,12 @@ def run_discovery_cheap_convexity(args, cities: dict) -> int:
         except Exception:
             pass
 
+    # v13.4: token-level dedup, cross-strategy (see run_discovery /
+    # db.query_live_tokens). Computed once per run — each market in the
+    # loop has its own token pair, so intra-run collisions are impossible.
+    with db.connect() as conn:
+        cc_live_tokens = db.query_live_tokens(conn)
+
     for m in raw_markets:
         slug = m.get("slug", "")
         question = m.get("question", "")
@@ -1854,6 +1962,13 @@ def run_discovery_cheap_convexity(args, cities: dict) -> int:
 
         fair_target = fair_yes_raw if side == "YES" else 1.0 - fair_yes_raw
         best_bid = (book_side.get("bids") or [{}])[0].get("price", 0.0)
+        # v13.4: token occupied by a live entry (any strategy, any slug
+        # spelling) → never share a paper position (post-mortem 2026-07-06).
+        tok_side = token_id_yes if side == "YES" else token_id_no
+        if tok_side and tok_side in cc_live_tokens:
+            _cc_skip(slug, spec.city, "duplicate_token_open",
+                     {"side": side, "token": tok_side})
+            continue
         with db.connect() as conn:
             # Duplicate/opposite guard: skip if any live entry on this slug.
             existing = conn.execute(
@@ -2003,6 +2118,10 @@ def run_execute(args) -> int:
         # without any side-conditional flip.
         fill_price = float(sizing["avg_fill"])
         forecast_prob = row["forecast_prob_at_entry"]
+        # v13.6: P(side) complement when the judge flipped the side — see
+        # the ladder pre-check for rationale.
+        if forecast_prob is not None and side != row["side"]:
+            forecast_prob = 1.0 - float(forecast_prob)
         if forecast_prob is None:
             current_edge_pp = None
         else:
@@ -2102,7 +2221,8 @@ def run_execute(args) -> int:
                 db.update_entry_status(conn2, entry_id, "EXECUTED",
                                        size_usd=target_usd,
                                        size_shares=sizing["max_shares"],
-                                       entry_price=sizing["avg_fill"])
+                                       entry_price=sizing["avg_fill"],
+                                       **_side_flip_extras(row, side))
             executed += 1
             continue
 
@@ -2123,7 +2243,8 @@ def run_execute(args) -> int:
                     db.update_entry_status(conn2, entry_id, "EXECUTED",
                                            size_usd=result.get("cost_usd"),
                                            size_shares=result.get("shares_filled"),
-                                           entry_price=result.get("avg_price"))
+                                           entry_price=result.get("avg_price"),
+                                           **_side_flip_extras(row, side))
                     log_event("entry_executed", {"entry_id": entry_id,
                                                  "shares": result.get("shares_filled"),
                                                  "avg_price": result.get("avg_price")})
@@ -2184,7 +2305,14 @@ def run_monitor_tick(args, cities: dict) -> None:
         if now_mono - last < interval:
             continue
         _last_monitor_per_entry[entry_id] = now_mono
-        _do_monitor_check(None, row, cities, args)
+        try:
+            _do_monitor_check(None, row, cities, args)
+        except Exception as e:
+            # One bad entry must not abort the remaining positions' checks
+            # (post-mortem 2026-07-06: an AttributeError escaping the ladder
+            # cashout phase 2 killed whole ticks via error where=main_loop).
+            log_event("error", {"where": "monitor_row", "entry_id": entry_id,
+                                "err": str(e)}, level="ERROR")
 
 
 def _do_monitor_check(conn, row, cities: dict, args) -> None:
@@ -2323,6 +2451,99 @@ def _do_monitor_check(conn, row, cities: dict, args) -> None:
 _ladder_cashing_out: set[str] = set()
 
 
+def _normalize_close_result(r) -> dict:
+    """paper_engine.close_position returns a LIST when more than one open
+    positions row matches (token, side). Callers here do r.get(...), which
+    raised AttributeError on lists — uncaught in the ladder phase-2 loop it
+    killed the whole monitor tick (post-mortem 2026-07-06). Aggregate a
+    multi-row close into one dict; dicts pass through untouched."""
+    if isinstance(r, dict):
+        return r
+    if not isinstance(r, list) or not r:
+        return {"status": "failed",
+                "reason": f"unexpected close result: {type(r).__name__}"}
+    shares = sum(float(x.get("shares_sold") or 0) for x in r)
+    avg = (sum(float(x.get("avg_sell_price") or 0)
+               * float(x.get("shares_sold") or 0) for x in r) / shares
+           if shares > 0 else 0.0)
+    status = ("closed" if all(x.get("status") == "closed" for x in r)
+              else "failed")
+    return {
+        "status": status,
+        "shares_sold": round(shares, 4),
+        "avg_sell_price": round(avg, 6),
+        "net_proceeds": round(sum(float(x.get("net_proceeds") or 0)
+                                   for x in r), 4),
+        "realized_pnl": round(sum(float(x.get("realized_pnl") or 0)
+                                   for x in r), 4),
+        "reason": None if status == "closed" else "partial multi-row close",
+    }
+
+
+def _close_leg(engine, token_id: str, side: str, reasoning: str) -> dict:
+    """Close one position via the engine, classifying the outcome:
+
+      status="closed"  — real close (normalized dict, see above).
+      status="phantom" — NO open position genuinely exists for (token,
+          side): a sibling entry sharing the same outcome token already
+          sold the merged paper position (positions are keyed per token,
+          entries per leg). Terminal: caller writes a phantom_shared_close
+          cashout row so the leg stops being retried every tick
+          (post-mortem 2026-07-06: 74 ladder_leg_close_rejected + 64
+          single-path failures, retried until resolution; entry 282 missed
+          its stop-loss this way and resolved at 0).
+      status="failed"  — transient failure with the position still open
+          (e.g. "No bids in order book", IntegrityError pre-migration):
+          caller keeps the leg open; the monitor retries next tick.
+    """
+    import sqlite3 as _sq
+    try:
+        from paper_engine import NoOpenPositionError
+    except ImportError:            # older engine without the typed error
+        NoOpenPositionError = ()   # isinstance(x, ()) is always False
+    try:
+        return _normalize_close_result(
+            engine.close_position(token_id=token_id, side=side,
+                                   reasoning=reasoning))
+    except _sq.IntegrityError as e:
+        # Position still open but unclosable under the pre-partial-index
+        # schema (paper_engine._migrate_positions_unique fixes this). NOT
+        # phantom — money is still in the position; retried after fix.
+        return {"status": "failed", "reason": f"integrity: {e}",
+                "integrity": True}
+    except Exception as e:
+        is_phantom = isinstance(e, NoOpenPositionError)
+        if not is_phantom:
+            # "No bids" fires BEFORE the position lookup in paper_engine,
+            # so a phantom leg on an empty-book market raises that instead.
+            # Ask the ground truth. Fail-safe: if the check itself errors,
+            # assume the position exists (keep retrying, never phantom).
+            try:
+                is_phantom = not engine.has_open_position(
+                    token_id=token_id, side=side)
+            except Exception:
+                is_phantom = False
+        return {"status": "phantom" if is_phantom else "failed",
+                "reason": str(e)}
+
+
+def _insert_phantom_cashout(conn, entry_id: int, forecast: dict,
+                            forecast_prob_now: float, reason) -> None:
+    """Terminal marker for a leg whose paper position was already sold by
+    a sibling entry sharing the token. exit_shares=0 / realized_pnl_usd=0.0
+    (NOT NULL: analyzer+dashboard use COALESCE(c.realized_pnl_usd, <resolution
+    formula>) — NULL would double-count P&L the sibling's merged close
+    already realized). The row removes the entry from query_open_positions,
+    ending the retry loop; the resolution sweep still records the outcome."""
+    db.insert_cashout(
+        conn, entry_id=entry_id, ts=_now_iso(),
+        exit_price=None, exit_shares=0.0, realized_pnl_usd=0.0,
+        forecast_prob_at_exit=forecast_prob_now,
+        forecast_snapshot_json=forecast,
+        reason=f"phantom_shared_close:{reason}"[:200],
+    )
+
+
 def _do_cashout(conn, row, bid: float, forecast: dict,
                 forecast_prob_now: float, args, reason: str) -> None:
     # v9: if this entry is part of a ladder group, cash out ALL legs of
@@ -2352,8 +2573,8 @@ def _do_cashout(conn, row, bid: float, forecast: dict,
     try:
         from paper_engine import PaperEngine
         engine = PaperEngine(portfolio=args.portfolio)
-        result = engine.close_position(token_id=token_id, side=side,
-                                        reasoning=f"weather_edge_bot: {reason}")
+        result = _close_leg(engine, token_id, side,
+                            f"weather_edge_bot: {reason}")
         if result.get("status") == "closed":
             exit_price = result.get("avg_sell_price") or result.get("avg_price")
             with db.connect() as conn2:
@@ -2370,6 +2591,16 @@ def _do_cashout(conn, row, bid: float, forecast: dict,
             log_event("cashout_executed", {"entry_id": entry_id,
                                             "exit_price": exit_price,
                                             "pnl": result.get("realized_pnl")})
+        elif result.get("status") == "phantom":
+            # Position already sold by a sibling entry sharing this token —
+            # write the terminal marker so this entry stops retrying.
+            with db.connect() as conn2:
+                _insert_phantom_cashout(conn2, entry_id, forecast,
+                                        forecast_prob_now,
+                                        result.get("reason"))
+            log_event("cashout_phantom_closed", {
+                "entry_id": entry_id, "reason": result.get("reason"),
+            }, level="WARN")
         else:
             log_event("cashout_rejected", {"entry_id": entry_id,
                                             "reason": result.get("reason")})
@@ -2386,17 +2617,13 @@ def _do_ladder_cashout(group_id: str, forecast: dict,
     single DB transaction. Partial failures are logged loudly but
     leave the partial-close state intact (no rollback in paper_engine).
     """
+    # v13.4: EXECUTED/FAST_PATH legs with no cashout AND no resolution —
+    # mirrors query_open_positions. The old filter here checked only the
+    # cashouts table, so legs already settled by the resolution sweep (or
+    # never executed) were re-"closed" every tick, failing forever
+    # (post-mortem 2026-07-06).
     with db.connect() as conn:
-        legs = db.query_ladder_group(conn, group_id)
-    # Only legs that are still open (no cashout row yet)
-    open_legs = []
-    with db.connect() as conn:
-        for leg in legs:
-            r = conn.execute(
-                "SELECT cashout_id FROM cashouts WHERE entry_id = ?",
-                (leg["entry_id"],)).fetchone()
-            if r is None:
-                open_legs.append(leg)
+        open_legs = db.query_ladder_group_open(conn, group_id)
     if not open_legs:
         return
 
@@ -2417,28 +2644,30 @@ def _do_ladder_cashout(group_id: str, forecast: dict,
 
     # Phase 1: close each leg's position via the engine, accumulating
     # results in memory. No DB writes until all closes attempted.
+    # _close_leg classifies each outcome: closed / phantom (position
+    # already sold by a sibling entry sharing the token) / failed.
     results = []
     for leg in open_legs:
         side = leg["side"]
         token_id = (leg["token_id_yes"] if side == "YES"
                      else leg["token_id_no"])
-        try:
-            r = engine.close_position(
-                token_id=token_id, side=side,
-                reasoning=(f"weather_edge_bot ladder group={group_id[:8]} "
-                            f"trigger={reason}"))
-        except Exception as e:
+        r = _close_leg(engine, token_id, side,
+                       f"weather_edge_bot ladder group={group_id[:8]} "
+                       f"trigger={reason}")
+        if r.get("status") == "failed":
             log_event("error", {"where": "ladder_cashout_close_position",
                                 "entry_id": leg["entry_id"],
                                 "ladder_group_id": group_id,
-                                "err": str(e)}, level="ERROR")
-            r = {"status": "failed", "reason": str(e)}
+                                "err": r.get("reason")}, level="ERROR")
         results.append((leg, r))
 
     # Phase 2: write all cashout rows in a single transaction. Even if
     # some closes failed at the engine level, we persist what succeeded
-    # so the DB matches paper_engine state.
+    # so the DB matches paper_engine state. Phantom legs get a terminal
+    # zero-pnl marker so they leave query_open_positions (ends the
+    # every-tick retry loop that produced 74 rejections on 2026-07-06).
     successes = 0
+    phantoms = 0
     with db.connect() as conn:
         for leg, r in results:
             if r.get("status") == "closed":
@@ -2454,8 +2683,19 @@ def _do_ladder_cashout(group_id: str, forecast: dict,
                     reason=f"ladder_group:{reason}"[:200],
                 )
                 successes += 1
+            elif r.get("status") == "phantom":
+                _insert_phantom_cashout(conn, leg["entry_id"], forecast,
+                                        forecast_prob_now, r.get("reason"))
+                phantoms += 1
+                log_event("ladder_leg_phantom_closed", {
+                    "entry_id": leg["entry_id"],
+                    "ladder_group_id": group_id,
+                    "reason": r.get("reason"),
+                }, level="WARN")
             else:
-                log_event("ladder_leg_close_rejected", {
+                event = ("ladder_leg_close_integrity_error"
+                         if r.get("integrity") else "ladder_leg_close_rejected")
+                log_event(event, {
                     "entry_id": leg["entry_id"],
                     "ladder_group_id": group_id,
                     "reason": r.get("reason"),
@@ -2470,6 +2710,7 @@ def _do_ladder_cashout(group_id: str, forecast: dict,
         "trigger_reason": reason,
         "n_legs_total": len(open_legs),
         "n_legs_closed": successes,
+        "n_legs_phantom": phantoms,
         "total_pnl_usd": round(total_pnl, 4),
     })
 
@@ -3538,6 +3779,457 @@ def _test_cheap_convexity_discovery():
     print("\nAll cheap_convexity discovery tests PASS")
 
 
+def _test_dup_token_discovery():
+    """v13.4: discovery must never propose a candidate whose outcome token
+    is occupied by a live entry (any strategy, any ladder group) — the root
+    cause of the 2026-07-06 merged-position cashout failures. Hermetic:
+    temp DB + direct calls to _filter_live_token_candidates, plus the
+    cheap_convexity hook end-to-end."""
+    import tempfile
+    import types
+    import weather_edge_bot as mod
+
+    tmp = Path(tempfile.mkdtemp()) / "dup_token.db"
+    db.init_db(tmp)
+    _orig_connect = db.connect
+    ts = "2026-07-06T00:00:00+00:00"
+
+    def seed(slug, status, ty, tn, strategy="weather_edge"):
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO entries (ts, market_slug, market_question, side, "
+                "status, entry_price, token_id_yes, token_id_no, strategy) "
+                "VALUES (?, ?, 'q', 'NO', ?, 0.3, ?, ?, ?)",
+                (ts, slug, status, ty, tn, strategy))
+            eid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.commit()
+        return eid
+
+    def cand(slug, side, ty, tn):
+        return {"slug": slug, "side": side, "token_id_yes": ty,
+                "token_id_no": tn}
+
+    try:
+        db.connect = lambda path=None: _orig_connect(tmp)
+
+        # T1: EXECUTED live entry blocks a candidate on the SAME NO token —
+        # even from a different slug spelling / would-be new ladder group.
+        seed("seoul-26c", "EXECUTED", "Y_A", "N_A")
+        skipped = {"duplicate_token_open": 0}
+        out = mod._filter_live_token_candidates(
+            [cand("seoul-26c-repost", "NO", "Y_A", "N_A"),
+             cand("sf-66f", "NO", "Y_B", "N_B")], skipped)
+        assert [c["slug"] for c in out] == ["sf-66f"], out
+        assert skipped["duplicate_token_open"] == 1, skipped
+        with db.connect() as conn:
+            n_skip = conn.execute(
+                "SELECT COUNT(*) FROM discovery_skips "
+                "WHERE reason='duplicate_token_open'").fetchone()[0]
+        assert n_skip == 1, n_skip
+        print("Test T1 PASS: live EXECUTED entry blocks same-token candidate "
+              "(other market passes; skip persisted)")
+
+        # T2: PROPOSED (in flight) also blocks; opposite-side token of a
+        # live entry blocks too (ADJUST can flip sides).
+        seed("nyc-90f", "PROPOSED", "Y_C", "N_C")
+        skipped = {"duplicate_token_open": 0}
+        out = mod._filter_live_token_candidates(
+            [cand("nyc-90f-again", "NO", "Y_C", "N_C"),
+             cand("nyc-90f-yes-side", "YES", "Y_C", "N_C")], skipped)
+        assert out == [] and skipped["duplicate_token_open"] == 2, (
+            out, skipped)
+        print("Test T2 PASS: PROPOSED blocks; both tokens of a live entry "
+              "blocked (side-flip safe)")
+
+        # T3: cashout/resolution FREE the token again.
+        e_cash = seed("london-20c", "EXECUTED", "Y_D", "N_D")
+        e_res = seed("tokyo-30c", "EXECUTED", "Y_E", "N_E")
+        with db.connect() as conn:
+            conn.execute("INSERT INTO cashouts (entry_id, ts, "
+                         "realized_pnl_usd) VALUES (?, ?, 1.0)", (e_cash, ts))
+            conn.execute("INSERT INTO resolutions (entry_id, ts_resolved, "
+                         "final_outcome, payout_per_share) "
+                         "VALUES (?, ?, 'NO', 1.0)", (e_res, ts))
+            conn.commit()
+        skipped = {"duplicate_token_open": 0}
+        out = mod._filter_live_token_candidates(
+            [cand("london-20c", "NO", "Y_D", "N_D"),
+             cand("tokyo-30c", "NO", "Y_E", "N_E")], skipped)
+        assert len(out) == 2 and skipped["duplicate_token_open"] == 0, (
+            out, skipped)
+        print("Test T3 PASS: cashed-out and resolved entries free their "
+              "tokens (re-entry allowed)")
+
+        # T4: cross-strategy — a live cheap_convexity entry blocks a legacy
+        # weather_edge candidate on the same token.
+        seed("berlin-15c", "EXECUTED", "Y_F", "N_F", strategy="cheap_convexity")
+        skipped = {"duplicate_token_open": 0}
+        out = mod._filter_live_token_candidates(
+            [cand("berlin-15c", "NO", "Y_F", "N_F")], skipped)
+        assert out == [] and skipped["duplicate_token_open"] == 1
+        print("Test T4 PASS: cross-strategy block (cc entry blocks "
+              "weather_edge candidate)")
+
+        # T5: cheap_convexity discovery hook end-to-end — a live
+        # weather_edge entry on (tY, tN) blocks the cc proposal for the
+        # same tokens (cc_duplicate_token_open), discovery does not abort.
+        future = (datetime.now(timezone.utc) + timedelta(hours=24)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        market = {
+            "slug": "highest-temp-in-paris-14c",
+            "question": "Will the highest temperature in Paris be 14°C?",
+            "endDate": future, "acceptingOrders": True,
+            "clobTokenIds": json.dumps(["tY", "tN"]),
+            "conditionId": "0xcc",
+        }
+        spec = types.SimpleNamespace(
+            city="Paris", confidence=0.9, metric="temp", comparison="range",
+            threshold_value=14.0, threshold_value_high=15.0,
+            threshold_unit="C")
+        seed("paris-14c-old-run", "EXECUTED", "tY", "tN")
+
+        saved = (mod.fetch_weather_markets, mod.parse_market,
+                 mod.fetch_orderbook, mod.implied_probabilities,
+                 mod.resolve_station, mod.auto_extract_station,
+                 mod.fetch_forecast, mod._compute_mae_for_market,
+                 mod._forecast_probability_raw, mod.forecast_probability,
+                 mod.compute_edge, mod.compute_max_size_for_slippage,
+                 mod._load_cc_gate)
+        try:
+            mod.fetch_weather_markets = lambda min_volume=0: [market]
+            mod.parse_market = lambda q, e, c: spec
+            mod.resolve_station = lambda city, cities: None
+            mod.auto_extract_station = lambda *a, **k: None
+            mod.fetch_forecast = lambda *a, **k: {"daily_forecast": [{}]}
+            mod._compute_mae_for_market = lambda s, f, a, station=None: (
+                2.0, None, None, {"station": "LFPG", "mae_dynamic": 2.0})
+            mod._forecast_probability_raw = lambda s, f, **k: 0.07
+            mod.forecast_probability = lambda s, f, **k: 0.30
+            mod.implied_probabilities = lambda by, bn: {"yes_ask": 0.02,
+                                                        "no_ask": 0.97}
+            mod.compute_edge = lambda fair, imp: {
+                "best_side": "YES",
+                "edge_pp_at_best": round((fair - imp["yes_ask"]) * 100, 2)}
+            book_ok = {"asks": [{"price": 0.02, "size": 1000}],
+                       "bids": [{"price": 0.015, "size": 1000}]}
+            mod.fetch_orderbook = lambda tid: book_ok
+            mod.compute_max_size_for_slippage = (
+                lambda book, side, max_slippage:
+                {"max_shares": 500.0, "max_usd": 10.0, "slippage_pct": 0.05})
+            mod._load_cc_gate = lambda: {"tail_calibration_pass": True}
+
+            args = types.SimpleNamespace(
+                cheap_convexity=True, cc_min_entry_price=0.01,
+                cc_max_entry_price=0.20, cc_min_edge_pp=3.0,
+                cc_exit_margin_pp=1.0, min_volume=100, window_hours=48,
+                min_ttr_hours=0.0, max_slippage=0.2, debug=False)
+
+            n = mod.run_discovery_cheap_convexity(args, cities={})
+            assert n == 0, f"expected 0 proposals (token occupied), got {n}"
+            with db.connect() as conn:
+                # T4 seeded an EXECUTED cc entry — count only NEW proposals
+                # for the market under test.
+                n_cc = conn.execute(
+                    "SELECT COUNT(*) FROM entries "
+                    "WHERE strategy='cheap_convexity' AND status='PROPOSED'"
+                ).fetchone()[0]
+                n_skip = conn.execute(
+                    "SELECT COUNT(*) FROM discovery_skips "
+                    "WHERE reason='cc_duplicate_token_open'").fetchone()[0]
+            assert n_cc == 0 and n_skip == 1, (n_cc, n_skip)
+            print("Test T5 PASS: cc discovery blocked by live weather_edge "
+                  "token (cc_duplicate_token_open persisted)")
+        finally:
+            (mod.fetch_weather_markets, mod.parse_market, mod.fetch_orderbook,
+             mod.implied_probabilities, mod.resolve_station,
+             mod.auto_extract_station, mod.fetch_forecast,
+             mod._compute_mae_for_market, mod._forecast_probability_raw,
+             mod.forecast_probability, mod.compute_edge,
+             mod.compute_max_size_for_slippage, mod._load_cc_gate) = saved
+
+        print("\nAll --test-dup-token-discovery PASS (5/5)")
+    finally:
+        db.connect = _orig_connect
+
+
+def _test_side_adjust():
+    """v13.6: a judge ADJUST that flips the side must be PERSISTED —
+    entries.side and the P(side) complement — so monitor/cashout/resolution
+    read the token actually held. Also: the execute-time edge re-validation
+    must use the complemented P(side) (the old math compared P(old side) to
+    the new side's fill). Hermetic: temp DB + fake engine, no network."""
+    import tempfile
+    import types
+    import weather_edge_bot as mod
+
+    tmp = Path(tempfile.mkdtemp()) / "side_adjust.db"
+    db.init_db(tmp)
+    _orig_connect = db.connect
+    _orig_pe_mod = sys.modules.get("paper_engine")
+    ts = "2026-07-06T00:00:00+00:00"
+
+    # T1/T2: helper unit semantics.
+    row_yes = {"entry_id": 1, "side": "YES", "forecast_prob_at_entry": 0.10}
+    assert mod._side_flip_extras(row_yes, "YES") == {}
+    ex = mod._side_flip_extras(row_yes, "NO")
+    assert ex["side"] == "NO" and abs(ex["forecast_prob_at_entry"] - 0.90) < 1e-9
+    ex2 = mod._side_flip_extras(
+        {"entry_id": 1, "side": "YES", "forecast_prob_at_entry": None}, "NO")
+    assert ex2 == {"side": "NO"}, ex2
+    print("Test S1 PASS: helper — no-flip {}, flip persiste side + "
+          "complemento, p=None só side")
+
+    fake_pe = types.ModuleType("paper_engine")
+
+    class FakeEngine:
+        def __init__(self, portfolio="default"):
+            pass
+    fake_pe.PaperEngine = FakeEngine
+    fake_pe.DEFAULT_FEE_RATE = 0.0
+    sys.modules["paper_engine"] = fake_pe
+
+    def seed(slug, ty, tn, prob):
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO entries (ts, market_slug, market_question, side, "
+                "status, entry_price, forecast_prob_at_entry, token_id_yes, "
+                "token_id_no, end_date, strategy) VALUES (?, ?, 'q', 'YES', "
+                "'ADJUSTED', 0.10, ?, ?, ?, '2026-07-08T00:00:00Z', "
+                "'weather_edge')", (ts, slug, prob, ty, tn))
+            eid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute(
+                "INSERT INTO judge_reviews (entry_id, ts, verdict, confidence, "
+                "judge_prob, bot_prob, rationale, cost_usd, adjusted_side) "
+                "VALUES (?, ?, 'ADJUST', 0.6, 0.6, 0.7, '', 0.02, 'NO')",
+                (eid, ts))
+            conn.commit()
+        return eid
+
+    saved = (mod.fetch_orderbook, mod.compute_max_size_for_slippage,
+             mod._risk_block_reason)
+    try:
+        db.connect = lambda path=None: _orig_connect(tmp)
+        mod.fetch_orderbook = lambda tid: {
+            "asks": [{"price": 0.60, "size": 1000}],
+            "bids": [{"price": 0.55, "size": 1000}]}
+        mod.compute_max_size_for_slippage = (
+            lambda book, side, max_slippage:
+            {"max_shares": 100.0, "max_usd": 50.0, "avg_fill": 0.60,
+             "slippage_pct": 0.02})
+        mod._risk_block_reason = lambda engine, args: None
+        args = types.SimpleNamespace(
+            dry_run=True, portfolio="default", max_slippage=0.15,
+            min_edge_pp=5.0, execute_min_edge_pp=5.0,
+            max_market_exposure_usd=100.0)
+
+        # T3: P(YES)=0.10 → judge flips to NO → P(NO)=0.90 vs fill 0.60 =
+        # +30pp de edge → executa; side e complemento persistidos.
+        e1 = seed("seoul-26c", "Y1", "N1", 0.10)
+        n = mod.run_execute(args)
+        assert n == 1, n
+        with db.connect() as conn:
+            r = conn.execute("SELECT * FROM entries WHERE entry_id=?",
+                             (e1,)).fetchone()
+        assert r["status"] == "EXECUTED", r["status"]
+        assert r["side"] == "NO", r["side"]
+        assert abs(r["forecast_prob_at_entry"] - 0.90) < 1e-9, (
+            r["forecast_prob_at_entry"])
+        # o monitor agora escolhe o token realmente comprado:
+        tok = r["token_id_yes"] if r["side"] == "YES" else r["token_id_no"]
+        assert tok == "N1", tok
+        print("Test S2 PASS: flip executado e persistido (side=NO, "
+              "P(side)=0.90, monitor lê token N1)")
+
+        # T4: prova da edge com complemento — P(YES)=0.85 → P(NO)=0.15 vs
+        # fill 0.60 = edge NEGATIVA → edge_stale/SKIPPED. (A matemática
+        # antiga usava P(YES)=0.85 → +25pp e executava errado.)
+        e2 = seed("sf-66f", "Y2", "N2", 0.85)
+        n = mod.run_execute(args)
+        assert n == 0, n
+        with db.connect() as conn:
+            r2 = conn.execute("SELECT status, skip_reason, side FROM entries "
+                              "WHERE entry_id=?", (e2,)).fetchone()
+        assert r2["status"] == "SKIPPED" and r2["skip_reason"] == "edge_stale", (
+            dict(r2))
+        assert r2["side"] == "YES", r2["side"]  # não executou → side original
+        print("Test S3 PASS: edge re-validada com o COMPLEMENTO "
+              "(P(NO)=0.15 vs 0.60 → edge_stale; math antiga executaria)")
+
+        print("\nAll --test-side-adjust PASS")
+    finally:
+        db.connect = _orig_connect
+        (mod.fetch_orderbook, mod.compute_max_size_for_slippage,
+         mod._risk_block_reason) = saved
+        if _orig_pe_mod is not None:
+            sys.modules["paper_engine"] = _orig_pe_mod
+        else:
+            sys.modules.pop("paper_engine", None)
+
+
+def _test_phantom_cashout():
+    """v13.4: self-heal for phantom legs (position already sold by a sibling
+    entry sharing the outcome token) + list-return normalization. Hermetic:
+    fake paper_engine module + temp weather_edge DB, no network."""
+    import tempfile
+    import types
+    import weather_edge_bot as mod
+
+    tmp = Path(tempfile.mkdtemp()) / "phantom_test.db"
+    db.init_db(tmp)
+    _orig_connect = db.connect
+    _orig_pe_mod = sys.modules.get("paper_engine")
+
+    # ---- fake paper_engine -------------------------------------------------
+    fake_pe = types.ModuleType("paper_engine")
+
+    class NoOpenPositionError(RuntimeError):
+        pass
+
+    class FakeEngine:
+        instances = 0
+        # behavior per token: "ok" | "phantom" | "nobids" | "list"
+        behavior: dict = {}
+
+        def __init__(self, portfolio="default"):
+            FakeEngine.instances += 1
+
+        def close_position(self, *, token_id, side=None, reasoning=""):
+            b = FakeEngine.behavior.get(token_id, "ok")
+            if b == "phantom":
+                raise NoOpenPositionError(
+                    f"No open position for token {token_id} side={side}")
+            if b == "nobids":
+                raise RuntimeError("No bids in order book — cannot close position")
+            base = {"status": "closed", "shares_sold": 10.0,
+                    "avg_sell_price": 0.9, "net_proceeds": 9.0,
+                    "realized_pnl": 5.0}
+            if b == "list":
+                return [dict(base), dict(base, shares_sold=5.0,
+                                          avg_sell_price=0.8,
+                                          net_proceeds=4.0, realized_pnl=1.5)]
+            return base
+
+        def has_open_position(self, *, token_id, side=None):
+            # "nobids" = position real, book vazio (retry). Phantom = sumiu.
+            return FakeEngine.behavior.get(token_id, "ok") != "phantom"
+
+    fake_pe.PaperEngine = FakeEngine
+    fake_pe.NoOpenPositionError = NoOpenPositionError
+    sys.modules["paper_engine"] = fake_pe
+
+    ts = "2026-07-06T00:00:00+00:00"
+
+    def seed(gid, pos, tok, eid_status="EXECUTED"):
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO entries (ts, market_slug, market_question, side, "
+                "status, ladder_group_id, ladder_position, entry_price, "
+                "token_id_yes, token_id_no, strategy) VALUES "
+                "(?, 's', 'q', 'NO', ?, ?, ?, 0.3, 'TY', ?, 'weather_edge')",
+                (ts, eid_status, gid, pos, tok))
+            eid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.commit()
+        return eid
+
+    args = types.SimpleNamespace(dry_run=False, portfolio="default")
+
+    try:
+        db.connect = lambda path=None: _orig_connect(tmp)
+
+        # P1: 2-leg group — leg1 closes, leg2 phantom. Both get cashout rows;
+        # leg2's is the zero-pnl terminal marker.
+        e1 = seed("g-phantom", "central", "TOK_OK")
+        e2 = seed("g-phantom", "below", "TOK_GONE")
+        FakeEngine.behavior = {"TOK_OK": "ok", "TOK_GONE": "phantom"}
+        mod._do_ladder_cashout("g-phantom", {}, 0.5, args, "convergence: test",
+                                trigger_entry_id=e1)
+        with db.connect() as conn:
+            r1 = conn.execute("SELECT * FROM cashouts WHERE entry_id=?",
+                              (e1,)).fetchone()
+            r2 = conn.execute("SELECT * FROM cashouts WHERE entry_id=?",
+                              (e2,)).fetchone()
+        assert r1 and r1["reason"].startswith("ladder_group:"), dict(r1 or {})
+        assert abs(r1["realized_pnl_usd"] - 5.0) < 1e-9
+        assert r2 and r2["reason"].startswith("phantom_shared_close:"), (
+            dict(r2 or {}))
+        assert r2["realized_pnl_usd"] == 0.0 and r2["exit_shares"] == 0.0
+        assert r2["exit_price"] is None
+        print("Test P1 PASS: leg closed + phantom leg marked "
+              "(phantom_shared_close, pnl 0.0)")
+
+        # P2: retry terminates — group has no open legs now; the engine must
+        # not even be instantiated on the second invocation.
+        before = FakeEngine.instances
+        mod._do_ladder_cashout("g-phantom", {}, 0.5, args, "retry",
+                                trigger_entry_id=e1)
+        assert FakeEngine.instances == before, "engine called on closed group"
+        with db.connect() as conn:
+            n_open = len(db.query_open_positions(conn))
+        assert n_open == 0, n_open
+        print("Test P2 PASS: second invocation is a no-op (retry loop ends)")
+
+        # P3: transient failure ("No bids") with the position still real →
+        # NO cashout row; leg stays open and will be retried.
+        e3 = seed("g-nobids", "central", "TOK_NOBIDS")
+        FakeEngine.behavior = {"TOK_NOBIDS": "nobids"}
+        mod._do_ladder_cashout("g-nobids", {}, 0.5, args, "stop_loss: test",
+                                trigger_entry_id=e3)
+        with db.connect() as conn:
+            r3 = conn.execute("SELECT * FROM cashouts WHERE entry_id=?",
+                              (e3,)).fetchone()
+            open_ids = {r["entry_id"] for r in db.query_open_positions(conn)}
+        assert r3 is None, dict(r3 or {})
+        assert e3 in open_ids, "transient-failed leg must stay open"
+        print("Test P3 PASS: 'No bids' + position real → still open, retried")
+
+        # P4: single path (no ladder_group_id) — phantom via _do_cashout.
+        e4 = seed(None, None, "TOK_GONE2")
+        FakeEngine.behavior = {"TOK_GONE2": "phantom"}
+        row = {"entry_id": e4, "side": "NO", "token_id_yes": "TY",
+               "token_id_no": "TOK_GONE2", "ladder_group_id": None}
+        mod._do_cashout(None, row, 0.9, {}, 0.5, args, "convergence: single")
+        with db.connect() as conn:
+            r4 = conn.execute("SELECT * FROM cashouts WHERE entry_id=?",
+                              (e4,)).fetchone()
+        assert r4 and r4["reason"].startswith("phantom_shared_close:"), (
+            dict(r4 or {}))
+        assert r4["realized_pnl_usd"] == 0.0
+        print("Test P4 PASS: single-path phantom marked via _do_cashout")
+
+        # P5: list return (>1 positions rows) — normalized, no AttributeError,
+        # aggregated values recorded.
+        agg = mod._normalize_close_result([
+            {"status": "closed", "shares_sold": 10.0, "avg_sell_price": 0.9,
+             "net_proceeds": 9.0, "realized_pnl": 5.0},
+            {"status": "closed", "shares_sold": 5.0, "avg_sell_price": 0.8,
+             "net_proceeds": 4.0, "realized_pnl": 1.5}])
+        assert agg["status"] == "closed" and agg["shares_sold"] == 15.0
+        # helper rounds avg_sell_price to 6 decimals — compare at 1e-6
+        assert abs(agg["avg_sell_price"] - (0.9 * 10 + 0.8 * 5) / 15) < 1e-6
+        assert abs(agg["realized_pnl"] - 6.5) < 1e-9
+
+        e5 = seed("g-list", "central", "TOK_LIST")
+        FakeEngine.behavior = {"TOK_LIST": "list"}
+        mod._do_ladder_cashout("g-list", {}, 0.5, args, "profit_lock: test",
+                                trigger_entry_id=e5)
+        with db.connect() as conn:
+            r5 = conn.execute("SELECT * FROM cashouts WHERE entry_id=?",
+                              (e5,)).fetchone()
+        assert r5 is not None, "list-returning close must still cash out"
+        assert abs(r5["realized_pnl_usd"] - 6.5) < 1e-9, dict(r5)
+        assert abs(r5["exit_shares"] - 15.0) < 1e-9, dict(r5)
+        print("Test P5 PASS: list return normalized (15 shares, pnl 6.5), "
+              "no AttributeError")
+
+        print("\nAll --test-phantom-cashout PASS (5/5)")
+    finally:
+        db.connect = _orig_connect
+        if _orig_pe_mod is not None:
+            sys.modules["paper_engine"] = _orig_pe_mod
+        else:
+            sys.modules.pop("paper_engine", None)
+
+
 if __name__ == "__main__":
     import sys
     if "--test-atomic" in sys.argv:
@@ -3550,5 +4242,11 @@ if __name__ == "__main__":
         _test_ladder_judge_cap()
     elif "--test-cc-discovery" in sys.argv:
         _test_cheap_convexity_discovery()
+    elif "--test-phantom-cashout" in sys.argv:
+        _test_phantom_cashout()
+    elif "--test-dup-token-discovery" in sys.argv:
+        _test_dup_token_discovery()
+    elif "--test-side-adjust" in sys.argv:
+        _test_side_adjust()
     else:
         main()

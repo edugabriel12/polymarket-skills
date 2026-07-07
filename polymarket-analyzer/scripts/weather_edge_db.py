@@ -636,6 +636,70 @@ def query_ladder_group(conn, ladder_group_id: str) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def query_ladder_group_open(conn, ladder_group_id: str) -> list[sqlite3.Row]:
+    """Legs of a ladder group that are genuinely still open: EXECUTED or
+    FAST_PATH, with NO cashout row AND NO resolution row (mirrors
+    query_open_positions' definition of "open").
+
+    Post-mortem 2026-07-06: _do_ladder_cashout used to filter open legs by
+    the cashouts table alone — no status filter, no resolutions check. It
+    would try to close legs already settled by the resolution sweep (or
+    never executed at all), failing "No open position" on every monitor
+    tick (74 ladder_leg_close_rejected in one day). This helper is the
+    single source of truth for "leg still needs closing".
+
+    No judge JOIN: cashout phase 1 only reads entry_id/side/token_ids.
+    """
+    return conn.execute(
+        "SELECT e.* FROM entries e "
+        "LEFT JOIN cashouts    c ON c.entry_id = e.entry_id "
+        "LEFT JOIN resolutions r ON r.entry_id = e.entry_id "
+        "WHERE e.ladder_group_id = ? "
+        "AND e.status IN ('EXECUTED','FAST_PATH') "
+        "AND c.cashout_id IS NULL "
+        "AND r.resolution_id IS NULL "
+        "ORDER BY CASE e.ladder_position WHEN 'central' THEN 0 "
+        "WHEN 'below' THEN 1 WHEN 'above' THEN 2 ELSE 3 END, e.entry_id",
+        (ladder_group_id,),
+    ).fetchall()
+
+
+def query_live_tokens(conn) -> set:
+    """Outcome tokens "occupied" by a live entry — any strategy.
+
+    Live = PROPOSED/APPROVED/ADJUSTED (in flight), or EXECUTED/FAST_PATH
+    with no cashout AND no resolution (open position). Returns BOTH tokens
+    (yes+no) of each live entry:
+
+      - blocking the opposite side is already policy (opposite_side_held);
+      - a judge ADJUST can flip the executed side without updating
+        entries.side, so deriving "the occupied token" from e.side is
+        unreliable.
+
+    Post-mortem 2026-07-06: the paper engine keys positions by (portfolio,
+    token, side) — entries per ladder leg. Discovery allowed re-entry on the
+    same (slug, side) after execution, so ladder groups from different runs
+    shared outcome tokens; their buys merged into ONE paper position and
+    whichever leg closed first stranded the siblings (74 failed cashout
+    retries in one day). Discovery must never propose a candidate whose
+    token is in this set.
+
+    Deliberately cross-strategy: paper positions are keyed by token, not
+    strategy — a token held by cheap_convexity must block weather_edge
+    proposals and vice-versa.
+    """
+    rows = conn.execute(
+        "SELECT e.token_id_yes, e.token_id_no "
+        "FROM entries e "
+        "LEFT JOIN cashouts    c ON c.entry_id = e.entry_id "
+        "LEFT JOIN resolutions r ON r.entry_id = e.entry_id "
+        "WHERE e.status IN ('PROPOSED','APPROVED','ADJUSTED') "
+        "   OR (e.status IN ('EXECUTED','FAST_PATH') "
+        "       AND c.cashout_id IS NULL AND r.resolution_id IS NULL)"
+    ).fetchall()
+    return {tok for row in rows for tok in (row[0], row[1]) if tok}
+
+
 def query_approved_unexecuted(conn) -> list[sqlite3.Row]:
     """Entries APPROVED or ADJUSTED but not yet executed (bot picks these up).
 
@@ -727,7 +791,13 @@ def query_per_trade_details(conn, since_iso: str,
 
 
 def query_for_counterfactual(conn) -> list[sqlite3.Row]:
-    """Entries with both a cashout AND a resolution (ready for delta)."""
+    """Entries with both a cashout AND a resolution (ready for delta).
+
+    Excludes phantom_shared_close rows: those are bookkeeping markers
+    (position already sold via a sibling entry sharing the token — pnl 0,
+    shares 0), not real exits; a counterfactual "cashout vs hold" delta
+    computed from exit_price=NULL/0 shares would be garbage.
+    """
     return conn.execute(
         "SELECT e.entry_id, e.entry_price, e.size_shares, "
         "       c.cashout_id, c.exit_price, c.realized_pnl_usd, "
@@ -736,7 +806,8 @@ def query_for_counterfactual(conn) -> list[sqlite3.Row]:
         "JOIN cashouts c ON c.entry_id = e.entry_id "
         "JOIN resolutions r ON r.entry_id = e.entry_id "
         "LEFT JOIN counterfactuals cf ON cf.entry_id = e.entry_id "
-        "WHERE cf.counterfactual_id IS NULL"
+        "WHERE cf.counterfactual_id IS NULL "
+        "  AND (c.reason IS NULL OR c.reason NOT LIKE 'phantom_shared_close%')"
     ).fetchall()
 
 
@@ -811,6 +882,95 @@ def _test_query_ladder_group_judge_join():
         assert leg["status"] == "ADJUSTED"
         print(f"Test PASS: query_ladder_group exposes judge_adjusted_side='{adj_side}' "
               f"size=${adj_size} (no IndexError)")
+    tmp.unlink()
+
+
+def _test_query_ladder_group_open():
+    """v13.4 regression: query_ladder_group_open must return ONLY legs that
+    still need closing — EXECUTED/FAST_PATH with no cashout AND no
+    resolution. The pre-v13.4 filter in _do_ladder_cashout checked only
+    the cashouts table, so resolved/never-executed legs were re-closed
+    (and re-failed) every monitor tick (74 rejections on 2026-07-06)."""
+    import tempfile
+    from pathlib import Path as P
+    tmp = P(tempfile.mkdtemp()) / "ladder_open.db"
+    init_db(tmp)
+    gid = "test-group-open"
+    ts = "2026-07-06T00:00:00+00:00"
+    with connect(tmp) as conn:
+        def add(pos, status):
+            conn.execute(
+                "INSERT INTO entries (ts, market_slug, market_question, side, "
+                "status, ladder_group_id, ladder_position, entry_price, "
+                "strategy) VALUES (?, 's', 'q', 'NO', ?, ?, ?, 0.3, "
+                "'weather_edge')", (ts, status, gid, pos))
+            return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        clean = add("above", "EXECUTED")          # returned
+        cashed = add("central", "EXECUTED")       # excluded: has cashout
+        resolved = add("below", "FAST_PATH")      # excluded: has resolution
+        add("above", "SKIPPED")                   # excluded: never executed
+        conn.execute(
+            "INSERT INTO cashouts (entry_id, ts, realized_pnl_usd) "
+            "VALUES (?, ?, 1.0)", (cashed, ts))
+        conn.execute(
+            "INSERT INTO resolutions (entry_id, ts_resolved, final_outcome, "
+            "payout_per_share) VALUES (?, ?, 'NO', 1.0)", (resolved, ts))
+        conn.commit()
+
+        legs = query_ladder_group_open(conn, gid)
+        got = [(leg["entry_id"], leg["ladder_position"]) for leg in legs]
+        assert got == [(clean, "above")], got
+        print(f"Test PASS: query_ladder_group_open returns only the clean "
+              f"EXECUTED leg ({got}) — cashed/resolved/skipped excluded")
+
+        # Ordering: add a clean central leg — must come before 'above'.
+        central = add("central", "EXECUTED")
+        conn.commit()
+        legs = query_ladder_group_open(conn, gid)
+        order = [leg["entry_id"] for leg in legs]
+        assert order == [central, clean], order
+        print("Test PASS: ordering central -> above respected")
+    tmp.unlink()
+
+
+def _test_query_live_tokens():
+    """v13.4: query_live_tokens must return the token pairs of live entries
+    only — pending (PROPOSED/APPROVED/ADJUSTED) or open (EXECUTED/FAST_PATH
+    without cashout AND without resolution) — across ALL strategies."""
+    import tempfile
+    from pathlib import Path as P
+    tmp = P(tempfile.mkdtemp()) / "live_tokens.db"
+    init_db(tmp)
+    ts = "2026-07-06T00:00:00+00:00"
+    with connect(tmp) as conn:
+        def add(slug, status, ty, tn, strategy="weather_edge"):
+            conn.execute(
+                "INSERT INTO entries (ts, market_slug, market_question, side, "
+                "status, entry_price, token_id_yes, token_id_no, strategy) "
+                "VALUES (?, ?, 'q', 'NO', ?, 0.3, ?, ?, ?)",
+                (ts, slug, status, ty, tn, strategy))
+            return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        add("s-open", "EXECUTED", "Y1", "N1")               # live: open
+        cashed = add("s-cashed", "EXECUTED", "Y2", "N2")    # freed by cashout
+        resolved = add("s-resolved", "FAST_PATH", "Y3", "N3")  # freed by resolution
+        add("s-pending", "PROPOSED", "Y4", "N4")            # live: in flight
+        add("s-skipped", "SKIPPED", "Y5", "N5")             # never live
+        add("s-rejected", "REJECTED", "Y6", "N6")           # never live
+        add("s-cc", "EXECUTED", "Y7", "N7", "cheap_convexity")  # live: cross-strategy
+        conn.execute("INSERT INTO cashouts (entry_id, ts, realized_pnl_usd) "
+                     "VALUES (?, ?, 1.0)", (cashed, ts))
+        conn.execute("INSERT INTO resolutions (entry_id, ts_resolved, "
+                     "final_outcome, payout_per_share) VALUES (?, ?, 'NO', 1.0)",
+                     (resolved, ts))
+        conn.commit()
+
+        live = query_live_tokens(conn)
+        expected = {"Y1", "N1", "Y4", "N4", "Y7", "N7"}
+        assert live == expected, f"expected {expected}, got {live}"
+    print("Test PASS: query_live_tokens = open+pending (both tokens, "
+          "cross-strategy); cashed/resolved/skipped/rejected freed")
     tmp.unlink()
 
 
@@ -898,6 +1058,12 @@ if __name__ == "__main__":
         sys.exit(0)
     if "--test-migration" in sys.argv:
         _test_migration_v11_strategy()
+        sys.exit(0)
+    if "--test-ladder-open" in sys.argv:
+        _test_query_ladder_group_open()
+        sys.exit(0)
+    if "--test-live-tokens" in sys.argv:
+        _test_query_live_tokens()
         sys.exit(0)
     # Smoke test: init DB and print version
     init_db()
