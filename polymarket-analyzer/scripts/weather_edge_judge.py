@@ -1291,19 +1291,35 @@ def main():
             log_event("judge_polling", {"pending": len(rows),
                                          "spent_today_usd": round(spent, 2)})
 
+            # v15 F3: per-batch group state. Siblings arrive contiguous
+            # (query_pending_proposals orders by ladder_group_id within ttr
+            # ties), so a leg killed in this batch short-circuits its
+            # siblings in memory, without re-querying the DB per row.
+            dead_groups: set = set()
+
             for row in rows:
                 if _shutdown:
                     break
                 row_dict = dict(row)
+                gid = row_dict.get("ladder_group_id")
 
-                # v15 F1: ladder-viability gate — if the group is already
+                # v15 F1+F3: ladder-viability gate — if the group is already
                 # dead (a sibling REJECTED/SKIPPED), the executor will kill
                 # this leg regardless of our verdict; skip BEFORE any HTTP
-                # or LLM spend.
-                sib = _sibling_failed_precheck(row_dict)
+                # or LLM spend. Batch dead-set first (free), live DB check
+                # as the cross-poll backstop.
+                if gid and gid in dead_groups:
+                    sib = {"entry_id": row_dict["entry_id"],
+                           "ladder_group_id": gid,
+                           "reason": "ladder_sibling_failed_prejudge",
+                           "via": "batch_dead_set"}
+                else:
+                    sib = _sibling_failed_precheck(row_dict)
                 if sib is not None:
                     log_event("judge_skipped_sibling_failed", sib)
                     _skip_sibling_failed(row_dict["entry_id"])
+                    if gid:
+                        dead_groups.add(gid)
                     continue
 
                 # Pre-judge edge re-check (v10): if the orderbook has moved
@@ -1317,6 +1333,8 @@ def main():
                             conn, row_dict["entry_id"], "SKIPPED",
                             judge_skipped_reason="edge_decay_prejudge",
                             skip_reason="edge_decay_prejudge")
+                    if gid:
+                        dead_groups.add(gid)   # v15 F3: grupo morreu agora
                     continue
 
                 # v13.2 (option B): conditional gate. Resolve the decisive
@@ -1344,6 +1362,8 @@ def main():
                         "bot_prob": float(row_dict["forecast_prob_at_entry"] or 0),
                         "cost_usd": 0.0, "llm_skipped": True,
                     })
+                    if gid:
+                        dead_groups.add(gid)   # v15 F3: REJECT mata o grupo
                     continue
 
                 # Tight-ensemble-far-from-bin: run the CHEAP web-search-only
@@ -1416,6 +1436,8 @@ def main():
                         db.update_entry_status(conn, row_dict["entry_id"], "SKIPPED",
                                                 judge_skipped_reason="judge_unavailable",
                                                 skip_reason="judge_unavailable")
+                    if gid:
+                        dead_groups.add(gid)   # v15 F3: SKIP mata o grupo
                     continue
 
                 cost = verdict.get("_meta", {}).get("cost_usd", 0)
@@ -1423,6 +1445,11 @@ def main():
 
                 with db.connect() as conn:
                     apply_verdict(conn, row_dict, verdict)
+
+                # v15 F3: apply_verdict muta o dict in place (overrides Rule 6
+                # etc.) — o verdict FINAL decide se o grupo morreu.
+                if gid and verdict.get("verdict") == "REJECT":
+                    dead_groups.add(gid)
 
                 log_event("judge_verdict", {
                     "entry_id": row_dict["entry_id"],
