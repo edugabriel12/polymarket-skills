@@ -828,6 +828,38 @@ def _build_ladder_candidates(candidates: list[dict], args) -> list[dict]:
     return out
 
 
+def _side_flip_extras(leg_row, executed_side: str,
+                      ladder_group_id: Optional[str] = None) -> dict:
+    """v13.6: extras for update_entry_status when the side actually executed
+    differs from the proposed one (judge ADJUST flipped the direction).
+
+    entries.side previously kept the PROPOSED side forever, so everything
+    downstream read the wrong token: the monitor evaluated triggers on the
+    wrong book, cashout tried to close the wrong position (post-v13.4 it
+    would even phantom-close the entry and strand the REAL position), and
+    the resolution sweep paid out the wrong side.
+
+    Persists the executed side AND the P(side) complement, keeping the DB
+    convention 'forecast_prob_at_entry stores P(entries.side)' true after
+    the flip (cc sizing, backtest replay and the monitor rely on it). The
+    original side stays auditable via judge_reviews.adjusted_side.
+    Returns {} when there is no flip.
+    """
+    row_side = leg_row["side"]
+    if executed_side == row_side:
+        return {}
+    extras: dict = {"side": executed_side}
+    p = leg_row["forecast_prob_at_entry"]
+    if p is not None:
+        extras["forecast_prob_at_entry"] = round(1.0 - float(p), 6)
+    payload = {"entry_id": leg_row["entry_id"],
+               "from_side": row_side, "to_side": executed_side}
+    if ladder_group_id:
+        payload["ladder_group_id"] = ladder_group_id
+    log_event("entry_side_adjusted", payload)
+    return extras
+
+
 def _filter_live_token_candidates(candidates: list[dict],
                                   skipped: dict) -> list[dict]:
     """v13.4: drop candidates whose chosen-side outcome token is already
@@ -1509,6 +1541,12 @@ def _execute_ladder_group_atomic(group_id: str, args, engine,
 
         fill_price = float(sizing["avg_fill"])
         forecast_prob = leg["forecast_prob_at_entry"]
+        # v13.6: forecast_prob_at_entry stores P(proposed side); when the
+        # judge flipped the side, the edge vs the NEW side's fill uses the
+        # complement — comparing P(old side) to the new token's price
+        # produced garbage edge_stale decisions.
+        if forecast_prob is not None and side != leg["side"]:
+            forecast_prob = 1.0 - float(forecast_prob)
         if forecast_prob is not None:
             current_edge_pp = round(
                 (float(forecast_prob) - fill_price) * 100.0, 4)
@@ -1567,13 +1605,20 @@ def _execute_ladder_group_atomic(group_id: str, args, engine,
         })
 
     # Phase 2: all pre-checks passed — execute every leg atomically
+    # v13.6: persist the side actually executed (judge ADJUST can flip it).
+    side_by_id = {pc["leg"]["entry_id"]: pc["side"] for pc in pre_checks}
+    leg_by_id = {pc["leg"]["entry_id"]: pc["leg"] for pc in pre_checks}
+
     if args.dry_run:
         with db.connect() as conn:
             for pc in pre_checks:
                 db.update_entry_status(conn, pc["leg"]["entry_id"], "EXECUTED",
                                        size_usd=pc["target_usd"],
                                        size_shares=pc["sizing"]["max_shares"],
-                                       entry_price=pc["sizing"]["avg_fill"])
+                                       entry_price=pc["sizing"]["avg_fill"],
+                                       **_side_flip_extras(pc["leg"],
+                                                           pc["side"],
+                                                           group_id))
             conn.commit()
         log_event("ladder_executed_dry", {
             "ladder_group_id": group_id,
@@ -1625,7 +1670,11 @@ def _execute_ladder_group_atomic(group_id: str, args, engine,
                         db.update_entry_status(conn, tried_leg["entry_id"], "EXECUTED",
                                                 size_usd=tried_result.get("cost_usd"),
                                                 size_shares=tried_result.get("shares_filled"),
-                                                entry_price=tried_result.get("avg_price"))
+                                                entry_price=tried_result.get("avg_price"),
+                                                **_side_flip_extras(
+                                                    leg_by_id[tried_leg["entry_id"]],
+                                                    side_by_id[tried_leg["entry_id"]],
+                                                    group_id))
                     else:
                         db.update_entry_status(conn, tried_leg["entry_id"], "SKIPPED",
                                                 skip_reason=str(tried_result.get("reason"))[:200])
@@ -1644,7 +1693,11 @@ def _execute_ladder_group_atomic(group_id: str, args, engine,
             db.update_entry_status(conn, leg["entry_id"], "EXECUTED",
                                     size_usd=result.get("cost_usd"),
                                     size_shares=result.get("shares_filled"),
-                                    entry_price=result.get("avg_price"))
+                                    entry_price=result.get("avg_price"),
+                                    **_side_flip_extras(
+                                        leg_by_id[leg["entry_id"]],
+                                        side_by_id[leg["entry_id"]],
+                                        group_id))
         conn.commit()
     log_event("ladder_executed", {
         "ladder_group_id": group_id,
@@ -2065,6 +2118,10 @@ def run_execute(args) -> int:
         # without any side-conditional flip.
         fill_price = float(sizing["avg_fill"])
         forecast_prob = row["forecast_prob_at_entry"]
+        # v13.6: P(side) complement when the judge flipped the side — see
+        # the ladder pre-check for rationale.
+        if forecast_prob is not None and side != row["side"]:
+            forecast_prob = 1.0 - float(forecast_prob)
         if forecast_prob is None:
             current_edge_pp = None
         else:
@@ -2164,7 +2221,8 @@ def run_execute(args) -> int:
                 db.update_entry_status(conn2, entry_id, "EXECUTED",
                                        size_usd=target_usd,
                                        size_shares=sizing["max_shares"],
-                                       entry_price=sizing["avg_fill"])
+                                       entry_price=sizing["avg_fill"],
+                                       **_side_flip_extras(row, side))
             executed += 1
             continue
 
@@ -2185,7 +2243,8 @@ def run_execute(args) -> int:
                     db.update_entry_status(conn2, entry_id, "EXECUTED",
                                            size_usd=result.get("cost_usd"),
                                            size_shares=result.get("shares_filled"),
-                                           entry_price=result.get("avg_price"))
+                                           entry_price=result.get("avg_price"),
+                                           **_side_flip_extras(row, side))
                     log_event("entry_executed", {"entry_id": entry_id,
                                                  "shares": result.get("shares_filled"),
                                                  "avg_price": result.get("avg_price")})
@@ -3893,6 +3952,120 @@ def _test_dup_token_discovery():
         db.connect = _orig_connect
 
 
+def _test_side_adjust():
+    """v13.6: a judge ADJUST that flips the side must be PERSISTED —
+    entries.side and the P(side) complement — so monitor/cashout/resolution
+    read the token actually held. Also: the execute-time edge re-validation
+    must use the complemented P(side) (the old math compared P(old side) to
+    the new side's fill). Hermetic: temp DB + fake engine, no network."""
+    import tempfile
+    import types
+    import weather_edge_bot as mod
+
+    tmp = Path(tempfile.mkdtemp()) / "side_adjust.db"
+    db.init_db(tmp)
+    _orig_connect = db.connect
+    _orig_pe_mod = sys.modules.get("paper_engine")
+    ts = "2026-07-06T00:00:00+00:00"
+
+    # T1/T2: helper unit semantics.
+    row_yes = {"entry_id": 1, "side": "YES", "forecast_prob_at_entry": 0.10}
+    assert mod._side_flip_extras(row_yes, "YES") == {}
+    ex = mod._side_flip_extras(row_yes, "NO")
+    assert ex["side"] == "NO" and abs(ex["forecast_prob_at_entry"] - 0.90) < 1e-9
+    ex2 = mod._side_flip_extras(
+        {"entry_id": 1, "side": "YES", "forecast_prob_at_entry": None}, "NO")
+    assert ex2 == {"side": "NO"}, ex2
+    print("Test S1 PASS: helper — no-flip {}, flip persiste side + "
+          "complemento, p=None só side")
+
+    fake_pe = types.ModuleType("paper_engine")
+
+    class FakeEngine:
+        def __init__(self, portfolio="default"):
+            pass
+    fake_pe.PaperEngine = FakeEngine
+    fake_pe.DEFAULT_FEE_RATE = 0.0
+    sys.modules["paper_engine"] = fake_pe
+
+    def seed(slug, ty, tn, prob):
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO entries (ts, market_slug, market_question, side, "
+                "status, entry_price, forecast_prob_at_entry, token_id_yes, "
+                "token_id_no, end_date, strategy) VALUES (?, ?, 'q', 'YES', "
+                "'ADJUSTED', 0.10, ?, ?, ?, '2026-07-08T00:00:00Z', "
+                "'weather_edge')", (ts, slug, prob, ty, tn))
+            eid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute(
+                "INSERT INTO judge_reviews (entry_id, ts, verdict, confidence, "
+                "judge_prob, bot_prob, rationale, cost_usd, adjusted_side) "
+                "VALUES (?, ?, 'ADJUST', 0.6, 0.6, 0.7, '', 0.02, 'NO')",
+                (eid, ts))
+            conn.commit()
+        return eid
+
+    saved = (mod.fetch_orderbook, mod.compute_max_size_for_slippage,
+             mod._risk_block_reason)
+    try:
+        db.connect = lambda path=None: _orig_connect(tmp)
+        mod.fetch_orderbook = lambda tid: {
+            "asks": [{"price": 0.60, "size": 1000}],
+            "bids": [{"price": 0.55, "size": 1000}]}
+        mod.compute_max_size_for_slippage = (
+            lambda book, side, max_slippage:
+            {"max_shares": 100.0, "max_usd": 50.0, "avg_fill": 0.60,
+             "slippage_pct": 0.02})
+        mod._risk_block_reason = lambda engine, args: None
+        args = types.SimpleNamespace(
+            dry_run=True, portfolio="default", max_slippage=0.15,
+            min_edge_pp=5.0, execute_min_edge_pp=5.0,
+            max_market_exposure_usd=100.0)
+
+        # T3: P(YES)=0.10 → judge flips to NO → P(NO)=0.90 vs fill 0.60 =
+        # +30pp de edge → executa; side e complemento persistidos.
+        e1 = seed("seoul-26c", "Y1", "N1", 0.10)
+        n = mod.run_execute(args)
+        assert n == 1, n
+        with db.connect() as conn:
+            r = conn.execute("SELECT * FROM entries WHERE entry_id=?",
+                             (e1,)).fetchone()
+        assert r["status"] == "EXECUTED", r["status"]
+        assert r["side"] == "NO", r["side"]
+        assert abs(r["forecast_prob_at_entry"] - 0.90) < 1e-9, (
+            r["forecast_prob_at_entry"])
+        # o monitor agora escolhe o token realmente comprado:
+        tok = r["token_id_yes"] if r["side"] == "YES" else r["token_id_no"]
+        assert tok == "N1", tok
+        print("Test S2 PASS: flip executado e persistido (side=NO, "
+              "P(side)=0.90, monitor lê token N1)")
+
+        # T4: prova da edge com complemento — P(YES)=0.85 → P(NO)=0.15 vs
+        # fill 0.60 = edge NEGATIVA → edge_stale/SKIPPED. (A matemática
+        # antiga usava P(YES)=0.85 → +25pp e executava errado.)
+        e2 = seed("sf-66f", "Y2", "N2", 0.85)
+        n = mod.run_execute(args)
+        assert n == 0, n
+        with db.connect() as conn:
+            r2 = conn.execute("SELECT status, skip_reason, side FROM entries "
+                              "WHERE entry_id=?", (e2,)).fetchone()
+        assert r2["status"] == "SKIPPED" and r2["skip_reason"] == "edge_stale", (
+            dict(r2))
+        assert r2["side"] == "YES", r2["side"]  # não executou → side original
+        print("Test S3 PASS: edge re-validada com o COMPLEMENTO "
+              "(P(NO)=0.15 vs 0.60 → edge_stale; math antiga executaria)")
+
+        print("\nAll --test-side-adjust PASS")
+    finally:
+        db.connect = _orig_connect
+        (mod.fetch_orderbook, mod.compute_max_size_for_slippage,
+         mod._risk_block_reason) = saved
+        if _orig_pe_mod is not None:
+            sys.modules["paper_engine"] = _orig_pe_mod
+        else:
+            sys.modules.pop("paper_engine", None)
+
+
 def _test_phantom_cashout():
     """v13.4: self-heal for phantom legs (position already sold by a sibling
     entry sharing the outcome token) + list-return normalization. Hermetic:
@@ -4073,5 +4246,7 @@ if __name__ == "__main__":
         _test_phantom_cashout()
     elif "--test-dup-token-discovery" in sys.argv:
         _test_dup_token_discovery()
+    elif "--test-side-adjust" in sys.argv:
+        _test_side_adjust()
     else:
         main()
