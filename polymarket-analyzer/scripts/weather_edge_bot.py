@@ -828,6 +828,45 @@ def _build_ladder_candidates(candidates: list[dict], args) -> list[dict]:
     return out
 
 
+def _filter_live_token_candidates(candidates: list[dict],
+                                  skipped: dict) -> list[dict]:
+    """v13.4: drop candidates whose chosen-side outcome token is already
+    occupied by a live entry (db.query_live_tokens — any strategy, any
+    ladder group). Prevents two entries from ever mapping onto the same
+    paper position (post-mortem 2026-07-06: merged positions made sibling
+    cashouts fail "No open position" forever).
+
+    Increments skipped["duplicate_token_open"] per drop — the counter MUST
+    be pre-initialized by the caller (v10 lesson: a missing key aborts the
+    whole discovery with KeyError)."""
+    if not candidates:
+        return candidates
+    with db.connect() as conn:
+        live_tokens = db.query_live_tokens(conn)
+    if not live_tokens:
+        return candidates
+    kept = []
+    for c in candidates:
+        tok = c["token_id_yes"] if c["side"] == "YES" else c["token_id_no"]
+        if tok and tok in live_tokens:
+            skipped["duplicate_token_open"] += 1
+            log_event("market_skipped", {
+                "slug": c["slug"], "reason": "duplicate_token_open",
+                "side": c["side"]})
+            try:
+                with db.connect() as _conn:
+                    db.insert_discovery_skip(_conn,
+                        ts=_now_iso(), slug=c["slug"],
+                        reason="duplicate_token_open",
+                        meta_json={"side": c["side"], "token": tok})
+                    _conn.commit()
+            except Exception:
+                pass
+            continue
+        kept.append(c)
+    return kept
+
+
 def run_discovery(args, cities: dict) -> int:
     """Run one discovery scan. Returns count of new proposals inserted."""
     log_event("discovery_start", {"min_edge_pp": args.min_edge_pp,
@@ -857,6 +896,7 @@ def run_discovery(args, cities: dict) -> int:
         "range_edge_after_cap": 0,    # v12.1: edge gone after sizing-cap
         "not_temperature": 0,         # v14: temperature-only policy
         "entry_too_expensive": 0,     # v10 counter was never initialized → KeyError aborted discovery
+        "duplicate_token_open": 0,    # v13.4: token already held by a live entry
     }
 
     # Phase 1: build candidate proposals using HTTP-only work (no DB lock held).
@@ -1251,6 +1291,15 @@ def run_discovery(args, cities: dict) -> int:
             # v9: parent-event grouping for laddering
             "event_slug": m.get("event_slug") or "",
         })
+
+    # v13.4: token-level dedup BEFORE ladder building — a duplicate leg must
+    # not silently shrink a Kelly-split ladder after stakes were computed.
+    # The (slug, side) checks in Phase 2 below deliberately allow re-entry
+    # after execution; the paper engine, however, keys positions by
+    # (portfolio, token, side), so entries sharing an outcome token merge
+    # into ONE position and whichever closes first strands the siblings
+    # (post-mortem 2026-07-06: 74 failed ladder cashout retries).
+    candidates = _filter_live_token_candidates(candidates, skipped)
 
     # v9: 3-bin laddering — group surviving candidates by event_slug and
     # transform groups with >=2 siblings into coordinated ladders with
@@ -1766,6 +1815,12 @@ def run_discovery_cheap_convexity(args, cities: dict) -> int:
         except Exception:
             pass
 
+    # v13.4: token-level dedup, cross-strategy (see run_discovery /
+    # db.query_live_tokens). Computed once per run — each market in the
+    # loop has its own token pair, so intra-run collisions are impossible.
+    with db.connect() as conn:
+        cc_live_tokens = db.query_live_tokens(conn)
+
     for m in raw_markets:
         slug = m.get("slug", "")
         question = m.get("question", "")
@@ -1854,6 +1909,13 @@ def run_discovery_cheap_convexity(args, cities: dict) -> int:
 
         fair_target = fair_yes_raw if side == "YES" else 1.0 - fair_yes_raw
         best_bid = (book_side.get("bids") or [{}])[0].get("price", 0.0)
+        # v13.4: token occupied by a live entry (any strategy, any slug
+        # spelling) → never share a paper position (post-mortem 2026-07-06).
+        tok_side = token_id_yes if side == "YES" else token_id_no
+        if tok_side and tok_side in cc_live_tokens:
+            _cc_skip(slug, spec.city, "duplicate_token_open",
+                     {"side": side, "token": tok_side})
+            continue
         with db.connect() as conn:
             # Duplicate/opposite guard: skip if any live entry on this slug.
             existing = conn.execute(
@@ -3658,6 +3720,179 @@ def _test_cheap_convexity_discovery():
     print("\nAll cheap_convexity discovery tests PASS")
 
 
+def _test_dup_token_discovery():
+    """v13.4: discovery must never propose a candidate whose outcome token
+    is occupied by a live entry (any strategy, any ladder group) — the root
+    cause of the 2026-07-06 merged-position cashout failures. Hermetic:
+    temp DB + direct calls to _filter_live_token_candidates, plus the
+    cheap_convexity hook end-to-end."""
+    import tempfile
+    import types
+    import weather_edge_bot as mod
+
+    tmp = Path(tempfile.mkdtemp()) / "dup_token.db"
+    db.init_db(tmp)
+    _orig_connect = db.connect
+    ts = "2026-07-06T00:00:00+00:00"
+
+    def seed(slug, status, ty, tn, strategy="weather_edge"):
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO entries (ts, market_slug, market_question, side, "
+                "status, entry_price, token_id_yes, token_id_no, strategy) "
+                "VALUES (?, ?, 'q', 'NO', ?, 0.3, ?, ?, ?)",
+                (ts, slug, status, ty, tn, strategy))
+            eid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.commit()
+        return eid
+
+    def cand(slug, side, ty, tn):
+        return {"slug": slug, "side": side, "token_id_yes": ty,
+                "token_id_no": tn}
+
+    try:
+        db.connect = lambda path=None: _orig_connect(tmp)
+
+        # T1: EXECUTED live entry blocks a candidate on the SAME NO token —
+        # even from a different slug spelling / would-be new ladder group.
+        seed("seoul-26c", "EXECUTED", "Y_A", "N_A")
+        skipped = {"duplicate_token_open": 0}
+        out = mod._filter_live_token_candidates(
+            [cand("seoul-26c-repost", "NO", "Y_A", "N_A"),
+             cand("sf-66f", "NO", "Y_B", "N_B")], skipped)
+        assert [c["slug"] for c in out] == ["sf-66f"], out
+        assert skipped["duplicate_token_open"] == 1, skipped
+        with db.connect() as conn:
+            n_skip = conn.execute(
+                "SELECT COUNT(*) FROM discovery_skips "
+                "WHERE reason='duplicate_token_open'").fetchone()[0]
+        assert n_skip == 1, n_skip
+        print("Test T1 PASS: live EXECUTED entry blocks same-token candidate "
+              "(other market passes; skip persisted)")
+
+        # T2: PROPOSED (in flight) also blocks; opposite-side token of a
+        # live entry blocks too (ADJUST can flip sides).
+        seed("nyc-90f", "PROPOSED", "Y_C", "N_C")
+        skipped = {"duplicate_token_open": 0}
+        out = mod._filter_live_token_candidates(
+            [cand("nyc-90f-again", "NO", "Y_C", "N_C"),
+             cand("nyc-90f-yes-side", "YES", "Y_C", "N_C")], skipped)
+        assert out == [] and skipped["duplicate_token_open"] == 2, (
+            out, skipped)
+        print("Test T2 PASS: PROPOSED blocks; both tokens of a live entry "
+              "blocked (side-flip safe)")
+
+        # T3: cashout/resolution FREE the token again.
+        e_cash = seed("london-20c", "EXECUTED", "Y_D", "N_D")
+        e_res = seed("tokyo-30c", "EXECUTED", "Y_E", "N_E")
+        with db.connect() as conn:
+            conn.execute("INSERT INTO cashouts (entry_id, ts, "
+                         "realized_pnl_usd) VALUES (?, ?, 1.0)", (e_cash, ts))
+            conn.execute("INSERT INTO resolutions (entry_id, ts_resolved, "
+                         "final_outcome, payout_per_share) "
+                         "VALUES (?, ?, 'NO', 1.0)", (e_res, ts))
+            conn.commit()
+        skipped = {"duplicate_token_open": 0}
+        out = mod._filter_live_token_candidates(
+            [cand("london-20c", "NO", "Y_D", "N_D"),
+             cand("tokyo-30c", "NO", "Y_E", "N_E")], skipped)
+        assert len(out) == 2 and skipped["duplicate_token_open"] == 0, (
+            out, skipped)
+        print("Test T3 PASS: cashed-out and resolved entries free their "
+              "tokens (re-entry allowed)")
+
+        # T4: cross-strategy — a live cheap_convexity entry blocks a legacy
+        # weather_edge candidate on the same token.
+        seed("berlin-15c", "EXECUTED", "Y_F", "N_F", strategy="cheap_convexity")
+        skipped = {"duplicate_token_open": 0}
+        out = mod._filter_live_token_candidates(
+            [cand("berlin-15c", "NO", "Y_F", "N_F")], skipped)
+        assert out == [] and skipped["duplicate_token_open"] == 1
+        print("Test T4 PASS: cross-strategy block (cc entry blocks "
+              "weather_edge candidate)")
+
+        # T5: cheap_convexity discovery hook end-to-end — a live
+        # weather_edge entry on (tY, tN) blocks the cc proposal for the
+        # same tokens (cc_duplicate_token_open), discovery does not abort.
+        future = (datetime.now(timezone.utc) + timedelta(hours=24)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        market = {
+            "slug": "highest-temp-in-paris-14c",
+            "question": "Will the highest temperature in Paris be 14°C?",
+            "endDate": future, "acceptingOrders": True,
+            "clobTokenIds": json.dumps(["tY", "tN"]),
+            "conditionId": "0xcc",
+        }
+        spec = types.SimpleNamespace(
+            city="Paris", confidence=0.9, metric="temp", comparison="range",
+            threshold_value=14.0, threshold_value_high=15.0,
+            threshold_unit="C")
+        seed("paris-14c-old-run", "EXECUTED", "tY", "tN")
+
+        saved = (mod.fetch_weather_markets, mod.parse_market,
+                 mod.fetch_orderbook, mod.implied_probabilities,
+                 mod.resolve_station, mod.auto_extract_station,
+                 mod.fetch_forecast, mod._compute_mae_for_market,
+                 mod._forecast_probability_raw, mod.forecast_probability,
+                 mod.compute_edge, mod.compute_max_size_for_slippage,
+                 mod._load_cc_gate)
+        try:
+            mod.fetch_weather_markets = lambda min_volume=0: [market]
+            mod.parse_market = lambda q, e, c: spec
+            mod.resolve_station = lambda city, cities: None
+            mod.auto_extract_station = lambda *a, **k: None
+            mod.fetch_forecast = lambda *a, **k: {"daily_forecast": [{}]}
+            mod._compute_mae_for_market = lambda s, f, a, station=None: (
+                2.0, None, None, {"station": "LFPG", "mae_dynamic": 2.0})
+            mod._forecast_probability_raw = lambda s, f, **k: 0.07
+            mod.forecast_probability = lambda s, f, **k: 0.30
+            mod.implied_probabilities = lambda by, bn: {"yes_ask": 0.02,
+                                                        "no_ask": 0.97}
+            mod.compute_edge = lambda fair, imp: {
+                "best_side": "YES",
+                "edge_pp_at_best": round((fair - imp["yes_ask"]) * 100, 2)}
+            book_ok = {"asks": [{"price": 0.02, "size": 1000}],
+                       "bids": [{"price": 0.015, "size": 1000}]}
+            mod.fetch_orderbook = lambda tid: book_ok
+            mod.compute_max_size_for_slippage = (
+                lambda book, side, max_slippage:
+                {"max_shares": 500.0, "max_usd": 10.0, "slippage_pct": 0.05})
+            mod._load_cc_gate = lambda: {"tail_calibration_pass": True}
+
+            args = types.SimpleNamespace(
+                cheap_convexity=True, cc_min_entry_price=0.01,
+                cc_max_entry_price=0.20, cc_min_edge_pp=3.0,
+                cc_exit_margin_pp=1.0, min_volume=100, window_hours=48,
+                min_ttr_hours=0.0, max_slippage=0.2, debug=False)
+
+            n = mod.run_discovery_cheap_convexity(args, cities={})
+            assert n == 0, f"expected 0 proposals (token occupied), got {n}"
+            with db.connect() as conn:
+                # T4 seeded an EXECUTED cc entry — count only NEW proposals
+                # for the market under test.
+                n_cc = conn.execute(
+                    "SELECT COUNT(*) FROM entries "
+                    "WHERE strategy='cheap_convexity' AND status='PROPOSED'"
+                ).fetchone()[0]
+                n_skip = conn.execute(
+                    "SELECT COUNT(*) FROM discovery_skips "
+                    "WHERE reason='cc_duplicate_token_open'").fetchone()[0]
+            assert n_cc == 0 and n_skip == 1, (n_cc, n_skip)
+            print("Test T5 PASS: cc discovery blocked by live weather_edge "
+                  "token (cc_duplicate_token_open persisted)")
+        finally:
+            (mod.fetch_weather_markets, mod.parse_market, mod.fetch_orderbook,
+             mod.implied_probabilities, mod.resolve_station,
+             mod.auto_extract_station, mod.fetch_forecast,
+             mod._compute_mae_for_market, mod._forecast_probability_raw,
+             mod.forecast_probability, mod.compute_edge,
+             mod.compute_max_size_for_slippage, mod._load_cc_gate) = saved
+
+        print("\nAll --test-dup-token-discovery PASS (5/5)")
+    finally:
+        db.connect = _orig_connect
+
+
 def _test_phantom_cashout():
     """v13.4: self-heal for phantom legs (position already sold by a sibling
     entry sharing the outcome token) + list-return normalization. Hermetic:
@@ -3836,5 +4071,7 @@ if __name__ == "__main__":
         _test_cheap_convexity_discovery()
     elif "--test-phantom-cashout" in sys.argv:
         _test_phantom_cashout()
+    elif "--test-dup-token-discovery" in sys.argv:
+        _test_dup_token_discovery()
     else:
         main()

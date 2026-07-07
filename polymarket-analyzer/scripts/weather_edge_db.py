@@ -664,6 +664,42 @@ def query_ladder_group_open(conn, ladder_group_id: str) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def query_live_tokens(conn) -> set:
+    """Outcome tokens "occupied" by a live entry — any strategy.
+
+    Live = PROPOSED/APPROVED/ADJUSTED (in flight), or EXECUTED/FAST_PATH
+    with no cashout AND no resolution (open position). Returns BOTH tokens
+    (yes+no) of each live entry:
+
+      - blocking the opposite side is already policy (opposite_side_held);
+      - a judge ADJUST can flip the executed side without updating
+        entries.side, so deriving "the occupied token" from e.side is
+        unreliable.
+
+    Post-mortem 2026-07-06: the paper engine keys positions by (portfolio,
+    token, side) — entries per ladder leg. Discovery allowed re-entry on the
+    same (slug, side) after execution, so ladder groups from different runs
+    shared outcome tokens; their buys merged into ONE paper position and
+    whichever leg closed first stranded the siblings (74 failed cashout
+    retries in one day). Discovery must never propose a candidate whose
+    token is in this set.
+
+    Deliberately cross-strategy: paper positions are keyed by token, not
+    strategy — a token held by cheap_convexity must block weather_edge
+    proposals and vice-versa.
+    """
+    rows = conn.execute(
+        "SELECT e.token_id_yes, e.token_id_no "
+        "FROM entries e "
+        "LEFT JOIN cashouts    c ON c.entry_id = e.entry_id "
+        "LEFT JOIN resolutions r ON r.entry_id = e.entry_id "
+        "WHERE e.status IN ('PROPOSED','APPROVED','ADJUSTED') "
+        "   OR (e.status IN ('EXECUTED','FAST_PATH') "
+        "       AND c.cashout_id IS NULL AND r.resolution_id IS NULL)"
+    ).fetchall()
+    return {tok for row in rows for tok in (row[0], row[1]) if tok}
+
+
 def query_approved_unexecuted(conn) -> list[sqlite3.Row]:
     """Entries APPROVED or ADJUSTED but not yet executed (bot picks these up).
 
@@ -898,6 +934,46 @@ def _test_query_ladder_group_open():
     tmp.unlink()
 
 
+def _test_query_live_tokens():
+    """v13.4: query_live_tokens must return the token pairs of live entries
+    only — pending (PROPOSED/APPROVED/ADJUSTED) or open (EXECUTED/FAST_PATH
+    without cashout AND without resolution) — across ALL strategies."""
+    import tempfile
+    from pathlib import Path as P
+    tmp = P(tempfile.mkdtemp()) / "live_tokens.db"
+    init_db(tmp)
+    ts = "2026-07-06T00:00:00+00:00"
+    with connect(tmp) as conn:
+        def add(slug, status, ty, tn, strategy="weather_edge"):
+            conn.execute(
+                "INSERT INTO entries (ts, market_slug, market_question, side, "
+                "status, entry_price, token_id_yes, token_id_no, strategy) "
+                "VALUES (?, ?, 'q', 'NO', ?, 0.3, ?, ?, ?)",
+                (ts, slug, status, ty, tn, strategy))
+            return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        add("s-open", "EXECUTED", "Y1", "N1")               # live: open
+        cashed = add("s-cashed", "EXECUTED", "Y2", "N2")    # freed by cashout
+        resolved = add("s-resolved", "FAST_PATH", "Y3", "N3")  # freed by resolution
+        add("s-pending", "PROPOSED", "Y4", "N4")            # live: in flight
+        add("s-skipped", "SKIPPED", "Y5", "N5")             # never live
+        add("s-rejected", "REJECTED", "Y6", "N6")           # never live
+        add("s-cc", "EXECUTED", "Y7", "N7", "cheap_convexity")  # live: cross-strategy
+        conn.execute("INSERT INTO cashouts (entry_id, ts, realized_pnl_usd) "
+                     "VALUES (?, ?, 1.0)", (cashed, ts))
+        conn.execute("INSERT INTO resolutions (entry_id, ts_resolved, "
+                     "final_outcome, payout_per_share) VALUES (?, ?, 'NO', 1.0)",
+                     (resolved, ts))
+        conn.commit()
+
+        live = query_live_tokens(conn)
+        expected = {"Y1", "N1", "Y4", "N4", "Y7", "N7"}
+        assert live == expected, f"expected {expected}, got {live}"
+    print("Test PASS: query_live_tokens = open+pending (both tokens, "
+          "cross-strategy); cashed/resolved/skipped/rejected freed")
+    tmp.unlink()
+
+
 def _test_migration_v11_strategy():
     """v11 regression: migrating a v10 DB must add the `strategy` column,
     backfill legacy rows to 'weather_edge', create the index, bump
@@ -985,6 +1061,9 @@ if __name__ == "__main__":
         sys.exit(0)
     if "--test-ladder-open" in sys.argv:
         _test_query_ladder_group_open()
+        sys.exit(0)
+    if "--test-live-tokens" in sys.argv:
+        _test_query_live_tokens()
         sys.exit(0)
     # Smoke test: init DB and print version
     init_db()
