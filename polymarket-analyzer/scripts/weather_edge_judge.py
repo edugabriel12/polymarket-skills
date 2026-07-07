@@ -604,6 +604,110 @@ def _skip_sibling_failed(entry_id: int) -> None:
                 skip_reason="ladder_sibling_failed")
 
 
+def _group_free_guard_sweep(gid: str, current_entry_id: int) -> dict:
+    """v15 F2: when the judge first meets ladder group `gid` in a batch, run
+    the FREE guards over ALL its PROPOSED legs (central/below/above order)
+    BEFORE paying for any leg:
+
+      1. _recheck_edge_prejudge — orderbook HTTP only, $0 LLM
+      2. _judge_route with action=='auto_reject' — deterministic, $0
+
+    auto_approve routes are NOT acted on here (they would need the paid
+    anomaly scan) — they merely count as "passed". The sweep can therefore
+    only kill EARLIER what the per-leg pipeline would kill anyway; it never
+    grants an approval. This closes the dominant waste pattern from the
+    2026-07-07 post-mortem: 50/58 sibling-failed victims were fully judged
+    while their killer died a FREE edge_decay_prejudge death later.
+
+    On the first failing leg (the killer):
+      - the killer gets its NATURAL outcome, byte-identical to its own
+        turn (prejudge → SKIPPED/edge_decay_prejudge; route →
+        apply_verdict(REJECT) with a $0 judge_reviews row);
+      - every other PROPOSED leg is marked via _skip_sibling_failed;
+      - a ladder_group_dead_prejudge event is emitted.
+
+    Returns {"dead", "killer_entry_id", "killer_reason",
+    "prejudge_passed_ids"} — the passed-ids let the caller skip re-fetching
+    the current row's orderbook in the same poll. Fail-open per leg: any
+    guard error counts as "passed" (never kill a group on a read failure).
+    """
+    try:
+        with db.connect() as conn:
+            legs = [dict(l) for l in db.query_ladder_group(conn, gid)]
+    except Exception:
+        return {"dead": False, "killer_entry_id": None,
+                "killer_reason": None, "prejudge_passed_ids": set()}
+    pending = [l for l in legs if l.get("status") == "PROPOSED"]
+    passed: set = set()
+    killer = None
+    killer_reason = None
+
+    for leg in pending:
+        # (1) free prejudge edge re-check — same write as the leg's own turn
+        try:
+            stale = _recheck_edge_prejudge(leg)
+        except Exception:
+            stale = None
+        if stale is not None:
+            log_event("judge_skipped_prejudge", {**stale, "swept_group": gid})
+            with db.connect() as conn:
+                cur = conn.execute(
+                    "SELECT status FROM entries WHERE entry_id = ?",
+                    (leg["entry_id"],)).fetchone()
+                if cur and cur["status"] == "PROPOSED":
+                    db.update_entry_status(
+                        conn, leg["entry_id"], "SKIPPED",
+                        judge_skipped_reason="edge_decay_prejudge",
+                        skip_reason="edge_decay_prejudge")
+            killer, killer_reason = leg, "edge_decay_prejudge"
+            break
+        # (2) deterministic auto-reject routes ($0). auto_approve/None fall
+        # through untouched — the leg will be judged at its own turn.
+        try:
+            route = _judge_route(leg)
+        except Exception:
+            route = None
+        if route is not None and route.get("action") == "auto_reject":
+            verdict = _synthesize_route_verdict(leg, route)
+            with db.connect() as conn:
+                apply_verdict(conn, leg, verdict)
+            _ev = ("judge_autoreject_nontemp"
+                   if route.get("kind") == "non_temperature"
+                   else "judge_autoreject_proximity")
+            log_event(_ev, {
+                "entry_id": leg["entry_id"],
+                "final_verdict": verdict["verdict"],
+                "reason": route["reason"],
+                "bot_prob": float(leg.get("forecast_prob_at_entry") or 0),
+                "cost_usd": 0.0, "llm_skipped": True,
+                "swept_group": gid,
+            })
+            killer = leg
+            killer_reason = f"auto_reject:{route.get('kind') or 'proximity'}"
+            break
+        passed.add(leg["entry_id"])
+
+    if killer is None:
+        return {"dead": False, "killer_entry_id": None,
+                "killer_reason": None, "prejudge_passed_ids": passed}
+
+    marked = []
+    for leg in pending:
+        if leg["entry_id"] == killer["entry_id"]:
+            continue
+        _skip_sibling_failed(leg["entry_id"])
+        marked.append(leg["entry_id"])
+    log_event("ladder_group_dead_prejudge", {
+        "ladder_group_id": gid,
+        "killer_entry_id": killer["entry_id"],
+        "killer_reason": killer_reason,
+        "marked_skipped": marked,
+        "est_llm_reviews_saved": len(marked),
+    })
+    return {"dead": True, "killer_entry_id": killer["entry_id"],
+            "killer_reason": killer_reason, "prejudge_passed_ids": passed}
+
+
 def _threshold_proximity_reason(entry_row) -> Optional[str]:
     """v11 (post-mortem): return an override reason if the bot's forecast
     sits within ~1°C of the threshold — or, for a range market, within ~1°C
@@ -1296,6 +1400,7 @@ def main():
             # ties), so a leg killed in this batch short-circuits its
             # siblings in memory, without re-querying the DB per row.
             dead_groups: set = set()
+            swept_groups: set = set()   # v15 F2: grupos já varridos no batch
 
             for row in rows:
                 if _shutdown:
@@ -1322,10 +1427,27 @@ def main():
                         dead_groups.add(gid)
                     continue
 
+                # v15 F2: first leg of a group in this batch → sweep the
+                # FREE guards of ALL siblings before paying for any leg.
+                # 86% of the 2026-07-07 waste was a sibling dying a free
+                # edge_decay death AFTER the victim's paid review.
+                prejudge_fresh = False
+                if gid and gid not in swept_groups:
+                    swept_groups.add(gid)
+                    sweep = _group_free_guard_sweep(gid, row_dict["entry_id"])
+                    if sweep["dead"]:
+                        dead_groups.add(gid)
+                        continue   # current row was marked inside the sweep
+                    prejudge_fresh = (row_dict["entry_id"]
+                                      in sweep["prejudge_passed_ids"])
+
                 # Pre-judge edge re-check (v10): if the orderbook has moved
                 # such that current edge is below the floor, skip the LLM
                 # call entirely. ~$0.04 saved per upstream skip.
-                stale = _recheck_edge_prejudge(row_dict)
+                # (v15 F2: skip the duplicate fetch when this row's recheck
+                # already ran clean inside this poll's group sweep.)
+                stale = (None if prejudge_fresh
+                         else _recheck_edge_prejudge(row_dict))
                 if stale is not None:
                     log_event("judge_skipped_prejudge", stale)
                     with db.connect() as conn:
@@ -1713,6 +1835,157 @@ def _test_sibling_gate():
     print("\nAll --test-sibling-gate PASS")
 
 
+def _test_group_sweep():
+    """v15 F2: hermetic tests for _group_free_guard_sweep — temp DB, stubbed
+    _recheck_edge_prejudge/_judge_route, real apply_verdict. No network."""
+    import tempfile
+    import weather_edge_judge as mod
+
+    tmp = Path(tempfile.mkdtemp()) / "group_sweep.db"
+    db.init_db(tmp)
+    _orig_connect = db.connect
+    saved_recheck = mod._recheck_edge_prejudge
+    saved_route = mod._judge_route
+    ts = "2026-07-07T00:00:00+00:00"
+
+    def seed(gid, pos, status="PROPOSED", prob=0.8):
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO entries (ts, market_slug, market_question, side, "
+                "status, ladder_group_id, ladder_position, entry_price, "
+                "forecast_prob_at_entry, strategy) VALUES "
+                "(?, 's', 'q', 'NO', ?, ?, ?, 0.3, ?, 'weather_edge')",
+                (ts, status, gid, pos, prob))
+            eid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.commit()
+        return eid
+
+    def status_of(eid):
+        with db.connect() as conn:
+            r = conn.execute("SELECT status, skip_reason, "
+                             "judge_skipped_reason FROM entries "
+                             "WHERE entry_id=?", (eid,)).fetchone()
+        return dict(r)
+
+    def n_reviews():
+        with db.connect() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM judge_reviews").fetchone()[0]
+
+    recheck_calls = []
+
+    try:
+        db.connect = lambda path=None: _orig_connect(tmp)
+
+        # S1: irmã decaída (o mecanismo dos 86%) — killer natural
+        # edge_decay_prejudge; a outra perna vira sibling_failed; ZERO
+        # judge_reviews (nenhum gasto).
+        k1 = seed("g1", "central")
+        v1 = seed("g1", "below")
+        mod._recheck_edge_prejudge = lambda leg: (
+            {"entry_id": leg["entry_id"], "reason": "edge_decay_prejudge",
+             "current_edge_pp": 1.0} if leg["entry_id"] == k1 else None)
+        mod._judge_route = lambda leg: None
+        r = mod._group_free_guard_sweep("g1", v1)
+        assert r["dead"] is True and r["killer_entry_id"] == k1, r
+        assert r["killer_reason"] == "edge_decay_prejudge", r
+        sk = status_of(k1)
+        assert sk["status"] == "SKIPPED" and \
+            sk["skip_reason"] == "edge_decay_prejudge", sk
+        sv = status_of(v1)
+        assert sv["status"] == "SKIPPED" and \
+            sv["skip_reason"] == "ladder_sibling_failed" and \
+            sv["judge_skipped_reason"] == "ladder_sibling_failed_prejudge", sv
+        assert n_reviews() == 0
+        print("Test W1 PASS: irmã decaída → killer natural + vítima marcada, "
+              "$0 (zero judge_reviews)")
+
+        # S2: irmã auto_reject por proximidade — killer REJECTED via
+        # apply_verdict real (linha em judge_reviews com custo $0), vítima
+        # skipped.
+        k2 = seed("g2", "central")
+        v2 = seed("g2", "below")
+        mod._recheck_edge_prejudge = lambda leg: None
+        mod._judge_route = lambda leg: (
+            {"action": "auto_reject",
+             "reason": "forecast within 1.0 of threshold"}
+            if leg["entry_id"] == k2 else None)
+        r = mod._group_free_guard_sweep("g2", v2)
+        assert r["dead"] is True and \
+            r["killer_reason"] == "auto_reject:proximity", r
+        assert status_of(k2)["status"] == "REJECTED", status_of(k2)
+        assert status_of(v2)["skip_reason"] == "ladder_sibling_failed"
+        assert n_reviews() == 1   # a review $0 do killer — desfecho natural
+        with db.connect() as conn:
+            cost = conn.execute("SELECT COALESCE(cost_usd, 0) FROM "
+                                "judge_reviews").fetchone()[0]
+        assert float(cost or 0) == 0.0, cost
+        print("Test W2 PASS: irmã auto_reject → killer REJECTED ($0), "
+              "vítima marcada")
+
+        # S3: grupo de 3 pernas todas passando → dead=False, ids em
+        # prejudge_passed_ids, nenhum write.
+        a = seed("g3", "central")
+        b = seed("g3", "below")
+        c = seed("g3", "above")
+        mod._recheck_edge_prejudge = lambda leg: None
+        mod._judge_route = lambda leg: None
+        before = n_reviews()
+        r = mod._group_free_guard_sweep("g3", a)
+        assert r["dead"] is False
+        assert r["prejudge_passed_ids"] == {a, b, c}, r
+        assert all(status_of(x)["status"] == "PROPOSED" for x in (a, b, c))
+        assert n_reviews() == before
+        print("Test W3 PASS: grupo saudável → dead=False, 3 ids passados, "
+              "zero writes")
+
+        # S4: irmã roteia auto_approve → NÃO agido na sweep (sem status
+        # change, sem judge_reviews) — nenhum gate de qualidade enfraquecido.
+        d = seed("g4", "central")
+        e = seed("g4", "below")
+        mod._judge_route = lambda leg: {"action": "auto_approve",
+                                        "reason": "tight ensemble"}
+        before = n_reviews()
+        r = mod._group_free_guard_sweep("g4", d)
+        assert r["dead"] is False
+        assert status_of(d)["status"] == "PROPOSED"
+        assert status_of(e)["status"] == "PROPOSED"
+        assert n_reviews() == before
+        print("Test W4 PASS: auto_approve NÃO é concedido na sweep "
+              "(perna julga no próprio turno)")
+
+        # S5: irmã já APPROVED → sweep só checa as PROPOSED.
+        f = seed("g5", "central", status="APPROVED")
+        g = seed("g5", "below")
+        recheck_calls.clear()
+        mod._recheck_edge_prejudge = lambda leg: (
+            recheck_calls.append(leg["entry_id"]) or None)
+        mod._judge_route = lambda leg: None
+        r = mod._group_free_guard_sweep("g5", g)
+        assert r["dead"] is False and recheck_calls == [g], recheck_calls
+        assert status_of(f)["status"] == "APPROVED"
+        print("Test W5 PASS: perna APPROVED ignorada (sweep só PROPOSED)")
+
+        # S6: guard lançando exceção → fail-open (conta como passou).
+        h = seed("g6", "central")
+        i = seed("g6", "below")
+        def boom(leg):
+            raise RuntimeError("orderbook fetch failed")
+        mod._recheck_edge_prejudge = boom
+        mod._judge_route = lambda leg: None
+        r = mod._group_free_guard_sweep("g6", h)
+        assert r["dead"] is False, r
+        assert status_of(h)["status"] == "PROPOSED"
+        assert status_of(i)["status"] == "PROPOSED"
+        print("Test W6 PASS: erro no guard → fail-open (grupo vivo)")
+
+        print("\nAll --test-group-sweep PASS (6/6)")
+    finally:
+        db.connect = _orig_connect
+        mod._recheck_edge_prejudge = saved_recheck
+        mod._judge_route = saved_route
+
+
 def _test_prejudge_recheck():
     """Hermetic tests for _recheck_edge_prejudge by stubbing _fetch_orderbook."""
     import weather_edge_judge as mod  # self-import for monkey-patching the module-level helper
@@ -2066,6 +2339,8 @@ if __name__ == "__main__":
         _test_rule6_enforce()
     elif "--test-sibling-gate" in sys.argv:
         _test_sibling_gate()
+    elif "--test-group-sweep" in sys.argv:
+        _test_group_sweep()
     elif "--test-prejudge" in sys.argv:
         _test_prejudge_recheck()
     elif "--test-autoroute" in sys.argv:
