@@ -48,6 +48,13 @@ import re
 _TOKEN_ID_RE = re.compile(r"^\d{20,120}$")
 
 
+class NoOpenPositionError(RuntimeError):
+    """close_position was asked to close a (token, side) with no open
+    positions row. Subclasses RuntimeError so existing `except RuntimeError`
+    guards (e.g. weather_edge_bot's resolution sweep) keep working, while
+    letting the bot's cashout self-heal catch this case specifically."""
+
+
 def _validate_token_id(token_id: str) -> str:
     """Validate a CLOB token ID before using it in URLs."""
     if not isinstance(token_id, str) or not _TOKEN_ID_RE.match(token_id):
@@ -144,8 +151,7 @@ def _init_schema(conn: sqlite3.Connection):
             opened_at     TEXT NOT NULL,
             updated_at    TEXT NOT NULL,
             closed        INTEGER NOT NULL DEFAULT 0,
-            closed_at     TEXT,
-            UNIQUE(portfolio_id, token_id, side, closed)
+            closed_at     TEXT
         );
 
         CREATE TABLE IF NOT EXISTS trades (
@@ -175,6 +181,67 @@ def _init_schema(conn: sqlite3.Connection):
             UNIQUE(portfolio_id, date)
         );
     """)
+    conn.commit()
+    _migrate_positions_unique(conn)
+
+
+def _migrate_positions_unique(conn: sqlite3.Connection):
+    """One-time rebuild: drop the table-level
+    UNIQUE(portfolio_id, token_id, side, closed) in favor of a PARTIAL
+    unique index over open rows only.
+
+    The old constraint allowed at most ONE closed=1 row per (portfolio,
+    token, side): re-trading a token after a full close worked on BUY
+    (new closed=0 row) but the second close's UPDATE ... SET closed=1
+    collided with the historical closed row -> sqlite3.IntegrityError,
+    leaving the position stuck open forever (observed 8x in the
+    2026-07-06 ladder cashout incident). The partial index keeps the
+    real invariant (one OPEN row per key) and allows unlimited closed
+    history.
+
+    Idempotent: the detection string vanishes after the rebuild. Safe:
+    no other table references positions by FK, and the old constraint
+    already guarantees <=1 open row per key, so creating the partial
+    unique index over existing data cannot fail.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='positions'"
+    ).fetchone()
+    if row and "UNIQUE(portfolio_id, token_id, side, closed)" in (row["sql"] or ""):
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("""
+            CREATE TABLE positions_new (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id  INTEGER NOT NULL REFERENCES portfolios(id),
+                token_id      TEXT NOT NULL,
+                market_question TEXT,
+                side          TEXT NOT NULL CHECK(side IN ('YES','NO')),
+                shares        REAL NOT NULL DEFAULT 0,
+                avg_entry     REAL NOT NULL DEFAULT 0,
+                current_price REAL NOT NULL DEFAULT 0,
+                opened_at     TEXT NOT NULL,
+                updated_at    TEXT NOT NULL,
+                closed        INTEGER NOT NULL DEFAULT 0,
+                closed_at     TEXT
+            )""")
+        # Explicit column list so the copy survives future column additions.
+        conn.execute("""
+            INSERT INTO positions_new
+                (id, portfolio_id, token_id, market_question, side, shares,
+                 avg_entry, current_price, opened_at, updated_at, closed,
+                 closed_at)
+            SELECT id, portfolio_id, token_id, market_question, side, shares,
+                   avg_entry, current_price, opened_at, updated_at, closed,
+                   closed_at
+            FROM positions""")
+        conn.execute("DROP TABLE positions")
+        conn.execute("ALTER TABLE positions_new RENAME TO positions")
+        conn.commit()
+    # DROP TABLE above also removes any index on it — (re)create outside the
+    # detection branch so fresh DBs get the index too.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_one_open "
+        "ON positions(portfolio_id, token_id, side) WHERE closed = 0")
     conn.commit()
 
 
@@ -742,7 +809,7 @@ def close_position(
 
         if not positions:
             conn.rollback()
-            raise RuntimeError(
+            raise NoOpenPositionError(
                 f"No open position for token {token_id}"
                 + (f" side={side}" if side else "")
             )
@@ -829,6 +896,31 @@ def close_position(
     except Exception:
         conn.rollback()
         raise
+    finally:
+        conn.close()
+
+
+def has_open_position(token_id: str, side: str | None = None,
+                      portfolio_name: str = "default") -> bool:
+    """Read-only ground truth: does an open (closed=0) positions row exist
+    for (portfolio, token[, side])?
+
+    Used by the weather bot's cashout self-heal to distinguish "position
+    vanished" (a sibling entry sharing the same outcome token already sold
+    the merged position -> stop retrying, write a phantom cashout) from
+    transient close failures like "No bids in order book" (position still
+    real -> keep retrying next tick).
+    """
+    conn = _get_db()
+    try:
+        pf = _active_portfolio(conn, portfolio_name)
+        q = ("SELECT 1 FROM positions "
+             "WHERE portfolio_id = ? AND token_id = ? AND closed = 0")
+        params: list = [pf["id"], token_id]
+        if side:
+            q += " AND side = ?"
+            params.append(side.upper())
+        return conn.execute(q + " LIMIT 1", params).fetchone() is not None
     finally:
         conn.close()
 
@@ -996,6 +1088,11 @@ class PaperEngine:
             portfolio_name=self.portfolio, reasoning=reasoning,
         )
 
+    def has_open_position(self, *, token_id: str,
+                           side: str | None = None) -> bool:
+        return has_open_position(token_id=token_id, side=side,
+                                 portfolio_name=self.portfolio)
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -1143,5 +1240,203 @@ Examples:
         sys.exit(1)
 
 
+# ---------------------------------------------------------------------------
+# Inline tests (offline, synthetic temp DBs — no network)
+# ---------------------------------------------------------------------------
+
+_OLD_POSITIONS_SCHEMA = """
+    CREATE TABLE portfolios (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        name          TEXT NOT NULL DEFAULT 'default',
+        starting_balance REAL NOT NULL,
+        cash_balance  REAL NOT NULL,
+        peak_value    REAL NOT NULL,
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL,
+        risk_config   TEXT NOT NULL,
+        active        INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE TABLE positions (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        portfolio_id  INTEGER NOT NULL REFERENCES portfolios(id),
+        token_id      TEXT NOT NULL,
+        market_question TEXT,
+        side          TEXT NOT NULL CHECK(side IN ('YES','NO')),
+        shares        REAL NOT NULL DEFAULT 0,
+        avg_entry     REAL NOT NULL DEFAULT 0,
+        current_price REAL NOT NULL DEFAULT 0,
+        opened_at     TEXT NOT NULL,
+        updated_at    TEXT NOT NULL,
+        closed        INTEGER NOT NULL DEFAULT 0,
+        closed_at     TEXT,
+        UNIQUE(portfolio_id, token_id, side, closed)
+    );
+"""
+
+
+def _swap_test_db():
+    """Point the module at a fresh temp DB; returns (tmp_path, restore_fn)."""
+    import tempfile
+    global DB_DIR, DB_PATH
+    old_dir, old_path = DB_DIR, DB_PATH
+    tmpdir = Path(tempfile.mkdtemp())
+    DB_DIR, DB_PATH = tmpdir, tmpdir / "portfolio_test.db"
+
+    def restore():
+        global DB_DIR, DB_PATH
+        DB_DIR, DB_PATH = old_dir, old_path
+    return DB_PATH, restore
+
+
+def _test_migration_positions():
+    """Migration v-old->partial-index: rebuild preserves rows, the
+    production IntegrityError disappears, one-open invariant survives,
+    and re-running is a no-op."""
+    tok = "1" * 30
+    now = "2026-07-06T00:00:00+00:00"
+    db_path, restore = _swap_test_db()
+    try:
+        # 1. Build the OLD schema by hand and seed the exact production
+        #    failure shape: one closed=1 row + one closed=0 row, same key.
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(_OLD_POSITIONS_SCHEMA)
+        conn.execute(
+            "INSERT INTO portfolios (name, starting_balance, cash_balance, "
+            "peak_value, created_at, updated_at, risk_config, active) "
+            "VALUES ('default', 1000, 1000, 1000, ?, ?, '{}', 1)", (now, now))
+        for closed in (1, 0):
+            conn.execute(
+                "INSERT INTO positions (portfolio_id, token_id, side, shares, "
+                "avg_entry, current_price, opened_at, updated_at, closed) "
+                "VALUES (1, ?, 'NO', 10, 0.5, 0.5, ?, ?, ?)",
+                (tok, now, now, closed))
+        conn.commit()
+        # Reproduce the incident: second close collides with the closed row.
+        try:
+            conn.execute(
+                "UPDATE positions SET closed = 1 WHERE token_id = ? AND closed = 0",
+                (tok,))
+            raise AssertionError("expected IntegrityError under OLD schema")
+        except sqlite3.IntegrityError:
+            conn.rollback()
+        conn.close()
+        print("Test 1 PASS: old schema reproduces the UNIQUE collision")
+
+        # 2. _get_db() triggers the migration.
+        conn = _get_db()
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='positions'"
+        ).fetchone()["sql"]
+        assert "UNIQUE(portfolio_id, token_id, side, closed)" not in sql, sql
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' "
+            "AND name='idx_positions_one_open'").fetchone(), "partial index missing"
+        n, = conn.execute("SELECT COUNT(*) FROM positions").fetchone()
+        assert n == 2, f"rows lost in rebuild: {n}"
+        print("Test 2 PASS: migration rebuilt table, index created, rows intact")
+
+        # 3. The same UPDATE now succeeds -> two closed rows coexist.
+        conn.execute(
+            "UPDATE positions SET closed = 1 WHERE token_id = ? AND closed = 0",
+            (tok,))
+        conn.commit()
+        n_closed, = conn.execute(
+            "SELECT COUNT(*) FROM positions WHERE closed = 1").fetchone()
+        assert n_closed == 2, n_closed
+        print("Test 3 PASS: second close no longer collides (2 closed rows)")
+
+        # 4. Partial index still enforces ONE open row per key.
+        conn.execute(
+            "INSERT INTO positions (portfolio_id, token_id, side, shares, "
+            "avg_entry, current_price, opened_at, updated_at, closed) "
+            "VALUES (1, ?, 'NO', 5, 0.4, 0.4, ?, ?, 0)", (tok, now, now))
+        conn.commit()  # isolate: the rollback below must not undo this row
+        try:
+            conn.execute(
+                "INSERT INTO positions (portfolio_id, token_id, side, shares, "
+                "avg_entry, current_price, opened_at, updated_at, closed) "
+                "VALUES (1, ?, 'NO', 5, 0.4, 0.4, ?, ?, 0)", (tok, now, now))
+            raise AssertionError("expected IntegrityError: 2nd open row")
+        except sqlite3.IntegrityError:
+            conn.rollback()
+        conn.close()
+        print("Test 4 PASS: partial index rejects a second OPEN row")
+
+        # 5. Idempotency: re-open (migration re-runs) without error.
+        conn = _get_db()
+        n, = conn.execute("SELECT COUNT(*) FROM positions").fetchone()
+        assert n == 3, n  # 2 closed + 1 open from test 4
+        conn.close()
+        print("Test 5 PASS: migration idempotent on second run")
+        print("\nAll --test-migration-positions PASS")
+    finally:
+        restore()
+
+
+def _test_no_open_position():
+    """NoOpenPositionError semantics + has_open_position + re-trade close."""
+    tok = "2" * 30
+    now = "2026-07-06T00:00:00+00:00"
+    _, restore = _swap_test_db()
+    try:
+        init_portfolio(100.0)
+
+        # 1. Closing a token with no position raises the TYPED error and it
+        #    is still a RuntimeError (resolution sweep compatibility).
+        try:
+            close_position(tok, side="YES", force_exit_price=0.5)
+            raise AssertionError("expected NoOpenPositionError")
+        except NoOpenPositionError as e:
+            assert isinstance(e, RuntimeError)
+        assert has_open_position(tok, "YES") is False
+        print("Test 1 PASS: NoOpenPositionError raised, subclasses RuntimeError")
+
+        # 2. Seed a position by SQL (place_order would hit the network),
+        #    close it via force_exit_price (no orderbook fetch) — the happy
+        #    path — then verify has_open_position flips true->false.
+        conn = _get_db()
+        conn.execute(
+            "INSERT INTO positions (portfolio_id, token_id, side, shares, "
+            "avg_entry, current_price, opened_at, updated_at, closed) "
+            "VALUES (1, ?, 'YES', 10, 0.3, 0.3, ?, ?, 0)", (tok, now, now))
+        conn.commit()
+        conn.close()
+        assert has_open_position(tok, "YES") is True
+        assert has_open_position(tok) is True          # side omitted
+        assert has_open_position(tok, "NO") is False   # other side
+        r = close_position(tok, side="YES", force_exit_price=0.5)
+        assert r["status"] == "closed" and r["shares_sold"] == 10, r
+        assert has_open_position(tok, "YES") is False
+        print("Test 2 PASS: has_open_position true->false around close")
+
+        # 3. Re-trade regression (the fix-D scenario end-to-end): open the
+        #    SAME token/side again after a full close, close again — with the
+        #    old UNIQUE this raised IntegrityError; now it must succeed.
+        conn = _get_db()
+        conn.execute(
+            "INSERT INTO positions (portfolio_id, token_id, side, shares, "
+            "avg_entry, current_price, opened_at, updated_at, closed) "
+            "VALUES (1, ?, 'YES', 4, 0.6, 0.6, ?, ?, 0)", (tok, now, now))
+        conn.commit()
+        conn.close()
+        r = close_position(tok, side="YES", force_exit_price=1.0)
+        assert r["status"] == "closed", r
+        conn = _get_db()
+        n_closed, = conn.execute(
+            "SELECT COUNT(*) FROM positions WHERE token_id = ? AND closed = 1",
+            (tok,)).fetchone()
+        conn.close()
+        assert n_closed == 2, n_closed
+        print("Test 3 PASS: re-traded token closes cleanly (2 closed rows)")
+        print("\nAll --test-no-open-position PASS")
+    finally:
+        restore()
+
+
 if __name__ == "__main__":
-    main()
+    if "--test-migration-positions" in sys.argv:
+        _test_migration_positions()
+    elif "--test-no-open-position" in sys.argv:
+        _test_no_open_position()
+    else:
+        main()
