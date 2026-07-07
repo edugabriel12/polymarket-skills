@@ -55,14 +55,39 @@ ou Debian 12.
    ssh polymarket@SEU_IP
    ```
 
+### 2b. Alternativa: provisionar no boot com "User data" (DigitalOcean etc.)
+
+Se o seu provider tem um campo de **User data / Startup script** (DigitalOcean:
+*Create Droplet → Advanced options → Add Initial Scripts*), dá para automatizar
+TODO o passo 2 no primeiro boot em vez de fazê-lo à mão. Cole o conteúdo de
+[`cloud-init.sh`](./cloud-init.sh) nesse campo ao criar a máquina. Ele roda como
+root **uma vez** e faz: swap 2GB, pacotes base, timezone UTC,
+`ufw allow OpenSSH`, cria o usuário `polymarket` (herdando a chave SSH que você
+registrou na droplet) e habilita linger. **Não clona o repo** (assume privado →
+ver §3b).
+
+> **RAM:** o menor droplet (512 MB) arrisca **OOM** — bot+judge têm
+> `MemoryMax=256M` cada e o `pip install` do bootstrap encosta em centenas de
+> MB. Prefira **1 GB** (o swap do `cloud-init.sh` dá margem extra de qualquer
+> forma).
+
+Depois do boot (~1-2 min) conecte **como `polymarket`, não root** e pule para
+§3b (repo privado) ou §3 (público):
+```bash
+ssh polymarket@SEU_IP
+# se falhar: o script pode não ter terminado, ou a cópia da chave falhou —
+# entre como root e veja o log: ssh root@SEU_IP 'cat /var/log/startup-script.log'
+```
+
 ---
 
 ## 3. Clonar + bootstrap
 
-Como o usuário `polymarket`:
+Como o usuário `polymarket`. **Repo privado → clone com o deploy key da §3b** e
+volte aqui para o `bootstrap.sh`; **público → o clone HTTPS abaixo basta**:
 
 ```bash
-git clone https://github.com/edugabriel12/polymarket-skills.git ~/polymarket-skills
+git clone https://github.com/edugabriel12/polymarket-skills.git ~/polymarket-skills   # repo PÚBLICO
 bash ~/polymarket-skills/agent/deploy/bootstrap.sh
 # (com dashboard na mesma máquina: WITH_DASHBOARD=1 bash .../bootstrap.sh)
 ```
@@ -79,6 +104,47 @@ O `bootstrap.sh` é **idempotente** e faz:
 - instala as unidades systemd **apontando para o python do venv** (as originais
   usam o python do sistema, que num VPS limpo não tem as libs → falha silenciosa);
 - **não inicia** nada — você preenche as keys primeiro.
+
+### 3b. Repo privado — deploy key read-only (recomendado)
+
+Se `polymarket-skills` for **privado**, o `git clone https://...` da §3 falha.
+Autentique a VPS no GitHub com uma **deploy key**: uma chave SSH escopada a
+ESTE repo, read-only, cuja parte privada **nunca sai da VPS** (mais seguro que
+um token de conta). Rode **na VPS** — o `ssh-keygen -N ""` falha no PowerShell
+do Windows, tem que ser no shell Linux da VPS:
+
+```bash
+# 1. gerar par de chaves dedicado, sem passphrase
+ssh-keygen -t ed25519 -C "polymarket-vps-deploy" -f ~/.ssh/id_deploy -N ""
+
+# 2. mostrar a PÚBLICA (copie a saída)
+cat ~/.ssh/id_deploy.pub
+```
+
+No GitHub: **repo `polymarket-skills` → Settings → Deploy keys → Add deploy
+key** → cole a pública, **NÃO** marque "Allow write access" (read-only).
+
+De volta na VPS:
+```bash
+# 3. usar essa chave no github.com e confiar no host
+cat >> ~/.ssh/config <<'EOF'
+Host github.com
+  IdentityFile ~/.ssh/id_deploy
+  IdentitiesOnly yes
+EOF
+chmod 600 ~/.ssh/config
+ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+# 4. clonar via SSH (git@ , não https) no caminho canônico das units
+git clone git@github.com:edugabriel12/polymarket-skills.git ~/polymarket-skills
+```
+
+Depois é o mesmo fluxo (`bootstrap.sh` acima → §4). `git pull` para atualizar
+passa a funcionar sem senha.
+
+> **Alternativa sem GitHub na VPS:** copie o repo do seu PC via `rsync -av
+> --exclude .git --exclude __pycache__ --exclude .env ./polymarket-skills
+> polymarket@SEU_IP:~/`. Simples, mas sem `git pull` (atualizar = novo rsync).
 
 ---
 
@@ -239,6 +305,8 @@ systemctl --user start weather-edge-bot weather-edge-judge
 ## 11. Checklist final
 
 - [ ] VPS Ubuntu 24.04, usuário não-root, `ufw allow OpenSSH`, unattended-upgrades
+      (manual §2, ou automatizado no boot com `cloud-init.sh` §2b)
+- [ ] repo privado: **deploy key read-only** no GitHub + `git clone git@...` (§3b)
 - [ ] `git clone` + `bootstrap.sh` sem erros
 - [ ] **linger habilitado** (`loginctl show-user $USER | grep Linger` → `yes`)
 - [ ] **timezone UTC** (`timedatectl` → `Time zone: UTC`)
