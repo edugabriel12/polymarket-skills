@@ -2184,7 +2184,14 @@ def run_monitor_tick(args, cities: dict) -> None:
         if now_mono - last < interval:
             continue
         _last_monitor_per_entry[entry_id] = now_mono
-        _do_monitor_check(None, row, cities, args)
+        try:
+            _do_monitor_check(None, row, cities, args)
+        except Exception as e:
+            # One bad entry must not abort the remaining positions' checks
+            # (post-mortem 2026-07-06: an AttributeError escaping the ladder
+            # cashout phase 2 killed whole ticks via error where=main_loop).
+            log_event("error", {"where": "monitor_row", "entry_id": entry_id,
+                                "err": str(e)}, level="ERROR")
 
 
 def _do_monitor_check(conn, row, cities: dict, args) -> None:
@@ -2323,6 +2330,99 @@ def _do_monitor_check(conn, row, cities: dict, args) -> None:
 _ladder_cashing_out: set[str] = set()
 
 
+def _normalize_close_result(r) -> dict:
+    """paper_engine.close_position returns a LIST when more than one open
+    positions row matches (token, side). Callers here do r.get(...), which
+    raised AttributeError on lists — uncaught in the ladder phase-2 loop it
+    killed the whole monitor tick (post-mortem 2026-07-06). Aggregate a
+    multi-row close into one dict; dicts pass through untouched."""
+    if isinstance(r, dict):
+        return r
+    if not isinstance(r, list) or not r:
+        return {"status": "failed",
+                "reason": f"unexpected close result: {type(r).__name__}"}
+    shares = sum(float(x.get("shares_sold") or 0) for x in r)
+    avg = (sum(float(x.get("avg_sell_price") or 0)
+               * float(x.get("shares_sold") or 0) for x in r) / shares
+           if shares > 0 else 0.0)
+    status = ("closed" if all(x.get("status") == "closed" for x in r)
+              else "failed")
+    return {
+        "status": status,
+        "shares_sold": round(shares, 4),
+        "avg_sell_price": round(avg, 6),
+        "net_proceeds": round(sum(float(x.get("net_proceeds") or 0)
+                                   for x in r), 4),
+        "realized_pnl": round(sum(float(x.get("realized_pnl") or 0)
+                                   for x in r), 4),
+        "reason": None if status == "closed" else "partial multi-row close",
+    }
+
+
+def _close_leg(engine, token_id: str, side: str, reasoning: str) -> dict:
+    """Close one position via the engine, classifying the outcome:
+
+      status="closed"  — real close (normalized dict, see above).
+      status="phantom" — NO open position genuinely exists for (token,
+          side): a sibling entry sharing the same outcome token already
+          sold the merged paper position (positions are keyed per token,
+          entries per leg). Terminal: caller writes a phantom_shared_close
+          cashout row so the leg stops being retried every tick
+          (post-mortem 2026-07-06: 74 ladder_leg_close_rejected + 64
+          single-path failures, retried until resolution; entry 282 missed
+          its stop-loss this way and resolved at 0).
+      status="failed"  — transient failure with the position still open
+          (e.g. "No bids in order book", IntegrityError pre-migration):
+          caller keeps the leg open; the monitor retries next tick.
+    """
+    import sqlite3 as _sq
+    try:
+        from paper_engine import NoOpenPositionError
+    except ImportError:            # older engine without the typed error
+        NoOpenPositionError = ()   # isinstance(x, ()) is always False
+    try:
+        return _normalize_close_result(
+            engine.close_position(token_id=token_id, side=side,
+                                   reasoning=reasoning))
+    except _sq.IntegrityError as e:
+        # Position still open but unclosable under the pre-partial-index
+        # schema (paper_engine._migrate_positions_unique fixes this). NOT
+        # phantom — money is still in the position; retried after fix.
+        return {"status": "failed", "reason": f"integrity: {e}",
+                "integrity": True}
+    except Exception as e:
+        is_phantom = isinstance(e, NoOpenPositionError)
+        if not is_phantom:
+            # "No bids" fires BEFORE the position lookup in paper_engine,
+            # so a phantom leg on an empty-book market raises that instead.
+            # Ask the ground truth. Fail-safe: if the check itself errors,
+            # assume the position exists (keep retrying, never phantom).
+            try:
+                is_phantom = not engine.has_open_position(
+                    token_id=token_id, side=side)
+            except Exception:
+                is_phantom = False
+        return {"status": "phantom" if is_phantom else "failed",
+                "reason": str(e)}
+
+
+def _insert_phantom_cashout(conn, entry_id: int, forecast: dict,
+                            forecast_prob_now: float, reason) -> None:
+    """Terminal marker for a leg whose paper position was already sold by
+    a sibling entry sharing the token. exit_shares=0 / realized_pnl_usd=0.0
+    (NOT NULL: analyzer+dashboard use COALESCE(c.realized_pnl_usd, <resolution
+    formula>) — NULL would double-count P&L the sibling's merged close
+    already realized). The row removes the entry from query_open_positions,
+    ending the retry loop; the resolution sweep still records the outcome."""
+    db.insert_cashout(
+        conn, entry_id=entry_id, ts=_now_iso(),
+        exit_price=None, exit_shares=0.0, realized_pnl_usd=0.0,
+        forecast_prob_at_exit=forecast_prob_now,
+        forecast_snapshot_json=forecast,
+        reason=f"phantom_shared_close:{reason}"[:200],
+    )
+
+
 def _do_cashout(conn, row, bid: float, forecast: dict,
                 forecast_prob_now: float, args, reason: str) -> None:
     # v9: if this entry is part of a ladder group, cash out ALL legs of
@@ -2352,8 +2452,8 @@ def _do_cashout(conn, row, bid: float, forecast: dict,
     try:
         from paper_engine import PaperEngine
         engine = PaperEngine(portfolio=args.portfolio)
-        result = engine.close_position(token_id=token_id, side=side,
-                                        reasoning=f"weather_edge_bot: {reason}")
+        result = _close_leg(engine, token_id, side,
+                            f"weather_edge_bot: {reason}")
         if result.get("status") == "closed":
             exit_price = result.get("avg_sell_price") or result.get("avg_price")
             with db.connect() as conn2:
@@ -2370,6 +2470,16 @@ def _do_cashout(conn, row, bid: float, forecast: dict,
             log_event("cashout_executed", {"entry_id": entry_id,
                                             "exit_price": exit_price,
                                             "pnl": result.get("realized_pnl")})
+        elif result.get("status") == "phantom":
+            # Position already sold by a sibling entry sharing this token —
+            # write the terminal marker so this entry stops retrying.
+            with db.connect() as conn2:
+                _insert_phantom_cashout(conn2, entry_id, forecast,
+                                        forecast_prob_now,
+                                        result.get("reason"))
+            log_event("cashout_phantom_closed", {
+                "entry_id": entry_id, "reason": result.get("reason"),
+            }, level="WARN")
         else:
             log_event("cashout_rejected", {"entry_id": entry_id,
                                             "reason": result.get("reason")})
@@ -2386,17 +2496,13 @@ def _do_ladder_cashout(group_id: str, forecast: dict,
     single DB transaction. Partial failures are logged loudly but
     leave the partial-close state intact (no rollback in paper_engine).
     """
+    # v13.4: EXECUTED/FAST_PATH legs with no cashout AND no resolution —
+    # mirrors query_open_positions. The old filter here checked only the
+    # cashouts table, so legs already settled by the resolution sweep (or
+    # never executed) were re-"closed" every tick, failing forever
+    # (post-mortem 2026-07-06).
     with db.connect() as conn:
-        legs = db.query_ladder_group(conn, group_id)
-    # Only legs that are still open (no cashout row yet)
-    open_legs = []
-    with db.connect() as conn:
-        for leg in legs:
-            r = conn.execute(
-                "SELECT cashout_id FROM cashouts WHERE entry_id = ?",
-                (leg["entry_id"],)).fetchone()
-            if r is None:
-                open_legs.append(leg)
+        open_legs = db.query_ladder_group_open(conn, group_id)
     if not open_legs:
         return
 
@@ -2417,28 +2523,30 @@ def _do_ladder_cashout(group_id: str, forecast: dict,
 
     # Phase 1: close each leg's position via the engine, accumulating
     # results in memory. No DB writes until all closes attempted.
+    # _close_leg classifies each outcome: closed / phantom (position
+    # already sold by a sibling entry sharing the token) / failed.
     results = []
     for leg in open_legs:
         side = leg["side"]
         token_id = (leg["token_id_yes"] if side == "YES"
                      else leg["token_id_no"])
-        try:
-            r = engine.close_position(
-                token_id=token_id, side=side,
-                reasoning=(f"weather_edge_bot ladder group={group_id[:8]} "
-                            f"trigger={reason}"))
-        except Exception as e:
+        r = _close_leg(engine, token_id, side,
+                       f"weather_edge_bot ladder group={group_id[:8]} "
+                       f"trigger={reason}")
+        if r.get("status") == "failed":
             log_event("error", {"where": "ladder_cashout_close_position",
                                 "entry_id": leg["entry_id"],
                                 "ladder_group_id": group_id,
-                                "err": str(e)}, level="ERROR")
-            r = {"status": "failed", "reason": str(e)}
+                                "err": r.get("reason")}, level="ERROR")
         results.append((leg, r))
 
     # Phase 2: write all cashout rows in a single transaction. Even if
     # some closes failed at the engine level, we persist what succeeded
-    # so the DB matches paper_engine state.
+    # so the DB matches paper_engine state. Phantom legs get a terminal
+    # zero-pnl marker so they leave query_open_positions (ends the
+    # every-tick retry loop that produced 74 rejections on 2026-07-06).
     successes = 0
+    phantoms = 0
     with db.connect() as conn:
         for leg, r in results:
             if r.get("status") == "closed":
@@ -2454,8 +2562,19 @@ def _do_ladder_cashout(group_id: str, forecast: dict,
                     reason=f"ladder_group:{reason}"[:200],
                 )
                 successes += 1
+            elif r.get("status") == "phantom":
+                _insert_phantom_cashout(conn, leg["entry_id"], forecast,
+                                        forecast_prob_now, r.get("reason"))
+                phantoms += 1
+                log_event("ladder_leg_phantom_closed", {
+                    "entry_id": leg["entry_id"],
+                    "ladder_group_id": group_id,
+                    "reason": r.get("reason"),
+                }, level="WARN")
             else:
-                log_event("ladder_leg_close_rejected", {
+                event = ("ladder_leg_close_integrity_error"
+                         if r.get("integrity") else "ladder_leg_close_rejected")
+                log_event(event, {
                     "entry_id": leg["entry_id"],
                     "ladder_group_id": group_id,
                     "reason": r.get("reason"),
@@ -2470,6 +2589,7 @@ def _do_ladder_cashout(group_id: str, forecast: dict,
         "trigger_reason": reason,
         "n_legs_total": len(open_legs),
         "n_legs_closed": successes,
+        "n_legs_phantom": phantoms,
         "total_pnl_usd": round(total_pnl, 4),
     })
 
@@ -3538,6 +3658,170 @@ def _test_cheap_convexity_discovery():
     print("\nAll cheap_convexity discovery tests PASS")
 
 
+def _test_phantom_cashout():
+    """v13.4: self-heal for phantom legs (position already sold by a sibling
+    entry sharing the outcome token) + list-return normalization. Hermetic:
+    fake paper_engine module + temp weather_edge DB, no network."""
+    import tempfile
+    import types
+    import weather_edge_bot as mod
+
+    tmp = Path(tempfile.mkdtemp()) / "phantom_test.db"
+    db.init_db(tmp)
+    _orig_connect = db.connect
+    _orig_pe_mod = sys.modules.get("paper_engine")
+
+    # ---- fake paper_engine -------------------------------------------------
+    fake_pe = types.ModuleType("paper_engine")
+
+    class NoOpenPositionError(RuntimeError):
+        pass
+
+    class FakeEngine:
+        instances = 0
+        # behavior per token: "ok" | "phantom" | "nobids" | "list"
+        behavior: dict = {}
+
+        def __init__(self, portfolio="default"):
+            FakeEngine.instances += 1
+
+        def close_position(self, *, token_id, side=None, reasoning=""):
+            b = FakeEngine.behavior.get(token_id, "ok")
+            if b == "phantom":
+                raise NoOpenPositionError(
+                    f"No open position for token {token_id} side={side}")
+            if b == "nobids":
+                raise RuntimeError("No bids in order book — cannot close position")
+            base = {"status": "closed", "shares_sold": 10.0,
+                    "avg_sell_price": 0.9, "net_proceeds": 9.0,
+                    "realized_pnl": 5.0}
+            if b == "list":
+                return [dict(base), dict(base, shares_sold=5.0,
+                                          avg_sell_price=0.8,
+                                          net_proceeds=4.0, realized_pnl=1.5)]
+            return base
+
+        def has_open_position(self, *, token_id, side=None):
+            # "nobids" = position real, book vazio (retry). Phantom = sumiu.
+            return FakeEngine.behavior.get(token_id, "ok") != "phantom"
+
+    fake_pe.PaperEngine = FakeEngine
+    fake_pe.NoOpenPositionError = NoOpenPositionError
+    sys.modules["paper_engine"] = fake_pe
+
+    ts = "2026-07-06T00:00:00+00:00"
+
+    def seed(gid, pos, tok, eid_status="EXECUTED"):
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO entries (ts, market_slug, market_question, side, "
+                "status, ladder_group_id, ladder_position, entry_price, "
+                "token_id_yes, token_id_no, strategy) VALUES "
+                "(?, 's', 'q', 'NO', ?, ?, ?, 0.3, 'TY', ?, 'weather_edge')",
+                (ts, eid_status, gid, pos, tok))
+            eid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.commit()
+        return eid
+
+    args = types.SimpleNamespace(dry_run=False, portfolio="default")
+
+    try:
+        db.connect = lambda path=None: _orig_connect(tmp)
+
+        # P1: 2-leg group — leg1 closes, leg2 phantom. Both get cashout rows;
+        # leg2's is the zero-pnl terminal marker.
+        e1 = seed("g-phantom", "central", "TOK_OK")
+        e2 = seed("g-phantom", "below", "TOK_GONE")
+        FakeEngine.behavior = {"TOK_OK": "ok", "TOK_GONE": "phantom"}
+        mod._do_ladder_cashout("g-phantom", {}, 0.5, args, "convergence: test",
+                                trigger_entry_id=e1)
+        with db.connect() as conn:
+            r1 = conn.execute("SELECT * FROM cashouts WHERE entry_id=?",
+                              (e1,)).fetchone()
+            r2 = conn.execute("SELECT * FROM cashouts WHERE entry_id=?",
+                              (e2,)).fetchone()
+        assert r1 and r1["reason"].startswith("ladder_group:"), dict(r1 or {})
+        assert abs(r1["realized_pnl_usd"] - 5.0) < 1e-9
+        assert r2 and r2["reason"].startswith("phantom_shared_close:"), (
+            dict(r2 or {}))
+        assert r2["realized_pnl_usd"] == 0.0 and r2["exit_shares"] == 0.0
+        assert r2["exit_price"] is None
+        print("Test P1 PASS: leg closed + phantom leg marked "
+              "(phantom_shared_close, pnl 0.0)")
+
+        # P2: retry terminates — group has no open legs now; the engine must
+        # not even be instantiated on the second invocation.
+        before = FakeEngine.instances
+        mod._do_ladder_cashout("g-phantom", {}, 0.5, args, "retry",
+                                trigger_entry_id=e1)
+        assert FakeEngine.instances == before, "engine called on closed group"
+        with db.connect() as conn:
+            n_open = len(db.query_open_positions(conn))
+        assert n_open == 0, n_open
+        print("Test P2 PASS: second invocation is a no-op (retry loop ends)")
+
+        # P3: transient failure ("No bids") with the position still real →
+        # NO cashout row; leg stays open and will be retried.
+        e3 = seed("g-nobids", "central", "TOK_NOBIDS")
+        FakeEngine.behavior = {"TOK_NOBIDS": "nobids"}
+        mod._do_ladder_cashout("g-nobids", {}, 0.5, args, "stop_loss: test",
+                                trigger_entry_id=e3)
+        with db.connect() as conn:
+            r3 = conn.execute("SELECT * FROM cashouts WHERE entry_id=?",
+                              (e3,)).fetchone()
+            open_ids = {r["entry_id"] for r in db.query_open_positions(conn)}
+        assert r3 is None, dict(r3 or {})
+        assert e3 in open_ids, "transient-failed leg must stay open"
+        print("Test P3 PASS: 'No bids' + position real → still open, retried")
+
+        # P4: single path (no ladder_group_id) — phantom via _do_cashout.
+        e4 = seed(None, None, "TOK_GONE2")
+        FakeEngine.behavior = {"TOK_GONE2": "phantom"}
+        row = {"entry_id": e4, "side": "NO", "token_id_yes": "TY",
+               "token_id_no": "TOK_GONE2", "ladder_group_id": None}
+        mod._do_cashout(None, row, 0.9, {}, 0.5, args, "convergence: single")
+        with db.connect() as conn:
+            r4 = conn.execute("SELECT * FROM cashouts WHERE entry_id=?",
+                              (e4,)).fetchone()
+        assert r4 and r4["reason"].startswith("phantom_shared_close:"), (
+            dict(r4 or {}))
+        assert r4["realized_pnl_usd"] == 0.0
+        print("Test P4 PASS: single-path phantom marked via _do_cashout")
+
+        # P5: list return (>1 positions rows) — normalized, no AttributeError,
+        # aggregated values recorded.
+        agg = mod._normalize_close_result([
+            {"status": "closed", "shares_sold": 10.0, "avg_sell_price": 0.9,
+             "net_proceeds": 9.0, "realized_pnl": 5.0},
+            {"status": "closed", "shares_sold": 5.0, "avg_sell_price": 0.8,
+             "net_proceeds": 4.0, "realized_pnl": 1.5}])
+        assert agg["status"] == "closed" and agg["shares_sold"] == 15.0
+        # helper rounds avg_sell_price to 6 decimals — compare at 1e-6
+        assert abs(agg["avg_sell_price"] - (0.9 * 10 + 0.8 * 5) / 15) < 1e-6
+        assert abs(agg["realized_pnl"] - 6.5) < 1e-9
+
+        e5 = seed("g-list", "central", "TOK_LIST")
+        FakeEngine.behavior = {"TOK_LIST": "list"}
+        mod._do_ladder_cashout("g-list", {}, 0.5, args, "profit_lock: test",
+                                trigger_entry_id=e5)
+        with db.connect() as conn:
+            r5 = conn.execute("SELECT * FROM cashouts WHERE entry_id=?",
+                              (e5,)).fetchone()
+        assert r5 is not None, "list-returning close must still cash out"
+        assert abs(r5["realized_pnl_usd"] - 6.5) < 1e-9, dict(r5)
+        assert abs(r5["exit_shares"] - 15.0) < 1e-9, dict(r5)
+        print("Test P5 PASS: list return normalized (15 shares, pnl 6.5), "
+              "no AttributeError")
+
+        print("\nAll --test-phantom-cashout PASS (5/5)")
+    finally:
+        db.connect = _orig_connect
+        if _orig_pe_mod is not None:
+            sys.modules["paper_engine"] = _orig_pe_mod
+        else:
+            sys.modules.pop("paper_engine", None)
+
+
 if __name__ == "__main__":
     import sys
     if "--test-atomic" in sys.argv:
@@ -3550,5 +3834,7 @@ if __name__ == "__main__":
         _test_ladder_judge_cap()
     elif "--test-cc-discovery" in sys.argv:
         _test_cheap_convexity_discovery()
+    elif "--test-phantom-cashout" in sys.argv:
+        _test_phantom_cashout()
     else:
         main()
