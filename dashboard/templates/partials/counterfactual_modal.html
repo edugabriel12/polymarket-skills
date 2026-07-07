@@ -10,6 +10,11 @@
 
     {% if not initial %}
       <div class="modal-error">Entry not found.</div>
+    {% elif initial.error %}
+      {# replay_with_params can return {"error": ...} (e.g. backtest import
+         failure) — mirror counterfactual_result.html's guard so the modal
+         shows the message instead of 500-ing on initial.entry_meta.*. #}
+      <div class="modal-error">{{ initial.error }}</div>
     {% else %}
     <div class="cf-context muted small">
       <strong>{{ initial.entry_meta.market_question }}</strong>
