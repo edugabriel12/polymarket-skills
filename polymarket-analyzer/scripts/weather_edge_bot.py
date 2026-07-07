@@ -1473,10 +1473,11 @@ def _ladder_atomic_gate(group_id: str, current_entry_id: int) -> str:
     sibling failed). Returns one of 'READY', 'DEFER', 'DEAD'."""
     with db.connect() as conn:
         legs = db.query_ladder_group(conn, group_id)
-    if not legs:
-        return "DEAD"
     statuses = {leg["status"] for leg in legs}
-    if statuses & {"REJECTED", "SKIPPED"}:
+    # Shared predicate (db.ladder_group_is_dead): empty group or any leg
+    # REJECTED/SKIPPED. The judge's viability pre-check uses the SAME
+    # predicate, so both daemons agree on "dead" (post-mortem 2026-07-07).
+    if db.ladder_group_is_dead(statuses):
         return "DEAD"
     if "PROPOSED" in statuses:
         return "DEFER"

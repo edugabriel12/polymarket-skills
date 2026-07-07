@@ -664,6 +664,41 @@ def query_ladder_group_open(conn, ladder_group_id: str) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+# Statuses that permanently kill atomic execution of a ladder group. One
+# terminal leg in this set means the group can NEVER execute (v9 strict
+# atomicity) — shared by the executor's gate and the judge's viability
+# pre-check so both processes agree on "dead".
+LADDER_DEAD_STATUSES = frozenset({"REJECTED", "SKIPPED"})
+
+
+def ladder_group_is_dead(statuses) -> bool:
+    """Pure predicate: a ladder group can never execute atomically once ANY
+    leg is REJECTED or SKIPPED, or when the group is empty. Mirrors the
+    DEAD-by-sibling branch of weather_edge_bot._ladder_atomic_gate.
+
+    Post-mortem 2026-07-07 (ladder_sibling_failed waste): the judge had no
+    group-awareness and spent LLM reviews on legs whose sibling had already
+    died — $2.24 = 18.9% of all judge spend. This predicate lets the judge
+    detect group death BEFORE any spend, with semantics identical to the
+    executor's gate."""
+    s = set(statuses)
+    return not s or bool(s & LADDER_DEAD_STATUSES)
+
+
+def query_ladder_group_statuses(conn, ladder_group_id: str) -> list:
+    """Cheap status-only fetch for a ladder group (no judge JOIN — the
+    judge's F1 viability gate runs this per pending ladder row, before any
+    HTTP or LLM spend)."""
+    return [r["status"] for r in conn.execute(
+        "SELECT status FROM entries WHERE ladder_group_id = ?",
+        (ladder_group_id,)).fetchall()]
+
+
+def query_ladder_group_dead(conn, ladder_group_id: str) -> bool:
+    """True when the group is already unexecutable (see ladder_group_is_dead)."""
+    return ladder_group_is_dead(query_ladder_group_statuses(conn, ladder_group_id))
+
+
 def query_live_tokens(conn) -> set:
     """Outcome tokens "occupied" by a live entry — any strategy.
 
@@ -974,6 +1009,48 @@ def _test_query_live_tokens():
     tmp.unlink()
 
 
+def _test_ladder_group_dead():
+    """v15: shared dead-group predicate — pure combos + temp-DB round trip.
+    Must mirror _ladder_atomic_gate's DEAD-by-sibling semantics exactly."""
+    # Pure predicate
+    assert ladder_group_is_dead([]) is True                       # empty
+    assert ladder_group_is_dead(["PROPOSED"]) is False
+    assert ladder_group_is_dead(["PROPOSED", "PROPOSED"]) is False
+    assert ladder_group_is_dead(["APPROVED", "PROPOSED"]) is False
+    assert ladder_group_is_dead(["APPROVED", "ADJUSTED"]) is False
+    assert ladder_group_is_dead(["PROPOSED", "REJECTED"]) is True
+    assert ladder_group_is_dead(["APPROVED", "SKIPPED"]) is True
+    assert ladder_group_is_dead(["EXECUTED", "EXECUTED"]) is False  # gate trata à parte
+    print("Test PASS: predicado puro (vazio/REJECTED/SKIPPED → morta; "
+          "pending/approved/executed → viva)")
+
+    # Temp-DB round trip
+    import tempfile
+    from pathlib import Path as P
+    tmp = P(tempfile.mkdtemp()) / "group_dead.db"
+    init_db(tmp)
+    ts = "2026-07-07T00:00:00+00:00"
+    with connect(tmp) as conn:
+        for gid, status in (("g-alive", "PROPOSED"), ("g-alive", "APPROVED"),
+                            ("g-dead", "APPROVED"), ("g-dead", "SKIPPED")):
+            conn.execute(
+                "INSERT INTO entries (ts, market_slug, market_question, side, "
+                "status, ladder_group_id, entry_price, strategy) VALUES "
+                "(?, 's', 'q', 'NO', ?, ?, 0.3, 'weather_edge')",
+                (ts, status, gid))
+        conn.commit()
+        assert query_ladder_group_statuses(conn, "g-alive") == [
+            "PROPOSED", "APPROVED"] or sorted(
+            query_ladder_group_statuses(conn, "g-alive")) == [
+            "APPROVED", "PROPOSED"]
+        assert query_ladder_group_dead(conn, "g-alive") is False
+        assert query_ladder_group_dead(conn, "g-dead") is True
+        assert query_ladder_group_dead(conn, "g-missing") is True  # vazio = morta
+    print("Test PASS: round-trip em DB (g-alive viva, g-dead morta, "
+          "inexistente morta)")
+    tmp.unlink()
+
+
 def _test_migration_v11_strategy():
     """v11 regression: migrating a v10 DB must add the `strategy` column,
     backfill legacy rows to 'weather_edge', create the index, bump
@@ -1064,6 +1141,9 @@ if __name__ == "__main__":
         sys.exit(0)
     if "--test-live-tokens" in sys.argv:
         _test_query_live_tokens()
+        sys.exit(0)
+    if "--test-group-dead" in sys.argv:
+        _test_ladder_group_dead()
         sys.exit(0)
     # Smoke test: init DB and print version
     init_db()
