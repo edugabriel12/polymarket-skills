@@ -178,6 +178,7 @@ _LADDER_EVENT_TYPES = {
     "ladder_built",
     "ladder_dropped",
     "ladder_group_dead",
+    "ladder_group_dead_prejudge",   # v15 F2: morte judge-side, pré-gasto
     "ladder_aborted",
     "ladder_partial_execution",
     "ladder_executed",

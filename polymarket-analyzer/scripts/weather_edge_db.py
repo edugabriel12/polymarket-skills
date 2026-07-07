@@ -604,10 +604,21 @@ def update_entry_status(conn, entry_id: int, status: str, **extras) -> None:
 
 
 def query_pending_proposals(conn, limit: int = 50) -> list[sqlite3.Row]:
-    """Entries awaiting judge review, oldest first by ttr."""
+    """Entries awaiting judge review, oldest first by ttr.
+
+    v15 F3: ladder_group_id as secondary key makes SIBLINGS CONTIGUOUS —
+    legs of one group share an identical ttr_hours_at_entry (one `now` per
+    discovery cycle + shared event end_date), so the tiebreak groups them
+    within a batch and the judge's per-batch dead-set/sweep sees the whole
+    group at once. NULLs (non-ladder rows) sort first in ASC, keeping their
+    position among ttr ties; single-bin decisions are order-independent.
+    Caveat: a group can still straddle the LIMIT boundary and ordering does
+    nothing across polls — the F1 live-DB viability check remains the
+    correctness backstop; this is a hit-rate optimization."""
     return conn.execute(
         "SELECT * FROM entries WHERE status = 'PROPOSED' "
-        "ORDER BY ttr_hours_at_entry ASC, ts ASC LIMIT ?",
+        "ORDER BY ttr_hours_at_entry ASC, ladder_group_id ASC, ts ASC "
+        "LIMIT ?",
         (limit,),
     ).fetchall()
 
@@ -662,6 +673,41 @@ def query_ladder_group_open(conn, ladder_group_id: str) -> list[sqlite3.Row]:
         "WHEN 'below' THEN 1 WHEN 'above' THEN 2 ELSE 3 END, e.entry_id",
         (ladder_group_id,),
     ).fetchall()
+
+
+# Statuses that permanently kill atomic execution of a ladder group. One
+# terminal leg in this set means the group can NEVER execute (v9 strict
+# atomicity) — shared by the executor's gate and the judge's viability
+# pre-check so both processes agree on "dead".
+LADDER_DEAD_STATUSES = frozenset({"REJECTED", "SKIPPED"})
+
+
+def ladder_group_is_dead(statuses) -> bool:
+    """Pure predicate: a ladder group can never execute atomically once ANY
+    leg is REJECTED or SKIPPED, or when the group is empty. Mirrors the
+    DEAD-by-sibling branch of weather_edge_bot._ladder_atomic_gate.
+
+    Post-mortem 2026-07-07 (ladder_sibling_failed waste): the judge had no
+    group-awareness and spent LLM reviews on legs whose sibling had already
+    died — $2.24 = 18.9% of all judge spend. This predicate lets the judge
+    detect group death BEFORE any spend, with semantics identical to the
+    executor's gate."""
+    s = set(statuses)
+    return not s or bool(s & LADDER_DEAD_STATUSES)
+
+
+def query_ladder_group_statuses(conn, ladder_group_id: str) -> list:
+    """Cheap status-only fetch for a ladder group (no judge JOIN — the
+    judge's F1 viability gate runs this per pending ladder row, before any
+    HTTP or LLM spend)."""
+    return [r["status"] for r in conn.execute(
+        "SELECT status FROM entries WHERE ladder_group_id = ?",
+        (ladder_group_id,)).fetchall()]
+
+
+def query_ladder_group_dead(conn, ladder_group_id: str) -> bool:
+    """True when the group is already unexecutable (see ladder_group_is_dead)."""
+    return ladder_group_is_dead(query_ladder_group_statuses(conn, ladder_group_id))
 
 
 def query_live_tokens(conn) -> set:
@@ -974,6 +1020,89 @@ def _test_query_live_tokens():
     tmp.unlink()
 
 
+def _test_pending_order():
+    """v15 F3: query_pending_proposals must keep ladder siblings CONTIGUOUS
+    within a ttr tie (secondary key ladder_group_id), with NULL (non-ladder)
+    rows first among the tie, cross-ttr ordering unchanged, LIMIT respected."""
+    import tempfile
+    from pathlib import Path as P
+    tmp = P(tempfile.mkdtemp()) / "pending_order.db"
+    init_db(tmp)
+    with connect(tmp) as conn:
+        def add(ts, ttr, gid):
+            conn.execute(
+                "INSERT INTO entries (ts, market_slug, market_question, side, "
+                "status, entry_price, ttr_hours_at_entry, ladder_group_id, "
+                "strategy) VALUES (?, 's', 'q', 'NO', 'PROPOSED', 0.3, ?, ?, "
+                "'weather_edge')", (ts, ttr, gid))
+            return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        # ttr=10.0 tie, tses INTERLEAVED between groups (the old ts-only
+        # tiebreak would interleave the legs):
+        a1 = add("2026-07-07T00:00:01Z", 10.0, "grp-A")
+        b1 = add("2026-07-07T00:00:02Z", 10.0, "grp-B")
+        s1 = add("2026-07-07T00:00:03Z", 10.0, None)     # single-bin
+        a2 = add("2026-07-07T00:00:04Z", 10.0, "grp-A")
+        b2 = add("2026-07-07T00:00:05Z", 10.0, "grp-B")
+        # menor ttr vem antes de tudo, mesmo com ts mais tarde:
+        c1 = add("2026-07-07T00:00:06Z", 5.0, "grp-C")
+        conn.commit()
+
+        got = [r["entry_id"] for r in query_pending_proposals(conn)]
+        # ttr 5 primeiro; no tie de ttr=10: NULL primeiro (ASC), depois
+        # grp-A contíguo, depois grp-B contíguo.
+        assert got == [c1, s1, a1, a2, b1, b2], got
+        print(f"Test PASS: ordering [{got}] — ttr primeiro, NULL antes, "
+              f"irmãs contíguas (A junto, B junto)")
+
+        got3 = [r["entry_id"] for r in query_pending_proposals(conn, limit=3)]
+        assert got3 == [c1, s1, a1], got3
+        print("Test PASS: LIMIT respeitado")
+    tmp.unlink()
+
+
+def _test_ladder_group_dead():
+    """v15: shared dead-group predicate — pure combos + temp-DB round trip.
+    Must mirror _ladder_atomic_gate's DEAD-by-sibling semantics exactly."""
+    # Pure predicate
+    assert ladder_group_is_dead([]) is True                       # empty
+    assert ladder_group_is_dead(["PROPOSED"]) is False
+    assert ladder_group_is_dead(["PROPOSED", "PROPOSED"]) is False
+    assert ladder_group_is_dead(["APPROVED", "PROPOSED"]) is False
+    assert ladder_group_is_dead(["APPROVED", "ADJUSTED"]) is False
+    assert ladder_group_is_dead(["PROPOSED", "REJECTED"]) is True
+    assert ladder_group_is_dead(["APPROVED", "SKIPPED"]) is True
+    assert ladder_group_is_dead(["EXECUTED", "EXECUTED"]) is False  # gate trata à parte
+    print("Test PASS: predicado puro (vazio/REJECTED/SKIPPED → morta; "
+          "pending/approved/executed → viva)")
+
+    # Temp-DB round trip
+    import tempfile
+    from pathlib import Path as P
+    tmp = P(tempfile.mkdtemp()) / "group_dead.db"
+    init_db(tmp)
+    ts = "2026-07-07T00:00:00+00:00"
+    with connect(tmp) as conn:
+        for gid, status in (("g-alive", "PROPOSED"), ("g-alive", "APPROVED"),
+                            ("g-dead", "APPROVED"), ("g-dead", "SKIPPED")):
+            conn.execute(
+                "INSERT INTO entries (ts, market_slug, market_question, side, "
+                "status, ladder_group_id, entry_price, strategy) VALUES "
+                "(?, 's', 'q', 'NO', ?, ?, 0.3, 'weather_edge')",
+                (ts, status, gid))
+        conn.commit()
+        assert query_ladder_group_statuses(conn, "g-alive") == [
+            "PROPOSED", "APPROVED"] or sorted(
+            query_ladder_group_statuses(conn, "g-alive")) == [
+            "APPROVED", "PROPOSED"]
+        assert query_ladder_group_dead(conn, "g-alive") is False
+        assert query_ladder_group_dead(conn, "g-dead") is True
+        assert query_ladder_group_dead(conn, "g-missing") is True  # vazio = morta
+    print("Test PASS: round-trip em DB (g-alive viva, g-dead morta, "
+          "inexistente morta)")
+    tmp.unlink()
+
+
 def _test_migration_v11_strategy():
     """v11 regression: migrating a v10 DB must add the `strategy` column,
     backfill legacy rows to 'weather_edge', create the index, bump
@@ -1064,6 +1193,12 @@ if __name__ == "__main__":
         sys.exit(0)
     if "--test-live-tokens" in sys.argv:
         _test_query_live_tokens()
+        sys.exit(0)
+    if "--test-group-dead" in sys.argv:
+        _test_ladder_group_dead()
+        sys.exit(0)
+    if "--test-pending-order" in sys.argv:
+        _test_pending_order()
         sys.exit(0)
     # Smoke test: init DB and print version
     init_db()
