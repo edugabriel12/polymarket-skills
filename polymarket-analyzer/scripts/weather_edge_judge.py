@@ -122,6 +122,18 @@ DAILY_BUDGET_USD = float(os.environ.get("JUDGE_DAILY_BUDGET_USD", "15.0"))
 # number (e.g. -100) to disable the recheck.
 PREJUDGE_MIN_EDGE_PP = float(os.environ.get("JUDGE_PREJUDGE_MIN_EDGE_PP", "15.0"))
 
+# v15.1 (post-mortem 2026-07-07): LADDER legs get their own, LOWER floor.
+# Discovery deliberately proposes ladder legs down to --ladder-min-leg-edge-pp
+# (default 10 — adjacent legs are hedges with structurally smaller edges),
+# but the single 15pp floor above made every leg born in [10, 15) dead on
+# arrival: skipped as "edge_decay" even when its edge IMPROVED, killing the
+# whole group under strict atomicity. Incident data: 156/167 (93%) of
+# edge_decay_prejudge skips were such DOA legs; only 11/167 ladder groups
+# ever executed. Default 10.0 mirrors the bot's --ladder-min-leg-edge-pp
+# (separate processes — keep the two in sync when tuning either).
+PREJUDGE_MIN_EDGE_PP_LADDER = float(os.environ.get(
+    "JUDGE_PREJUDGE_MIN_EDGE_PP_LADDER", "10.0"))
+
 # v12 (advisor sug_003/004, 2026-06-01): range-market calibration caps.
 # On Polymarket 'range' markets the bin is ~1°C wide, so directional
 # consensus (forecast below the bin) is necessary but NOT sufficient —
@@ -515,6 +527,20 @@ def _recheck_edge_prejudge(row: dict) -> Optional[dict]:
     Returns a payload dict (loggable) if the entry should be skipped
     upstream with skip_reason='edge_decay_prejudge'.
 
+    NOTE the check is an ABSOLUTE FLOOR on the current edge, NOT a
+    comparison against the original edge — a leg whose edge IMPROVED but
+    remains below the floor is still skipped. The 'edge_decay_prejudge'
+    reason string predates this clarification and is kept for analytics
+    continuity (analyzer/dashboard group by it).
+
+    v15.1: the floor is LEG-AWARE. Ladder legs use the lower
+    PREJUDGE_MIN_EDGE_PP_LADDER (default 10, mirroring the bot's
+    --ladder-min-leg-edge-pp discovery floor); single-bin entries keep
+    PREJUDGE_MIN_EDGE_PP (15). The old single 15pp floor made every ladder
+    leg born in [10, 15) dead on arrival — 93% of all edge_decay skips in
+    the 2026-07-07 incident data — dooming its whole group under strict
+    atomicity (only 11/167 groups executed).
+
     Uses top-of-book ask as a STRICT UPPER BOUND on the edge — the executor
     walks volume-weighted into the book so its actual fill price is at or
     above the best ask. If even the best ask leaves edge below the floor,
@@ -543,7 +569,10 @@ def _recheck_edge_prejudge(row: dict) -> Optional[dict]:
     best_ask = float(book["asks"][0]["price"])
     fp = float(forecast_prob)
     edge_pp = round((fp - best_ask) * 100.0, 4)
-    if edge_pp >= PREJUDGE_MIN_EDGE_PP:
+    # v15.1: leg-aware floor (see docstring).
+    floor = (PREJUDGE_MIN_EDGE_PP_LADDER if row.get("ladder_group_id")
+             else PREJUDGE_MIN_EDGE_PP)
+    if edge_pp >= floor:
         return None
     return {
         "entry_id": row.get("entry_id"),
@@ -551,7 +580,7 @@ def _recheck_edge_prejudge(row: dict) -> Optional[dict]:
         "original_edge_pp": row.get("edge_pp_at_entry"),
         "current_edge_pp": edge_pp,
         "best_ask": round(best_ask, 4),
-        "threshold_pp": PREJUDGE_MIN_EDGE_PP,
+        "threshold_pp": floor,
         "side": side,
     }
 
@@ -2086,7 +2115,52 @@ def _test_prejudge_recheck():
         assert r is None, f"edge exactly at threshold should proceed: {r}"
         print("Test 7 PASS: edge = threshold proceeds (>=)")
 
-        print("\nAll pre-judge recheck tests PASS (7/7)")
+        # --- v15.1: piso leg-aware -----------------------------------------
+        saved_ladder_floor = mod.PREJUDGE_MIN_EDGE_PP_LADDER
+        mod.PREJUDGE_MIN_EDGE_PP_LADDER = 10.0
+        try:
+            # Test 8: perna de LADDER com edge 12pp — abaixo do piso single
+            # (15) mas acima do piso de ladder (10) → PROCEDE. Era o caso
+            # DOA do post-mortem (93% dos skips): proposta a 10-15pp e
+            # pulada para sempre, mesmo com o edge melhorando.
+            mod._fetch_orderbook = lambda tid: {
+                "asks": [{"price": 0.78, "size": 100}]}
+            ladder_row = {
+                "entry_id": 8, "side": "YES",
+                "token_id_yes": "tokY", "token_id_no": "tokN",
+                "forecast_prob_at_entry": 0.90, "edge_pp_at_entry": 13.0,
+                "ladder_group_id": "g-ladder",
+            }
+            r = mod._recheck_edge_prejudge(ladder_row)   # edge = 12pp
+            assert r is None, f"ladder leg 12pp >= floor 10 must proceed: {r}"
+            # mesma linha SEM ladder_group_id → piso 15 → skip (regressão)
+            single_row = {k: v for k, v in ladder_row.items()
+                          if k != "ladder_group_id"}
+            r = mod._recheck_edge_prejudge(single_row)
+            assert r is not None and r["threshold_pp"] == 15.0, r
+            print("Test 8 PASS: 12pp — perna de ladder procede (piso 10); "
+                  "single-bin pula (piso 15)")
+
+            # Test 9: perna de ladder com edge 8pp → skip com o piso de
+            # ladder reportado no payload.
+            mod._fetch_orderbook = lambda tid: {
+                "asks": [{"price": 0.82, "size": 100}]}
+            r = mod._recheck_edge_prejudge(ladder_row)   # edge = 8pp
+            assert r is not None, "8pp < 10 deve pular"
+            assert r["threshold_pp"] == 10.0, r
+            assert abs(r["current_edge_pp"] - 8.0) < 0.01, r
+            print("Test 9 PASS: perna de ladder 8pp < 10 → skip, "
+                  "threshold_pp=10 no payload")
+
+            # Test 10: override por env (constante) respeitado.
+            mod.PREJUDGE_MIN_EDGE_PP_LADDER = 5.0
+            r = mod._recheck_edge_prejudge(ladder_row)   # edge 8pp >= 5
+            assert r is None, f"floor 5: 8pp deve proceder: {r}"
+            print("Test 10 PASS: piso de ladder configurável respeitado")
+        finally:
+            mod.PREJUDGE_MIN_EDGE_PP_LADDER = saved_ladder_floor
+
+        print("\nAll pre-judge recheck tests PASS (10/10)")
     finally:
         mod._fetch_orderbook = saved_fetch
         mod.PREJUDGE_MIN_EDGE_PP = saved_threshold
