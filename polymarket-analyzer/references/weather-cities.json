@@ -247,9 +247,16 @@
     "Seoul":        {"lat": 37.4691, "lon": 126.4505, "station": "RKSI", "temp_bias_f": 0.0},
     "Lucknow":      {"lat": 26.7606, "lon": 80.8893,  "station": "VILK", "temp_bias_f": 0.0},
 
-    "London":       {"lat": 51.5048, "lon": 0.0495,   "station": "EGLC", "temp_bias_f": 0.0},
-    "Paris":        {"lat": 48.9694, "lon": 2.4414,   "station": "LFPB", "temp_bias_f": 0.0},
-    "Berlin":       {"lat": 52.5597, "lon": 13.2877,  "station": "EDDT", "temp_bias_f": 0.0}
+    "London":       {"lat": 51.5048, "lon": 0.0495,   "station": "EGLC", "temp_bias_f": 0.0,
+                     "om_models": ["ukmo_uk_deterministic_2km", "knmi_harmonie_arome_europe", "icon_eu", "ecmwf_ifs025", "gfs_seamless"]},
+    "Paris":        {"lat": 48.9694, "lon": 2.4414,   "station": "LFPB", "temp_bias_f": 0.0,
+                     "om_models": ["meteofrance_arome_france_hd", "meteofrance_arpege_europe", "icon_eu", "ecmwf_ifs025", "gfs_seamless"]},
+    "Berlin":       {"lat": 52.3667, "lon": 13.5033,  "station": "EDDB", "temp_bias_f": 0.0,
+                     "om_models": ["icon_d2", "icon_eu", "dmi_harmonie_arome_europe", "ecmwf_ifs025", "gfs_seamless"]},
+    "Madrid":       {"lat": 40.4936, "lon": -3.5668,  "station": "LEMD", "temp_bias_f": 0.0,
+                     "om_models": ["meteofrance_arpege_europe", "icon_eu", "ecmwf_ifs025", "gfs_seamless"]},
+    "Warsaw":       {"lat": 52.1657, "lon": 20.9671,  "station": "EPWA", "temp_bias_f": 0.0,
+                     "om_models": ["icon_eu", "dmi_harmonie_arome_europe", "ecmwf_ifs025", "gfs_seamless"]}
   },
   "_station_names_doc": "v9: map of station name phrases (as they appear in Polymarket market descriptions) to ICAO codes that exist in the 'stations' dict above. Used by auto_extract_station_from_description to resolve markets where the operator hasn't yet curated the city. Keys are lowercased phrases; auto-extractor strips 'Station', 'Airport', 'the', 'International' etc before lookup.",
   "station_names": {
@@ -283,6 +290,13 @@
     "le bourget":                 "LFPB",
     "charles de gaulle":          "LFPG",
     "tegel":                      "EDDT",
-    "brandenburg":                "EDDB"
+    "brandenburg":                "EDDB",
+    "berlin brandenburg":         "EDDB",
+    "willy brandt":               "EDDB",
+    "chopin":                     "EPWA",
+    "warsaw chopin":              "EPWA",
+    "barajas":                    "LEMD",
+    "adolfo suarez":              "LEMD",
+    "adolfo suarez madrid":       "LEMD"
   }
 }

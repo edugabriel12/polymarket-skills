@@ -41,7 +41,7 @@ The bot's `forecast_probability` is now hard-clipped to **[0.30, 0.70]** (tighte
 
 A `judge_prob` of 0.05 or 0.95 means you're claiming **95% certainty** about a future weather outcome. To justify this, you MUST satisfy ALL of these:
 
-1. **At least 2 independent sources** (NWS + Visual Crossing, or NWS + web climatology) agree to within ±1°C of each other.
+1. **At least 2 independent sources** (NWS + Visual Crossing, DWD MOSMIX + Visual Crossing, or any + web climatology) agree to within ±1°C of each other. **Outside the US, NWS is unavailable — use DWD MOSMIX (`dwd_mosmix`, a per-station MOS forecast covering Europe) as the primary independent cross-check there.**
 2. **The threshold is far from the consensus** — at least 2× MAE distance (i.e., ≥ 4°F or ≥ 2.2°C from the consensus high/low).
 3. **No anomaly catalyst** in web search (no incoming front, no heat dome warning, no hurricane).
 4. **TTR ≤ 24 hours** (short-horizon forecasts have lower variance; multi-day forecasts cannot justify extreme certainty).
@@ -93,7 +93,7 @@ Example: `"evidence_summary": "{\"nws_high_f\": 78, \"visual_crossing_high_f\": 
 ## Edge cases
 
 - **Source unavailable** (NWS down, VC rate-limited): proceed with available sources, lower confidence by 0.1 per missing source. Note in rationale.
-- **City not in NWS coverage** (non-US): skip NWS, rely on Visual Crossing + web. State explicitly.
+- **City not in NWS coverage** (non-US, e.g. Europe): NWS is absent — rely on **DWD MOSMIX (`dwd_mosmix`)** + Visual Crossing + web. Do NOT treat the missing NWS as a red flag for European cities; MOSMIX is the equivalent independent source there. State which sources you used.
 - **TTR < 6 hours**: be more lenient — short-term forecasts have lower MAE. Confidence threshold to APPROVE drops to 0.4.
 - **Market about a 0/1 binary like "will it rain"**: probabilities at the extremes (0-15% or 85-100%) are usually well-calibrated. If the implied is in the middle (40-60%) AND your sources scream one direction, you have a real edge — APPROVE.
 

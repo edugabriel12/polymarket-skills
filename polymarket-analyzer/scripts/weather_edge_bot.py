@@ -551,20 +551,37 @@ def _compute_mae_for_market(spec: MarketSpec, ow_forecast: dict,
     om_enabled = getattr(args, "open_meteo", False) and station and (
         station.get("lat") is not None and station.get("lon") is not None)
     if om_enabled:
+        # v15.4: per-city regional models (weather-cities.json > stations >
+        # <city> > om_models). None → global trio (byte-identical).
+        om_models = station.get("om_models") if station else None
         try:
             om_data = fetch_open_meteo_ensemble(
-                station["lat"], station["lon"], spec.target_date)
+                station["lat"], station["lon"], spec.target_date,
+                models=om_models)
         except Exception as e:
             log_event("warn", {"where": "fetch_open_meteo",
                                 "city": spec.city, "err": str(e)},
                        level="WARN")
             om_data = None
         if om_data:
+            if om_data.get("fallback_from"):
+                # A regional key in om_models was rejected by Open-Meteo (400)
+                # → we fell back to the global trio. Surface so the operator
+                # can fix the key; NOT an error (ensemble still works).
+                log_event("open_meteo_model_fallback", {
+                    "city": spec.city,
+                    "requested": om_data["fallback_from"],
+                    "used": om_data.get("model_keys"),
+                }, level="WARN")
             om_suffix = "_min_c" if temp_kind == "low" else "_max_c"
-            for model in ("icon", "gfs", "ecmwf"):
-                val_c = om_data.get(f"{model}{om_suffix}")
+            # Iterate over whatever members the response actually carries
+            # (trio or extended), skipping the aggregate spread keys.
+            for k, val_c in om_data.items():
+                if not (k.endswith(om_suffix) and not k.startswith("spread")):
+                    continue
                 if val_c is None:
                     continue
+                model = k[:-len(om_suffix)]   # short label back out of the key
                 # Convert to spec.threshold_unit if market is F
                 val = (float(val_c) if spec.threshold_unit == "C"
                        else float(val_c) * 9.0 / 5.0 + 32.0)

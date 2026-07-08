@@ -165,88 +165,127 @@ def fetch_visual_crossing(city: str,
 # treated as outlier; if spread > 3C the bot inflates MAE x 1.5.
 # ---------------------------------------------------------------------------
 
-_OM_CACHE: dict = {}              # (lat, lon, target_iso) -> (ts_unix, dict)
+_OM_CACHE: dict = {}              # (lat, lon, target_iso, models) -> (ts_unix, dict)
 _OM_CACHE_TTL_SEC = 6 * 3600      # 6h
+
+# v15.4: the canonical global trio. European cities can override per-city via
+# the `om_models` array in weather-cities.json (data-driven, no code branch)
+# to add regional models (AROME France 1.5km, ICON-EU 7km, ICON-D2/HARMONIE
+# 2km) that have higher skill there. Default keeps behavior byte-identical.
+DEFAULT_OM_MODELS = ["icon_seamless", "gfs_seamless", "ecmwf_ifs025"]
+
+# Map an Open-Meteo model key -> the short label used in vals keys /
+# forecast_history source. The trio keep their legacy short names (so
+# forecast_history rows and calibration stay byte-identical); any other model
+# uses its full key as the label (e.g. "arome_france_hd").
+_OM_SHORT = {"icon_seamless": "icon", "gfs_seamless": "gfs",
+             "ecmwf_ifs025": "ecmwf"}
+
+
+def _om_short_name(model_key: str) -> str:
+    return _OM_SHORT.get(model_key, model_key)
 
 
 def fetch_open_meteo_ensemble(lat: float, lon: float,
                                 target_date,  # date or YYYY-MM-DD string
-                                force_refresh: bool = False
+                                force_refresh: bool = False,
+                                models: Optional[list] = None
                                 ) -> Optional[dict]:
-    """Pull ICON+GFS+ECMWF daily max AND min temp (C) for `target_date`
-    at (lat, lon).
+    """Pull daily max AND min temp (C) for `target_date` at (lat, lon) from a
+    set of Open-Meteo models.
 
-    Returns:
+    `models` = list of Open-Meteo model keys. Default (None) = the canonical
+    global trio icon_seamless+gfs_seamless+ecmwf_ifs025 (DEFAULT_OM_MODELS),
+    keeping every non-European caller byte-identical. European cities pass an
+    extended list (e.g. arome_france_hd, icon_eu, icon_d2) via their station's
+    `om_models` in weather-cities.json.
+
+    Returns e.g.:
       {"icon_max_c": 25.3, "gfs_max_c": 24.8, "ecmwf_max_c": 26.1,
-       "icon_min_c": 14.2, "gfs_min_c": 13.8, "ecmwf_min_c": 14.9,
-       "spread_c": 1.3, "spread_min_c": 0.9, "agree": True}
-    or None on HTTP failure / malformed response.
+       "icon_min_c": 14.2, ..., "arome_france_hd_max_c": 25.0, ...,
+       "spread_c": 1.3, "spread_min_c": 0.9, "agree": True, "n_models": 3,
+       "model_keys": [...]}
+    or None on HTTP failure / malformed response. The short label of each
+    model (icon/gfs/ecmwf for the trio, else the full key) prefixes its
+    *_max_c/_min_c keys.
 
-    v13.4: the *_min_c keys feed lowest-temperature markets — before this
-    the ensemble only knew the daily max, so low markets were priced off
-    the wrong extreme. `spread_c`/`agree` remain max-based (legacy
-    consumers); `spread_min_c` is the min-members spread.
-    `agree=True` when max spread <= 3C (article rule). Cached 6h per
-    (lat, lon, target_iso).
+    v13.4: *_min_c keys feed lowest-temperature markets. `spread_c`/`agree`
+    remain max-based. Cached 6h per (lat, lon, target_iso, models).
     """
+    model_keys = list(models) if models else list(DEFAULT_OM_MODELS)
     target_iso = (target_date.isoformat()
                    if hasattr(target_date, "isoformat") else str(target_date))
-    cache_key = (round(float(lat), 4), round(float(lon), 4), target_iso)
+    cache_key = (round(float(lat), 4), round(float(lon), 4), target_iso,
+                 ",".join(model_keys))
     now = time.time()
     if not force_refresh and cache_key in _OM_CACHE:
         cached_ts, cached_data = _OM_CACHE[cache_key]
         if now - cached_ts < _OM_CACHE_TTL_SEC:
             return cached_data
 
-    try:
-        r = requests.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": lat,
-                "longitude": lon,
-                "models": "icon_seamless,gfs_seamless,ecmwf_ifs025",
-                "hourly": "temperature_2m",
-                "temperature_unit": "celsius",
-                "start_date": target_iso,
-                "end_date": target_iso,
-            },
-            timeout=20,
-        )
-        if r.status_code != 200:
+    def _query(keys: list) -> Optional[dict]:
+        """One Open-Meteo call for `keys`; parse into vals+spread; None on any
+        failure. Isolated so we can fall back to the trio if a regional key
+        makes the API 400 the whole request."""
+        try:
+            r = requests.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": lat, "longitude": lon,
+                    "models": ",".join(keys),
+                    "hourly": "temperature_2m",
+                    "temperature_unit": "celsius",
+                    "start_date": target_iso, "end_date": target_iso,
+                },
+                timeout=20,
+            )
+            if r.status_code != 200:
+                return None
+            hourly = (r.json().get("hourly") or {})
+        except Exception:
             return None
-        data = r.json()
-        hourly = data.get("hourly") or {}
-    except Exception:
-        return None
 
-    def _extreme_of(model_key: str, fn) -> Optional[float]:
-        series = hourly.get(f"temperature_2m_{model_key}")
-        if not series:
+        def _extreme_of(series_key, fn):
+            series = hourly.get(series_key)
+            if not series:
+                return None
+            clean = [v for v in series if v is not None]
+            return fn(clean) if clean else None
+
+        single = len(keys) == 1
+        vals = {}
+        for key in keys:
+            name = _om_short_name(key)
+            sk = "temperature_2m" if single else f"temperature_2m_{key}"
+            vals[f"{name}_max_c"] = _extreme_of(sk, max)
+            vals[f"{name}_min_c"] = _extreme_of(sk, min)
+        pmax = [v for k, v in vals.items()
+                if k.endswith("_max_c") and v is not None]
+        pmin = [v for k, v in vals.items()
+                if k.endswith("_min_c") and v is not None]
+        if not pmax:
             return None
-        clean = [v for v in series if v is not None]
-        return fn(clean) if clean else None
+        spread = max(pmax) - min(pmax)
+        return {
+            **vals,
+            "spread_c": round(spread, 2),
+            "spread_min_c": (round(max(pmin) - min(pmin), 2) if pmin else None),
+            "agree": spread <= 3.0,
+            "n_models": len(pmax),
+            "model_keys": keys,
+        }
 
-    vals = {}
-    for name, key in (("icon", "icon_seamless"), ("gfs", "gfs_seamless"),
-                      ("ecmwf", "ecmwf_ifs025")):
-        vals[f"{name}_max_c"] = _extreme_of(key, max)
-        vals[f"{name}_min_c"] = _extreme_of(key, min)
-
-    present_max = [v for k, v in vals.items() if k.endswith("_max_c") and v is not None]
-    present_min = [v for k, v in vals.items() if k.endswith("_min_c") and v is not None]
-    if not present_max:
+    result = _query(model_keys)
+    # v15.4: robustness — a bad/unknown regional model key makes Open-Meteo
+    # 400 the ENTIRE request, which would strip the trio too and disable the
+    # ensemble for that (European) city. Fall back to the global trio so
+    # regional models are strictly additive-or-neutral (worst case = today).
+    if result is None and model_keys != DEFAULT_OM_MODELS:
+        result = _query(list(DEFAULT_OM_MODELS))
+        if result is not None:
+            result["fallback_from"] = model_keys
+    if result is None:
         return None
-
-    spread_c = max(present_max) - min(present_max)
-    spread_min_c = (max(present_min) - min(present_min)) if present_min else None
-    result = {
-        **vals,
-        "spread_c": round(spread_c, 2),
-        "spread_min_c": (round(spread_min_c, 2)
-                         if spread_min_c is not None else None),
-        "agree": spread_c <= 3.0,
-        "n_models": len(present_max),
-    }
     _OM_CACHE[cache_key] = (now, result)
     return result
 
@@ -284,10 +323,13 @@ def compute_ensemble_calibration(om_data: Optional[dict],
     if not om_data:
         return None
     suffix = "_min_c" if temp_kind == "low" else "_max_c"
+    # v15.4: iterate over ALL present members (not the fixed trio) so extra
+    # regional models (arome_france_hd, icon_eu, icon_d2, ...) count in μ/σ.
+    # Exclude the aggregate spread keys (spread_c / spread_min_c) which also
+    # end in "_c". Byte-identical for the trio.
     members_c = []
-    for model in ("icon", "gfs", "ecmwf"):
-        v = om_data.get(f"{model}{suffix}")
-        if v is not None:
+    for k, v in om_data.items():
+        if k.endswith(suffix) and not k.startswith("spread") and v is not None:
             members_c.append(float(v))
     if len(members_c) < 2:
         return None  # need ≥2 for spread; fall back to MAE path
@@ -2164,6 +2206,90 @@ if __name__ == "__main__":
     assert compute_ensemble_calibration(om_old, "C", temp_kind="low") is None
     assert compute_ensemble_calibration(om_old, "C", temp_kind="high") is not None
     print("Test M5 PASS: om_data legado sem mins → low usa fallback (None)")
+
+    # M6 (v15.4): calibração conta TODOS os membros presentes (trio +
+    # regionais), e NUNCA conta spread_c/spread_min_c como membro.
+    om_ext = {"icon_max_c": 28.1, "gfs_max_c": 28.9, "ecmwf_max_c": 27.1,
+              "meteofrance_arome_france_hd_max_c": 27.5, "icon_eu_max_c": 28.3,
+              "icon_min_c": 15.4, "gfs_min_c": 16.1, "ecmwf_min_c": 15.8,
+              "meteofrance_arome_france_hd_min_c": 15.6, "icon_eu_min_c": 15.9,
+              "spread_c": 1.8, "spread_min_c": 0.7, "n_models": 5}
+    cal_hi = compute_ensemble_calibration(om_ext, "C", temp_kind="high")
+    cal_lo = compute_ensemble_calibration(om_ext, "C", temp_kind="low")
+    assert cal_hi["n_models"] == 5, cal_hi          # 5 membros, spread excluído
+    assert cal_lo["n_models"] == 5, cal_lo          # spread_min_c NÃO conta
+    assert 27.0 < cal_hi["mu"] < 29.0, cal_hi
+    assert 15.0 < cal_lo["mu"] < 16.5, cal_lo
+    print(f"Test M6 PASS: calibração com 5 membros (n={cal_hi['n_models']}), "
+          "spread_c/spread_min_c excluídos")
+
+    # M7 (v15.4): _om_short_name — trio mantém rótulo curto, regionais usam a
+    # chave inteira (byte-idêntico p/ forecast_history do trio).
+    assert _om_short_name("icon_seamless") == "icon"
+    assert _om_short_name("ecmwf_ifs025") == "ecmwf"
+    assert _om_short_name("meteofrance_arome_france_hd") == "meteofrance_arome_france_hd"
+    print("Test M7 PASS: _om_short_name (trio curto, regional = chave inteira)")
+
+    # M8 (v15.4): fetch_open_meteo_ensemble — (a) modelos estendidos parseados;
+    # (b) fallback ao trio quando a chamada com regionais falha (400). Mock de
+    # requests.get sem rede.
+    saved_get = requests.get
+
+    class _FR:
+        def __init__(self, status, payload):
+            self.status_code = status
+            self._p = payload
+        def json(self):
+            return self._p
+
+    try:
+        # (a) resposta multi-modelo (sufixos por chave) → parseia N membros.
+        def fake_multi(url, params=None, **kw):
+            keys = (params or {}).get("models", "").split(",")
+            hourly = {"time": ["2026-07-09T00:00", "2026-07-09T15:00"]}
+            base = {"icon_seamless": 27.0, "gfs_seamless": 28.0,
+                    "ecmwf_ifs025": 27.5, "icon_eu": 28.4,
+                    "meteofrance_arome_france_hd": 27.2}
+            for k in keys:
+                hourly[f"temperature_2m_{k}"] = [base.get(k, 20.0) - 5, base.get(k, 20.0)]
+            return _FR(200, {"hourly": hourly})
+        requests.get = fake_multi
+        r = fetch_open_meteo_ensemble(
+            48.97, 2.44, "2026-07-09", force_refresh=True,
+            models=["meteofrance_arome_france_hd", "icon_eu", "ecmwf_ifs025",
+                    "gfs_seamless"])
+        assert r and r["n_models"] == 4, r
+        assert "meteofrance_arome_france_hd_max_c" in r, r
+        assert "fallback_from" not in r, r
+        print(f"Test M8a PASS: fetch parseia 4 modelos regionais (n={r['n_models']})")
+
+        # (b) chamada com regionais 400a → cai no trio. Primeira chamada (com
+        # regionais) status 400; segunda (trio) 200.
+        state = {"n": 0}
+        def fake_fallback(url, params=None, **kw):
+            state["n"] += 1
+            keys = (params or {}).get("models", "").split(",")
+            if any(k not in ("icon_seamless", "gfs_seamless", "ecmwf_ifs025")
+                   for k in keys):
+                return _FR(400, {"error": True, "reason": "invalid model"})
+            hourly = {"time": ["2026-07-09T00:00", "2026-07-09T15:00"]}
+            for k in keys:
+                hourly[f"temperature_2m_{k}"] = [20.0, 27.0]
+            return _FR(200, {"hourly": hourly})
+        requests.get = fake_fallback
+        r = fetch_open_meteo_ensemble(
+            51.5, 0.05, "2026-07-09", force_refresh=True,
+            models=["ukmo_uk_deterministic_2km", "icon_eu", "ecmwf_ifs025",
+                    "gfs_seamless"])
+        assert r is not None, "esperava fallback ao trio, não None"
+        assert r.get("fallback_from") == ["ukmo_uk_deterministic_2km", "icon_eu",
+                                          "ecmwf_ifs025", "gfs_seamless"], r
+        assert r["model_keys"] == DEFAULT_OM_MODELS, r
+        assert state["n"] == 2, state          # 1 tentativa regional + 1 trio
+        print("Test M8b PASS: chave regional inválida (400) → fallback ao trio "
+              "(fallback_from registrado)")
+    finally:
+        requests.get = saved_get
 
     # M6: default retrocompatível — spec antigo sem temp_kind se comporta
     # como high (dataclass default)

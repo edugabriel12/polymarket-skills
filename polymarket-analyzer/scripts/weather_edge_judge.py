@@ -251,6 +251,55 @@ def get_nws_forecast(lat: float, lon: float) -> Optional[dict]:
         return None
 
 
+def get_brightsky_forecast(lat: float, lon: float,
+                           target_date: str) -> Optional[dict]:
+    """DWD MOSMIX point forecast for `target_date` via the free Bright Sky
+    JSON API (no key). Bright Sky serves DWD's MOSMIX model (a per-station
+    MOS product combining ICON + ECMWF IFS) for ~5400 stations, most in
+    Europe — the independent corroboration source the judge lacks in Europe
+    (get_nws_forecast is US-only: api.weather.gov 404s abroad -> None).
+
+    Returns {"source_station", "distance_m", "max_c", "min_c", "n_hours"} for
+    the target day, or None on any non-200 / empty / exception (fail-open:
+    the judge then proceeds on Visual Crossing + the bot's ensemble, exactly
+    as it does when NWS returns None). Never raises.
+
+    Mirrors get_nws_forecast's contract so review_proposal can add it to the
+    evidence dict with no country branch.
+    """
+    base = os.environ.get("BRIGHTSKY_BASE_URL", "https://api.brightsky.dev")
+    ua = os.environ.get("BRIGHTSKY_USER_AGENT",
+                        os.environ.get("NWS_USER_AGENT",
+                                       "polymarket-skills weather-edge-bot"))
+    try:
+        r = requests.get(
+            f"{base}/weather",
+            params={"lat": lat, "lon": lon,
+                    "date": target_date, "last_date": target_date,
+                    "units": "dwd"},
+            headers={"User-Agent": ua, "Accept": "application/json"},
+            timeout=10)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        temps = [row.get("temperature") for row in (data.get("weather") or [])
+                 if row.get("temperature") is not None]
+        if not temps:
+            return None
+        sources = data.get("sources") or []
+        src = sources[0] if sources else {}
+        return {
+            "provider": "dwd_mosmix",
+            "source_station": src.get("station_name") or src.get("wmo_station_id"),
+            "distance_m": src.get("distance"),
+            "max_c": round(max(temps), 2),
+            "min_c": round(min(temps), 2),
+            "n_hours": len(temps),
+        }
+    except Exception:
+        return None
+
+
 def get_visual_crossing(city: str, date_iso: Optional[str] = None) -> Optional[dict]:
     """v7: thin wrapper over weather_edge_helpers.fetch_visual_crossing,
     which is now the canonical implementation (cached + shared with the
@@ -477,6 +526,14 @@ def review_proposal(entry: dict, system_prompt: str) -> Optional[dict]:
         nws = get_nws_forecast(*coords)
         if nws:
             evidence["nws"] = nws
+        # v15.3: DWD MOSMIX via Bright Sky — the independent corroboration
+        # the judge lacks OUTSIDE the US (NWS 404s abroad). Reuses the coords
+        # already resolved; no country branch (returns None where MOSMIX has
+        # no nearby station, so US cities simply don't get this key).
+        if target_date:
+            bs = get_brightsky_forecast(coords[0], coords[1], target_date)
+            if bs:
+                evidence["dwd_mosmix"] = bs
 
     # Visual Crossing
     vc = get_visual_crossing(city, target_date) if city else None
@@ -2347,6 +2404,96 @@ def _test_anomaly():
     print("\nAll anomaly-scan tests PASS (6/6)")
 
 
+def _test_brightsky():
+    """v15.3: hermetic tests for get_brightsky_forecast + its wiring into
+    review_proposal. Monkeypatches requests.get (no network)."""
+    import weather_edge_judge as mod
+
+    class FakeResp:
+        def __init__(self, status, payload):
+            self.status_code = status
+            self._p = payload
+        def json(self):
+            return self._p
+
+    saved_get = mod.requests.get
+    try:
+        # 1. Série horária válida → max/min extraídos (°C).
+        payload = {
+            "weather": [
+                {"timestamp": "2026-07-09T00:00", "temperature": 14.0},
+                {"timestamp": "2026-07-09T12:00", "temperature": 22.5},
+                {"timestamp": "2026-07-09T15:00", "temperature": 23.1},
+                {"timestamp": "2026-07-09T22:00", "temperature": None},
+            ],
+            "sources": [{"station_name": "Berlin-Brandenburg", "distance": 3200}],
+        }
+        mod.requests.get = lambda *a, **k: FakeResp(200, payload)
+        r = mod.get_brightsky_forecast(52.36, 13.50, "2026-07-09")
+        assert r is not None, "esperava dict"
+        assert r["max_c"] == 23.1 and r["min_c"] == 14.0, r
+        assert r["n_hours"] == 3, r          # None ignorado
+        assert r["provider"] == "dwd_mosmix"
+        assert r["source_station"] == "Berlin-Brandenburg"
+        print("Test BS1 PASS: série horária → max 23.1 / min 14.0 (None ignorado)")
+
+        # 2. Não-200 → None.
+        mod.requests.get = lambda *a, **k: FakeResp(404, {})
+        assert mod.get_brightsky_forecast(0, 0, "2026-07-09") is None
+        print("Test BS2 PASS: HTTP não-200 → None")
+
+        # 3. Série vazia / sem temperaturas → None.
+        mod.requests.get = lambda *a, **k: FakeResp(200, {"weather": [], "sources": []})
+        assert mod.get_brightsky_forecast(0, 0, "2026-07-09") is None
+        mod.requests.get = lambda *a, **k: FakeResp(
+            200, {"weather": [{"temperature": None}], "sources": []})
+        assert mod.get_brightsky_forecast(0, 0, "2026-07-09") is None
+        print("Test BS3 PASS: sem temperaturas → None")
+
+        # 4. Exceção de rede → None (fail-open, nunca lança).
+        def boom(*a, **k):
+            raise RuntimeError("network down")
+        mod.requests.get = boom
+        assert mod.get_brightsky_forecast(0, 0, "2026-07-09") is None
+        print("Test BS4 PASS: exceção → None (fail-open)")
+
+        # 5. Wiring em review_proposal: coords resolvem, Bright Sky OK →
+        #    evidence["dwd_mosmix"] preenchido; sem chamar o LLM (stub call_claude).
+        saved_geo = mod._geocode_city
+        saved_nws = mod.get_nws_forecast
+        saved_vc = mod.get_visual_crossing
+        saved_call = mod.call_claude
+        saved_bs = mod.get_brightsky_forecast
+        try:
+            mod._geocode_city = lambda city: (48.97, 2.44)   # Paris
+            mod.get_nws_forecast = lambda lat, lon: None       # US-only → None na EU
+            mod.get_visual_crossing = lambda city, date: None
+            mod.get_brightsky_forecast = lambda lat, lon, d: {
+                "provider": "dwd_mosmix", "max_c": 25.0, "min_c": 15.0,
+                "n_hours": 24, "source_station": "Paris"}
+            captured = {}
+            mod.call_claude = lambda entry, evidence, sp: captured.update(
+                evidence=evidence) or {"verdict": "APPROVE", "_meta": {}}
+            entry = {"entry_id": 1, "city_resolved": "Paris",
+                     "end_date": "2026-07-09T12:00:00Z"}
+            mod.review_proposal(entry, "sys")
+            assert "dwd_mosmix" in captured["evidence"], captured
+            assert "nws" not in captured["evidence"]
+            assert captured["evidence"]["dwd_mosmix"]["max_c"] == 25.0
+            print("Test BS5 PASS: review_proposal injeta evidence['dwd_mosmix'] "
+                  "na Europa (NWS ausente)")
+        finally:
+            mod._geocode_city = saved_geo
+            mod.get_nws_forecast = saved_nws
+            mod.get_visual_crossing = saved_vc
+            mod.call_claude = saved_call
+            mod.get_brightsky_forecast = saved_bs
+
+        print("\nAll --test-brightsky PASS (5/5)")
+    finally:
+        mod.requests.get = saved_get
+
+
 def _test_cc_route():
     """v11: _judge_route must auto-approve cheap_convexity on deterministic
     guards WITHOUT the LLM, auto-reject bad ones, fail-safe on corrupt meta,
@@ -2440,5 +2587,7 @@ if __name__ == "__main__":
         _test_anomaly()
     elif "--test-cc-route" in sys.argv:
         _test_cc_route()
+    elif "--test-brightsky" in sys.argv:
+        _test_brightsky()
     else:
         main()
