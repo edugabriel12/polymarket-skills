@@ -4017,14 +4017,19 @@ def _test_side_adjust():
     fake_pe.DEFAULT_FEE_RATE = 0.0
     sys.modules["paper_engine"] = fake_pe
 
+    # end_date dinâmico no futuro — um valor fixo expiraria com o tempo e
+    # o guard v15.2 (expired_before_execute) pularia as entries do teste.
+    future_end = (datetime.now(timezone.utc) + timedelta(hours=24)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
     def seed(slug, ty, tn, prob):
         with db.connect() as conn:
             conn.execute(
                 "INSERT INTO entries (ts, market_slug, market_question, side, "
                 "status, entry_price, forecast_prob_at_entry, token_id_yes, "
                 "token_id_no, end_date, strategy) VALUES (?, ?, 'q', 'YES', "
-                "'ADJUSTED', 0.10, ?, ?, ?, '2026-07-08T00:00:00Z', "
-                "'weather_edge')", (ts, slug, prob, ty, tn))
+                "'ADJUSTED', 0.10, ?, ?, ?, ?, "
+                "'weather_edge')", (ts, slug, prob, ty, tn, future_end))
             eid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.execute(
                 "INSERT INTO judge_reviews (entry_id, ts, verdict, confidence, "

@@ -613,10 +613,17 @@ def _sibling_failed_precheck(row: dict) -> Optional[dict]:
             "sibling_statuses": sorted(statuses)}
 
 
-def _skip_sibling_failed(entry_id: int) -> None:
+def _skip_sibling_failed(entry_id: int) -> bool:
     """Mark a leg SKIPPED because its group is dead — race-guarded: only
     writes while the row is still PROPOSED (never clobbers a status the
     executor or an earlier same-batch action wrote meanwhile).
+
+    Returns True when it actually wrote; False when the guard held (row
+    already terminal — e.g. the KILLER leg the sweep just marked). v15.2:
+    callers gate their logging/bookkeeping on the return value, so killer
+    legs no longer emit a misleading duplicate judge_skipped_sibling_failed
+    event (observed for entries 13/16 on 2026-07-07; DB was never corrupted,
+    the event was just noise).
 
     skip_reason reuses 'ladder_sibling_failed' (analyzer/dashboard keep
     counting all group-death casualties in one bucket);
@@ -631,6 +638,8 @@ def _skip_sibling_failed(entry_id: int) -> None:
                 conn, entry_id, "SKIPPED",
                 judge_skipped_reason="ladder_sibling_failed_prejudge",
                 skip_reason="ladder_sibling_failed")
+            return True
+    return False
 
 
 def _group_free_guard_sweep(gid: str, current_entry_id: int) -> dict:
@@ -724,8 +733,9 @@ def _group_free_guard_sweep(gid: str, current_entry_id: int) -> dict:
     for leg in pending:
         if leg["entry_id"] == killer["entry_id"]:
             continue
-        _skip_sibling_failed(leg["entry_id"])
-        marked.append(leg["entry_id"])
+        # v15.2: only count legs actually written (race guard may no-op).
+        if _skip_sibling_failed(leg["entry_id"]):
+            marked.append(leg["entry_id"])
     log_event("ladder_group_dead_prejudge", {
         "ladder_group_id": gid,
         "killer_entry_id": killer["entry_id"],
@@ -1450,8 +1460,12 @@ def main():
                 else:
                     sib = _sibling_failed_precheck(row_dict)
                 if sib is not None:
-                    log_event("judge_skipped_sibling_failed", sib)
-                    _skip_sibling_failed(row_dict["entry_id"])
+                    # v15.2: log only when we actually marked the row —
+                    # a killer leg already terminal stays silent (the
+                    # guard no-ops) instead of emitting a misleading
+                    # duplicate sibling_failed event.
+                    if _skip_sibling_failed(row_dict["entry_id"]):
+                        log_event("judge_skipped_sibling_failed", sib)
                     if gid:
                         dead_groups.add(gid)
                     continue
@@ -1844,20 +1858,23 @@ def _test_sibling_gate():
                     "VALUES (?, 's', 'q', 'NO', ?, 'g5', 0.3, 'weather_edge')",
                     (ts, status))
             conn.commit()
-        _skip_sibling_failed(1)
-        _skip_sibling_failed(2)   # REJECTED — não pode ser sobrescrito
+        wrote1 = _skip_sibling_failed(1)
+        wrote2 = _skip_sibling_failed(2)   # REJECTED — não pode ser sobrescrito
         with db.connect() as conn:
             r1 = conn.execute("SELECT status, skip_reason, "
                               "judge_skipped_reason FROM entries "
                               "WHERE entry_id=1").fetchone()
             r2 = conn.execute("SELECT status FROM entries "
                               "WHERE entry_id=2").fetchone()
+        assert wrote1 is True and wrote2 is False, (wrote1, wrote2)
         assert r1["status"] == "SKIPPED"
         assert r1["skip_reason"] == "ladder_sibling_failed"
         assert r1["judge_skipped_reason"] == "ladder_sibling_failed_prejudge"
         assert r2["status"] == "REJECTED", r2["status"]
-        print("Test G6 PASS: write race-guarded (PROPOSED marcada; killer "
-              "REJECTED intocado)")
+        # v15.2: re-marcar a já-SKIPPED também é no-op silencioso (False)
+        assert _skip_sibling_failed(1) is False
+        print("Test G6 PASS: write race-guarded + retorno bool (True só "
+              "quando escreve; killer REJECTED/re-mark → False)")
     finally:
         db.connect = _orig_connect
 
