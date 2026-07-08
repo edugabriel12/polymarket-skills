@@ -300,6 +300,103 @@ def get_brightsky_forecast(lat: float, lon: float,
         return None
 
 
+# v16: city -> IPMA globalIdLocal (Portugal daily-forecast endpoint). Small
+# curated map for the two Portuguese cities the bot trades; extend as needed
+# from https://api.ipma.pt/open-data/distrits-islands.json
+_IPMA_GLOBAL_ID = {
+    "Lisbon": 1110600, "Lisboa": 1110600,
+    "Porto": 1131200,
+}
+
+
+def get_ipma_forecast(city: str, target_date: str) -> Optional[dict]:
+    """IPMA (Portugal national service) daily city forecast for `target_date`.
+
+    Free, no API key, JSON. IPMA blends ECMWF + AROME with statistical
+    (MOS-style) post-processing, so for Lisbon/Porto it is a genuinely
+    independent, MOS-quality corroboration source — the European analogue of
+    NWS for Portugal (where Bright Sky/MOSMIX may be thin and met.no is raw
+    ECMWF). Daily granularity only (tMin/tMax), which matches the °C
+    highest/lowest-temperature markets.
+
+    Returns {"provider":"ipma","max_c","min_c"} for the day or None (unknown
+    city / non-200 / date absent / exception). Fail-open, never raises.
+    """
+    gid = _IPMA_GLOBAL_ID.get(city)
+    if not gid:
+        return None
+    base = os.environ.get("IPMA_BASE_URL", "https://api.ipma.pt")
+    try:
+        r = requests.get(
+            f"{base}/open-data/forecast/meteorology/cities/daily/{gid}.json",
+            headers={"Accept": "application/json"}, timeout=10)
+        if r.status_code != 200:
+            return None
+        days = (r.json() or {}).get("data") or []
+        row = next((d for d in days
+                    if str(d.get("forecastDate")) == target_date), None)
+        if not row:
+            return None
+        tmax = row.get("tMax")
+        tmin = row.get("tMin")
+        if tmax is None and tmin is None:
+            return None
+        out = {"provider": "ipma"}
+        if tmax is not None:
+            out["max_c"] = round(float(tmax), 2)
+        if tmin is not None:
+            out["min_c"] = round(float(tmin), 2)
+        return out
+    except Exception:
+        return None
+
+
+def get_metno_forecast(lat: float, lon: float,
+                       target_date: str) -> Optional[dict]:
+    """MET Norway Locationforecast point forecast for `target_date`.
+
+    Free, no key, global — BUT met.no applies per-station MOS post-processing
+    only in the Nordics/Arctic; elsewhere it is raw ECMWF-HRES (so it is a
+    strong INDEPENDENT corroborator only for Oslo/Stockholm/Copenhagen/
+    Helsinki/Reykjavik, and correlated-with-the-ensemble noise elsewhere —
+    the judge prompt says as much). Requires a custom User-Agent (missing UA
+    -> HTTP 403).
+
+    Returns {"provider":"metno","max_c","min_c","n_hours"} for the day or
+    None. Fail-open, never raises.
+    """
+    ua = os.environ.get("METNO_USER_AGENT",
+                        os.environ.get("NWS_USER_AGENT",
+                                       "polymarket-skills weather-edge-bot"))
+    base = os.environ.get("METNO_BASE_URL",
+                          "https://api.met.no/weatherapi/locationforecast/2.0")
+    try:
+        r = requests.get(
+            f"{base}/compact",
+            params={"lat": round(float(lat), 4), "lon": round(float(lon), 4)},
+            headers={"User-Agent": ua, "Accept": "application/json"},
+            timeout=10)
+        if r.status_code != 200:
+            return None
+        series = (((r.json() or {}).get("properties") or {}).get("timeseries")
+                  or [])
+        temps = []
+        for pt in series:
+            t = str(pt.get("time") or "")
+            if not t.startswith(target_date):
+                continue
+            val = (((pt.get("data") or {}).get("instant") or {})
+                   .get("details") or {}).get("air_temperature")
+            if val is not None:
+                temps.append(float(val))
+        if not temps:
+            return None
+        return {"provider": "metno", "max_c": round(max(temps), 2),
+                "min_c": round(min(temps), 2), "n_hours": len(temps)}
+    except Exception:
+        return None
+
+
 def get_visual_crossing(city: str, date_iso: Optional[str] = None) -> Optional[dict]:
     """v7: thin wrapper over weather_edge_helpers.fetch_visual_crossing,
     which is now the canonical implementation (cached + shared with the
@@ -534,6 +631,18 @@ def review_proposal(entry: dict, system_prompt: str) -> Optional[dict]:
             bs = get_brightsky_forecast(coords[0], coords[1], target_date)
             if bs:
                 evidence["dwd_mosmix"] = bs
+            # v16: met.no — MOS-quality independent source in the Nordics
+            # (raw ECMWF elsewhere; the prompt tells the LLM how to weight it).
+            mn = get_metno_forecast(coords[0], coords[1], target_date)
+            if mn:
+                evidence["metno"] = mn
+
+    # v16: IPMA (Portugal national MOS) — independent corroboration for
+    # Lisbon/Porto, where Bright Sky may be thin and met.no is raw ECMWF.
+    if city and target_date:
+        ipma = get_ipma_forecast(city, target_date)
+        if ipma:
+            evidence["ipma"] = ipma
 
     # Visual Crossing
     vc = get_visual_crossing(city, target_date) if city else None
@@ -2494,6 +2603,87 @@ def _test_brightsky():
         mod.requests.get = saved_get
 
 
+def _test_ipma():
+    """v16: hermetic tests for get_ipma_forecast (monkeypatch requests.get)."""
+    import weather_edge_judge as mod
+
+    class FakeResp:
+        def __init__(self, status, payload):
+            self.status_code = status
+            self._p = payload
+        def json(self):
+            return self._p
+
+    saved = mod.requests.get
+    try:
+        payload = {"data": [
+            {"forecastDate": "2026-07-09", "tMax": "31.4", "tMin": "18.2"},
+            {"forecastDate": "2026-07-10", "tMax": "30.0", "tMin": "17.5"}]}
+        mod.requests.get = lambda *a, **k: FakeResp(200, payload)
+        r = mod.get_ipma_forecast("Lisbon", "2026-07-09")
+        assert r and r["provider"] == "ipma", r
+        assert r["max_c"] == 31.4 and r["min_c"] == 18.2, r
+        print("Test IPMA1 PASS: Lisboa 2026-07-09 → max 31.4 / min 18.2")
+
+        # cidade sem globalIdLocal → None, sem chamar HTTP
+        called = {"n": 0}
+        mod.requests.get = lambda *a, **k: called.__setitem__("n", called["n"]+1) or FakeResp(200, payload)
+        assert mod.get_ipma_forecast("Madrid", "2026-07-09") is None
+        assert called["n"] == 0
+        print("Test IPMA2 PASS: cidade fora de Portugal → None sem HTTP")
+
+        # data ausente no payload → None
+        mod.requests.get = lambda *a, **k: FakeResp(200, payload)
+        assert mod.get_ipma_forecast("Porto", "2026-12-31") is None
+        # não-200 e exceção → None
+        mod.requests.get = lambda *a, **k: FakeResp(500, {})
+        assert mod.get_ipma_forecast("Lisbon", "2026-07-09") is None
+        def boom(*a, **k): raise RuntimeError("net")
+        mod.requests.get = boom
+        assert mod.get_ipma_forecast("Lisbon", "2026-07-09") is None
+        print("Test IPMA3 PASS: data ausente / não-200 / exceção → None")
+        print("\nAll --test-ipma PASS")
+    finally:
+        mod.requests.get = saved
+
+
+def _test_metno():
+    """v16: hermetic tests for get_metno_forecast (monkeypatch requests.get)."""
+    import weather_edge_judge as mod
+
+    class FakeResp:
+        def __init__(self, status, payload):
+            self.status_code = status
+            self._p = payload
+        def json(self):
+            return self._p
+
+    saved = mod.requests.get
+    try:
+        payload = {"properties": {"timeseries": [
+            {"time": "2026-07-09T00:00:00Z", "data": {"instant": {"details": {"air_temperature": 12.0}}}},
+            {"time": "2026-07-09T14:00:00Z", "data": {"instant": {"details": {"air_temperature": 22.4}}}},
+            {"time": "2026-07-10T14:00:00Z", "data": {"instant": {"details": {"air_temperature": 99.0}}}}]}}
+        mod.requests.get = lambda *a, **k: FakeResp(200, payload)
+        r = mod.get_metno_forecast(59.91, 10.75, "2026-07-09")
+        assert r and r["provider"] == "metno", r
+        assert r["max_c"] == 22.4 and r["min_c"] == 12.0, r   # 10-jul (99) excluído
+        assert r["n_hours"] == 2, r
+        print("Test METNO1 PASS: só horas do dia-alvo (max 22.4 / min 12.0)")
+
+        mod.requests.get = lambda *a, **k: FakeResp(403, {})   # sem UA → 403
+        assert mod.get_metno_forecast(0, 0, "2026-07-09") is None
+        mod.requests.get = lambda *a, **k: FakeResp(200, {"properties": {"timeseries": []}})
+        assert mod.get_metno_forecast(0, 0, "2026-07-09") is None
+        def boom(*a, **k): raise RuntimeError("net")
+        mod.requests.get = boom
+        assert mod.get_metno_forecast(0, 0, "2026-07-09") is None
+        print("Test METNO2 PASS: 403 / vazio / exceção → None (fail-open)")
+        print("\nAll --test-metno PASS")
+    finally:
+        mod.requests.get = saved
+
+
 def _test_cc_route():
     """v11: _judge_route must auto-approve cheap_convexity on deterministic
     guards WITHOUT the LLM, auto-reject bad ones, fail-safe on corrupt meta,
@@ -2587,6 +2777,10 @@ if __name__ == "__main__":
         _test_anomaly()
     elif "--test-cc-route" in sys.argv:
         _test_cc_route()
+    elif "--test-ipma" in sys.argv:
+        _test_ipma()
+    elif "--test-metno" in sys.argv:
+        _test_metno()
     elif "--test-brightsky" in sys.argv:
         _test_brightsky()
     else:

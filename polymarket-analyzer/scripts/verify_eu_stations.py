@@ -33,8 +33,17 @@ import weather_edge_helpers as weh  # noqa: E402
 from weather_edge_bot import fetch_weather_markets  # noqa: E402
 
 # Cidades europeias-alvo (nome canônico como aparece no slug/pergunta).
-_DEFAULT_EU = ["London", "Paris", "Berlin", "Madrid", "Warsaw",
-               "Istanbul", "Ankara"]
+_DEFAULT_EU = [
+    # já curadas (validar)
+    "London", "Paris", "Berlin", "Madrid", "Warsaw", "Istanbul", "Ankara",
+    # v16 — Leste/Centro EU
+    "Prague", "Vienna", "Budapest", "Bratislava", "Zagreb", "Belgrade",
+    "Bucharest", "Athens", "Sofia", "Kyiv", "Vilnius", "Riga", "Tallinn",
+    # v16 — Escandinávia
+    "Oslo", "Stockholm", "Copenhagen", "Helsinki", "Reykjavik",
+    # v16 — Itália + Portugal
+    "Rome", "Milan", "Naples", "Lisbon", "Porto",
+]
 
 
 def _market_text(m: dict) -> str:
