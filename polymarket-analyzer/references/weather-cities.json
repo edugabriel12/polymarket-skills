@@ -256,7 +256,11 @@
     "Madrid":       {"lat": 40.4936, "lon": -3.5668,  "station": "LEMD", "temp_bias_f": 0.0,
                      "om_models": ["meteofrance_arpege_europe", "icon_eu", "ecmwf_ifs025", "gfs_seamless"]},
     "Warsaw":       {"lat": 52.1657, "lon": 20.9671,  "station": "EPWA", "temp_bias_f": 0.0,
-                     "om_models": ["icon_eu", "dmi_harmonie_arome_europe", "ecmwf_ifs025", "gfs_seamless"]}
+                     "om_models": ["icon_eu", "dmi_harmonie_arome_europe", "ecmwf_ifs025", "gfs_seamless"]},
+    "Istanbul":     {"lat": 41.2619, "lon": 28.7414,  "station": "LTFM", "temp_bias_f": 0.0,
+                     "om_models": ["icon_eu", "ukmo_seamless", "ecmwf_ifs025", "gfs_seamless"]},
+    "Ankara":       {"lat": 40.1281, "lon": 32.9951,  "station": "LTAC", "temp_bias_f": 0.0,
+                     "om_models": ["icon_eu", "ukmo_seamless", "ecmwf_ifs025", "gfs_seamless"]}
   },
   "_station_names_doc": "v9: map of station name phrases (as they appear in Polymarket market descriptions) to ICAO codes that exist in the 'stations' dict above. Used by auto_extract_station_from_description to resolve markets where the operator hasn't yet curated the city. Keys are lowercased phrases; auto-extractor strips 'Station', 'Airport', 'the', 'International' etc before lookup.",
   "station_names": {
@@ -297,6 +301,11 @@
     "warsaw chopin":              "EPWA",
     "barajas":                    "LEMD",
     "adolfo suarez":              "LEMD",
-    "adolfo suarez madrid":       "LEMD"
+    "adolfo suarez madrid":       "LEMD",
+    "adolfo suarez madrid-barajas": "LEMD",
+    "paris-le bourget":           "LFPB",
+    "istanbul":                   "LTFM",
+    "esenboga":                   "LTAC",
+    "esenboga intl":              "LTAC"
   }
 }
