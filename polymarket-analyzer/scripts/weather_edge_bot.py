@@ -2062,6 +2062,34 @@ def run_execute(args) -> int:
         entry_id = row["entry_id"]
         status = row["status"]
 
+        # v15.2: expiry guard — an APPROVED/ADJUSTED entry whose market
+        # already closed is unexecutable by definition, but nothing ever
+        # cleaned it up: the resolution sweep and the monitor only cover
+        # EXECUTED/FAST_PATH, so a single-bin entry sat here hitting
+        # no_orderbook -> `continue` forever (observed: baseline entry #16,
+        # APPROVED 5 days past end_date), polluting query_live_tokens and
+        # the pending/DEFER sets. Runs BEFORE the ladder gate and any HTTP.
+        # Fail-open: missing/unparseable end_date NEVER expires.
+        end_date_str = row["end_date"] if "end_date" in row.keys() else None
+        if end_date_str:
+            try:
+                _end = datetime.fromisoformat(
+                    str(end_date_str).replace("Z", "+00:00"))
+                _expired = _end < datetime.now(timezone.utc)
+            except (ValueError, TypeError):
+                _expired = False
+            if _expired:
+                log_event("execute_skipped", {
+                    "entry_id": entry_id,
+                    "reason": "expired_before_execute",
+                    "end_date": end_date_str,
+                })
+                with db.connect() as conn2:
+                    db.update_entry_status(
+                        conn2, entry_id, "SKIPPED",
+                        skip_reason="expired_before_execute")
+                continue
+
         # v9: gate ladder rows. Single-bin rows (no ladder_group_id)
         # fall through to legacy path unchanged.
         ladder_group_id = row["ladder_group_id"] if "ladder_group_id" in row.keys() else None
@@ -4067,6 +4095,122 @@ def _test_side_adjust():
             sys.modules.pop("paper_engine", None)
 
 
+def _test_expired_execute():
+    """v15.2: run_execute must SKIP (expired_before_execute) any APPROVED/
+    ADJUSTED entry whose end_date already passed — BEFORE any orderbook
+    fetch — instead of hitting no_orderbook forever (baseline orphan #16).
+    Fail-open on missing/invalid end_date. Hermetic: temp DB + fake engine."""
+    import tempfile
+    import types
+    import weather_edge_bot as mod
+
+    tmp = Path(tempfile.mkdtemp()) / "expired_exec.db"
+    db.init_db(tmp)
+    _orig_connect = db.connect
+    _orig_pe_mod = sys.modules.get("paper_engine")
+    fake_pe = types.ModuleType("paper_engine")
+
+    class FakeEngine:
+        def __init__(self, portfolio="default"):
+            pass
+    fake_pe.PaperEngine = FakeEngine
+    fake_pe.DEFAULT_FEE_RATE = 0.0
+    sys.modules["paper_engine"] = fake_pe
+
+    past = "2026-07-01T12:00:00Z"
+    future = (datetime.now(timezone.utc) + timedelta(hours=24)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    ts = "2026-07-07T00:00:00+00:00"
+
+    def seed(slug, end_date, gid=None, pos=None):
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO entries (ts, market_slug, market_question, side, "
+                "status, entry_price, forecast_prob_at_entry, token_id_yes, "
+                "token_id_no, end_date, ladder_group_id, ladder_position, "
+                "strategy) VALUES (?, ?, 'q', 'YES', 'APPROVED', 0.10, 0.85, "
+                "'TY', 'TN', ?, ?, ?, 'weather_edge')",
+                (ts, slug, end_date, gid, pos))
+            eid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.commit()
+        return eid
+
+    fetches = []
+    saved = (mod.fetch_orderbook, mod.compute_max_size_for_slippage,
+             mod._risk_block_reason)
+    try:
+        db.connect = lambda path=None: _orig_connect(tmp)
+        mod.fetch_orderbook = lambda tid: (fetches.append(tid) or {
+            "asks": [{"price": 0.60, "size": 1000}],
+            "bids": [{"price": 0.55, "size": 1000}]})
+        mod.compute_max_size_for_slippage = (
+            lambda book, side, max_slippage:
+            {"max_shares": 100.0, "max_usd": 50.0, "avg_fill": 0.60,
+             "slippage_pct": 0.02})
+        mod._risk_block_reason = lambda engine, args: None
+        args = types.SimpleNamespace(
+            dry_run=True, portfolio="default", max_slippage=0.15,
+            min_edge_pp=5.0, execute_min_edge_pp=5.0,
+            max_market_exposure_usd=100.0)
+
+        def status_of(eid):
+            with db.connect() as conn:
+                return dict(conn.execute(
+                    "SELECT status, skip_reason FROM entries "
+                    "WHERE entry_id=?", (eid,)).fetchone())
+
+        # E1: single APPROVED com end_date passado → SKIPPED sem fetch.
+        e1 = seed("expired-market", past)
+        n = mod.run_execute(args)
+        r = status_of(e1)
+        assert n == 0 and r["status"] == "SKIPPED", (n, r)
+        assert r["skip_reason"] == "expired_before_execute", r
+        assert fetches == [], f"fetch antes do guard: {fetches}"
+        print("Test E1 PASS: APPROVED expirada → SKIPPED/expired_before_"
+              "execute, ZERO fetches de orderbook")
+
+        # E2: end_date futuro → executa normalmente (dry-run).
+        e2 = seed("live-market", future)
+        n = mod.run_execute(args)
+        assert n == 1 and status_of(e2)["status"] == "EXECUTED", status_of(e2)
+        print("Test E2 PASS: end_date futuro executa normalmente")
+
+        # E3: end_date NULL → fail-open (não expira; executa).
+        e3 = seed("no-enddate-market", None)
+        n = mod.run_execute(args)
+        assert n == 1 and status_of(e3)["status"] == "EXECUTED", status_of(e3)
+        # E3b: end_date inválido → fail-open também.
+        e3b = seed("bad-enddate-market", "not-a-date")
+        n = mod.run_execute(args)
+        assert n == 1 and status_of(e3b)["status"] == "EXECUTED", status_of(e3b)
+        print("Test E3 PASS: end_date NULL/inválido → fail-open (executa)")
+
+        # E4: pernas de ladder expiradas → ambas SKIPPED como expiradas
+        # (o guard corta cada uma antes do gate; nenhuma vira execução).
+        a = seed("ladder-exp", past, gid="g-exp", pos="central")
+        b = seed("ladder-exp-2", past, gid="g-exp", pos="below")
+        fetches.clear()
+        n = mod.run_execute(args)
+        ra, rb = status_of(a), status_of(b)
+        assert n == 0 and ra["status"] == "SKIPPED" == rb["status"], (ra, rb)
+        assert ra["skip_reason"] == "expired_before_execute", ra
+        assert rb["skip_reason"] in ("expired_before_execute",
+                                     "ladder_sibling_failed"), rb
+        assert fetches == [], fetches
+        print("Test E4 PASS: ladder expirado morre inteiro sem fetch "
+              f"(reasons: {ra['skip_reason']}/{rb['skip_reason']})")
+
+        print("\nAll --test-expired-execute PASS (4/4)")
+    finally:
+        db.connect = _orig_connect
+        (mod.fetch_orderbook, mod.compute_max_size_for_slippage,
+         mod._risk_block_reason) = saved
+        if _orig_pe_mod is not None:
+            sys.modules["paper_engine"] = _orig_pe_mod
+        else:
+            sys.modules.pop("paper_engine", None)
+
+
 def _test_phantom_cashout():
     """v13.4: self-heal for phantom legs (position already sold by a sibling
     entry sharing the outcome token) + list-return normalization. Hermetic:
@@ -4249,5 +4393,7 @@ if __name__ == "__main__":
         _test_dup_token_discovery()
     elif "--test-side-adjust" in sys.argv:
         _test_side_adjust()
+    elif "--test-expired-execute" in sys.argv:
+        _test_expired_execute()
     else:
         main()
