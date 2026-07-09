@@ -225,6 +225,41 @@ def fetch_orderbook(ticker: str) -> dict | None:
     return _get(f"/markets/{ticker}/orderbook")
 
 
+def _debug_market_sample(ticker: str | None) -> int:
+    """Imprime o JSON CRU de um único mercado aberto — diagnóstico cirúrgico
+    e não o --debug genérico (que dispararia um log por cada uma das ~88
+    séries × N mercados, inviável de colar de volta).
+
+    Motivo: um run real encontrou 88 séries + 542 mercados corretamente, mas
+    volume/open_interest/yes_bid/yes_ask vieram todos None — os nomes de
+    campo que assumi (documentação antiga do trading-api, agora
+    descontinuado) provavelmente não batem com o schema real do
+    api.elections.kalshi.com. Ver o JSON de UM mercado real revela os nomes
+    corretos sem gerar um log gigante.
+    """
+    if not ticker:
+        series = discover_weather_series()
+        if not series:
+            print("Nenhuma série de temperatura encontrada — não dá pra "
+                  "amostrar um mercado. Rode --debug pra diagnosticar a "
+                  "descoberta de séries primeiro.")
+            return 1
+        ticker = series[0]["ticker"]
+        print(f"(nenhum --ticker dado; usando a 1a série descoberta: "
+              f"{ticker})\n")
+    data = _get("/markets", params={"series_ticker": ticker,
+                                    "status": "open", "limit": 1})
+    markets = _safe_list(data, "markets")
+    if not markets:
+        print(f"Nenhum mercado aberto encontrado para a série {ticker!r} "
+              f"(ou a chamada falhou). Rode --debug pra ver a resposta "
+              f"bruta da chamada.")
+        return 1
+    print(f"Mercado cru de {ticker!r} (cole isto de volta):\n")
+    print(json.dumps(markets[0], indent=2, ensure_ascii=False))
+    return 0
+
+
 def _spread(m: dict) -> float | None:
     bid, ask = m.get("yes_bid"), m.get("yes_ask")
     if bid is None or ask is None:
@@ -513,7 +548,26 @@ def _test() -> int:
         print("T11 PASS: filtro de temperatura descarta HURRICANENAME "
               "mesmo vindo do filtro de categoria (mantém só KXHIGHNY)")
 
-        print("\nAll verify_kalshi_weather self-tests PASS (11/11)")
+        # T12: _debug_market_sample imprime o mercado cru (achando série
+        # sozinho quando ticker=None) e retorna 0; [] gracioso -> 1.
+        def fake_sample(url, params=None, **kw):
+            if "/series" in url:
+                return _R(200, {"series": [{"ticker": "KXHIGHNY",
+                                            "title": "Highest Temperature NYC"}]})
+            if "/markets" in url:
+                return _R(200, {"markets": [
+                    {"ticker": "KXHIGHNY-26JUL10-T94", "campo_estranho": 42}]})
+            return _R(200, {})
+        requests.get = fake_sample
+        rc = _debug_market_sample(None)
+        assert rc == 0, rc
+        requests.get = lambda *a, **k: _R(200, {"markets": []})
+        rc2 = _debug_market_sample("KXHIGHNY")
+        assert rc2 == 1, rc2
+        print("T12 PASS: _debug_market_sample acha série sozinho + imprime "
+              "mercado cru (0); [] -> 1 gracioso")
+
+        print("\nAll verify_kalshi_weather self-tests PASS (12/12)")
         return 0
     finally:
         requests.get = saved
@@ -534,12 +588,22 @@ def main() -> int:
     ap.add_argument("--debug", action="store_true",
                     help="imprime status/corpo cru de cada chamada HTTP no "
                         "stderr (rode isto se '0 séries' persistir)")
+    ap.add_argument("--debug-market-sample", nargs="?", const="",
+                    metavar="TICKER",
+                    help="imprime o JSON cru de UM mercado aberto (ticker "
+                        "de série opcional; sem ele usa a 1a série de "
+                        "temperatura descoberta) e sai — rode isto se "
+                        "volume/oi/bid/ask vierem vazios, pra eu ver os "
+                        "nomes reais dos campos sem um log de 500+ linhas")
     ap.add_argument("--test", action="store_true",
                     help="self-test hermético (sem rede)")
     args = ap.parse_args()
 
     if args.test:
         return _test()
+
+    if args.debug_market_sample is not None:
+        return _debug_market_sample(args.debug_market_sample or None)
 
     if args.debug:
         global _DEBUG
