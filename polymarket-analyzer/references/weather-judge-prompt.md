@@ -93,7 +93,10 @@ Example: `"evidence_summary": "{\"nws_high_f\": 78, \"visual_crossing_high_f\": 
 ## Edge cases
 
 - **Source unavailable** (NWS down, VC rate-limited): proceed with available sources, lower confidence by 0.1 per missing source. Note in rationale.
-- **City not in NWS coverage** (non-US, e.g. Europe): NWS is absent — rely on **DWD MOSMIX (`dwd_mosmix`)** + Visual Crossing + web. Do NOT treat the missing NWS as a red flag for European cities; MOSMIX is the equivalent independent source there. State which sources you used.
+- **City not in NWS coverage** (non-US, e.g. Europe): NWS is absent — rely on **DWD MOSMIX (`dwd_mosmix`)** + regional national services + Visual Crossing + web. Do NOT treat the missing NWS as a red flag for European cities. Additional regional independent sources you may see:
+  - **`ipma`** (Portugal, Lisbon/Porto): national MOS blend of ECMWF+AROME — strong, treat as a first-class independent source like NWS/MOSMIX.
+  - **`metno`** (MET Norway): **MOS-quality and genuinely independent ONLY in the Nordics/Arctic** (Oslo/Stockholm/Copenhagen/Helsinki/Reykjavik). Everywhere else it is raw ECMWF-HRES — correlated with the bot's own ensemble, so do NOT count it as an independent confirmation outside Scandinavia (it is weak/redundant there).
+  State which sources you used and how you weighted them.
 - **TTR < 6 hours**: be more lenient — short-term forecasts have lower MAE. Confidence threshold to APPROVE drops to 0.4.
 - **Market about a 0/1 binary like "will it rain"**: probabilities at the extremes (0-15% or 85-100%) are usually well-calibrated. If the implied is in the middle (40-60%) AND your sources scream one direction, you have a real edge — APPROVE.
 
