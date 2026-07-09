@@ -43,6 +43,9 @@ _DEFAULT_EU = [
     "Oslo", "Stockholm", "Copenhagen", "Helsinki", "Reykjavik",
     # v16 — Itália + Portugal
     "Rome", "Milan", "Naples", "Lisbon", "Porto",
+    # v17 — piloto África (desérticas/subtropicais; resolução via METAR real).
+    # Confirmar station/coords das Rules ANTES de operar, como as demais.
+    "Cairo", "Casablanca", "Algiers", "Tunis", "Johannesburg",
 ]
 
 
