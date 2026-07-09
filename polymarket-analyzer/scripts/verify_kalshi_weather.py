@@ -212,9 +212,13 @@ def discover_weather_series(categories: tuple = _WEATHER_CATEGORIES) -> list[dic
 
 
 def fetch_open_markets(series_ticker: str, limit: int = 50) -> list[dict]:
-    """Mercados abertos hoje para uma série (cada um já traz volume/
-    open_interest/yes_bid/yes_ask/last_price segundo a doc pública da
-    Kalshi). Retorna [] em qualquer falha."""
+    """Mercados abertos hoje para uma série. Cada dict cru traz (confirmado
+    via --debug-market-sample contra api.elections.kalshi.com, NÃO a doc
+    antiga do trading-api descontinuado): volume_fp/open_interest_fp
+    (contagens, string numérica) e yes_bid_dollars/yes_ask_dollars/
+    no_bid_dollars/no_ask_dollars/last_price_dollars/liquidity_dollars
+    (preços/valores, string dolarizada tipo '0.0100') — ver _to_float().
+    Retorna [] em qualquer falha."""
     data = _get("/markets", params={"series_ticker": series_ticker,
                                     "status": "open", "limit": limit})
     return _safe_list(data, "markets")
@@ -274,14 +278,27 @@ def _debug_market_sample(ticker: str | None) -> int:
     return 1
 
 
-def _spread(m: dict) -> float | None:
-    bid, ask = m.get("yes_bid"), m.get("yes_ask")
-    if bid is None or ask is None:
+def _to_float(v) -> float | None:
+    """Converte um valor da Kalshi pra float. Os campos reais vêm como
+    STRINGS dolarizadas (ex. 'yes_bid_dollars': '0.0100'), não floats/centavos
+    inteiros como a doc antiga do trading-api (descontinuado) sugeria —
+    confirmado via --debug-market-sample contra api.elections.kalshi.com.
+    None/''/inconversível -> None, nunca levanta."""
+    if v is None or v == "":
         return None
     try:
-        return round(float(ask) - float(bid), 4)
+        return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _spread(row: dict) -> float | None:
+    """Spread YES a partir do row JÁ CONVERTIDO (yes_bid/yes_ask floats),
+    não do dict cru da Kalshi (que usa yes_bid_dollars/yes_ask_dollars)."""
+    bid, ask = row.get("yes_bid"), row.get("yes_ask")
+    if bid is None or ask is None:
+        return None
+    return round(ask - bid, 4)
 
 
 def run(*, want_markets: bool = False, want_orderbook: bool = False,
@@ -306,14 +323,17 @@ def run(*, want_markets: bool = False, want_orderbook: bool = False,
                     "market_ticker": m.get("ticker"),
                     "title": m.get("title"),
                     "status": m.get("status"),
-                    "volume": m.get("volume"),
-                    "open_interest": m.get("open_interest"),
-                    "yes_bid": m.get("yes_bid"),
-                    "yes_ask": m.get("yes_ask"),
-                    "spread": _spread(m),
-                    "last_price": m.get("last_price"),
+                    "volume": _to_float(m.get("volume_fp")),
+                    "open_interest": _to_float(m.get("open_interest_fp")),
+                    "liquidity": _to_float(m.get("liquidity_dollars")),
+                    "yes_bid": _to_float(m.get("yes_bid_dollars")),
+                    "yes_ask": _to_float(m.get("yes_ask_dollars")),
+                    "no_bid": _to_float(m.get("no_bid_dollars")),
+                    "no_ask": _to_float(m.get("no_ask_dollars")),
+                    "last_price": _to_float(m.get("last_price_dollars")),
                     "close_time": m.get("close_time"),
                 }
+                row["spread"] = _spread(row)
                 if want_orderbook:
                     row["orderbook"] = fetch_orderbook(m.get("ticker"))
                 report["markets"].append(row)
@@ -336,10 +356,12 @@ def run(*, want_markets: bool = False, want_orderbook: bool = False,
 def _fmt_market(row: dict) -> str:
     vol = row.get("volume")
     oi = row.get("open_interest")
+    liq = row.get("liquidity")
     spread = row.get("spread")
-    return (f"    {row.get('market_ticker', '?'):<20} "
+    return (f"    {row.get('market_ticker', '?'):<24} "
             f"vol={vol if vol is not None else '?':<8} "
             f"oi={oi if oi is not None else '?':<8} "
+            f"liq=${liq if liq is not None else '?':<8} "
             f"bid={row.get('yes_bid')} ask={row.get('yes_ask')} "
             f"spread={spread if spread is not None else '?'}")
 
@@ -461,18 +483,29 @@ def _test() -> int:
         assert discover_weather_series() == []
         print("T4 PASS: exceção de rede -> None/[] (fail-open, sem raise)")
 
-        # T5: fetch_open_markets parseia volume/oi/bid/ask e spread calculado.
+        # T5: fetch_open_markets repassa os campos REAIS da Kalshi cru
+        # (volume_fp/open_interest_fp contagem-string, yes_bid_dollars/
+        # yes_ask_dollars string dolarizada tipo '0.4200' -- confirmado via
+        # --debug-market-sample contra api.elections.kalshi.com; a doc
+        # antiga do trading-api descontinuado sugeria volume/yes_bid
+        # numéricos diretos, o que causava tudo None no run real). _to_float
+        # converte; _spread computa em cima do já convertido.
         requests.get = lambda *a, **k: _R(200, {"markets": [
             {"ticker": "KXHIGHNY-26JUL10-B70", "title": "NYC high >= 70F",
-             "status": "open", "volume": 1500, "open_interest": 800,
-             "yes_bid": 0.42, "yes_ask": 0.47, "last_price": 0.45,
+             "status": "active", "volume_fp": "1500.00",
+             "open_interest_fp": "800.00", "yes_bid_dollars": "0.4200",
+             "yes_ask_dollars": "0.4700", "last_price_dollars": "0.4500",
              "close_time": "2026-07-10T23:59:00Z"}]})
         markets = fetch_open_markets("KXHIGHNY")
-        assert len(markets) == 1 and markets[0]["volume"] == 1500, markets
-        s = _spread(markets[0])
+        assert len(markets) == 1 and markets[0]["volume_fp"] == "1500.00", markets
+        assert _to_float(markets[0]["volume_fp"]) == 1500.0
+        row = {"yes_bid": _to_float(markets[0]["yes_bid_dollars"]),
+              "yes_ask": _to_float(markets[0]["yes_ask_dollars"])}
+        s = _spread(row)
         assert abs(s - 0.05) < 1e-9, s
-        print("T5 PASS: fetch_open_markets parseia volume/oi/bid/ask; "
-              "spread = ask-bid calculado corretamente (0.05)")
+        print("T5 PASS: fetch_open_markets repassa campos reais "
+              "(volume_fp/*_dollars); _to_float + _spread = ask-bid "
+              "calculado corretamente (0.05)")
 
         # T6: _spread gracioso quando bid/ask ausente.
         assert _spread({"yes_bid": None, "yes_ask": 0.5}) is None
@@ -497,16 +530,19 @@ def _test() -> int:
                 return _R(200, {"series": []})
             if "/markets" in url and "orderbook" not in url:
                 return _R(200, {"markets": [
-                    {"ticker": "KXHIGHNY-26JUL10-B70", "volume": 100,
-                     "open_interest": 50, "yes_bid": 0.3, "yes_ask": 0.35}]})
+                    {"ticker": "KXHIGHNY-26JUL10-B70", "volume_fp": "100.00",
+                     "open_interest_fp": "50.00", "yes_bid_dollars": "0.3000",
+                     "yes_ask_dollars": "0.3500"}]})
             return _R(200, {})
         requests.get = fake_run
         rep = run(want_markets=True, want_orderbook=False,
                  want_polymarket_count=False)
         assert len(rep["series"]) == 1 and rep["series"][0]["ticker"] == "KXHIGHNY", rep
-        assert len(rep["markets"]) == 1 and rep["markets"][0]["volume"] == 100, rep
+        assert len(rep["markets"]) == 1 and rep["markets"][0]["volume"] == 100.0, rep
+        assert abs(rep["markets"][0]["spread"] - 0.05) < 1e-9, rep
         assert rep["polymarket"] is None, rep
-        print("T8 PASS: run() agrega series(1) + markets(1); Polymarket "
+        print("T8 PASS: run() agrega series(1) + markets(1) com campos "
+              "reais convertidos (volume=100.0, spread=0.05); Polymarket "
               "não tocado quando want_polymarket_count=False")
 
         # T9: 1o host candidato falha (conexão recusada), 2o responde 200 ->
