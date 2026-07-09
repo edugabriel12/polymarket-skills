@@ -46,6 +46,18 @@ _DEFAULT_EU = [
     # v17 — piloto África (desérticas/subtropicais; resolução via METAR real).
     # Confirmar station/coords das Rules ANTES de operar, como as demais.
     "Cairo", "Casablanca", "Algiers", "Tunis", "Johannesburg",
+    # v18 — candidatos América do Sul (deep-research 2026-07: NENHUMA cidade
+    # curada ainda; nenhum modelo regional Open-Meteo na região; nem sequer
+    # confirmamos se existe mercado ativo). Grafia ASCII sem acento (Sao
+    # Paulo/Bogota/Montevideo/Brasilia/Asuncion) de propósito: _matches_city
+    # é um substring-match sensível a acento contra o texto do mercado, que a
+    # Polymarket escreve em inglês/ASCII — "São Paulo" não bateria com "Sao
+    # Paulo" no texto real. Rodar isto é o único jeito de resolver o ângulo
+    # 'qual estação' que a pesquisa web não consegue (ver
+    # references/south-america-research-notes.md).
+    "Sao Paulo", "Rio de Janeiro", "Buenos Aires", "Bogota", "Lima",
+    "Santiago", "Caracas", "Quito", "Montevideo", "La Paz", "Brasilia",
+    "Asuncion",
 ]
 
 
