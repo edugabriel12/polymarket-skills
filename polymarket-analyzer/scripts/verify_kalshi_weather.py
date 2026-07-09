@@ -236,28 +236,42 @@ def _debug_market_sample(ticker: str | None) -> int:
     descontinuado) provavelmente não batem com o schema real do
     api.elections.kalshi.com. Ver o JSON de UM mercado real revela os nomes
     corretos sem gerar um log gigante.
+
+    Sem `ticker` explícito: percorre as séries descobertas EM ORDEM até
+    achar uma com mercado aberto — algumas séries descobertas não têm
+    mercado aberto agora (ex. ticker antigo/aposentado que a API de séries
+    ainda lista, como KXLOWNY vs. a ativa KXLOWTNYC), então parar na
+    primeira sem checar as demais falha à toa mesmo havendo outras com
+    dados reais.
     """
-    if not ticker:
+    candidates = [ticker] if ticker else None
+    tried: list[str] = []
+    if candidates is None:
         series = discover_weather_series()
         if not series:
             print("Nenhuma série de temperatura encontrada — não dá pra "
                   "amostrar um mercado. Rode --debug pra diagnosticar a "
                   "descoberta de séries primeiro.")
             return 1
-        ticker = series[0]["ticker"]
-        print(f"(nenhum --ticker dado; usando a 1a série descoberta: "
-              f"{ticker})\n")
-    data = _get("/markets", params={"series_ticker": ticker,
-                                    "status": "open", "limit": 1})
-    markets = _safe_list(data, "markets")
-    if not markets:
-        print(f"Nenhum mercado aberto encontrado para a série {ticker!r} "
-              f"(ou a chamada falhou). Rode --debug pra ver a resposta "
-              f"bruta da chamada.")
-        return 1
-    print(f"Mercado cru de {ticker!r} (cole isto de volta):\n")
-    print(json.dumps(markets[0], indent=2, ensure_ascii=False))
-    return 0
+        candidates = [s["ticker"] for s in series]
+
+    for tk in candidates:
+        tried.append(tk)
+        data = _get("/markets", params={"series_ticker": tk,
+                                        "status": "open", "limit": 1})
+        markets = _safe_list(data, "markets")
+        if markets:
+            if not ticker:
+                print(f"(nenhum --ticker dado; tentativas até achar "
+                      f"mercado aberto: {tried})\n")
+            print(f"Mercado cru de {tk!r} (cole isto de volta):\n")
+            print(json.dumps(markets[0], indent=2, ensure_ascii=False))
+            return 0
+
+    print(f"Nenhum mercado aberto encontrado em {len(tried)} série(s) "
+          f"tentada(s) ({tried}). Rode --debug pra ver a resposta bruta "
+          f"das chamadas, ou passe um --ticker específico.")
+    return 1
 
 
 def _spread(m: dict) -> float | None:
@@ -567,7 +581,30 @@ def _test() -> int:
         print("T12 PASS: _debug_market_sample acha série sozinho + imprime "
               "mercado cru (0); [] -> 1 gracioso")
 
-        print("\nAll verify_kalshi_weather self-tests PASS (12/12)")
+        # T13: 1a série descoberta (KXLOWNY) NÃO tem mercado aberto -- o
+        # bug real que o operador bateu (dict iterou uma série aposentada
+        # primeiro). Deve pular pra 2a série (KXHIGHNY) automaticamente em
+        # vez de desistir na 1a.
+        def fake_stale_first_series(url, params=None, **kw):
+            if "/series" in url:
+                return _R(200, {"series": [
+                    {"ticker": "KXLOWNY", "title": "Lowest Temperature in NYC"},
+                    {"ticker": "KXHIGHNY", "title": "Highest Temperature NYC"},
+                ]})
+            if "/markets" in url:
+                tk = (params or {}).get("series_ticker")
+                if tk == "KXLOWNY":
+                    return _R(200, {"markets": []})  # série sem mercado aberto
+                return _R(200, {"markets": [
+                    {"ticker": "KXHIGHNY-26JUL10-T94", "campo_real": True}]})
+            return _R(200, {})
+        requests.get = fake_stale_first_series
+        rc3 = _debug_market_sample(None)
+        assert rc3 == 0, rc3
+        print("T13 PASS: 1a série descoberta sem mercado aberto -> pula "
+              "automaticamente pra 2a com dados (reproduz o KXLOWNY real)")
+
+        print("\nAll verify_kalshi_weather self-tests PASS (13/13)")
         return 0
     finally:
         requests.get = saved
