@@ -36,12 +36,20 @@ Uso:
     python verify_kalshi_weather.py --markets       # + mercados abertos por série
     python verify_kalshi_weather.py --orderbook     # + profundidade de book
     python verify_kalshi_weather.py --json
+    python verify_kalshi_weather.py --debug         # imprime status/corpo cru de
+                                                     # cada chamada no stderr —
+                                                     # rode isto se "0 séries"
+                                                     # persistir, pra eu ver a
+                                                     # resposta real da API
     python verify_kalshi_weather.py --test          # self-test hermético (sem rede)
 
 Env vars:
-    KALSHI_API_BASE   (default https://trading-api.kalshi.com/trade-api/v2 —
-                       a pesquisa não confirmou este hostname ao vivo; ajuste
-                       aqui sem mudar código se a Kalshi tiver migrado)
+    KALSHI_API_BASE   (se definida, ÚNICO host tentado — sem ela, o script
+                       tenta em sequência os dois hosts que a pesquisa
+                       encontrou mencionados, já que nenhum foi confirmado
+                       ao vivo: trading-api.kalshi.com e
+                       api.elections.kalshi.com. Ajuste aqui sem mudar
+                       código se a Kalshi tiver migrado para outro.)
 """
 from __future__ import annotations
 
@@ -56,8 +64,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import requests  # noqa: E402
 
-KALSHI_BASE = os.environ.get("KALSHI_API_BASE",
-                             "https://trading-api.kalshi.com/trade-api/v2")
+_ENV_BASE = os.environ.get("KALSHI_API_BASE")
+# v2 (2026-07-09, "0 séries" no run real do operador): nem trading-api nem
+# api.elections foram confirmados ao vivo pela pesquisa (a tentativa dela
+# foi bloqueada pelo proxy do sandbox pros dois). Sem KALSHI_API_BASE
+# explícita, tenta os dois em sequência e fixa o primeiro que responder
+# 200 em QUALQUER chamada (cache em _WORKING_BASE) — assim um host errado
+# não precisa de retry manual do operador.
+_CANDIDATE_BASES = ([_ENV_BASE] if _ENV_BASE else [
+    "https://trading-api.kalshi.com/trade-api/v2",
+    "https://api.elections.kalshi.com/trade-api/v2",
+])
+_WORKING_BASE: str | None = None  # preenchido na 1a chamada bem-sucedida
+_DEBUG = False
 
 # Categorias candidatas para o filtro de série da Kalshi. Tentadas em ordem;
 # a primeira que devolver resultado é usada. Nomes exatos de categoria não
@@ -73,18 +92,45 @@ _WEATHER_KEYWORDS = re.compile(
     r"fahrenheit|celsius|°[fc])\b", re.IGNORECASE)
 
 
+def _debug_log(base: str, path: str, params: dict | None, status, body) -> None:
+    if not _DEBUG:
+        return
+    print(f"[debug] GET {base}{path} params={params or {}}", file=sys.stderr)
+    print(f"[debug]   status={status}  body[:500]={str(body)[:500]!r}",
+          file=sys.stderr)
+
+
 def _get(path: str, params: dict | None = None, timeout: int = 20):
     """GET num endpoint público da Kalshi. Fail-open: retorna None em
     qualquer falha (não-200, exceção de rede, JSON malformado). Nunca
-    levanta — mesma disciplina de todo fetch_* deste projeto."""
-    try:
-        r = requests.get(f"{KALSHI_BASE}{path}", params=params or {},
-                         timeout=timeout)
-        if r.status_code != 200:
-            return None
-        return r.json()
-    except Exception:
-        return None
+    levanta — mesma disciplina de todo fetch_* deste projeto.
+
+    v2: sem KALSHI_API_BASE explícita, tenta os hosts candidatos em
+    sequência (nenhum foi confirmado ao vivo pela pesquisa) e fixa em
+    _WORKING_BASE o primeiro que responder — chamadas seguintes vão direto
+    nele, sem retentar os outros a cada vez. Com --debug, imprime status e
+    corpo cru (sucesso ou falha) de cada tentativa no stderr.
+    """
+    global _WORKING_BASE
+    bases = [_WORKING_BASE] if _WORKING_BASE else _CANDIDATE_BASES
+    for base in bases:
+        try:
+            r = requests.get(f"{base}{path}", params=params or {},
+                             timeout=timeout)
+            body_preview = None
+            try:
+                body_preview = r.json()
+            except Exception:
+                body_preview = r.text
+            _debug_log(base, path, params, r.status_code, body_preview)
+            if r.status_code != 200:
+                continue
+            _WORKING_BASE = base
+            return body_preview if isinstance(body_preview, (dict, list)) else None
+        except Exception as e:
+            _debug_log(base, path, params, "exception", str(e))
+            continue
+    return None
 
 
 def discover_weather_series(categories: tuple = _WEATHER_CATEGORIES) -> list[dict]:
@@ -260,7 +306,10 @@ def _print_report(report: dict, want_markets: bool, want_orderbook: bool) -> int
 # Self-test hermético (sem rede) — monkeypatch requests.get
 # ---------------------------------------------------------------------------
 def _test() -> int:
+    global _WORKING_BASE, _DEBUG
     saved = requests.get
+    saved_working_base, saved_debug = _WORKING_BASE, _DEBUG
+    _WORKING_BASE = None  # cada teste começa sem host cacheado
 
     class _R:
         def __init__(self, status, payload):
@@ -364,10 +413,34 @@ def _test() -> int:
         print("T8 PASS: run() agrega series(1) + markets(1); Polymarket "
               "não tocado quando want_polymarket_count=False")
 
-        print("\nAll verify_kalshi_weather self-tests PASS (8/8)")
+        # T9: 1o host candidato falha (conexão recusada), 2o responde 200 ->
+        # _get tenta em sequência e fixa o 2o em _WORKING_BASE; chamada
+        # seguinte vai direto nele (sem retentar o 1o).
+        _WORKING_BASE = None
+        calls = {"first_base_tries": 0, "second_base_tries": 0}
+        def fake_multi_base(url, params=None, **kw):
+            if url.startswith(_CANDIDATE_BASES[0]):
+                calls["first_base_tries"] += 1
+                raise requests.exceptions.ConnectionError("refused")
+            calls["second_base_tries"] += 1
+            return _R(200, {"series": [{"ticker": "KXHIGHNY", "title": "x"}]})
+        requests.get = fake_multi_base
+        r1 = _get("/series", params={"category": "Climate and Weather"})
+        assert r1 == {"series": [{"ticker": "KXHIGHNY", "title": "x"}]}, r1
+        assert _WORKING_BASE == _CANDIDATE_BASES[1], _WORKING_BASE
+        assert calls["first_base_tries"] == 1 and calls["second_base_tries"] == 1, calls
+        # 2a chamada: so o host cacheado e tentado (1o candidato nao sobe de novo).
+        r2 = _get("/series", params={"category": "Weather"})
+        assert r2 is not None and calls["first_base_tries"] == 1, calls
+        assert calls["second_base_tries"] == 2, calls
+        print("T9 PASS: 1o host falha, 2o responde -> fixado em _WORKING_BASE "
+              "(chamada seguinte não retenta o 1o)")
+
+        print("\nAll verify_kalshi_weather self-tests PASS (9/9)")
         return 0
     finally:
         requests.get = saved
+        _WORKING_BASE, _DEBUG = saved_working_base, saved_debug
 
 
 def main() -> int:
@@ -381,12 +454,19 @@ def main() -> int:
     ap.add_argument("--no-polymarket", action="store_true",
                     help="não busca a contagem de mercados da Polymarket")
     ap.add_argument("--json", action="store_true", help="saída JSON crua")
+    ap.add_argument("--debug", action="store_true",
+                    help="imprime status/corpo cru de cada chamada HTTP no "
+                        "stderr (rode isto se '0 séries' persistir)")
     ap.add_argument("--test", action="store_true",
                     help="self-test hermético (sem rede)")
     args = ap.parse_args()
 
     if args.test:
         return _test()
+
+    if args.debug:
+        global _DEBUG
+        _DEBUG = True
 
     want_markets = args.markets or args.orderbook
     report = run(want_markets=want_markets, want_orderbook=args.orderbook,
