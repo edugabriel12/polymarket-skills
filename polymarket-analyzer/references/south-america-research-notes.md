@@ -1,13 +1,31 @@
 # Notas de pesquisa — América do Sul (2026-07)
 
-> Status: **REFERÊNCIA (não implementado).** Duas rodadas de deep-research
+> Status: **PARCIALMENTE IMPLEMENTADO.** Duas rodadas de deep-research
 > (Sonnet 5) investigaram se o bot pode operar cidades sul-americanas com o
-> mesmo rigor que a Europa/África receberam nos PRs #165-172. Veredito: hoje
-> **zero cidades sul-americanas estão curadas** em `weather-cities.json`
-> (só `São Paulo`, `Buenos Aires`, `Rio de Janeiro` existem como nomes soltos
-> na lista `world`, sem `stations`/`om_models`) e a base de evidência para
-> curar a região é **bem mais fraca** que a da Europa/África — não implementar
-> ainda; usar este documento como ponto de partida quando/se isso mudar.
+> mesmo rigor que a Europa/África receberam nos PRs #165-172. Veredito
+> original: base de evidência **bem mais fraca** que Europa/África — não
+> curar sem confirmar mercado + estação real primeiro.
+>
+> **Atualização 2026-07-09**: o operador rodou `verify_eu_stations.py
+> --cities "Sao Paulo" "Rio de Janeiro"` e confirmou um mercado REAL ativo
+> para São Paulo, com a Rules citando a estação explicitamente ("recorded at
+> the Sao Paulo-Guarulhos International Airport Station" → SBGR) — cruzando
+> a barreira que travava a implementação. **São Paulo foi curado** em
+> `weather-cities.json` (ver `_south_america_doc`): `stations["São Paulo"]`
+> = SBGR/Guarulhos, sem `om_models` (nenhum modelo regional Open-Meteo existe
+> para a região, cai no trio global — mesmo padrão do piloto África) e sem
+> `resolution_source`/`pilot` (São Paulo fica na zona sudeste do Brasil que a
+> pesquisa NÃO flagrou como degradada para ERA5 — ver seção "Qualidade da
+> verdade-terra" abaixo — diferente da África, onde o arquivo era
+> confiavelmente ruim). `station_names` ganhou `guarulhos`/
+> `sao paulo-guarulhos`/variantes → SBGR, para o auto-extractor resolver
+> automaticamente se o mercado reaparecer. **Rio de Janeiro** e os outros 10
+> candidatos não tinham mercado ativo no momento da verificação — ficam
+> pendentes, deliberadamente sem coords pré-preenchidas (diferente do padrão
+> EU/África de pré-preencher com "aeroporto primário padrão", já que aqui não
+> temos uma base de precedentes confirmados para arriscar um palpite) —
+> re-rodar `verify_eu_stations.py` (lista default já inclui os 12) quando um
+> mercado aparecer.
 
 ## Rodada 1 — visão geral (Open-Meteo, APIs nacionais)
 
