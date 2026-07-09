@@ -649,6 +649,19 @@ def review_proposal(entry: dict, system_prompt: str) -> Optional[dict]:
     if vc:
         evidence["visual_crossing"] = vc
 
+    # v17 Africa pilot: flag high-risk so the LLM applies extra scrutiny. These
+    # cities have NO regional forecast model and resolve off real METAR (the
+    # ERA5 archive is too biased to settle a 1°C tick), so the ensemble's
+    # confidence is worth less here — demand independent corroboration.
+    if _entry_is_pilot(entry):
+        evidence["africa_pilot"] = {
+            "high_risk": True,
+            "note": ("Africa desert/subtropical pilot: no regional model, "
+                     "resolution via real station METAR. Require independent "
+                     "corroboration; prefer ADJUST (reduced size) over a bare "
+                     "APPROVE when sources are thin."),
+        }
+
     if not evidence:
         log_event("judge_no_evidence", {"entry_id": entry["entry_id"],
                                          "city": city}, level="WARN")
@@ -1026,6 +1039,20 @@ def _range_calibration(entry_row) -> Optional[dict]:
             "ensemble": ensemble_sigma is not None}
 
 
+def _entry_is_pilot(entry_row) -> bool:
+    """v17: True when discovery tagged this proposal as an Africa desert/
+    subtropical PILOT entry (discovery_meta_json.pilot). Pilot entries always
+    get the full LLM cross-check — never a deterministic auto-approve — because
+    the continent has no regional model and the ERA5 resolution truth is
+    unreliable (see weather-cities.json _africa_pilot_doc). Fail-safe: any
+    missing/corrupt field → False (normal routing)."""
+    try:
+        dm = json.loads(entry_row["discovery_meta_json"] or "{}")
+        return bool(dm.get("pilot"))
+    except Exception:
+        return False
+
+
 def _judge_route(entry_row) -> Optional[dict]:
     """v13.2 (option B): decide whether this proposal needs the LLM judge at
     all, or can be resolved by the deterministic code guards alone — saving
@@ -1071,6 +1098,16 @@ def _judge_route(entry_row) -> Optional[dict]:
         return {"action": "auto_reject", "kind": "non_temperature",
                 "reason": (f"non_temperature_market: metric={spec0.metric} — "
                            f"bot is temperature-only (policy 2026-07-05)")}
+
+    # (0.3) v17 Africa pilot: pilot entries NEVER take a deterministic route —
+    # neither auto-approve nor cheap_convexity — they always go to the full LLM
+    # judge (None). The deterministic ensemble guards are less trustworthy in
+    # Africa (no regional model; ERA5-based calibration/truth biased), so the
+    # LLM cross-check is mandatory. Runs AFTER the fail-closed non-temp reject
+    # (a non-temp African market is still rejected) and BEFORE every approve
+    # path, independent of JUDGE_AUTOROUTE.
+    if _entry_is_pilot(entry_row):
+        return None
 
     # (0.5) v11 cheap_convexity: skip the LLM entirely (operator decision).
     # These entries already cleared (i) the tail-calibration gate at

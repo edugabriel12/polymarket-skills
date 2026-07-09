@@ -428,6 +428,89 @@ def fetch_open_meteo_archive(lat: float, lon: float,
     return result
 
 
+def fetch_metar_daily_extremes(icao: str, target_date,
+                               hours: int = 72) -> Optional[dict]:
+    """Observed daily max/min 2 m temperature for `target_date` (UTC) at an
+    airport, reconstructed from real METAR reports via aviationweather.gov.
+
+    This is the resolution truth source for the Africa desert/subtropical
+    PILOT (weather-cities.json stations with resolution_source='metar'). On
+    that continent the Open-Meteo archive returns ERA5 reanalysis (~9-25 km,
+    NOT the station), whose bias exceeds the 1°C market tick, and there is no
+    regional forecast model — so resolution must come from the actual reporting
+    station, exactly as Polymarket's Rules specify. METAR reports temperature
+    to the whole °C (and the remark group sometimes to 0.1°C), which is coarse
+    but is the genuine observation rather than a gridded proxy.
+
+    Returns {"observed_max_c","observed_min_c","observed_max_f","observed_min_f",
+             "n_obs","source":"metar-aviationweather"} or None when the station
+    filed no report for that UTC day / HTTP non-200 / parse failure. Fail-open,
+    never raises. Callers MUST treat None as "unresolved" and NOT silently fall
+    back to the ERA5 archive (that is the whole point of the pilot).
+
+    `hours` is the aviationweather look-back window; the archive endpoint serves
+    recent observations, so resolution (which runs ~1-2 days after end_date)
+    stays inside a 72 h window.
+    """
+    if not icao:
+        return None
+    target_iso = (target_date.isoformat()
+                  if hasattr(target_date, "isoformat") else str(target_date))[:10]
+    base = os.environ.get("AVIATIONWEATHER_BASE_URL",
+                          "https://aviationweather.gov/api/data")
+    try:
+        r = requests.get(
+            f"{base}/metar",
+            params={"ids": icao, "format": "json", "hours": hours},
+            headers={"Accept": "application/json"},
+            timeout=20)
+        if r.status_code != 200:
+            return None
+        rows = r.json()
+        if not isinstance(rows, list):
+            return None
+        temps = []
+        for ob in rows:
+            t = ob.get("temp")
+            if t is None:
+                continue
+            # Determine the observation's UTC date. aviationweather JSON gives
+            # `reportTime` as an ISO-ish string ("2026-07-08 12:51:00") and
+            # `obsTime` as a unix epoch (seconds, UTC). Prefer the string; fall
+            # back to the epoch. Skip obs we can't date (never guess).
+            day = None
+            rt = ob.get("reportTime")
+            if isinstance(rt, str) and len(rt) >= 10:
+                day = rt[:10]
+            elif ob.get("obsTime") is not None:
+                try:
+                    day = datetime.fromtimestamp(
+                        int(ob["obsTime"]), tz=timezone.utc).date().isoformat()
+                except (ValueError, OSError, OverflowError):
+                    day = None
+            if day != target_iso:
+                continue
+            try:
+                temps.append(float(t))
+            except (TypeError, ValueError):
+                continue
+        if not temps:
+            return None
+    except Exception:
+        return None
+
+    obs_max_c = max(temps)
+    obs_min_c = min(temps)
+    return {
+        "observed_max_c": round(obs_max_c, 2),
+        "observed_min_c": round(obs_min_c, 2),
+        "observed_max_f": round(obs_max_c * 9 / 5 + 32, 2),
+        "observed_min_f": round(obs_min_c * 9 / 5 + 32, 2),
+        "n_obs": len(temps),
+        "source": "metar-aviationweather",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Market parsing
 # ---------------------------------------------------------------------------

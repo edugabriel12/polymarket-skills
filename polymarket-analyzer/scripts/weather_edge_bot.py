@@ -111,6 +111,70 @@ PAPER_DB = Path.home() / ".polymarket-paper" / "portfolio.db"
 
 
 # ---------------------------------------------------------------------------
+# v17 Africa pilot fence
+# ---------------------------------------------------------------------------
+# The Africa expansion is a SMALL, HIGH-RISK pilot restricted to desert/
+# subtropical hub cities (curated with resolution_source='metar' + pilot=true
+# in weather-cities.json). The rest of the continent — above all the
+# monsoon/ITCZ belt (Lagos/Accra/Dakar/Addis/Nairobi) — is explicitly NOT
+# operated: forecast skill collapses there and the resolution truth is
+# unreliable. `_africa_pilot_gate` fences discovery to the allow-list.
+AFRICA_PILOT_CITIES = frozenset({
+    "Cairo", "Casablanca", "Algiers", "Tunis", "Johannesburg",
+})
+
+# Known African cities the bot must never open (defense-in-depth by NAME, for
+# candidates whose coords aren't resolved because they lack a curated station).
+# The coordinate box below is the primary fence; this catches stationless ones.
+AFRICA_NON_PILOT_CITIES = frozenset({
+    "Lagos", "Nairobi", "Cape Town", "Accra", "Dakar", "Addis Ababa",
+    "Abidjan", "Kinshasa", "Khartoum", "Luanda", "Dar es Salaam", "Kampala",
+    "Kano", "Mombasa", "Nouakchott", "Bamako", "Niamey", "Ouagadougou",
+    "Douala", "Kigali", "Maputo", "Harare", "Lusaka", "Antananarivo",
+})
+
+# Continental bounding box (lat, lon). Covers mainland Africa; any candidate
+# whose RESOLVED station coords land inside it and is not a pilot city is
+# fenced. Bounds: lat -35 (Cape Agulhas) .. 37 (Cap Angela, Tunisia);
+# lon -18 (Cabo Verde/west) .. 52 (Somali/Horn east). Deliberately excludes
+# the Middle East (Riyadh/Dubai/Tel Aviv sit east of ~34.5°E but north of
+# ~37°N is out; the box's north edge keeps Mediterranean-basin non-African
+# coasts out on latitude, and the pilot cities are all allow-listed anyway).
+_AFRICA_BOX = (-35.0, 37.0, -18.0, 52.0)  # lat_min, lat_max, lon_min, lon_max
+
+
+def _in_africa_box(lat, lon) -> bool:
+    """True when (lat, lon) falls inside the mainland-Africa bounding box."""
+    if lat is None or lon is None:
+        return False
+    try:
+        lat, lon = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return False
+    lat_min, lat_max, lon_min, lon_max = _AFRICA_BOX
+    return lat_min <= lat <= lat_max and lon_min <= lon <= lon_max
+
+
+def _africa_pilot_gate(city, lat, lon):
+    """Return a discovery skip reason ('africa_non_pilot') when a candidate is
+    in Africa but NOT one of the allow-listed desert/subtropical pilot cities;
+    None means 'allowed to proceed'.
+
+    Order matters: a PILOT city always passes even though its coords sit in the
+    box. Otherwise a candidate is fenced if EITHER its name is a known African
+    non-pilot city (catches stationless candidates with no resolved coords) OR
+    its resolved station coords fall inside the continental box.
+    """
+    if city in AFRICA_PILOT_CITIES:
+        return None
+    if city in AFRICA_NON_PILOT_CITIES:
+        return "africa_non_pilot"
+    if _in_africa_box(lat, lon):
+        return "africa_non_pilot"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
@@ -1094,6 +1158,31 @@ def run_discovery(args, cities: dict) -> int:
                         "station": station["station"],
                         "lat": station["lat"], "lon": station["lon"],
                     })
+
+        # v17 Africa pilot fence: only the allow-listed desert/subtropical
+        # pilot cities may be traded on the African continent. Any other
+        # candidate whose name or resolved station coords land in Africa is
+        # skipped 'africa_non_pilot' (the operator refused to operate the
+        # monsoon/ITCZ belt). Placed before the forecast fetch so a fenced
+        # market costs no further HTTP.
+        _glat = station.get("lat") if station else None
+        _glon = station.get("lon") if station else None
+        _africa_skip = _africa_pilot_gate(spec.city, _glat, _glon)
+        if _africa_skip:
+            skipped["africa_non_pilot"] = skipped.get("africa_non_pilot", 0) + 1
+            log_event("market_skipped", {
+                "slug": slug, "reason": "africa_non_pilot",
+                "city": spec.city, "lat": _glat, "lon": _glon})
+            try:
+                with db.connect() as _conn:
+                    db.insert_discovery_skip(_conn, ts=_now_iso(), slug=slug,
+                        city=spec.city, reason="africa_non_pilot",
+                        meta_json={"lat": _glat, "lon": _glon})
+                    _conn.commit()
+            except Exception:
+                pass  # never block discovery on observability write
+            continue
+
         if station:
             forecast = fetch_forecast(spec.city, days=5,
                                        lat=station["lat"], lon=station["lon"])
@@ -1112,6 +1201,13 @@ def run_discovery(args, cities: dict) -> int:
         mae_dynamic, bias, mu_override, mae_meta = _compute_mae_for_market(
             spec, forecast, args, station=station)
         ensemble_calibrated = bool(mae_meta.get("ensemble_calibrated"))
+
+        # v17 Africa pilot: stash the pilot flag into discovery_meta_json so the
+        # judge (_judge_route/_entry_is_pilot) forces the full LLM review and
+        # never a deterministic auto-approve for these high-risk entries.
+        if station and station.get("pilot"):
+            mae_meta["pilot"] = True
+            mae_meta["resolution_source"] = station.get("resolution_source")
 
         forecast_prob = forecast_probability(spec, forecast,
                                               mae_override=mae_dynamic,
@@ -4397,6 +4493,82 @@ def _test_phantom_cashout():
             sys.modules.pop("paper_engine", None)
 
 
+def _test_africa_pilot_gate():
+    """v17: the Africa pilot fence + judge full-review forcing.
+      (A) _in_africa_box boundary behavior.
+      (B) _africa_pilot_gate: pilot city passes; non-pilot African name or
+          coords are fenced; non-African passes.
+      (C) a pilot-tagged entry forces the judge to the full LLM review
+          (_judge_route → None), short-circuiting even a deterministic
+          auto-approve path; the same entry without the pilot flag does not.
+    """
+    # (A) box boundaries
+    assert _in_africa_box(30.12, 31.41) is True          # Cairo
+    assert _in_africa_box(-26.14, 28.25) is True         # Johannesburg
+    assert _in_africa_box(51.51, -0.13) is False         # London
+    assert _in_africa_box(37.0, 52.0) is True            # NE corner inclusive
+    assert _in_africa_box(37.01, 0.0) is False           # just north of edge
+    assert _in_africa_box(None, None) is False
+    assert _in_africa_box("x", "y") is False
+    print("Test AF-A PASS: _in_africa_box boundaries")
+
+    # (B) gate decisions
+    assert _africa_pilot_gate("Cairo", 30.12, 31.41) is None      # pilot passes
+    assert _africa_pilot_gate("Johannesburg", -26.14, 28.25) is None
+    assert _africa_pilot_gate("Cairo", None, None) is None        # pilot w/o coords
+    assert _africa_pilot_gate("Lagos", None, None) == "africa_non_pilot"  # by name
+    assert _africa_pilot_gate("Nairobi", -1.29, 36.82) == "africa_non_pilot"
+    # unknown African city caught by the coordinate box alone (not in any list)
+    assert _africa_pilot_gate("Zzz", 9.0, 8.5) == "africa_non_pilot"
+    assert _africa_pilot_gate("Paris", 48.86, 2.35) is None       # EU passes
+    assert _africa_pilot_gate("London", None, None) is None       # no coords, not African
+    print("Test AF-B PASS: _africa_pilot_gate allow-list + box + name fence")
+
+    # (C) pilot flag forces the judge to full LLM review
+    import types
+    import weather_edge_judge as judge
+    import weather_edge_helpers as helpers
+    saved = (helpers.parse_market, helpers.load_cities,
+             helpers.is_tradeable_spec)
+    try:
+        helpers.parse_market = lambda q, e, c: types.SimpleNamespace(
+            metric="temp", comparison="range", threshold_value=14.0,
+            threshold_value_high=15.0, threshold_unit="C")
+        helpers.load_cities = lambda: {}
+        helpers.is_tradeable_spec = lambda s: True
+
+        def _row(meta):
+            return {
+                "entry_id": 1, "market_question": "temp?",
+                "end_date": "2026-07-09", "side": "YES", "entry_price": 0.02,
+                "forecast_prob_at_entry": 0.07,
+                "forecast_snapshot_json": json.dumps({}),
+                "discovery_meta_json": json.dumps(meta),
+                "strategy": "cheap_convexity",
+            }
+
+        # Without the pilot flag, a valid cheap_convexity entry auto-approves
+        # deterministically (no LLM) — the baseline.
+        base = judge._judge_route(_row(
+            {"fair_target": 0.07, "exit_liquidity_shares": 500}))
+        assert base and base["action"] == "auto_approve", base
+        print("Test AF-C1 PASS: non-pilot cc entry auto-approves (baseline)")
+
+        # Same entry tagged pilot=true → forced to the full LLM judge (None),
+        # short-circuiting the deterministic auto-approve.
+        piloted = judge._judge_route(_row(
+            {"fair_target": 0.07, "exit_liquidity_shares": 500, "pilot": True}))
+        assert piloted is None, piloted
+        assert judge._entry_is_pilot(_row({"pilot": True})) is True
+        assert judge._entry_is_pilot(_row({})) is False
+        print("Test AF-C2 PASS: pilot=true forces full LLM review "
+              "(_judge_route None, short-circuits auto-approve)")
+        print("\nAll --test-africa-pilot-gate PASS")
+    finally:
+        (helpers.parse_market, helpers.load_cities,
+         helpers.is_tradeable_spec) = saved
+
+
 if __name__ == "__main__":
     import sys
     if "--test-atomic" in sys.argv:
@@ -4417,5 +4589,7 @@ if __name__ == "__main__":
         _test_side_adjust()
     elif "--test-expired-execute" in sys.argv:
         _test_expired_execute()
+    elif "--test-africa-pilot-gate" in sys.argv:
+        _test_africa_pilot_gate()
     else:
         main()

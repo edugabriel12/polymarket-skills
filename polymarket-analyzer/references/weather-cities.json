@@ -29,6 +29,9 @@
     "Tel Aviv",
     "Ankara",
     "Cape Town",
+    "Casablanca",
+    "Algiers",
+    "Tunis",
     "Jeddah",
     "Busan",
     "Qingdao",
@@ -307,8 +310,19 @@
     "Lisbon":       {"lat": 38.7742, "lon": -9.1342,  "station": "LPPT", "temp_bias_f": 0.0,
                      "om_models": ["meteofrance_arpege_europe", "icon_eu", "ecmwf_ifs025", "gfs_seamless"]},
     "Porto":        {"lat": 41.2481, "lon": -8.6814,  "station": "LPPR", "temp_bias_f": 0.0,
-                     "om_models": ["meteofrance_arpege_europe", "icon_eu", "ecmwf_ifs025", "gfs_seamless"]}
+                     "om_models": ["meteofrance_arpege_europe", "icon_eu", "ecmwf_ifs025", "gfs_seamless"]},
+    "Cairo":        {"lat": 30.1219, "lon": 31.4056,  "station": "HECA", "temp_bias_f": 0.0,
+                     "resolution_source": "metar", "pilot": true},
+    "Casablanca":   {"lat": 33.3675, "lon": -7.5900,  "station": "GMMN", "temp_bias_f": 0.0,
+                     "resolution_source": "metar", "pilot": true},
+    "Algiers":      {"lat": 36.6910, "lon": 3.2154,   "station": "DAAG", "temp_bias_f": 0.0,
+                     "resolution_source": "metar", "pilot": true},
+    "Tunis":        {"lat": 36.8510, "lon": 10.2272,  "station": "DTTA", "temp_bias_f": 0.0,
+                     "resolution_source": "metar", "pilot": true},
+    "Johannesburg": {"lat": -26.1392, "lon": 28.2460, "station": "FAOR", "temp_bias_f": 0.0,
+                     "resolution_source": "metar", "pilot": true}
   },
+  "_africa_pilot_doc": "v17 (2026-07): Africa is a SMALL, HIGH-RISK pilot restricted to desert/subtropical hub cities only (Cairo, Casablanca, Algiers, Tunis, Johannesburg). Two safeguards distinguish these from the EU stations: (1) resolution_source='metar' routes force_resolution_sweep to REAL station observations via aviationweather.gov instead of the Open-Meteo ERA5 archive (ERA5 bias in Africa exceeds the 1C market tick and there is NO regional forecast model on the continent); if the METAR is unavailable the market stays UNRESOLVED rather than falling back to ERA5. (2) pilot=true forces every proposal through the full LLM judge (never deterministic auto-approve) and marks it high-risk. The bot fences the rest of Africa (lat -35..37, lon -18..52) with a discovery skip 'africa_non_pilot' — the monsoon/ITCZ belt (Lagos/Accra/Dakar/Addis/Nairobi) is explicitly NOT operated (forecast skill collapses and the resolution truth is unreliable there). No om_models: no regional model exists, so the global trio (icon/gfs/ecmwf) is used.",
   "_station_names_doc": "v9: map of station name phrases (as they appear in Polymarket market descriptions) to ICAO codes that exist in the 'stations' dict above. Used by auto_extract_station_from_description to resolve markets where the operator hasn't yet curated the city. Keys are lowercased phrases; auto-extractor strips 'Station', 'Airport', 'the', 'International' etc before lookup.",
   "station_names": {
     "hartsfield-jackson":         "KATL",
@@ -398,6 +412,18 @@
     "humberto delgado":           "LPPT",
     "lisbon portela":             "LPPT",
     "porto francisco sa carneiro": "LPPR",
-    "francisco sa carneiro":      "LPPR"
+    "francisco sa carneiro":      "LPPR",
+    "cairo international":         "HECA",
+    "cairo intl":                 "HECA",
+    "mohammed v":                 "GMMN",
+    "casablanca mohammed v":      "GMMN",
+    "houari boumediene":          "DAAG",
+    "algiers houari boumediene":  "DAAG",
+    "tunis carthage":             "DTTA",
+    "tunis-carthage":             "DTTA",
+    "or tambo":                   "FAOR",
+    "o r tambo":                  "FAOR",
+    "oliver tambo":               "FAOR",
+    "johannesburg or tambo":      "FAOR"
   }
 }
