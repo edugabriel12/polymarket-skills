@@ -320,8 +320,10 @@
     "Tunis":        {"lat": 36.8510, "lon": 10.2272,  "station": "DTTA", "temp_bias_f": 0.0,
                      "resolution_source": "metar", "pilot": true},
     "Johannesburg": {"lat": -26.1392, "lon": 28.2460, "station": "FAOR", "temp_bias_f": 0.0,
-                     "resolution_source": "metar", "pilot": true}
+                     "resolution_source": "metar", "pilot": true},
+    "São Paulo":    {"lat": -23.4331, "lon": -46.4734, "station": "SBGR", "temp_bias_f": 0.0}
   },
+  "_south_america_doc": "v19 (2026-07): São Paulo confirmed via verify_eu_stations.py against a REAL live Polymarket market (highest-temperature-in-sao-paulo-on-july-10-2026-20corbelow) whose Rules name the station explicitly: 'recorded at the Sao Paulo-Guarulhos International Airport Station' -> SBGR. Deep-research (references/south-america-research-notes.md) found NO South American regional Open-Meteo model (om_models omitted -> falls back to the global trio, same as the Africa pilot) but reasonable ERA5/archive ground-truth quality specifically for southeast Brazil (not the flagged degraded north/northeast Amazon-adjacent zone, no extreme-altitude bias like the Andes) -> standard Open-Meteo-archive resolution used, no METAR pilot flag needed here unlike Africa. Rio de Janeiro and the other researched candidates (Buenos Aires, Bogota, Lima, Santiago, Caracas, Quito, Montevideo, La Paz, Brasilia, Asuncion) had NO active market at verification time (2026-07-09) and are deliberately NOT pre-filled with guessed coords/station — re-run verify_eu_stations.py (its default city list already includes all 12) when a market appears before curating.",
   "_africa_pilot_doc": "v17 (2026-07): Africa is a SMALL, HIGH-RISK pilot restricted to desert/subtropical hub cities only (Cairo, Casablanca, Algiers, Tunis, Johannesburg). Two safeguards distinguish these from the EU stations: (1) resolution_source='metar' routes force_resolution_sweep to REAL station observations via aviationweather.gov instead of the Open-Meteo ERA5 archive (ERA5 bias in Africa exceeds the 1C market tick and there is NO regional forecast model on the continent); if the METAR is unavailable the market stays UNRESOLVED rather than falling back to ERA5. (2) pilot=true forces every proposal through the full LLM judge (never deterministic auto-approve) and marks it high-risk. The bot fences the rest of Africa (lat -35..37, lon -18..52) with a discovery skip 'africa_non_pilot' — the monsoon/ITCZ belt (Lagos/Accra/Dakar/Addis/Nairobi) is explicitly NOT operated (forecast skill collapses and the resolution truth is unreliable there). No om_models: no regional model exists, so the global trio (icon/gfs/ecmwf) is used.",
   "_station_names_doc": "v9: map of station name phrases (as they appear in Polymarket market descriptions) to ICAO codes that exist in the 'stations' dict above. Used by auto_extract_station_from_description to resolve markets where the operator hasn't yet curated the city. Keys are lowercased phrases; auto-extractor strips 'Station', 'Airport', 'the', 'International' etc before lookup.",
   "station_names": {
@@ -424,6 +426,10 @@
     "or tambo":                   "FAOR",
     "o r tambo":                  "FAOR",
     "oliver tambo":               "FAOR",
-    "johannesburg or tambo":      "FAOR"
+    "johannesburg or tambo":      "FAOR",
+    "guarulhos":                  "SBGR",
+    "sao paulo-guarulhos":        "SBGR",
+    "sao paulo guarulhos":        "SBGR",
+    "guarulhos international":    "SBGR"
   }
 }
