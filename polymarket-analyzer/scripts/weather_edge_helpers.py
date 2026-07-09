@@ -595,6 +595,11 @@ def resolve_station(name: str, cities: dict[str, Any]) -> Optional[dict]:
 # Each captures group(1) = the station name phrase. Ordered most-specific
 # to least-specific so we don't trigger false matches.
 _STATION_PATTERNS = [
+    # "recorded by NOAA at the Istanbul Airport" — data-provider-prefixed form.
+    # Capture the STATION after "...by <provider> at (the) ... airport/station",
+    # NOT the provider. Must come before the generic "recorded by" pattern so
+    # the station wins over the provider ("NOAA") on this phrasing.
+    re.compile(r"\b(?:recorded|reported|measured)\s+by\s+[\w.\s]+?\s+at\s+(?:the\s+)?([\w\-'.\s]+?)\s+(?:airport|station|observatory)\b", re.I),
     # "recorded at the Hartsfield-Jackson International Airport Station"
     re.compile(r"recorded\s+at\s+(?:the\s+)?([\w\-'.\s]+?)\s+station\b", re.I),
     # "as recorded by the Hong Kong Observatory"
@@ -622,12 +627,17 @@ _STATION_NOISE_WORDS = re.compile(
 
 
 def _normalize_station_phrase(phrase: str) -> str:
-    """Lowercase + strip noise words + collapse whitespace.
+    """Lowercase + strip accents + strip noise words + collapse whitespace.
     'The Hartsfield-Jackson International Airport' -> 'hartsfield-jackson'
+
+    Accent stripping is what lets Polymarket Rules that spell a station with
+    diacritics ('Adolfo Suárez Madrid-Barajas', 'Esenboğa Intl') match the
+    ASCII keys in station_names ('adolfo suarez madrid-barajas', 'esenboga
+    intl'). No-op on already-ASCII phrases, so it never changes existing hits.
     """
     if not phrase:
         return ""
-    cleaned = _STATION_NOISE_WORDS.sub(" ", phrase.lower())
+    cleaned = _STATION_NOISE_WORDS.sub(" ", _strip_accents(phrase.lower()))
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
@@ -700,8 +710,9 @@ def auto_extract_station(name: str, cities: dict[str, Any],
             # Try raw lowercased FIRST so "hong kong observatory" matches its
             # full station_names key (the noise-word stripper would remove
             # "observatory" and lose the signal). Then fall back to
-            # normalized + progressively-shorter prefixes.
-            raw_lower = re.sub(r"\s+", " ", raw.lower()).strip()
+            # normalized + progressively-shorter prefixes. Accents stripped so
+            # an accented Rule phrase still hits the ASCII station_names keys.
+            raw_lower = _strip_accents(re.sub(r"\s+", " ", raw.lower()).strip())
             icao = station_names.get(raw_lower)
             if not icao:
                 normalized = _normalize_station_phrase(raw)
@@ -1737,6 +1748,70 @@ if __name__ == "__main__":
     assert spec2 and spec2.city == "London" and spec2.metric == "precip"
     assert spec2.threshold_value == 5.0 and spec2.threshold_unit == "mm"
     print(f"Test 2 PASS: {spec2}")
+
+    # ------------------------------------------------------------------
+    # AX (v17.1): auto_extract_station hardening — accents + "recorded by
+    # <provider> at the <station>". Fixtures are the REAL Polymarket Rule
+    # strings from the operator's verify_eu_stations run (2026-07-09), which
+    # returned "regra não parseada" for Madrid/Istanbul/Ankara before this fix.
+    # ------------------------------------------------------------------
+    _ax_cities = {
+        "stations": {
+            "Madrid":   {"lat": 40.4936, "lon": -3.5668, "station": "LEMD",
+                         "temp_bias_f": 0.0},
+            "Istanbul": {"lat": 41.2619, "lon": 28.7414, "station": "LTFM",
+                         "temp_bias_f": 0.0},
+            "Ankara":   {"lat": 40.1281, "lon": 32.9951, "station": "LTAC",
+                         "temp_bias_f": 0.0},
+            "London":   {"lat": 51.5048, "lon": 0.0495, "station": "EGLC",
+                         "temp_bias_f": 0.0},
+        },
+        "station_names": {
+            "adolfo suarez madrid-barajas": "LEMD",
+            "istanbul": "LTFM",
+            "esenboga intl": "LTAC",
+            "esenboga": "LTAC",
+            "london city": "EGLC",
+        },
+    }
+    _ax_madrid = ("This market will resolve to the temperature range that "
+                  "contains the highest temperature recorded at the Adolfo "
+                  "Suárez Madrid-Barajas Airport Station in degrees Celsius on "
+                  "9 Jul '26.")
+    _ax_istanbul = ("This market will resolve to the temperature range that "
+                    "contains the highest temperature recorded by NOAA at the "
+                    "Istanbul Airport in degrees Celsius on 9 Jul '26.")
+    _ax_ankara = ("This market will resolve to the temperature range that "
+                  "contains the highest temperature recorded at the Esenboğa "
+                  "Intl Airport Station in degrees Celsius on 9 Jul '26.")
+
+    r = auto_extract_station("Madrid", _ax_cities, _ax_madrid)
+    assert r and r["station"] == "LEMD", r      # accent: Suárez -> suarez
+    print("Test AX1 PASS: 'Adolfo Suárez Madrid-Barajas' -> LEMD (acento)")
+
+    r = auto_extract_station("Ankara", _ax_cities, _ax_ankara)
+    assert r and r["station"] == "LTAC", r      # accent: Esenboğa -> esenboga
+    print("Test AX2 PASS: 'Esenboğa Intl' -> LTAC (acento)")
+
+    r = auto_extract_station("Istanbul", _ax_cities, _ax_istanbul)
+    assert r and r["station"] == "LTFM", r      # provider-prefixed "by NOAA at"
+    print("Test AX3 PASS: 'recorded by NOAA at the Istanbul Airport' -> LTFM")
+
+    # AX4 regression: the plain "recorded at the X Station" form still resolves
+    # via the existing pattern (unaffected by the new one).
+    r = auto_extract_station("London", _ax_cities,
+                             "highest temperature recorded at the London City "
+                             "Airport Station in degrees Celsius.")
+    assert r and r["station"] == "EGLC", r
+    print("Test AX4 PASS: 'recorded at the London City Airport Station' -> EGLC")
+
+    # AX5 regression: "recorded by <provider>" WITHOUT "at the <station>" does
+    # not resolve to a bogus station (provider not in station_names -> None).
+    r = auto_extract_station("Nowhere", _ax_cities,
+                             "highest temperature recorded by NOAA in degrees "
+                             "Celsius on 9 Jul '26.")
+    assert r is None, r
+    print("Test AX5 PASS: 'recorded by NOAA' sem estação -> None (gracioso)")
 
     # Test 3: forecast → prob (temperature)
     forecast = {"forecasts": [
