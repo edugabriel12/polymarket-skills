@@ -20,10 +20,20 @@ Espelha exatamente o endpoint/params que o bot usa
 (weather_edge_helpers.fetch_open_meteo_ensemble), então "válido aqui" == "o bot
 vai usar o modelo em vez de cair no trio".
 
+v2 (2026-07-09, post-mortem "terminal parecia travado"): um --per-city varre
+~145 chamadas HTTP sequenciais. Antes desta versão nada era impresso até o
+final, o que numa rodada real ficou minutos em silêncio total — indistinguível
+de travado. Agora cada resultado é impresso com um contador [i/N] assim que
+acontece (default; `--quiet` restaura o dump-tudo-no-final). Também: uma rodada
+real revelou "Connection aborted"/ConnectionResetError transitórios (rede,
+não a chave/cidade) — agora há 1 retry automático nesses casos antes de marcar
+como falha.
+
 Uso:
     python verify_om_models.py                 # 1 probe por chave distinta
     python verify_om_models.py --per-city      # cada par (cidade, modelo)
     python verify_om_models.py --models icon_d2 icon_eu
+    python verify_om_models.py --quiet         # sem progresso ao vivo (dump no final)
     python verify_om_models.py --json
     python verify_om_models.py --test          # self-test hermético (sem rede)
 """
@@ -32,6 +42,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -59,6 +70,29 @@ def _classify_reason(reason: str) -> str:
     return "unknown_4xx"
 
 
+def _get_with_retry(url: str, params: dict, timeout: int = 20,
+                    retries: int = 1, backoff: float = 0.5):
+    """requests.get with a short retry on transient connection failures.
+
+    A --per-city run fires ~100+ sequential requests at the same host; in
+    practice a handful reset mid-sequence (ConnectionResetError) with nothing
+    wrong with the model/city — a real-world run surfaced 4 of these out of
+    145 calls. Retrying once turns a false '⚠ revisar' into the ✅ it should
+    be. Deterministic HTTP responses (200/4xx) never need a retry — only
+    exceptions from the transport layer do. Raises the last exception after
+    exhausting retries; the caller (probe_model) catches it same as before.
+    """
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            return requests.get(url, params=params, timeout=timeout)
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            if attempt < retries:
+                time.sleep(backoff)
+    raise last_exc
+
+
 def probe_model(model_key: str, lat: float, lon: float,
                 date_iso: str) -> dict:
     """Uma chamada à Open-Meteo para UM modelo em (lat, lon) no dia-alvo.
@@ -72,7 +106,7 @@ def probe_model(model_key: str, lat: float, lon: float,
            "http": None, "status": "error", "reason": None,
            "n_hours": 0, "sample_max_c": None}
     try:
-        r = requests.get(
+        r = _get_with_retry(
             OM_FORECAST_URL,
             params={
                 "latitude": lat, "longitude": lon,
@@ -83,7 +117,7 @@ def probe_model(model_key: str, lat: float, lon: float,
             },
             timeout=20,
         )
-    except Exception as e:  # rede/DNS/timeout
+    except Exception as e:  # rede/DNS/timeout, após esgotar o retry
         rep["reason"] = f"request_failed: {e}"
         return rep
 
@@ -146,7 +180,19 @@ def _fmt(rep: dict) -> str:
 
 
 def run(cities: dict, *, per_city: bool, only_models: list | None,
-        date_iso: str) -> dict:
+        date_iso: str, progress: bool = False) -> dict:
+    """Probe the trio baseline, each distinct om_models key, and (if per_city)
+    every (city, model) pair. Sequential — a --per-city sweep over the full
+    config is ~145 HTTP calls, each up to 20s on failure.
+
+    progress=True prints each result AS IT HAPPENS (with a running [i/N]
+    counter), instead of silently collecting everything and dumping it all at
+    the end. A real run against production config surfaced 145 sequential
+    calls with zero feedback in between — indistinguishable from a hang, and
+    the exact bug report this addresses. progress=False keeps the original
+    silent behavior for callers (e.g. the self-test) that don't want stdout
+    noise; --quiet on the CLI restores it for interactive use too.
+    """
     stations = cities.get("stations", {})
     by_key = _distinct_keys(stations)
     if only_models:
@@ -161,21 +207,7 @@ def run(cities: dict, *, per_city: bool, only_models: list | None,
     ref_lat = (ref or {}).get("lat", 51.5)
     ref_lon = (ref or {}).get("lon", 0.0)
 
-    report = {"date": date_iso, "baseline": [], "per_key": [], "per_city": []}
-
-    for mk in trio:
-        report["baseline"].append(probe_model(mk, ref_lat, ref_lon, date_iso))
-
-    # Uma probe por chave distinta, na primeira cidade que a usa (coords que a
-    # config afirma estarem no domínio do modelo).
-    for mk, city_list in by_key.items():
-        rep_city = city_list[0]
-        s = stations[rep_city]
-        rep = probe_model(mk, s["lat"], s["lon"], date_iso)
-        rep["representative_city"] = rep_city
-        rep["n_cities"] = len(city_list)
-        report["per_key"].append(rep)
-
+    per_city_pairs = []
     if per_city:
         for city, s in stations.items():
             if not isinstance(s, dict):
@@ -183,16 +215,68 @@ def run(cities: dict, *, per_city: bool, only_models: list | None,
             models = s.get("om_models") or []
             if only_models:
                 models = [m for m in models if m in only_models]
-            if not models:
-                continue
+            if models:
+                per_city_pairs.append((city, s, models))
+
+    total = len(trio) + len(by_key) + sum(len(m) for _, _, m in per_city_pairs)
+    done = 0
+
+    def _stream(rep: dict, suffix: str = "") -> dict:
+        nonlocal done
+        done += 1
+        if progress:
+            print(f"[{done}/{total}] {_fmt(rep).lstrip()}{suffix}", flush=True)
+        return rep
+
+    report = {"date": date_iso, "baseline": [], "per_key": [], "per_city": []}
+
+    if progress:
+        print(f"Verificação de chaves de modelo Open-Meteo "
+              f"(dia-alvo {date_iso}) — {total} chamadas HTTP no total\n")
+        print("● Baseline (trio global — DEVE ser tudo ✅):")
+    for mk in trio:
+        report["baseline"].append(
+            _stream(probe_model(mk, ref_lat, ref_lon, date_iso)))
+    if progress and not all(r["status"] == "valid" for r in report["baseline"]):
+        print("\n  ⚠ O trio global falhou — provável problema de rede/API no "
+              "host (proxy? sem internet?), NÃO as chaves regionais. "
+              "Resolva isto antes de interpretar o resto.\n")
+
+    # Uma probe por chave distinta, na primeira cidade que a usa (coords que a
+    # config afirma estarem no domínio do modelo).
+    if progress:
+        print("\n● Por chave distinta (1 probe na cidade representante):")
+    for mk, city_list in by_key.items():
+        rep_city = city_list[0]
+        s = stations[rep_city]
+        rep = probe_model(mk, s["lat"], s["lon"], date_iso)
+        rep["representative_city"] = rep_city
+        rep["n_cities"] = len(city_list)
+        _stream(rep, suffix=f"   [{rep_city} · {len(city_list)} cidades]")
+        report["per_key"].append(rep)
+
+    if per_city:
+        if progress:
+            print("\n● Por (cidade, modelo) — cobertura de domínio:")
+        for city, s, models in per_city_pairs:
             probes = [probe_model(m, s["lat"], s["lon"], date_iso)
                       for m in models]
+            if progress:
+                bad = [p for p in probes if p["status"] != "valid"]
+                flag = "  ⚠ revisar" if bad else ""
+                print(f"  {city} ({s.get('station')}){flag}")
+                for p in probes:
+                    _stream(p)
+            else:
+                done += len(probes)
             report["per_city"].append({"city": city, "station": s.get("station"),
                                         "probes": probes})
     return report
 
 
-def _print_report(report: dict, per_city: bool) -> int:
+def _print_bodies(report: dict, per_city: bool) -> None:
+    """Full non-streamed dump of every probe — used only with --quiet, where
+    run() was called with progress=False and nothing was printed yet."""
     print(f"Verificação de chaves de modelo Open-Meteo "
           f"(dia-alvo {report['date']})\n")
 
@@ -220,7 +304,10 @@ def _print_report(report: dict, per_city: bool) -> int:
             for p in row["probes"]:
                 print(_fmt(p))
 
+
+def _print_summary(report: dict) -> int:
     # Resumo/veredito
+    baseline_ok = all(r["status"] == "valid" for r in report["baseline"])
     invalid = [r for r in report["per_key"] if r["status"] == "invalid_key"]
     domain = [r for r in report["per_key"]
               if r["status"] in ("out_of_domain", "no_data")]
@@ -331,7 +418,24 @@ def _test() -> int:
         assert icon_eu["n_cities"] == 2 and icon_eu["representative_city"] == "London", icon_eu
         print("T7 PASS: run() agrega baseline(3) + per_key(distintas) + per_city(2)")
 
-        print("\nAll verify_om_models self-tests PASS (7/7)")
+        # T8: retry recupera de UM reset de conexão transitório — o modo de
+        # falha real do run de 2026-07-09 (4 "Connection aborted" em 145
+        # chamadas). 1a chamada levanta ConnectionError, 2a sucede.
+        calls = {"n": 0}
+        def _flaky(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise requests.exceptions.ConnectionError(
+                    "('Connection aborted.', ConnectionResetError(10054, ...))")
+            return _R(200, {"hourly": {"temperature_2m": [22.0, 30.5]}})
+        requests.get = _flaky
+        r = probe_model("gfs_seamless", 52.5, 13.4, "2026-07-10")
+        assert r["status"] == "valid" and r["sample_max_c"] == 30.5, r
+        assert calls["n"] == 2, calls
+        print("T8 PASS: reset de conexão na 1a tentativa, retry recupera -> "
+              "valid (não vira falso '⚠ revisar' por blip transitório)")
+
+        print("\nAll verify_om_models self-tests PASS (8/8)")
         return 0
     finally:
         requests.get = saved
@@ -349,6 +453,9 @@ def main() -> int:
     ap.add_argument("--date", default=None,
                     help="dia-alvo YYYY-MM-DD (default: amanhã UTC)")
     ap.add_argument("--json", action="store_true", help="saída JSON crua")
+    ap.add_argument("--quiet", action="store_true",
+                    help="não imprime progresso em tempo real; junta tudo no "
+                        "final como antes (útil ao redirecionar para arquivo)")
     ap.add_argument("--test", action="store_true",
                     help="self-test hermético (sem rede)")
     args = ap.parse_args()
@@ -358,15 +465,20 @@ def main() -> int:
 
     date_iso = args.date or _tomorrow_iso()
     cities = weh.load_cities()
+    stream = not args.json and not args.quiet
     report = run(cities, per_city=args.per_city, only_models=args.models,
-                 date_iso=date_iso)
+                 date_iso=date_iso, progress=stream)
     if args.json:
         print(json.dumps(report, indent=2, ensure_ascii=False))
         # ainda retorna código de saída acionável
         invalid = any(r["status"] == "invalid_key" for r in report["per_key"])
         baseline_ok = all(r["status"] == "valid" for r in report["baseline"])
         return 1 if (invalid or not baseline_ok) else 0
-    return _print_report(report, args.per_city)
+    if not stream:
+        _print_bodies(report, args.per_city)
+    else:
+        print()  # espaçamento antes do resumo, como no dump não-streamed
+    return _print_summary(report)
 
 
 if __name__ == "__main__":
