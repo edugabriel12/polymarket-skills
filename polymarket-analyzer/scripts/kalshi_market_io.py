@@ -319,13 +319,42 @@ _STRIKE_TYPE_MAP = {
 }
 
 
+def _continuity_correct(strike: float, comparison: str) -> float:
+    """Correção de continuidade para strikes de cauda (T-strikes).
+
+    O CLI do NWS reporta temperatura INTEIRA e a regra da Kalshi é estrita —
+    rules_primary real (KXHIGHNY-26JUL11-T88, smoke do operador 2026-07-10):
+    "...is greater than 88°, then the market resolves to Yes". Com reporte
+    inteiro, ">88" é o evento "reportado ≥ 89" ⟺ temperatura contínua
+    ≥ 88.5. Sem a correção, o CDF contínuo em 88.0 superestima P(YES) pela
+    massa em (88.0, 88.5) — edge fantasma de vários pp perto do strike.
+
+      greater: menor inteiro m > strike é floor(strike)+1 → limiar m − 0.5
+               = floor(strike) + 0.5   (88 → 88.5; 83.99 → 83.5;
+               87.5 → 87.5 inalterado)
+      below:   maior inteiro m < strike é ceil(strike)−1 → limiar m + 0.5
+               = ceil(strike) − 0.5    (56 → 55.5; 60.5 → 60.5 inalterado)
+
+    'between' NÃO passa por aqui: os B-strikes da Kalshi já vêm em .5
+    (B87.5/B89.5 ⟺ reportado ∈ {88, 89}) — a janela contínua coincide.
+    """
+    if comparison == "exceed":
+        return math.floor(strike) + 0.5
+    if comparison == "below":
+        return math.ceil(strike) - 0.5
+    return strike
+
+
 def build_market_spec(market: dict, city: str, temp_kind: str) -> Optional[MarketSpec]:
     """Constrói o MarketSpec a partir dos campos ESTRUTURADOS de um mercado
     Kalshi (floor_strike/cap_strike/strike_type/event_ticker) — nada de
     regex sobre o título. Fail-open: None se faltar qualquer campo.
 
     Convenção Kalshi: 'greater' usa floor_strike; 'less' usa cap_strike;
-    'between' usa ambos. threshold_unit é sempre F (mercados US)."""
+    'between' usa ambos. threshold_unit é sempre F (mercados US).
+    Strikes de cauda recebem correção de continuidade (ver
+    _continuity_correct) — o threshold armazenado é o LIMIAR CONTÍNUO do
+    evento de settlement, não o strike nominal."""
     if not market or not city:
         return None
     comparison = _STRIKE_TYPE_MAP.get((market.get("strike_type") or "").lower())
@@ -340,12 +369,12 @@ def build_market_spec(market: dict, city: str, temp_kind: str) -> Optional[Marke
     elif comparison == "exceed":
         if floor_v is None:
             return None
-        threshold, threshold_high = floor_v, None
+        threshold, threshold_high = _continuity_correct(floor_v, "exceed"), None
     else:  # below
         v = cap_v if cap_v is not None else floor_v
         if v is None:
             return None
-        threshold, threshold_high = v, None
+        threshold, threshold_high = _continuity_correct(v, "below"), None
 
     target = parse_event_date(market.get("event_ticker")
                               or market.get("ticker") or "")
@@ -634,8 +663,24 @@ def _test() -> int:
         assert build_market_spec({**base_m, "event_ticker": "KXHIGHNY",
                                   "ticker": "KXHIGHNY"},
                                  "New York", "high") is None
-        print("T3 PASS: specs greater/less/between; fail-open sem strike/"
-              "strike_type desconhecido/sem data")
+        # Correção de continuidade em strikes INTEIROS de cauda: rules real
+        # de KXHIGHNY-...-T88 é "greater than 88°" com CLI inteiro →
+        # evento é ≥89 ⟺ limiar contínuo 88.5. Strikes .5 não mudam.
+        sp_int = build_market_spec({**base_m, "floor_strike": "88"},
+                                   "New York", "high")
+        assert sp_int and sp_int.threshold_value == 88.5, sp_int
+        sp_hr = build_market_spec({**base_m, "floor_strike": "83.99"},
+                                  "New York", "high")
+        assert sp_hr and sp_hr.threshold_value == 83.5, sp_hr
+        sp_less_int = build_market_spec(
+            {**base_m, "strike_type": "less", "floor_strike": None,
+             "cap_strike": "56"}, "New York", "low")
+        assert sp_less_int and sp_less_int.threshold_value == 55.5, sp_less_int
+        assert _continuity_correct(87.5, "exceed") == 87.5
+        assert _continuity_correct(60.5, "below") == 60.5
+        print("T3 PASS: specs greater/less/between; correção de "
+              "continuidade (88→88.5, 83.99→83.5, <56→55.5; .5 inalterado); "
+              "fail-open sem strike/strike_type desconhecido/sem data")
 
         # T4: parse_event_date incluindo virada de ano e formatos.
         assert parse_event_date("KXHIGHNY-26JUL12-B85") == date(2026, 7, 12)
