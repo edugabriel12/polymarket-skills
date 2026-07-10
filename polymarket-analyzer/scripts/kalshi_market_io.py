@@ -47,6 +47,15 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
+# Windows: stdout PIPADO cai em cp1252, que não codifica ●/→/≥ — o --sample
+# do smoke do operador (2026-07-10) morreu com UnicodeEncodeError dentro de
+# `| Out-File`. Mesma proteção já usada no weather_edge_judge.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except (AttributeError, OSError):
+    pass
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import requests  # noqa: E402
@@ -723,22 +732,32 @@ def _test() -> int:
         print("T6 PASS: série→cidade exato + fallback por título "
               "(LA≠Philadelphia, furacão → None)")
 
-        # T7: config real válida — 11 cidades, chaves obrigatórias, pilot,
-        # estações batendo com o playbook.
+        # T7: config real válida — 20 cidades (11 originais + 9 confirmadas
+        # via settlement_sources da API no sweep de 2026-07-10), chaves
+        # obrigatórias, pilot, estações batendo com a fonte primária.
         cfg = load_kalshi_cities()
         cities = cfg.get("cities") or {}
-        assert len(cities) == 11, len(cities)
+        assert len(cities) == 20, len(cities)
         req = {"series_high", "series_low", "station", "wfo", "lat", "lon",
                "timezone", "pilot", "om_models", "risk_notes", "confirmation"}
         for name, c in cities.items():
             assert req <= set(c), (name, req - set(c))
             assert c["pilot"] is True, name
+            # v2: settlement_sources confirmou TODAS — nenhum series_low
+            # fica null (LA/PHX/PHIL/MIA preenchidos no sweep).
+            assert c["series_high"] and c["series_low"], name
         expected = {"New York": "KNYC", "Chicago": "KMDW", "Houston": "KHOU",
-                    "Austin": "KAUS", "Denver": "KDEN"}
+                    "Austin": "KAUS", "Denver": "KDEN",
+                    # sweep 2026-07-10: hipóteses confirmadas + Dallas
+                    # resolvido para KDFW (não KDAL do fluxo Polymarket).
+                    "Seattle": "KSEA", "Dallas": "KDFW",
+                    "San Antonio": "KSAT", "New Orleans": "KMSY",
+                    "Minneapolis": "KMSP"}
         for city, icao in expected.items():
             assert cities[city]["station"] == icao, (city, cities[city]["station"])
-        print("T7 PASS: kalshi-cities.json válido (11 cidades, chaves ok, "
-              "pilot=true, KNYC/KMDW/KHOU/KAUS/KDEN corretos)")
+        print("T7 PASS: kalshi-cities.json válido (20 cidades, chaves ok, "
+              "pilot=true, lows preenchidos, KNYC/KMDW/KHOU/KAUS/KDEN + "
+              "KSEA/KDFW/KSAT/KMSY/KMSP corretos)")
 
         # T8: implied_from_market_row → shape do implied_probabilities.
         imp = implied_from_market_row({
