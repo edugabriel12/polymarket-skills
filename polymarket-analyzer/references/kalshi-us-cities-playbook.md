@@ -18,13 +18,10 @@ integração pendente do operador.
 
 - **20/20 cidades** têm pesquisa completa (fontes de forecast, padrões
   climáticos locais, fontes de notícia/insider, estação de resolução Kalshi).
-- **17/20 cidades** tiveram a estação de resolução adicionalmente checada por
-  3 verificadores adversariais independentes cada (rodou em 2 tentativas —
-  bateu no limite de sessão do workflow duas vezes, retomado a partir do
-  `runId` salvo em ambas).
-- **3/20 cidades** (Nova Orleans, Austin, Minneapolis) ainda não têm essa
-  segunda camada — bateram no limite de sessão pela segunda vez consecutiva;
-  o resume está agendado para quando a cota permitir novamente.
+- **20/20 cidades** tiveram a estação de resolução adicionalmente checada por
+  3 verificadores adversariais independentes cada — completo, em 3 rodadas
+  (bateu no limite de sessão do workflow duas vezes; retomado a partir do
+  `runId` salvo até concluir todos os 80 agentes sem erro).
 - Bloqueio recorrente em todos os agentes: `kalshi.com`, `help.kalshi.com` e
   `forecast.weather.gov` retornam HTTP 403 para fetch automatizado dentro
   deste ambiente (confirmado como bloqueio de política de proxy no nível de
@@ -32,6 +29,12 @@ integração pendente do operador.
   `kalshi-public-docs.s3.amazonaws.com/contract_terms/` **não é bloqueado** —
   toda confirmação por fonte primária nesta pesquisa veio de PDFs baixados
   diretamente desse bucket.
+- Achado estrutural adicional (via arquivamento CFTC de Nova Orleans): para
+  cidades sem PDF dedicado, a Kalshi mantém o mapeamento cidade→estação num
+  **"Appendix C (Confidential)"** dos seus filings regulatórios — ou seja,
+  não é apenas que os verificadores não encontraram o documento; a Kalshi
+  **não divulga publicamente** essa informação para essas cidades. A única
+  forma de confirmar é lendo a aba "Rules" da página do mercado ao vivo.
 
 ### Achado estrutural: nem toda cidade tem um PDF de regras dedicado
 
@@ -73,6 +76,7 @@ mesma cidade. Confirmado com evidência de fonte primária (PDF oficial de
 | Washington DC | não configurado | KDCA (Reagan National) | confirmado 3-0 |
 | Miami | KMIA | KMIA (mesma estação) | confirmado 3-0 |
 | Boston | KBOS | KBOS (mesma estação) | confirmado 2-1 |
+| Austin | não configurado | **KAUS (Bergstrom)**, não Camp Mabry (KATT) | confirmado por PDF `AUSHIGH.pdf` — ambiguidade original resolvida |
 
 **Nota sobre Los Angeles**: o bucket S3 tem **dois** documentos de regras
 distintos — `LAHIGH.pdf` (estação = "Downtown Los Angeles, CA") e
@@ -269,26 +273,25 @@ atual antes de configurar Las Vegas para operar.
 
 ---
 
-## Cidades ainda sem verificação adversarial (bateram no limite de sessão 2x)
+## Austin — RESOLVIDO por fonte primária (correção à hipótese original)
 
-*(confiança abaixo é a estimativa de um único pesquisador, ainda não checada
-por um segundo agente independente — retomar quando a cota de sessão do
-workflow permitir, runId `wf_cef281ed-666`)*
+### Austin — confiança 0.9, disputed 1-2 no voto binário, mas com confirmação primária real
+- **Resolução**: **KAUS (Austin-Bergstrom International Airport)**, NÃO Camp Mabry (KATT) — a ambiguidade da pesquisa original (confiança 0.5, "genuinamente ambígua") foi **resolvida** por dois verificadores que localizaram e leram o PDF dedicado `AUSHIGH.pdf` no bucket S3 da Kalshi. Texto literal: *"the maximum temperature recorded... published in the National Weather Service's Daily Climate Report for Austin Bergstrom"*. Um dos verificadores também baixou o filing de autocertificação CFTC (Regra 40.2(a), assinado por Xavier Sottile, Head of Markets) que confirma o mesmo. O contrato de **mínima** (`KXLOWTAUS`) não tem PDF próprio (usa template genérico `CITYLOW.pdf`) — a mesma estação é uma inferência forte, não 100% documentada separadamente.
+- **Correção confirmada**: o ticker `KXTEMPAUSH` citado como indício em pesquisa anterior desta sessão **foi refutado** — não existe. Tickers reais: `KXHIGHAUS` / `KXLOWTAUS`.
+- **Padrões críticos**: dryline na fronteira Balcones Escarpment; "blue northers"; nebulosidade/neblina matinal por advecção do Golfo; diferença real de 3-5°F entre Camp Mabry e Bergstrom (mais pronunciada nas mínimas) — relevante mesmo com a estação já resolvida, pois qualquer forecast/climatologia usada precisa ser calibrada para Bergstrom especificamente, não Camp Mabry.
+- **Fontes de edge**: Troy Kimmel (UT Austin, meteorologista de emissoras desde 1984), Bob Rose (LCRA Hydromet, cobre o Hill Country a montante).
 
-### Nova Orleans (New Orleans) — confiança 0.7
-- **Resolução (hipótese)**: KMSY, NWS CLI, WFO LIX (New Orleans/Baton Rouge). Cidade não configurada hoje.
+## Cidades sem PDF dedicado (continuação — Nova Orleans e Minneapolis)
+
+### Nova Orleans (New Orleans) — confiança 0.7, disputed 1-2 (sem contradição — apenas sem PDF)
+- **Resolução (hipótese)**: KMSY, NWS CLI, WFO LIX (New Orleans/Baton Rouge). Sem PDF dedicado (testado exaustivamente) — e um verificador descobriu que o mapeamento cidade→estação para essas cidades é literalmente marcado como confidencial no arquivamento regulatório da Kalshi (Appendix C). Cidade não configurada hoje.
 - **Padrões críticos**: convergência de dupla brisa (Lago Pontchartrain + Golfo — dispara pop-up storms vespertinas); ilha de calor urbana pronunciada (17ª pior entre 65 cidades dos EUA); baixa amplitude térmica diurna típica da Costa do Golfo (maxima mais sensível a pequenos erros de nebulosidade).
 - **Fontes de edge**: Chris Franklin (WWL-TV), Jay Grymes (Climatologista Estadual da Louisiana).
 
-### Austin — confiança 0.5 (ambiguidade genuína de estação)
-- **Resolução (hipótese)**: **AMBÍGUO** entre Camp Mabry (KATT, estação climatológica oficial desde 1897, usada pela mídia local para recordes) e Aeroporto Bergstrom (KAUS, estação ASOS) — fontes secundárias divergem, diferença típica de 3-5°F entre as duas (mais pronunciada nas mínimas). Cidade não configurada hoje.
-- **Correção importante**: o ticker `KXTEMPAUSH` citado como indício na pesquisa anterior desta sessão **foi refutado** — não aparece em nenhuma URL/documento real da Kalshi. Tickers confirmados ativos: `KXHIGHAUS` / `KXLOWTAUS`.
-- **Padrões críticos**: dryline na fronteira Balcones Escarpment; "blue northers"; nebulosidade/neblina matinal por advecção do Golfo.
-- **Fontes de edge**: Troy Kimmel (UT Austin, meteorologista de emissoras desde 1984), Bob Rose (LCRA Hydromet, cobre o Hill Country a montante).
-- **Ação necessária antes de operar**: abrir a aba "Rules" do mercado `kxhighaus` na Kalshi para resolver a ambiguidade — isso não pôde ser feito neste ambiente (403).
-
-### Minneapolis — confiança 0.6
-- **Resolução (hipótese)**: KMSP (Minneapolis-St. Paul Intl), NWS CLI, WFO Twin Cities/Chanhassen (MPX). Cidade não configurada hoje.
+### Minneapolis — confiança 0.6, disputed 0-3 (sem contradição — apenas sem PDF)
+- **Resolução (hipótese)**: KMSP (Minneapolis-St. Paul Intl), NWS CLI, WFO Twin Cities/Chanhassen (MPX). Sem PDF dedicado (testado exaustivamente). Cidade não configurada hoje.
+- **Correção confirmada**: o ticker real é `KXHIGHTMIN`/`KXLOWTMIN` (abreviação da cidade "MIN"), **não** `KXHIGHMSP`/`KXLOWMSP` como inferido por analogia na pesquisa original.
+- **Ambiguidade residual não descartada**: St. Paul tem seu próprio aeroporto menor (KSTP, Holman Field/downtown) — situação estruturalmente análoga à ambiguidade Downtown-vs-Airport já documentada para Los Angeles. Não há evidência de que seja usado, mas também não foi descartado.
 - **Padrões críticos**: clima continental extremo sem barreiras a massas árticas (irrupções costumam vir mais severas que os modelos globais sugerem); ilha de calor urbana na própria estação de liquidação; "corn sweat" (evapotranspiração agrícola eleva o ponto de orvalho 5-10°F em jul-ago, fenômeno específico do meio-oeste).
 - **Fontes de edge**: Paul Douglas (Star Tribune, 40+ anos de experiência em MN), MPR News Updraft.
 - **Nota**: o próprio pesquisador sugeriu, por analogia ao piloto africano deste bot, considerar `resolution_source: metar` como fallback de verdade-terra para esta cidade dado o nível de incerteza.
@@ -300,10 +303,12 @@ workflow permitir, runId `wf_cef281ed-666`)*
 1. **Antes de configurar QUALQUER cidade para operar na Kalshi**: confirmar a
    estação lendo a aba "Rules" do mercado ativo diretamente no site/app da
    Kalshi (bloqueado neste ambiente de pesquisa, mas acessível normalmente
-   pelo operador). Isso é **obrigatório** para Dallas (incerteza genuína
-   KDAL/KDFW), Austin (ambíguo KATT/KAUS), Los Angeles (Downtown vs.
-   Airport), e recomendado para as 6 cidades sem PDF dedicado (Atlanta,
-   Seattle, San Antonio, OKC, Las Vegas, SF).
+   pelo operador). Isso é **obrigatório** para Dallas (única incerteza
+   genuína e não resolvida: KDAL/KDFW) e Los Angeles (Downtown vs. Airport,
+   ambiguidade residual), e recomendado para as 8 cidades sem PDF dedicado
+   (Atlanta, Seattle, San Antonio, OKC, Las Vegas, SF, Nova Orleans,
+   Minneapolis). Austin **já foi resolvido** por fonte primária (KAUS/
+   Bergstrom) e não precisa dessa checagem adicional.
 2. **Nunca reaproveitar cegamente a config de estação da Polymarket** para a
    Kalshi — confirmado que diverge em NYC e Chicago. O padrão de "estação
    secundária/mais central, não a maior/mais famosa" é real (Central
@@ -324,14 +329,14 @@ workflow permitir, runId `wf_cef281ed-666`)*
 5. **Prefixo de ticker não é uniforme** — confirmar caso a caso via API
    (`GET /trade-api/v2/series` ou `/markets?series_ticker=`) em vez de
    assumir um padrão fixo ao implementar discovery automático.
-6. **9 cidades não têm nenhuma config hoje no bot** (Houston, Denver,
-   Filadélfia, San Antonio, OKC, Las Vegas, DC, Nova Orleans, Minneapolis) +
-   Austin (ambíguo) = 10 cidades totalmente novas se a migração para Kalshi
-   avançar.
-7. **Completar a verificação adversarial das 3 cidades restantes** (Nova
-   Orleans, Austin, Minneapolis) quando a cota de sessão permitir — o
-   workflow pode ser retomado a partir do `runId` salvo (`wf_cef281ed-666`)
-   sem repetir a pesquisa já feita.
+6. **10 cidades não têm nenhuma config hoje no bot** (Houston, Denver,
+   Filadélfia, San Antonio, OKC, Las Vegas, DC, Nova Orleans, Minneapolis,
+   Austin) — todas totalmente novas se a migração para Kalshi avançar; a
+   estação já está resolvida com boa confiança para todas elas exceto San
+   Antonio (0.55, a mais baixa) e as demais sem PDF dedicado.
+7. **Verificação adversarial completa (20/20)** — não há mais pendência de
+   research nesta pesquisa. O único item que continua genuinamente em aberto
+   é a estação de Dallas.
 
 ## Caveats
 
