@@ -47,6 +47,15 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
+# Windows: stdout PIPADO cai em cp1252, que não codifica ●/→/≥ — o --sample
+# do smoke do operador (2026-07-10) morreu com UnicodeEncodeError dentro de
+# `| Out-File`. Mesma proteção já usada no weather_edge_judge.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except (AttributeError, OSError):
+    pass
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import requests  # noqa: E402

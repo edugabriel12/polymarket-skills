@@ -58,6 +58,14 @@ import json
 import sys
 from pathlib import Path
 
+# Windows: stdout pipado cai em cp1252 (sem ●/→/≥) — força UTF-8, mesma
+# proteção do weather_edge_judge.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except (AttributeError, OSError):
+    pass
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import requests  # noqa: E402  (usado pelos self-tests p/ monkeypatch)
