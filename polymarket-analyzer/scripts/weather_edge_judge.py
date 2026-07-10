@@ -102,7 +102,10 @@ _load_dotenv()
 import weather_edge_db as db  # noqa: E402
 
 LOG_DIR = Path.home() / ".polymarket-paper"
-LOG_FILE = LOG_DIR / "weather_edge.jsonl"
+# WEATHER_EDGE_JUDGE_LOG permite a uma segunda instância do judge (ex.: a do
+# bot Kalshi, apontada para outro DB via WEATHER_EDGE_DB_PATH) escrever num
+# JSONL próprio em vez de misturar eventos no log da instância Polymarket.
+LOG_FILE = Path(os.environ.get("WEATHER_EDGE_JUDGE_LOG") or (LOG_DIR / "weather_edge.jsonl"))
 PROMPT_PATH = REPO_ROOT / "polymarket-analyzer" / "references" / "weather-judge-prompt.md"
 
 DEFAULT_MODEL = os.environ.get("CLAUDE_JUDGE_MODEL", "claude-sonnet-5")
@@ -1588,9 +1591,13 @@ def main():
     signal.signal(signal.SIGINT, _handle_sig)
 
     db.init_db()
-    # PID file for dashboard-driven restart.
+    # PID file for dashboard-driven restart. WEATHER_EDGE_JUDGE_PID permite a
+    # uma segunda instância (ex.: judge do bot Kalshi) usar um pid file
+    # próprio — sem isso, o unlink no shutdown de uma instância apagaria o
+    # pid da outra.
     from pathlib import Path as _P
-    pid_file = _P.home() / ".polymarket-paper" / "judge.pid.json"
+    pid_file = _P(os.environ.get("WEATHER_EDGE_JUDGE_PID")
+                  or (_P.home() / ".polymarket-paper" / "judge.pid.json"))
     try:
         pid_file.parent.mkdir(parents=True, exist_ok=True)
         tmp = pid_file.with_suffix(".tmp")

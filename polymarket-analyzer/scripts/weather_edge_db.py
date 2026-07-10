@@ -9,13 +9,21 @@ judge_reviews. See plan in /root/.claude/plans/ for column definitions.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-DB_PATH = Path.home() / ".polymarket-paper" / "weather_edge.db"
+# WEATHER_EDGE_DB_PATH permite apontar uma instância inteira de bot+judge para
+# outro arquivo (ex.: o bot Kalshi usa kalshi_edge.db com o mesmo schema).
+# Lido UMA vez na importação — processos que precisam do override devem setar
+# a env var antes de importar este módulo.
+DB_PATH = Path(
+    os.environ.get("WEATHER_EDGE_DB_PATH")
+    or (Path.home() / ".polymarket-paper" / "weather_edge.db")
+)
 SCHEMA_VERSION = 11
 
 
@@ -1180,6 +1188,51 @@ def _test_migration_v11_strategy():
     tmp.unlink()
 
 
+def _test_db_path_env():
+    """WEATHER_EDGE_DB_PATH deve redirecionar DB_PATH no import (subprocess)
+    e, ausente, DB_PATH deve continuar no default — sem tocar o DB real."""
+    import os as _os
+    import subprocess
+    import sys as _sys
+    import tempfile
+    from pathlib import Path as P
+
+    tmpdir = P(tempfile.mkdtemp())
+    custom = tmpdir / "kalshi_edge.db"
+    probe = (
+        "import weather_edge_db as db; "
+        "db.init_db(); "
+        "print(db.DB_PATH)"
+    )
+
+    # 1. Com env: DB_PATH aponta para o custom e init_db cria o arquivo lá.
+    env = dict(_os.environ)
+    env["WEATHER_EDGE_DB_PATH"] = str(custom)
+    out = subprocess.run(
+        [_sys.executable, "-c", probe],
+        env=env, capture_output=True, text=True,
+        cwd=P(__file__).resolve().parent,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == str(custom), out.stdout
+    assert custom.exists(), "init_db não criou o DB no path do env"
+
+    # 2. Sem env: DB_PATH resolve no default (só checa o valor — não roda
+    #    init_db para não tocar o DB real do operador).
+    env.pop("WEATHER_EDGE_DB_PATH", None)
+    out = subprocess.run(
+        [_sys.executable, "-c", "import weather_edge_db as db; print(db.DB_PATH)"],
+        env=env, capture_output=True, text=True,
+        cwd=P(__file__).resolve().parent,
+    )
+    assert out.returncode == 0, out.stderr
+    expected_default = str(P.home() / ".polymarket-paper" / "weather_edge.db")
+    assert out.stdout.strip() == expected_default, out.stdout
+
+    print("Test PASS: WEATHER_EDGE_DB_PATH redireciona DB_PATH no import; "
+          "default preservado sem a env")
+
+
 if __name__ == "__main__":
     import sys
     if "--test-judge-join" in sys.argv:
@@ -1199,6 +1252,9 @@ if __name__ == "__main__":
         sys.exit(0)
     if "--test-pending-order" in sys.argv:
         _test_pending_order()
+        sys.exit(0)
+    if "--test-db-path" in sys.argv:
+        _test_db_path_env()
         sys.exit(0)
     # Smoke test: init DB and print version
     init_db()
