@@ -77,6 +77,7 @@ from kalshi_market_io import (  # noqa: E402
     discover_weather_series,
     fetch_open_markets,
     fetch_orderbook,
+    raw_book_sides,
 )
 
 
@@ -176,7 +177,12 @@ def run(*, want_markets: bool = False, want_orderbook: bool = False,
                     "status": m.get("status"),
                     "volume": _to_float(m.get("volume_fp")),
                     "open_interest": _to_float(m.get("open_interest_fp")),
-                    "liquidity": _to_float(m.get("liquidity_dollars")),
+                    # liquidity_dollars sumiu do payload real (jul/2026) —
+                    # tenta as variantes; "liquidity" legado vem em cents.
+                    "liquidity": (_to_float(m.get("liquidity_dollars"))
+                                  or _to_float(m.get("liquidity_fp"))
+                                  or ((_to_float(m.get("liquidity")) or 0) / 100.0
+                                      or None)),
                     "yes_bid": _to_float(m.get("yes_bid_dollars")),
                     "yes_ask": _to_float(m.get("yes_ask_dollars")),
                     "no_bid": _to_float(m.get("no_bid_dollars")),
@@ -239,11 +245,11 @@ def _print_report(report: dict, want_markets: bool, want_orderbook: bool) -> int
         for m in markets:
             print(_fmt_market(m))
             if want_orderbook and m.get("orderbook") is not None:
-                ob = m["orderbook"]
-                yes_levels = len((ob.get("orderbook") or {}).get("yes") or [])
-                no_levels = len((ob.get("orderbook") or {}).get("no") or [])
-                print(f"        orderbook: {yes_levels} níveis YES, "
-                      f"{no_levels} níveis NO")
+                # raw_book_sides entende os dois formatos da API
+                # (orderbook_fp/yes_dollars novo e orderbook/yes legado).
+                yes_raw, no_raw = raw_book_sides(m["orderbook"])
+                print(f"        orderbook: {len(yes_raw)} níveis YES, "
+                      f"{len(no_raw)} níveis NO")
             elif want_orderbook:
                 print("        orderbook: indisponível")
         print()

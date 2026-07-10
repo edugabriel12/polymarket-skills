@@ -2443,8 +2443,12 @@ def run_monitor_tick(args, cities: dict) -> None:
         entry_id = row["entry_id"]
         ttr_h = _ttr_hours(row["end_date"] or "")
         interval = _monitor_interval_for_ttr(ttr_h)
-        last = _last_monitor_per_entry.get(entry_id, 0)
-        if now_mono - last < interval:
+        # Sentinela None = nunca checada → checa JÁ. O default 0 antigo
+        # conflitava com time.monotonic() (segundos desde o BOOT): numa
+        # máquina recém-reiniciada monotonic < interval e todas as posições
+        # eram puladas até o uptime alcançar o intervalo.
+        last = _last_monitor_per_entry.get(entry_id)
+        if last is not None and now_mono - last < interval:
             continue
         _last_monitor_per_entry[entry_id] = now_mono
         try:
@@ -3446,10 +3450,12 @@ def main():
         return
 
     discovery_int = args.discovery_interval_min * 60
-    last_discovery = 0.0
-    last_heartbeat = 0.0
-    last_resolution = 0.0
-    last_execute = 0.0
+    # -inf, não 0.0: monotonic() conta desde o boot, e 0.0 atrasaria o
+    # primeiro ciclo numa máquina recém-reiniciada (uptime < intervalo).
+    last_discovery = float("-inf")
+    last_heartbeat = float("-inf")
+    last_resolution = float("-inf")
+    last_execute = float("-inf")
 
     while not _shutdown:
         now_mono = time.monotonic()
