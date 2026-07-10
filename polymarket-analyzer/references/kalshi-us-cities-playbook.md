@@ -354,3 +354,49 @@ atual antes de configurar Las Vegas para operar.
   menos de 1 ano).
 - Este documento não substitui a checagem em tempo real da API/rules da
   Kalshi antes de qualquer trade real.
+
+---
+
+## ADENDO 2026-07-10 (pós-implementação): 20/20 confirmadas por `settlement_sources` da API
+
+**A pendência acima está encerrada.** Durante o smoke do bot em host real, o
+operador descobriu (com o `--sample` + `GET /series/{ticker}`) que o objeto
+de SÉRIE da API pública carrega o campo `settlement_sources`, com a URL
+exata do produto CLI de resolução — incluindo o WFO (`site=`) e a ESTAÇÃO
+(`issuedby=`). Exemplo real:
+
+```
+GET /trade-api/v2/series/KXHIGHTSEA →
+  "settlement_sources": [{
+    "name": "NWS Climatological Report Seattle",
+    "url": "https://forecast.weather.gov/product.php?site=SEW&product=CLI&issuedby=SEA"
+  }]
+```
+
+Isso torna o "Appendix C confidencial" irrelevante: a estação é pública na
+API, só não estava no `rules_primary` dessas cidades (que diz apenas
+"recorded at Seattle"). Sweep completo do operador (33 séries — highs+lows
+das 20 cidades) em 2026-07-10:
+
+| Cidade | WFO | issuedby | Estação | Veredito vs pesquisa |
+|---|---|---|---|---|
+| Seattle | SEW | SEA | KSEA | hipótese confirmada |
+| Atlanta | FFC | ATL | KATL | hipótese confirmada |
+| San Antonio | EWX | SAT | KSAT | hipótese confirmada (era a de menor confiança, 0.55) |
+| Oklahoma City | OUN | OKC | KOKC | hipótese confirmada |
+| Las Vegas | VEF | LAS | KLAS | hipótese confirmada (⚠️ litígio Nevada segue relevante) |
+| San Francisco | MTR | SFO | KSFO | hipótese confirmada |
+| New Orleans | LIX | MSY | KMSY | hipótese confirmada |
+| Minneapolis | MPX | MSP | KMSP | hipótese confirmada; ambiguidade KSTP descartada |
+| **Dallas** | **FWD** | **DFW** | **KDFW** | **RESOLVIDO — contra o padrão "estação secundária"; NÃO é o KDAL do fluxo Polymarket** |
+| Los Angeles | LOX | LAX | KLAX | ambiguidade Downtown vs Airport resolvida: **Airport** |
+| NYC/Chicago/Houston/Phoenix/Denver/Philly/DC/Miami/Boston/Austin | — | NYC/MDW/HOU/PHX/DEN/PHL/DCA/MIA/BOS/AUS | conforme config | todas as 11 validadas, zero divergência |
+
+Consequências aplicadas:
+1. `references/kalshi-cities.json` expandido para **20 cidades** (as 9 novas
+   com risk_notes deste playbook, `pilot: true`, séries high+low
+   confirmadas; lows de LA/PHX/PHIL/MIA preenchidos — mesma estação do high).
+2. Dallas entra com aviso destacado: climatologia/calibração do fluxo
+   Polymarket é de KDAL e NÃO se aplica a KDFW sem recalibração.
+3. Rota de confirmação recomendada daqui em diante: `GET /series/{ticker}` →
+   `settlement_sources` (mais forte e mais barata que PDF/aba Rules).

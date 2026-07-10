@@ -1,5 +1,5 @@
 {
-  "_doc": "Config das cidades Kalshi (mercados de temperatura). NUNCA reutilizar o dict `stations` do weather-cities.json: a estacao de resolucao da Kalshi DIVERGE da Polymarket em NYC (KNYC Central Park != KLGA) e Chicago (KMDW Midway != KORD). Fonte: kalshi-us-cities-playbook.md (pesquisa 2026-07-10, verificacao adversarial 20/20). Resolucao: a Kalshi liquida SEMPRE pelo NWS Daily Climate Report (produto CLI do WFO local) -- nunca METAR bruto nem agregadores. Dia climatologico em hora padrao local (LST) o ano todo: durante o DST a janela real e 01:00-00:59 local; aproximamos para o dia-calendario local (erro maximo: extremos entre 00:00-01:00 locais). target_date vem da data no event_ticker (ex. -26JUL12 = dia local). series_high/series_low: ticker de serie confirmado por URL/API real, ou null (descoberta em runtime via /series + titulo). lat/lon sao do PONTO DA ESTACAO Kalshi (nao do centro da cidade) -- operador deve confirmar coords de KNYC/KMDW/KHOU/KDEN/KAUS/KPHL/KDCA no primeiro smoke. om_models: null = trio global Open-Meteo (icon_seamless/gfs_seamless/ecmwf_ifs025); candidatos US (gfs_hrrr, ncep_nbm_conus) entram por follow-up de config depois que o operador validar as chaves com verify_om_models.py. pilot: true em todas = judge LLM completo obrigatorio (semantica do piloto Africa) enquanto a venue e nova. risk_notes: injetadas como evidencia no prompt do judge. confirmation: como a estacao foi confirmada na pesquisa (PDF primario + votos da verificacao adversarial).",
+  "_doc": "Config das cidades Kalshi (mercados de temperatura). NUNCA reutilizar o dict `stations` do weather-cities.json: a estacao de resolucao da Kalshi DIVERGE da Polymarket em NYC (KNYC Central Park != KLGA), Chicago (KMDW Midway != KORD) e Dallas (KDFW != KDAL). Fonte: kalshi-us-cities-playbook.md (pesquisa 2026-07-10, verificacao adversarial 20/20) + CONFIRMACAO PRIMARIA DEFINITIVA via settlement_sources da API (GET /series/{ticker} -> settlement_sources[].url com site=WFO e issuedby=ESTACAO), sweep do operador em 2026-07-10 cobrindo as 20 cidades (highs e lows). Resolucao: a Kalshi liquida SEMPRE pelo NWS Daily Climate Report (produto CLI do WFO local) -- nunca METAR bruto nem agregadores. Dia climatologico em hora padrao local (LST) o ano todo: durante o DST a janela real e 01:00-00:59 local; aproximamos para o dia-calendario local (erro maximo: extremos entre 00:00-01:00 locais). target_date vem da data no event_ticker (ex. -26JUL12 = dia local). lat/lon sao do PONTO DA ESTACAO Kalshi (nao do centro da cidade) -- operador deve confirmar coords de KNYC/KMDW/KHOU/KDEN/KAUS/KPHL/KDCA e das 9 novas (KSEA/KATL/KSAT/KOKC/KLAS/KSFO/KMSY/KMSP/KDFW) no primeiro smoke. om_models: null = trio global Open-Meteo (icon_seamless/gfs_seamless/ecmwf_ifs025); candidatos US (gfs_hrrr, ncep_nbm_conus) entram por follow-up de config depois que o operador validar as chaves com verify_om_models.py. pilot: true em todas = judge LLM completo obrigatorio (semantica do piloto Africa) enquanto a venue e nova. risk_notes: injetadas como evidencia no prompt do judge. confirmation: como a estacao foi confirmada.",
   "cities": {
     "New York": {
       "series_high": "KXHIGHNY",
@@ -12,11 +12,11 @@
       "pilot": true,
       "om_models": null,
       "risk_notes": "Brisa maritima x ilha de calor urbana: timing de poucas horas muda a maxima em varios F. Central Park diverge de LGA/JFK/EWR no mesmo evento (jul/2026: LGA recorde de meia-noite enquanto KNYC empatou recorde de 1966). Frentes backdoor do Atlantico/nordeste. ATENCAO: forecast/climatologia calibrados para KLGA (fluxo Polymarket) tem vies sistematico aplicados a KNYC.",
-      "confirmation": "NHIGH.pdf (fonte primaria), verificacao 3-0"
+      "confirmation": "NHIGH.pdf (fonte primaria), verificacao 3-0; settlement_sources API (site=OKX, issuedby=NYC) 2026-07-10"
     },
     "Los Angeles": {
       "series_high": "KXHIGHLAX",
-      "series_low": null,
+      "series_low": "KXLOWTLAX",
       "station": "KLAX",
       "wfo": "LOX",
       "lat": 33.9416,
@@ -24,8 +24,8 @@
       "timezone": "America/Los_Angeles",
       "pilot": true,
       "om_models": null,
-      "risk_notes": "June Gloom/May Gray: horario de dissipacao da camada marinha e a maior fonte de erro. Catalina Eddy prolonga nebulosidade. Santa Ana eleva maxima 10-20F+ em horas, mal cronometrado pelos modelos. KLAX rente a costa: muito mais sensivel a brisa maritima que Downtown/Vale. Ambiguidade residual: existe contrato Downtown LA (LAHIGH.pdf) alem do Airport (LAXHIGH.pdf) -- confirmar aba Rules do mercado ativo.",
-      "confirmation": "LAXHIGH.pdf (fonte primaria), verificacao 3-0; ambiguidade Downtown vs Airport registrada"
+      "risk_notes": "June Gloom/May Gray: horario de dissipacao da camada marinha e a maior fonte de erro. Catalina Eddy prolonga nebulosidade. Santa Ana eleva maxima 10-20F+ em horas, mal cronometrado pelos modelos. KLAX rente a costa: muito mais sensivel a brisa maritima que Downtown/Vale.",
+      "confirmation": "LAXHIGH.pdf (fonte primaria), verificacao 3-0; ambiguidade Downtown vs Airport RESOLVIDA por settlement_sources API (site=LOX, issuedby=LAX = Airport) 2026-07-10"
     },
     "Chicago": {
       "series_high": "KXHIGHCHI",
@@ -38,7 +38,7 @@
       "pilot": true,
       "om_models": null,
       "risk_notes": "Brisa do Lago Michigan trava a maxima perto do lago enquanto Midway (mais interior/urbana) continua esquentando. Midway registra sistematicamente mais dias de 90F+ que O'Hare (ate +10 dias/ano). Alberta clippers/vortice polar no inverno; neve de efeito lago. ATENCAO: dados historicos do fluxo Polymarket sao de KORD -- vies sistematico aplicados a KMDW.",
-      "confirmation": "CHIHIGH.pdf (fonte primaria), verificacao 3-0"
+      "confirmation": "CHIHIGH.pdf (fonte primaria), verificacao 3-0; settlement_sources API (site=LOT, issuedby=MDW) 2026-07-10"
     },
     "Houston": {
       "series_high": "KXHIGHTHOU",
@@ -51,11 +51,11 @@
       "pilot": true,
       "om_models": null,
       "risk_notes": "Brisa do Golfo/Baia de Galveston: timing muda a maxima em 1-3F (principal fator de incerteza). Blue northers derrubam 20-40F em horas no inverno. Nevoeiro de radiacao alimentado por umidade do Golfo atrasa aquecimento. Temporada de furacoes jun-nov suprime maxima via nebulosidade de bandas externas. Estacao e Hobby (KHOU), NAO Bush Intercontinental (KIAH).",
-      "confirmation": "HOUHIGH.pdf (fonte primaria), verificacao 3-0"
+      "confirmation": "HOUHIGH.pdf (fonte primaria), verificacao 3-0; settlement_sources API (site=HGX, issuedby=HOU) 2026-07-10"
     },
     "Phoenix": {
       "series_high": "KXHIGHTPHX",
-      "series_low": null,
+      "series_low": "KXLOWTPHX",
       "station": "KPHX",
       "wfo": "PSR",
       "lat": 33.4373,
@@ -64,7 +64,7 @@
       "pilot": true,
       "om_models": null,
       "risk_notes": "Moncao do sudoeste (jun-set, padrao bursts/breaks): nebulosidade convectiva mal cronometrada e o maior erro de maxima no verao. Outflow boundaries e haboobs derrubam a temperatura em minutos. Ilha de calor urbana entre as maiores do mundo (10-14F vs rural) infla minimas. Inversao termica de inverno no vale atrasa aquecimento.",
-      "confirmation": "template generico HIGHTEMP.pdf (sem PDF dedicado), verificacao 2-1"
+      "confirmation": "template generico HIGHTEMP.pdf, verificacao 2-1; settlement_sources API (site=PSR, issuedby=PHX) 2026-07-10"
     },
     "Denver": {
       "series_high": "KXHIGHDEN",
@@ -77,11 +77,11 @@
       "pilot": true,
       "om_models": null,
       "risk_notes": "Chinook eleva temperatura 30-60F em menos de 36h (mal resolvido por modelos globais). Denver Cyclone/DCVZ dispara tempestades vespertinas abruptas (~90min). Cold air damming/upslope segura maxima bem abaixo do previsto. NBM tem vies documentado de subestimar TMAX em dias quentes. Estacao KDEN fica ~19km do centro, mais exposta/ventosa e menos amortecida por UHI.",
-      "confirmation": "DENHIGH.pdf (fonte primaria), verificacao 3-0"
+      "confirmation": "DENHIGH.pdf (fonte primaria), verificacao 3-0; settlement_sources API (site=BOU, issuedby=DEN) 2026-07-10"
     },
     "Philadelphia": {
       "series_high": "KXHIGHPHIL",
-      "series_low": null,
+      "series_low": "KXLOWTPHIL",
       "station": "KPHL",
       "wfo": "PHI",
       "lat": 39.8683,
@@ -90,7 +90,7 @@
       "pilot": true,
       "om_models": null,
       "risk_notes": "NBM tem vies documentado de SUBESTIMAR a maxima em dias de calor extremo na regiao. Brisa maritima da Baia de Delaware corta a maxima quando chega cedo. Fall Line (Piemonte x Coastal Plain) gera gradiente termico entre suburbios e o aeroporto (KPHL fica no Coastal Plain, junto ao rio, mais ameno que o centro urbano). Frentes backdoor primavera/inicio de verao.",
-      "confirmation": "PHILHIGH.pdf (fonte primaria), verificacao 3-0"
+      "confirmation": "PHILHIGH.pdf (fonte primaria), verificacao 3-0; settlement_sources API (site=PHI, issuedby=PHL) 2026-07-10"
     },
     "Washington DC": {
       "series_high": "KXHIGHTDC",
@@ -103,11 +103,11 @@
       "pilot": true,
       "om_models": null,
       "risk_notes": "Ilha de calor urbana centrada na PROPRIA estacao de liquidacao: KDCA roda ~10-15F mais quente a noite que Dulles (40km) -- modelos de grade subestimam minimas. Cold air damming e frentes backdoor dificeis de cronometrar em transicao de estacao. Heat domes: recorde historico de 102F em jul/2026 (batendo 1898); em dias de heat dome os modelos tendem a sub-prever.",
-      "confirmation": "sem PDF dedicado, verificacao 3-0 (convergencia forte)"
+      "confirmation": "sem PDF dedicado, verificacao 3-0; settlement_sources API (site=LWX, issuedby=DCA) 2026-07-10"
     },
     "Miami": {
       "series_high": "KXHIGHMIA",
-      "series_low": null,
+      "series_low": "KXLOWTMIA",
       "station": "KMIA",
       "wfo": "MFL",
       "lat": 25.7959,
@@ -116,7 +116,7 @@
       "pilot": true,
       "om_models": null,
       "risk_notes": "Brisa dupla Atlantico x Golfo com convergencia sobre a peninsula (efeito ziper): timing da conveccao vespertina e o maior fator de erro na estacao chuvosa (mai-out) -- chegou cedo corta a maxima, atrasou supera a previsao. UHI com padrao espacial invertido: aeroporto no interior aquece mais e recebe a brisa mais tarde que a orla. Furacoes jun-nov: bandas externas suprimem maxima mesmo com centro distante.",
-      "confirmation": "MIAHIGH.pdf (fonte primaria), verificacao 3-0"
+      "confirmation": "MIAHIGH.pdf (fonte primaria), verificacao 3-0; settlement_sources API (site=MFL, issuedby=MIA) 2026-07-10"
     },
     "Boston": {
       "series_high": "KXHIGHTBOS",
@@ -129,7 +129,7 @@
       "pilot": true,
       "om_models": null,
       "risk_notes": "Logan e uma das estacoes ASOS mais expostas ao mar do pais (aterro cercado de agua em tres lados): quando a brisa maritima se estabelece, KBOS fica 10-15F mais fria que o interior -- o fator isolado mais importante da maxima em dias quentes. Frentes backdoor do oceano derrubam maxima com pouca antecedencia. Nevoeiro/estrato marinho mai-jul (agua ainda fria). Nor'easters com ciclogenese rapida.",
-      "confirmation": "sem PDF dedicado, verificacao 2-1"
+      "confirmation": "sem PDF dedicado, verificacao 2-1; settlement_sources API (site=BOX, issuedby=BOS) 2026-07-10"
     },
     "Austin": {
       "series_high": "KXHIGHAUS",
@@ -142,7 +142,124 @@
       "pilot": true,
       "om_models": null,
       "risk_notes": "Dryline na fronteira Balcones Escarpment: posicao decide setor quente/seco vs nublado/instavel (erro de dezenas de km nos modelos). Blue northers no inverno (queda de 20-40F). Neblina/estratos matinais por adveccao do Golfo atrasam aquecimento. Estacao e Bergstrom (KAUS), NAO Camp Mabry (KATT): diferenca sistematica de 3-5F entre as duas (maior nas minimas; sensor de KAUS em vale com drenagem de ar frio) -- calibrar climatologia para KAUS especificamente.",
-      "confirmation": "AUSHIGH.pdf + autocertificacao CFTC 40.2(a) (fonte primaria); ambiguidade Camp Mabry resolvida"
+      "confirmation": "AUSHIGH.pdf + autocertificacao CFTC 40.2(a) (fonte primaria); settlement_sources API (site=EWX, issuedby=AUS) 2026-07-10"
+    },
+    "Seattle": {
+      "series_high": "KXHIGHTSEA",
+      "series_low": "KXLOWTSEA",
+      "station": "KSEA",
+      "wfo": "SEW",
+      "lat": 47.4444,
+      "lon": -122.3139,
+      "timezone": "America/Los_Angeles",
+      "pilot": true,
+      "om_models": null,
+      "risk_notes": "Stratus marinho/'burn-off' matinal decide a maxima. Calha termica costeira + escoamento offshore: mecanismo do heat dome de 2021, quando a maxima foi subestimada em 2-5C mesmo com 1-3 dias de antecedencia. Puget Sound Convergence Zone; 'marine push'. Edge local: Cliff Mass (UW, WRF regional proprio de 1.3km) e mirror independente da UW do produto CLISEA.",
+      "confirmation": "settlement_sources API (site=SEW, issuedby=SEA), sweep do operador 2026-07-10; hipotese da pesquisa (0.75) confirmada"
+    },
+    "Atlanta": {
+      "series_high": "KXHIGHTATL",
+      "series_low": "KXLOWTATL",
+      "station": "KATL",
+      "wfo": "FFC",
+      "lat": 33.6301,
+      "lon": -84.4418,
+      "timezone": "America/New_York",
+      "pilot": true,
+      "om_models": null,
+      "risk_notes": "Cold air damming/'the wedge' contra os Apalaches: um dos padroes mais dificeis da regiao, modelos erram o timing da erosao. Pop-up storms vespertinas sao o maior fator de erro de maxima no verao. Remanescentes de furacoes (ex. Helene set/2024). Sem estacao concorrente plausivel na regiao metro.",
+      "confirmation": "settlement_sources API (site=FFC, issuedby=ATL), sweep do operador 2026-07-10; hipotese da pesquisa (0.6) confirmada"
+    },
+    "San Antonio": {
+      "series_high": "KXHIGHTSATX",
+      "series_low": "KXLOWTSATX",
+      "station": "KSAT",
+      "wfo": "EWX",
+      "lat": 29.5443,
+      "lon": -98.4839,
+      "timezone": "America/Chicago",
+      "pilot": true,
+      "om_models": null,
+      "risk_notes": "Fronteira Balcones Escarpment/Edwards Plateau; dryline e quebra de cap convectivo; seca plurianual La Nina com vies de maxima ACIMA da climatologia. Sem blog meteorologico independente dedicado (lacuna vs Houston) -- fontes: TV local e NWS EWX. Era a cidade de MENOR confianca da pesquisa (0.55) -- agora confirmada.",
+      "confirmation": "settlement_sources API (site=EWX, issuedby=SAT), sweep do operador 2026-07-10; hipotese da pesquisa (0.55, a mais baixa) confirmada"
+    },
+    "Oklahoma City": {
+      "series_high": "KXHIGHTOKC",
+      "series_low": "KXLOWTOKC",
+      "station": "KOKC",
+      "wfo": "OUN",
+      "lat": 35.3889,
+      "lon": -97.6006,
+      "timezone": "America/Chicago",
+      "pilot": true,
+      "om_models": null,
+      "risk_notes": "Dryline; jato noturno de baixos niveis + MCS (nuvens residuais suprimem inesperadamente o aquecimento diurno); blue northers; retroalimentacao de umidade do solo pos-conveccao. Edge local raro: Oklahoma Mesonet (120 estacoes, obs a cada 5 min) e NWS Norman.",
+      "confirmation": "settlement_sources API (site=OUN, issuedby=OKC), sweep do operador 2026-07-10; hipotese da pesquisa (0.7, corroborada por IEM/CFTC) confirmada"
+    },
+    "Las Vegas": {
+      "series_high": "KXHIGHTLV",
+      "series_low": "KXLOWTLV",
+      "station": "KLAS",
+      "wfo": "VEF",
+      "lat": 36.0719,
+      "lon": -115.1634,
+      "timezone": "America/Los_Angeles",
+      "pilot": true,
+      "om_models": null,
+      "risk_notes": "ATENCAO REGULATORIA: litigio Nevada vs. Kalshi sobre jurisdicao de jogos em aberto na epoca da pesquisa -- operador deve checar o status antes de manter a cidade ativa. Meteorologia: vale cercado por montanhas (drenagem noturna de ar frio); moncao norte-americana jul-set e a maior incerteza de maxima; grande amplitude termica diaria de deserto.",
+      "confirmation": "settlement_sources API (site=VEF, issuedby=LAS), sweep do operador 2026-07-10; hipotese da pesquisa (0.65) confirmada"
+    },
+    "San Francisco": {
+      "series_high": "KXHIGHTSFO",
+      "series_low": "KXLOWTSFO",
+      "station": "KSFO",
+      "wfo": "MTR",
+      "lat": 37.6197,
+      "lon": -122.3656,
+      "timezone": "America/Los_Angeles",
+      "pilot": true,
+      "om_models": null,
+      "risk_notes": "Camada marinha 'Karl the Fog': a maxima depende quase inteiramente do horario de dissipacao do estrato. Brisa canalizada pelo San Bruno Gap; ventos offshore Diablo (apps de grade subestimam sistematicamente). Ciclo sazonal INVERTIDO: dias mais quentes tipicamente em set/out. Edge local unico: SFO Marine Stratus Forecast System (NWS/MIT Lincoln Lab, especifico desta estacao); Jan Null; Weather West.",
+      "confirmation": "settlement_sources API (site=MTR, issuedby=SFO), sweep do operador 2026-07-10; hipotese da pesquisa (0.65) confirmada"
+    },
+    "New Orleans": {
+      "series_high": "KXHIGHTNOLA",
+      "series_low": "KXLOWTNOLA",
+      "station": "KMSY",
+      "wfo": "LIX",
+      "lat": 29.9928,
+      "lon": -90.251,
+      "timezone": "America/Chicago",
+      "pilot": true,
+      "om_models": null,
+      "risk_notes": "Convergencia de dupla brisa (Lago Pontchartrain + Golfo) dispara pop-up storms vespertinas. UHI pronunciada (17a pior dos EUA). Baixa amplitude diurna tipica da Costa do Golfo: a maxima e muito sensivel a pequenos erros de nebulosidade. Furacoes jun-nov.",
+      "confirmation": "settlement_sources API (site=LIX, issuedby=MSY), sweep do operador 2026-07-10; hipotese da pesquisa (0.7) confirmada"
+    },
+    "Minneapolis": {
+      "series_high": "KXHIGHTMIN",
+      "series_low": "KXLOWTMIN",
+      "station": "KMSP",
+      "wfo": "MPX",
+      "lat": 44.8831,
+      "lon": -93.2289,
+      "timezone": "America/Chicago",
+      "pilot": true,
+      "om_models": null,
+      "risk_notes": "Clima continental extremo sem barreiras a massas articas: irrupcoes costumam vir mais severas do que os modelos globais sugerem. UHI na propria estacao de liquidacao. 'Corn sweat': evapotranspiracao agricola eleva o dewpoint 5-10F em jul-ago (fenomeno do meio-oeste).",
+      "confirmation": "settlement_sources API (site=MPX, issuedby=MSP), sweep do operador 2026-07-10; hipotese da pesquisa (0.6) confirmada, ambiguidade KSTP descartada"
+    },
+    "Dallas": {
+      "series_high": "KXHIGHTDAL",
+      "series_low": "KXLOWTDAL",
+      "station": "KDFW",
+      "wfo": "FWD",
+      "lat": 32.8968,
+      "lon": -97.038,
+      "timezone": "America/Chicago",
+      "pilot": true,
+      "om_models": null,
+      "risk_notes": "ATENCAO: estacao e KDFW (Dallas-Fort Worth Intl), NAO KDAL (Love Field) usado pelo fluxo Polymarket -- climatologia/calibracao existentes tem vies sistematico aplicadas a KDFW; a unica incerteza genuina da pesquisa foi resolvida CONTRA o padrao 'estacao secundaria'. Dryline decide setor quente/seco vs umido; 'the cap' (forca do tampao de inversao); outflow boundaries de MCS noturno (10-20F entre lados opostos da fronteira); blue northers.",
+      "confirmation": "settlement_sources API (site=FWD, issuedby=DFW), sweep do operador 2026-07-10; unica incerteza genuina da pesquisa RESOLVIDA (KDFW, nao KDAL)"
     }
   }
 }
