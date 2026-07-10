@@ -18,7 +18,7 @@ from fastapi.templating import Jinja2Templates
 
 from . import settings as S
 from .services import (advisor, advisor_jobs, analytics, charts,
-                        counterfactual, costs, events, live_trading,
+                        counterfactual, costs, events, kalshi, live_trading,
                         notifier, onchain_history, portfolio, positions,
                         process_manager, settings_service,
                         suggestion_applier, wallet)
@@ -128,6 +128,55 @@ def page_performance(request: Request, days: int = 14):
 def page_events(request: Request):
     return templates.TemplateResponse(
         request, "events.html", _common_ctx("events"))
+
+
+# ---------------------------------------------------------------------------
+# Aba Kalshi — banca paper separada "kalshi" + kalshi_edge.db (read-only)
+# ---------------------------------------------------------------------------
+
+@app.get("/kalshi", response_class=HTMLResponse)
+def page_kalshi(request: Request, days: int = 30):
+    ctx = _common_ctx("kalshi")
+    ctx["days"] = days
+    return templates.TemplateResponse(request, "kalshi.html", ctx)
+
+
+@app.get("/api/kalshi/kpis", response_class=HTMLResponse)
+def api_kalshi_kpis(request: Request):
+    try:
+        k = kalshi.get_kpis()
+    except Exception as e:
+        k = {"available": False, "reason": str(e)}
+    return templates.TemplateResponse(
+        request, "partials/kalshi_kpis.html", {"k": k})
+
+
+@app.get("/api/kalshi/positions", response_class=HTMLResponse)
+def api_kalshi_positions(request: Request, sort: str = "entry_id"):
+    return templates.TemplateResponse(
+        request, "partials/kalshi_positions.html",
+        {"positions": kalshi.get_open_positions(sort_by=sort)})
+
+
+@app.get("/api/kalshi/history", response_class=HTMLResponse)
+def api_kalshi_history(request: Request, outcome: str = "all",
+                       limit: int = 200):
+    filt = outcome if outcome in ("winner", "loser") else None
+    return templates.TemplateResponse(
+        request, "partials/kalshi_history.html",
+        {"history": kalshi.get_history(limit=limit, filter_outcome=filt),
+         "summary": kalshi.get_history_summary(),
+         "filter_outcome": outcome})
+
+
+@app.get("/api/kalshi/performance", response_class=HTMLResponse)
+def api_kalshi_performance(request: Request, days: int = 30):
+    series = kalshi.get_performance_series(days=days)
+    return templates.TemplateResponse(
+        request, "partials/kalshi_performance.html",
+        {"series": series, "days": days,
+         "chart_html": charts.cumulative_pnl(
+             series, div_id="chart_kalshi_pnl")})
 
 
 @app.get("/advisor", response_class=HTMLResponse)

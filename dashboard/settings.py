@@ -13,6 +13,13 @@ PORTFOLIO_DB = DATA_DIR / "portfolio.db"
 JSONL_PATH = DATA_DIR / "weather_edge.jsonl"
 ADVISOR_REPORTS_DIR = DATA_DIR / "advisor_reports"
 
+# Bot Kalshi (mercados de temperatura EUA): DB de entries/monitor/resolution
+# próprio (WEATHER_EDGE_DB_PATH do daemon kalshi_edge_bot) + banca paper
+# separada no MESMO portfolio.db (PaperEngine(portfolio="kalshi")).
+KALSHI_EDGE_DB = DATA_DIR / "kalshi_edge.db"
+KALSHI_JSONL = DATA_DIR / "kalshi_edge.jsonl"
+KALSHI_PORTFOLIO = "kalshi"
+
 # Refresh intervals (seconds) for HTMX polling
 REFRESH_KPI_SEC = 10
 REFRESH_RECENT_EVENTS_SEC = 5

@@ -272,6 +272,7 @@ Scanner ──→ Analyzer ──→ Strategy Advisor ──→ Paper Trader ─
 | Execute real trades | polymarket-live-executor | `execute_live.py`, `check_positions.py` |
 | Analyze any public wallet | polymarket-wallet-analyzer | `analyze_wallet.py` |
 | Paper copy-trade public wallets (buys+sells, slippage-bounded) | polymarket-copy-trader | `backend/poller.py`, `backend/copy_engine.py`, `backend/app.py` |
+| Paper-trade Kalshi US temperature markets (11 cities, separate "kalshi" bank, judge pilot) | polymarket-analyzer | `kalshi_edge_bot.py`, `kalshi_market_io.py`, `verify_kalshi_weather.py` |
 | Weekly self-tuning meta-agent (suggestion-only) | polymarket-analyzer | `weather_strategy_advisor.py` |
 
 **Note on the strategy advisor (`weather_strategy_advisor.py`)**: this is a
@@ -288,6 +289,7 @@ All API calls use:
 - **Gamma API** (`gamma-api.polymarket.com`) — market metadata, zero auth
 - **CLOB API** (`clob.polymarket.com`) — prices/orderbooks read-only, trading needs L2 auth
 - **Data API** (`data-api.polymarket.com`) — wallet positions/trades/holders, read-only, zero auth
+- **Kalshi API** (`api.elections.kalshi.com/trade-api/v2`) — markets/orderbooks read-only zero auth; portfolio/trading requer assinatura RSA-PSS (ver `kalshi_live_stub.py`)
 
 ---
 

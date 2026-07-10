@@ -64,6 +64,21 @@ def _validate_token_id(token_id: str) -> str:
     return token_id
 
 
+# Tokens de venue externa (ex. tickers Kalshi "KXHIGHNY-26JUL12-B85").
+# Aceitos APENAS no caminho em que o caller fornece market_question + price
+# explícitos — nesse caminho o token nunca entra em URL da CLOB/Gamma; a
+# validação é defesa em profundidade contra lixo no DB.
+_EXTERNAL_TOKEN_RE = re.compile(r"^[A-Za-z0-9._:-]{5,80}$")
+
+
+def _validate_external_token_id(token_id: str) -> str:
+    if not isinstance(token_id, str) or not _EXTERNAL_TOKEN_RE.match(token_id):
+        raise ValueError(
+            f"Invalid external token/ticker format: {token_id!r}"
+        )
+    return token_id
+
+
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
@@ -573,12 +588,14 @@ def place_order(
     portfolio_name: str = "default",
     fee_rate: float = DEFAULT_FEE_RATE,
     force: bool = False,
+    market_question: str | None = None,
 ) -> dict:
     """
     Place a paper trade.
 
     Args:
-        token_id: CLOB token ID
+        token_id: CLOB token ID — ou ticker de venue externa (ex. Kalshi)
+            quando market_question é fornecido
         side: 'YES' or 'NO'
         size: Amount in USD to spend
         price: Limit price (None = market order using live book)
@@ -586,6 +603,10 @@ def place_order(
         portfolio_name: Which portfolio to trade in
         fee_rate: Fee rate override (default 0 for most markets)
         force: Skip risk checks (except balance)
+        market_question: quando fornecido, PULA o lookup_market na Gamma
+            (venue externa: o caller já sabe a question e o token não é um
+            CLOB token ID — ex. bot Kalshi, que também fornece `price`
+            calculado do book da própria Kalshi)
 
     Returns: Trade execution result dict.
     """
@@ -597,8 +618,12 @@ def place_order(
 
     # Fetch market data and simulate fill BEFORE acquiring the write lock
     # so we don't hold the lock during network I/O.
-    market_info = lookup_market(token_id)
-    market_question = market_info["question"] if market_info else "Unknown market"
+    if market_question is None:
+        market_info = lookup_market(token_id)
+        market_question = market_info["question"] if market_info else "Unknown market"
+    else:
+        # Venue externa: sem Gamma/CLOB — valida o formato do ticker apenas.
+        _validate_external_token_id(token_id)
 
     if price is not None:
         # Limit order: fill at specified price
@@ -925,6 +950,38 @@ def has_open_position(token_id: str, side: str | None = None,
         conn.close()
 
 
+def set_position_price(token_id: str, price: float,
+                       portfolio_name: str = "default",
+                       side: str | None = None) -> int:
+    """Atualiza positions.current_price das posições abertas de um token.
+
+    Para venues externas (ex. Kalshi): o refresh automático de preços do
+    get_portfolio usa fetch_midpoint da CLOB, que falha silenciosamente com
+    tickers não-Polymarket (try/except pass) e deixaria o valor de portfólio
+    — e portanto o drawdown-halt — congelado no preço de entrada. O monitor
+    do bot Kalshi chama isto a cada tick com o bid real da Kalshi.
+
+    Retorna o número de linhas atualizadas (0 se não há posição aberta).
+    """
+    if not (0.0 <= price <= 1.0):
+        raise ValueError(f"price {price} out of range [0, 1]")
+    conn = _get_db()
+    try:
+        pf = _active_portfolio(conn, portfolio_name)
+        q = ("UPDATE positions SET current_price = ?, updated_at = ? "
+             "WHERE portfolio_id = ? AND token_id = ? AND closed = 0")
+        params: list = [price, datetime.now(timezone.utc).isoformat(),
+                        pf["id"], token_id]
+        if side:
+            q += " AND side = ?"
+            params.append(side.upper())
+        cur = conn.execute(q, params)
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
 def get_trades(
     portfolio_name: str = "default",
     limit: int = 50,
@@ -1061,14 +1118,20 @@ class PaperEngine:
         return get_portfolio(self.portfolio, refresh_prices=refresh_prices)
 
     def open_position(self, *, token_id: str, side: str, size_usd: float,
-                       market_question: str = "",   # ignored — engine looks it up
+                       market_question: str = "",   # se vazio, engine faz lookup
                        fee_rate: float = DEFAULT_FEE_RATE,
                        confidence: float = 0.5,     # informational, ignored
-                       reasoning: str = "") -> dict:
+                       reasoning: str = "",
+                       price: float | None = None) -> dict:
+        # market_question/price propagados (venue externa, ex. Kalshi):
+        # question fornecida pula o lookup_market na Gamma; price fornecido
+        # vira limit fill sem tocar o orderbook da CLOB.
         result = place_order(
             token_id=token_id, side=side, size=size_usd,
             portfolio_name=self.portfolio,
             fee_rate=fee_rate, reasoning=reasoning,
+            price=price,
+            market_question=market_question or None,
         )
         # Normalize result keys to what weather_edge_bot.run_execute expects.
         if result.get("status") == "filled":
@@ -1082,10 +1145,16 @@ class PaperEngine:
         return result
 
     def close_position(self, *, token_id: str, side: str | None = None,
-                        reasoning: str = "") -> dict:
+                        reasoning: str = "",
+                        force_exit_price: float | None = None,
+                        fee_rate: float = DEFAULT_FEE_RATE) -> dict:
+        # force_exit_price/fee_rate propagados: closes de venue externa
+        # (Kalshi) SEMPRE usam force_exit_price (o caminho normal busca o
+        # book na CLOB, que não conhece o ticker).
         return close_position(
             token_id=token_id, side=side,
             portfolio_name=self.portfolio, reasoning=reasoning,
+            force_exit_price=force_exit_price, fee_rate=fee_rate,
         )
 
     def has_open_position(self, *, token_id: str,
@@ -1433,10 +1502,120 @@ def _test_no_open_position():
         restore()
 
 
+def _test_external_venue():
+    """Caminho de venue externa (ex. tickers Kalshi): place_order com
+    market_question + price explícitos NÃO pode tocar rede (Gamma/CLOB);
+    closes usam force_exit_price; set_position_price mantém current_price."""
+    global _api_get
+    tok = "KXHIGHNY-26JUL12-B85"
+    _, restore = _swap_test_db()
+    saved_api = _api_get
+
+    def _boom(url, timeout=15):
+        raise AssertionError(f"network call attempted: {url}")
+    _api_get = _boom
+    try:
+        init_portfolio(1000.0)
+
+        # 1. Ticker Kalshi SEM market_question → ValueError do regex CLOB
+        #    (caminho Polymarket intocado/protegido).
+        try:
+            place_order(tok, "YES", 10.0, price=0.42)
+            raise AssertionError("expected ValueError for Kalshi ticker "
+                                 "without market_question")
+        except ValueError:
+            pass
+        print("Test 1 PASS: ticker externo sem market_question -> ValueError "
+              "(regex CLOB preservado)")
+
+        # 2. place_order com question + price: zero rede (_api_get explode
+        #    se chamado), posição aberta, question/fee corretos.
+        r = place_order(tok, "YES", 10.0, price=0.40,
+                        market_question="Highest temperature in NYC?",
+                        fee_rate=0.042)  # kalshi_fee_rate(0.40)=0.07*0.6
+        assert r["status"] == "filled", r
+        assert abs(r["shares"] - 25.0) < 1e-6, r
+        assert abs(r["fee"] - 0.42) < 1e-6, r
+        assert has_open_position(tok, "YES") is True
+        conn = _get_db()
+        row = conn.execute(
+            "SELECT market_question FROM positions WHERE token_id = ?",
+            (tok,)).fetchone()
+        conn.close()
+        assert row["market_question"] == "Highest temperature in NYC?", row
+        print("Test 2 PASS: place_order externo (question+price) sem rede; "
+              "25 shares @0.40, fee $0.42, question persistida")
+
+        # 3. Wrapper PaperEngine propaga price/market_question e normaliza
+        #    o resultado para o shape do run_execute.
+        eng = PaperEngine(portfolio="default")
+        r2 = eng.open_position(token_id="KXLOWTNYC-26JUL12-B60", side="NO",
+                               size_usd=5.0, price=0.50,
+                               market_question="Lowest temperature in NYC?",
+                               fee_rate=0.035)
+        assert r2["status"] == "executed", r2
+        assert abs(r2["avg_price"] - 0.50) < 1e-9, r2
+        assert abs(r2["shares_filled"] - 10.0) < 1e-6, r2
+        assert r2["cost_usd"] is not None, r2
+        print("Test 3 PASS: PaperEngine.open_position propaga price/question "
+              "(status executed, avg_price 0.50, 10 shares)")
+
+        # 4. set_position_price atualiza current_price (rowcount) e valida
+        #    range; token sem posição aberta -> 0.
+        n = set_position_price(tok, 0.55, side="YES")
+        assert n == 1, n
+        conn = _get_db()
+        cp = conn.execute(
+            "SELECT current_price FROM positions WHERE token_id = ? "
+            "AND closed = 0", (tok,)).fetchone()["current_price"]
+        conn.close()
+        assert abs(cp - 0.55) < 1e-9, cp
+        assert set_position_price("KXNOPE-26JAN01", 0.5) == 0
+        try:
+            set_position_price(tok, 1.5)
+            raise AssertionError("expected ValueError for price 1.5")
+        except ValueError:
+            pass
+        print("Test 4 PASS: set_position_price (1 linha, 0.55; token sem "
+              "posição -> 0; range validado)")
+
+        # 5. Wrapper close_position propaga force_exit_price + fee_rate:
+        #    sem rede, P&L líquido de fee.
+        r3 = eng.close_position(token_id=tok, side="YES",
+                                force_exit_price=0.60, fee_rate=0.028,
+                                reasoning="cashout kalshi")
+        assert r3["status"] == "closed", r3
+        assert abs(r3["avg_sell_price"] - 0.60) < 1e-9, r3
+        # proceeds 25*0.60=15.0; fee=15*0.028=0.42; pnl=(0.60-0.40)*25-0.42
+        assert abs(r3["fee"] - 0.42) < 1e-6, r3
+        assert abs(r3["realized_pnl"] - 4.58) < 1e-6, r3
+        assert has_open_position(tok, "YES") is False
+        print("Test 5 PASS: PaperEngine.close_position propaga "
+              "force_exit_price+fee_rate (pnl 4.58 líquido de fee, sem rede)")
+
+        # 6. Validação do ticker externo: lixo com espaço/curto demais ->
+        #    ValueError mesmo com question fornecida.
+        for bad in ("KX HIGH", "abc", "x" * 81):
+            try:
+                place_order(bad, "YES", 5.0, price=0.5,
+                            market_question="q")
+                raise AssertionError(f"expected ValueError for {bad!r}")
+            except ValueError:
+                pass
+        print("Test 6 PASS: tickers externos inválidos rejeitados")
+
+        print("\nAll --test-external-venue PASS (6/6)")
+    finally:
+        _api_get = saved_api
+        restore()
+
+
 if __name__ == "__main__":
     if "--test-migration-positions" in sys.argv:
         _test_migration_positions()
     elif "--test-no-open-position" in sys.argv:
         _test_no_open_position()
+    elif "--test-external-venue" in sys.argv:
+        _test_external_venue()
     else:
         main()

@@ -58,7 +58,7 @@ import os
 import signal
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -102,7 +102,10 @@ _load_dotenv()
 import weather_edge_db as db  # noqa: E402
 
 LOG_DIR = Path.home() / ".polymarket-paper"
-LOG_FILE = LOG_DIR / "weather_edge.jsonl"
+# WEATHER_EDGE_JUDGE_LOG permite a uma segunda instância do judge (ex.: a do
+# bot Kalshi, apontada para outro DB via WEATHER_EDGE_DB_PATH) escrever num
+# JSONL próprio em vez de misturar eventos no log da instância Polymarket.
+LOG_FILE = Path(os.environ.get("WEATHER_EDGE_JUDGE_LOG") or (LOG_DIR / "weather_edge.jsonl"))
 PROMPT_PATH = REPO_ROOT / "polymarket-analyzer" / "references" / "weather-judge-prompt.md"
 
 DEFAULT_MODEL = os.environ.get("CLAUDE_JUDGE_MODEL", "claude-sonnet-5")
@@ -614,11 +617,23 @@ def review_proposal(entry: dict, system_prompt: str) -> Optional[dict]:
     """Gather evidence + call Claude + return verdict dict (with _meta)."""
     city = entry["city_resolved"] or ""
     target_date = (entry["end_date"] or "")[:10]  # YYYY-MM-DD
+    meta = _entry_meta(entry)
+    venue = _entry_venue(entry)
 
     evidence: dict[str, Any] = {}
 
-    # NWS (US only)
-    coords = _geocode_city(city) if city else None
+    # Coords: preferir lat/lon do meta do discovery (Kalshi grava o PONTO DA
+    # ESTAÇÃO de resolução — KNYC Central Park ≠ "New York" do geocoder, que
+    # pode devolver LGA/centro e puxar o NWS gridpoint errado). Fallback:
+    # geocode por nome (fluxo Polymarket inalterado).
+    coords = None
+    try:
+        if meta.get("lat") is not None and meta.get("lon") is not None:
+            coords = (float(meta["lat"]), float(meta["lon"]))
+    except (TypeError, ValueError):
+        coords = None
+    if coords is None:
+        coords = _geocode_city(city) if city else None
     if coords:
         nws = get_nws_forecast(*coords)
         if nws:
@@ -654,13 +669,37 @@ def review_proposal(entry: dict, system_prompt: str) -> Optional[dict]:
     # ERA5 archive is too biased to settle a 1°C tick), so the ensemble's
     # confidence is worth less here — demand independent corroboration.
     if _entry_is_pilot(entry):
-        evidence["africa_pilot"] = {
-            "high_risk": True,
-            "note": ("Africa desert/subtropical pilot: no regional model, "
-                     "resolution via real station METAR. Require independent "
-                     "corroboration; prefer ADJUST (reduced size) over a bare "
-                     "APPROVE when sources are thin."),
-        }
+        if venue == "kalshi":
+            # Kalshi US temperature pilot: venue/estação novas para o bot.
+            # risk_notes vem da pesquisa por cidade (kalshi-cities.json) e é
+            # o contexto local que o LLM não tem de outra forma (brisa
+            # marítima, UHI, viés documentado do NBM etc.).
+            evidence["kalshi_pilot"] = {
+                "high_risk": True,
+                "station_icao": meta.get("station_icao"),
+                "risk_notes": meta.get("risk_notes"),
+                "resolution": (
+                    "Settles on the NWS Daily Climate Report (CLI) of the "
+                    "local WFO — NOT raw METAR or aggregators. Climatological "
+                    "day in LOCAL STANDARD TIME year-round (during DST the "
+                    "window is 01:00-00:59 local)."),
+                "fees": ("Kalshi taker fee (0.07*P*(1-P)) is ALREADY deducted "
+                         "from edge_pp_at_entry — do not re-deduct."),
+                "note": ("Kalshi US temperature pilot: new venue and NEW "
+                         "resolution station for this pipeline (forecast "
+                         "calibration history comes from a different "
+                         "station in some cities). Require independent "
+                         "corroboration; prefer ADJUST (reduced size) over "
+                         "a bare APPROVE when sources disagree."),
+            }
+        else:
+            evidence["africa_pilot"] = {
+                "high_risk": True,
+                "note": ("Africa desert/subtropical pilot: no regional model, "
+                         "resolution via real station METAR. Require independent "
+                         "corroboration; prefer ADJUST (reduced size) over a bare "
+                         "APPROVE when sources are thin."),
+            }
 
     if not evidence:
         log_event("judge_no_evidence", {"entry_id": entry["entry_id"],
@@ -738,7 +777,21 @@ def _recheck_edge_prejudge(row: dict) -> Optional[dict]:
     forecast_prob = row.get("forecast_prob_at_entry")
     if forecast_prob is None:
         return None
-    book = _fetch_orderbook(str(token_id))
+    venue = _entry_venue(row)
+    fee_pp = 0.0
+    if venue == "kalshi":
+        # token_id é o ticker Kalshi; book vem da API da Kalshi (asks de
+        # side sintetizados de 1 − bid do lado oposto). Import lazy +
+        # fail-open: qualquer falha → None (segue para o LLM), nunca um
+        # skip por indisponibilidade de dados.
+        try:
+            import kalshi_market_io as kio
+            raw = kio.fetch_orderbook(str(token_id))
+            book = kio.normalize_orderbook(raw, side) if raw else None
+        except Exception:
+            book = None
+    else:
+        book = _fetch_orderbook(str(token_id))
     if not book or not book.get("asks"):
         log_event("prejudge_fetch_failed", {
             "entry_id": row.get("entry_id"),
@@ -747,13 +800,21 @@ def _recheck_edge_prejudge(row: dict) -> Optional[dict]:
         return None
     best_ask = float(book["asks"][0]["price"])
     fp = float(forecast_prob)
-    edge_pp = round((fp - best_ask) * 100.0, 4)
+    if venue == "kalshi":
+        # edge_pp_at_entry da Kalshi é LÍQUIDO de fee (gate do discovery);
+        # manter a mesma régua aqui, senão o floor compara maçãs com laranjas.
+        try:
+            import kalshi_market_io as kio
+            fee_pp = float(kio.kalshi_fee_pp(best_ask))
+        except Exception:
+            fee_pp = 0.0
+    edge_pp = round((fp - best_ask) * 100.0 - fee_pp, 4)
     # v15.1: leg-aware floor (see docstring).
     floor = (PREJUDGE_MIN_EDGE_PP_LADDER if row.get("ladder_group_id")
              else PREJUDGE_MIN_EDGE_PP)
     if edge_pp >= floor:
         return None
-    return {
+    payload = {
         "entry_id": row.get("entry_id"),
         "reason": "edge_decay_prejudge",
         "original_edge_pp": row.get("edge_pp_at_entry"),
@@ -762,6 +823,10 @@ def _recheck_edge_prejudge(row: dict) -> Optional[dict]:
         "threshold_pp": floor,
         "side": side,
     }
+    if venue == "kalshi":
+        payload["venue"] = "kalshi"
+        payload["fee_pp"] = round(fee_pp, 3)
+    return payload
 
 
 def _sibling_failed_precheck(row: dict) -> Optional[dict]:
@@ -926,6 +991,50 @@ def _group_free_guard_sweep(gid: str, current_entry_id: int) -> dict:
             "killer_reason": killer_reason, "prejudge_passed_ids": passed}
 
 
+def _entry_meta(entry_row) -> dict:
+    """discovery_meta_json como dict — aceita sqlite3.Row ou dict, fail-soft {}."""
+    try:
+        raw = entry_row["discovery_meta_json"]
+        return json.loads(raw) if raw else {}
+    except (KeyError, IndexError, TypeError, ValueError):
+        return {}
+
+
+def _entry_venue(entry_row) -> str:
+    """Venue do entry ("kalshi" | "polymarket"). Ausência de meta = polymarket
+    (todo o histórico pré-Kalshi não tem o campo)."""
+    return str(_entry_meta(entry_row).get("venue") or "polymarket")
+
+
+def _entry_spec(entry_row):
+    """Spec do mercado para os guards determinísticos do judge.
+
+    Venue externa (Kalshi): o discovery grava o MarketSpec ESTRUTURADO em
+    discovery_meta_json["spec"] (derivado de strike_type/floor/cap_strike da
+    API — nunca de regex no título). O título Kalshi não segue o fraseado
+    Polymarket, então parse_market retornaria None e transformaria os
+    hard-guards (proximidade de threshold, calibração de range, auto-route)
+    em no-ops silenciosos. Preferimos SEMPRE o spec do meta quando presente;
+    fallback parse_market mantém o fluxo Polymarket byte-a-byte. Fail-open
+    None (mesma convenção dos call sites)."""
+    d = _entry_meta(entry_row).get("spec")
+    if d:
+        try:
+            from weather_edge_helpers import MarketSpec
+            d = dict(d)
+            if d.get("target_date"):
+                d["target_date"] = date.fromisoformat(d["target_date"])
+            return MarketSpec(**d)
+        except Exception:
+            pass  # spec corrompido → tenta o parser de título
+    try:
+        from weather_edge_helpers import parse_market, load_cities
+        return parse_market(entry_row["market_question"],
+                            entry_row["end_date"], load_cities())
+    except Exception:
+        return None
+
+
 def _threshold_proximity_reason(entry_row) -> Optional[str]:
     """v11 (post-mortem): return an override reason if the bot's forecast
     sits within ~1°C of the threshold — or, for a range market, within ~1°C
@@ -935,15 +1044,10 @@ def _threshold_proximity_reason(entry_row) -> Optional[str]:
     them. Returns None when not too close / not a temp market / unparseable.
     """
     try:
-        from weather_edge_helpers import (parse_market, forecast_ref_value,
-                                          load_cities)
+        from weather_edge_helpers import forecast_ref_value
     except Exception:
         return None
-    try:
-        spec = parse_market(entry_row["market_question"], entry_row["end_date"],
-                            load_cities())
-    except Exception:
-        return None
+    spec = _entry_spec(entry_row)
     if not spec or spec.metric != "temp":
         return None
     try:
@@ -983,16 +1087,11 @@ def _range_calibration(entry_row) -> Optional[dict]:
     None when not a range temp market or unparseable (fail-open).
     """
     try:
-        from weather_edge_helpers import (parse_market, forecast_ref_value,
-                                          load_cities, MAE_TEMP_C, MAE_TEMP_F,
-                                          ENSEMBLE_PROB_CAP)
+        from weather_edge_helpers import (forecast_ref_value, MAE_TEMP_C,
+                                          MAE_TEMP_F, ENSEMBLE_PROB_CAP)
     except Exception:
         return None
-    try:
-        spec = parse_market(entry_row["market_question"], entry_row["end_date"],
-                            load_cities())
-    except Exception:
-        return None
+    spec = _entry_spec(entry_row)
     if (not spec or spec.metric != "temp" or spec.comparison != "range"
             or spec.threshold_value_high is None):
         return None
@@ -1086,12 +1185,11 @@ def _judge_route(entry_row) -> Optional[dict]:
     # JUDGE_AUTOROUTE=0 because this is policy, not a routing optimization.
     # An unparseable spec (None) keeps the legacy behavior (fall through →
     # LLM). Import stays lazy so _test_autoroute's monkey-patching of
-    # helpers.parse_market/load_cities is picked up at call time.
+    # helpers.parse_market/load_cities is picked up at call time (via
+    # _entry_spec's own lazy fallback import).
     try:
-        from weather_edge_helpers import (parse_market, load_cities,
-                                          is_tradeable_spec)
-        spec0 = parse_market(entry_row["market_question"],
-                             entry_row["end_date"], load_cities())
+        from weather_edge_helpers import is_tradeable_spec
+        spec0 = _entry_spec(entry_row)
     except Exception:
         spec0 = None
     if spec0 is not None and not is_tradeable_spec(spec0):
@@ -1150,15 +1248,10 @@ def _judge_route(entry_row) -> Optional[dict]:
 
     # (2) Auto-approve only tight-ensemble, far-from-bin temp bets.
     try:
-        from weather_edge_helpers import (parse_market, forecast_ref_value,
-                                          load_cities)
+        from weather_edge_helpers import forecast_ref_value
     except Exception:
         return None
-    try:
-        spec = parse_market(entry_row["market_question"], entry_row["end_date"],
-                            load_cities())
-    except Exception:
-        return None
+    spec = _entry_spec(entry_row)
     if not spec or spec.metric != "temp":
         # Unreachable for non-temp since the v14 step (0) fail-closed reject;
         # kept as a belt so auto-approve can never fire on a non-temp spec.
@@ -1588,9 +1681,13 @@ def main():
     signal.signal(signal.SIGINT, _handle_sig)
 
     db.init_db()
-    # PID file for dashboard-driven restart.
+    # PID file for dashboard-driven restart. WEATHER_EDGE_JUDGE_PID permite a
+    # uma segunda instância (ex.: judge do bot Kalshi) usar um pid file
+    # próprio — sem isso, o unlink no shutdown de uma instância apagaria o
+    # pid da outra.
     from pathlib import Path as _P
-    pid_file = _P.home() / ".polymarket-paper" / "judge.pid.json"
+    pid_file = _P(os.environ.get("WEATHER_EDGE_JUDGE_PID")
+                  or (_P.home() / ".polymarket-paper" / "judge.pid.json"))
     try:
         pid_file.parent.mkdir(parents=True, exist_ok=True)
         tmp = pid_file.with_suffix(".tmp")
@@ -2798,6 +2895,136 @@ def _test_cc_route():
          helpers.is_tradeable_spec, mod.JUDGE_AUTOROUTE) = saved
 
 
+def _test_kalshi_route():
+    """Hermetic tests do caminho venue=kalshi: _entry_spec prefere o spec
+    estruturado do meta (título Kalshi é imparseável pelo parse_market),
+    hard-guards voltam a funcionar, pilot roteia para o LLM, prejudge usa o
+    book da Kalshi líquido de fee, e review_proposal usa coords do meta +
+    evidência kalshi_pilot (sem africa_pilot)."""
+    import weather_edge_judge as mod
+    import weather_edge_helpers as helpers
+    import kalshi_market_io as kio
+
+    spec_meta = {
+        "city": "New York", "threshold_value": 87.0, "threshold_unit": "F",
+        "metric": "temp", "comparison": "exceed",
+        "target_date": "2026-07-12", "confidence": 0.95,
+        "raw_question": "Highest temperature in NYC on Jul 12?",
+        "threshold_value_high": None, "temp_kind": "high",
+    }
+
+    def _row(*, spec=spec_meta, ref=92.0, pilot=True, sigma=None,
+             prob=0.80, side="YES"):
+        dm = {"venue": "kalshi", "pilot": pilot, "lat": 40.7789,
+              "lon": -73.9692, "station_icao": "KNYC",
+              "risk_notes": "brisa marítima vs UHI", "spec": spec}
+        if sigma is not None:
+            dm["ensemble_calibrated"] = True
+            dm["mae_dynamic"] = sigma
+        return {
+            "entry_id": 1, "entry_price": 0.40, "side": side,
+            # Título Kalshi real: parse_market NÃO extrai spec disso.
+            "market_question": "Highest temperature in NYC on Jul 12?",
+            "end_date": "2026-07-13T03:00:00Z", "city_resolved": "New York",
+            "forecast_prob_at_entry": prob,
+            "forecast_snapshot_json": json.dumps({"daily_forecast": [
+                {"date": "2026-07-12", "temp_high_f": ref}]}),
+            "discovery_meta_json": json.dumps(dm),
+            "token_id_yes": "KXHIGHNY-26JUL12-T87",
+            "token_id_no": "KXHIGHNY-26JUL12-T87",
+        }
+
+    saved = (helpers.parse_market, kio.fetch_orderbook, mod.JUDGE_AUTOROUTE,
+             mod.get_nws_forecast, mod.get_brightsky_forecast,
+             mod.get_metno_forecast, mod.get_ipma_forecast,
+             mod.get_visual_crossing, mod.call_claude, mod._geocode_city)
+    try:
+        # Test 1: _entry_spec prefere o spec do meta — parse_market plantado
+        # para explodir prova que o caminho Kalshi nem o consulta.
+        def _boom(*a, **k):
+            raise AssertionError("parse_market não deve ser chamado com spec no meta")
+        helpers.parse_market = _boom
+        spec = mod._entry_spec(_row())
+        assert spec is not None and spec.comparison == "exceed", spec
+        assert spec.threshold_value == 87.0 and spec.threshold_unit == "F"
+        assert spec.target_date == date(2026, 7, 12), spec.target_date
+        print("Test 1 PASS: _entry_spec reconstrói MarketSpec do meta "
+              "(parse_market não consultado)")
+
+        # Test 2: hard-guard de proximidade FUNCIONA para entry Kalshi —
+        # forecast 87.5°F a 0.5° do strike 87 (< 1.8°F) → coin flip.
+        r = mod._threshold_proximity_reason(_row(ref=87.5))
+        assert r is not None and "too close" in r, r
+        r = mod._threshold_proximity_reason(_row(ref=92.0))
+        assert r is None, r
+        print("Test 2 PASS: proximity guard vivo para Kalshi (87.5 fire, "
+              "92.0 não)")
+
+        # Test 3: pilot Kalshi NUNCA auto-aprova — mesmo ensemble apertado
+        # longe do strike vai para o LLM (rota None).
+        mod.JUDGE_AUTOROUTE = True
+        r = mod._judge_route(_row(ref=95.0, sigma=1.0))
+        assert r is None, r
+        # Não-temp via meta spec → fail-closed auto_reject, mesmo pilot.
+        bad_spec = dict(spec_meta, metric="precip")
+        r = mod._judge_route(_row(spec=bad_spec, ref=95.0))
+        assert r and r["action"] == "auto_reject", r
+        assert r.get("kind") == "non_temperature", r
+        print("Test 3 PASS: pilot → LLM (None); não-temp → auto_reject "
+              "fail-closed")
+
+        # Test 4: prejudge usa book Kalshi e edge LÍQUIDO de fee.
+        # bid NO 0.60 → ask YES 0.40; P=0.50 → bruto 10pp,
+        # fee_pp(0.40)=1.68 → líquido 8.32 < floor 15 → skip payload.
+        kio.fetch_orderbook = lambda tk: {
+            "orderbook": {"yes": [[0.35, 100]], "no": [[0.60, 50]]}}
+        pj = mod._recheck_edge_prejudge(_row(prob=0.50))
+        assert pj is not None and pj["venue"] == "kalshi", pj
+        assert abs(pj["current_edge_pp"] - 8.32) < 0.01, pj
+        assert abs(pj["fee_pp"] - 1.68) < 0.01, pj
+        # Edge alto passa (P=0.80 → líquido 38.32 ≥ 15 → None = segue LLM).
+        pj2 = mod._recheck_edge_prejudge(_row(prob=0.80))
+        assert pj2 is None, pj2
+        # Fail-open: book indisponível → None (nunca skip por falta de dado).
+        def _neterr(tk):
+            raise RuntimeError("net down")
+        kio.fetch_orderbook = _neterr
+        pj3 = mod._recheck_edge_prejudge(_row(prob=0.50))
+        assert pj3 is None, pj3
+        print("Test 4 PASS: prejudge Kalshi líquido de fee (skip 8.32pp, "
+              "passa 38.32pp, fail-open em erro)")
+
+        # Test 5: review_proposal usa coords do meta (geocode plantado para
+        # explodir) e injeta kalshi_pilot (não africa_pilot) na evidência.
+        seen = {}
+        def _geo_boom(city):
+            raise AssertionError("geocode não deve rodar com coords no meta")
+        mod._geocode_city = _geo_boom
+        mod.get_nws_forecast = lambda lat, lon: seen.setdefault(
+            "coords", (lat, lon)) and {"high_f": 92}
+        mod.get_brightsky_forecast = lambda lat, lon, d: None
+        mod.get_metno_forecast = lambda lat, lon, d: None
+        mod.get_ipma_forecast = lambda c, d: None
+        mod.get_visual_crossing = lambda c, d: None
+        mod.call_claude = lambda entry, evidence, prompt: {"evidence": evidence}
+        out = mod.review_proposal(_row(), "prompt")
+        ev = out["evidence"]
+        assert seen["coords"] == (40.7789, -73.9692), seen
+        assert "kalshi_pilot" in ev and "africa_pilot" not in ev, ev.keys()
+        kp = ev["kalshi_pilot"]
+        assert kp["station_icao"] == "KNYC" and kp["risk_notes"], kp
+        assert "CLI" in kp["resolution"], kp["resolution"]
+        print("Test 5 PASS: review_proposal — coords do meta, evidência "
+              "kalshi_pilot com station/risk_notes/resolução CLI")
+
+        print("\nAll --test-kalshi-route PASS (5/5)")
+    finally:
+        (helpers.parse_market, kio.fetch_orderbook, mod.JUDGE_AUTOROUTE,
+         mod.get_nws_forecast, mod.get_brightsky_forecast,
+         mod.get_metno_forecast, mod.get_ipma_forecast,
+         mod.get_visual_crossing, mod.call_claude, mod._geocode_city) = saved
+
+
 if __name__ == "__main__":
     import sys
     if "--test-rule6" in sys.argv:
@@ -2820,5 +3047,7 @@ if __name__ == "__main__":
         _test_metno()
     elif "--test-brightsky" in sys.argv:
         _test_brightsky()
+    elif "--test-kalshi-route" in sys.argv:
+        _test_kalshi_route()
     else:
         main()
