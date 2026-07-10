@@ -1,0 +1,33 @@
+[Unit]
+Description=Kalshi weather edge judge (mesma codebase do judge, DB/log/pid próprios)
+Documentation=file:%h/polymarket-skills/polymarket-analyzer/references/kalshi-us-cities-playbook.md
+After=network-online.target kalshi-edge-bot.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/polymarket-skills/agent/.env
+# Segunda instância do weather_edge_judge apontada para o mundo Kalshi:
+# sem estes overrides ela colidiria com a instância Polymarket (mesmo DB,
+# mesmo JSONL, mesmo pid file).
+Environment=WEATHER_EDGE_DB_PATH=%h/.polymarket-paper/kalshi_edge.db
+Environment=WEATHER_EDGE_JUDGE_LOG=%h/.polymarket-paper/kalshi_edge.jsonl
+Environment=WEATHER_EDGE_JUDGE_PID=%h/.polymarket-paper/kalshi-judge.pid.json
+Environment=JUDGE_DAILY_BUDGET_USD=10
+ExecStart=/usr/bin/env python3 %h/polymarket-skills/polymarket-analyzer/scripts/weather_edge_judge.py
+Restart=on-failure
+RestartSec=120s
+StandardOutput=journal
+StandardError=journal
+MemoryMax=256M
+CPUQuota=25%
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.polymarket-paper
+
+[Install]
+WantedBy=default.target

@@ -144,6 +144,8 @@ install_unit() {
 say "Instalando unidades systemd (venv python)..."
 install_unit "${REPO_DIR}/agent/weather-edge-bot.service"
 install_unit "${REPO_DIR}/agent/weather-edge-judge.service"
+install_unit "${REPO_DIR}/agent/kalshi-edge-bot.service"
+install_unit "${REPO_DIR}/agent/kalshi-edge-judge.service"
 install_unit "${REPO_DIR}/agent/weather-strategy-advisor.service"
 cp "${REPO_DIR}/agent/weather-strategy-advisor.timer" "${UNIT_DIR}/"
 # Backup semanal (bash, sem sed) + dashboard (já usa venv uvicorn, sem sed).

@@ -1,0 +1,30 @@
+[Unit]
+Description=Kalshi weather edge bot (paper-only, 11 cidades EUA)
+Documentation=file:%h/polymarket-skills/polymarket-analyzer/references/kalshi-us-cities-playbook.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/polymarket-skills/agent/.env
+# O bot já faz setdefault() para este caminho antes de importar o DB; a
+# Environment= explícita documenta a intenção e blinda contra um .env que
+# aponte WEATHER_EDGE_DB_PATH para o DB da Polymarket.
+Environment=WEATHER_EDGE_DB_PATH=%h/.polymarket-paper/kalshi_edge.db
+ExecStart=/usr/bin/env python3 %h/polymarket-skills/polymarket-analyzer/scripts/kalshi_edge_bot.py --daemon
+Restart=on-failure
+RestartSec=60s
+StandardOutput=journal
+StandardError=journal
+MemoryMax=256M
+CPUQuota=25%
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.polymarket-paper
+
+[Install]
+WantedBy=default.target
