@@ -373,18 +373,39 @@ def build_market_spec(market: dict, city: str, temp_kind: str) -> Optional[Marke
 # Orderbook → formato dos helpers
 # ---------------------------------------------------------------------------
 
+def raw_book_sides(raw: dict | None) -> tuple[list, list]:
+    """Extrai os níveis crus (yes, no) do payload do orderbook em QUALQUER
+    dos dois formatos observados na API real:
+
+    - novo (observado jul/2026 no smoke do operador):
+        {"orderbook_fp": {"yes_dollars": [["0.0100", "701.00"], ...],
+                          "no_dollars":  [...]}}
+      preços em STRING de dólares e quantidades fracionárias em string.
+    - legado (documentado):
+        {"orderbook": {"yes": [[preço, qtd], ...], "no": [...]}}
+
+    Retorna ([], []) em falha — o caller trata book vazio como sem
+    profundidade, nunca levanta."""
+    raw = raw or {}
+    fp = raw.get("orderbook_fp")
+    if isinstance(fp, dict):
+        return (fp.get("yes_dollars") or fp.get("yes") or [],
+                fp.get("no_dollars") or fp.get("no") or [])
+    ob = raw.get("orderbook") or {}
+    return ob.get("yes") or [], ob.get("no") or []
+
+
 def normalize_orderbook(raw: dict | None, side: str = "YES") -> dict:
     """Normaliza o orderbook cru da Kalshi para o formato que
     compute_max_size_for_slippage/implied_probabilities esperam:
     {"bids": [{"price", "size"}] desc, "asks": [{"price", "size"}] asc}.
 
     A Kalshi só publica BIDS de yes e de no; o ask de um lado deriva do bid
-    do outro (bid NO a 0.58 == oferta de venda de YES a 0.42). Autodetecção
-    de unidade: qualquer preço > 0.99 ⇒ cents ⇒ ÷100 (num binário o preço
-    máximo em dólares é 0.99). `unit_detected` vai no retorno para log."""
-    ob = (raw or {}).get("orderbook") or {}
-    yes_levels = ob.get("yes") or []
-    no_levels = ob.get("no") or []
+    do outro (bid NO a 0.58 == oferta de venda de YES a 0.42). Aceita os dois
+    formatos de payload (ver raw_book_sides). Autodetecção de unidade:
+    qualquer preço > 0.99 ⇒ cents ⇒ ÷100 (num binário o preço máximo em
+    dólares é 0.99). `unit_detected` vai no retorno para log."""
+    yes_levels, no_levels = raw_book_sides(raw)
 
     def _prices(levels):
         out = []
@@ -565,6 +586,28 @@ def _test() -> int:
         assert only_yes["bids"] and only_yes["asks"] == [], only_yes
         print("T2 PASS: dollars sem conversão, lado NO espelhado, book "
               "vazio/só-yes gracioso")
+
+        # T2b: formato NOVO da API (jul/2026) — orderbook_fp com
+        # yes_dollars/no_dollars, preços e quantidades como STRINGS de
+        # dólares (payload real do smoke: KXHIGHNY-26JUL11-T81, top bid YES
+        # 0.61, bid NO 0.37 → ask YES 0.63). Quantidades fracionárias.
+        raw_fp = {"orderbook_fp": {
+            "yes_dollars": [["0.0100", "1222.00"], ["0.6100", "2.00"],
+                            ["0.6000", "80.00"]],
+            "no_dollars": [["0.3700", "159.95"], ["0.3600", "253.00"],
+                           ["0.1600", "34.77"]],
+        }}
+        nb_fp = normalize_orderbook(raw_fp, "YES")
+        assert nb_fp["unit_detected"] == "dollars", nb_fp
+        assert nb_fp["bids"][0] == {"price": 0.61, "size": 2.0}, nb_fp["bids"]
+        assert nb_fp["asks"][0] == {"price": 0.63, "size": 159.95}, nb_fp["asks"]
+        assert nb_fp["asks"][1] == {"price": 0.64, "size": 253.0}, nb_fp["asks"]
+        ys, ns = raw_book_sides(raw_fp)
+        assert len(ys) == 3 and len(ns) == 3, (ys, ns)
+        assert raw_book_sides({"orderbook_fp": {"yes_dollars": None,
+                                                "no_dollars": None}}) == ([], [])
+        print("T2b PASS: formato orderbook_fp/yes_dollars (strings de "
+              "dólares, qty fracionária) normalizado; raw_book_sides ok")
 
         # T3: build_market_spec greater/less/between + fail-open.
         base_m = {"event_ticker": "KXHIGHNY-26JUL12", "ticker":
