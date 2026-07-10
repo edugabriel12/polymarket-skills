@@ -1,0 +1,65 @@
+{% if not positions %}
+  <div class="empty-state">
+    <div class="empty-icon">○</div>
+    <div class="empty-title">No open Kalshi positions</div>
+    <div class="empty-msg">Quando o bot Kalshi abrir uma posição paper, ela
+      aparece aqui com o bid do último monitor check, P&L e triggers.
+      Daemon parado? Rode:
+      <br><code>python polymarket-analyzer/scripts/kalshi_edge_bot.py --daemon</code></div>
+  </div>
+{% else %}
+<table class="data-table positions-table mobile-cards" id="kalshi-positions-table">
+  <thead>
+    <tr>
+      <th>ID</th><th>Market</th><th>Side</th>
+      <th>Stake</th><th>Entry</th><th>Bid</th><th>Peak</th>
+      <th>P&L</th><th>Held</th><th>Edge@entry</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for p in positions %}
+    <tr>
+      <td class="mono" data-label="ID">#{{ p.entry_id }}</td>
+      <td data-label="Market">
+        <div class="city">{{ p.city or '?' }}</div>
+        <div class="slug muted small">
+          <a href="https://kalshi.com/markets/{{ p.ticker.split('-')[0]|lower }}"
+             target="_blank" rel="noopener" class="market-link"
+             title="Abrir a série na Kalshi">
+            {{ p.ticker }} ↗
+          </a>
+        </div>
+      </td>
+      <td data-label="Side">
+        <span class="side-badge side-{{ p.side|lower }}">{{ p.side }}</span>
+      </td>
+      <td class="mono" data-label="Stake">${{ "%.2f"|format(p.size_usd) }}
+        <div class="muted small">{{ "%.0f"|format(p.size_shares) }} contratos</div>
+      </td>
+      <td class="mono" data-label="Entry">{{ "%.2f"|format(p.entry_price) }}</td>
+      <td class="mono" data-label="Bid">{{ "%.2f"|format(p.current_bid) }}
+        {% if p.bid_ts %}<div class="muted small">{{ p.bid_ts[:16] }}</div>{% endif %}
+      </td>
+      <td class="mono" data-label="Peak">
+        {% if p.peak_bid is not none %}{{ "%.2f"|format(p.peak_bid) }}{% else %}—{% endif %}
+      </td>
+      <td class="mono {% if p.paper_pnl_usd > 0 %}up{% elif p.paper_pnl_usd < 0 %}down{% endif %}"
+          data-label="P&L">
+        {{ "+" if p.paper_pnl_usd >= 0 else "" }}${{ "%.2f"|format(p.paper_pnl_usd) }}
+        <div class="muted small">{{ "%+.1f"|format(p.paper_pnl_pct) }}%</div>
+      </td>
+      <td class="mono" data-label="Held">{{ p.held_human }}</td>
+      <td class="mono" data-label="Edge@entry">{{ "%.1f"|format(p.edge_pp_at_entry) }}pp
+        {% if p.forecast_prob_yes is not none %}
+          <div class="muted small">P(YES) {{ "%.2f"|format(p.forecast_prob_yes) }}</div>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<div class="muted small" style="margin-top:6px;">
+  Bid do último monitor check (o bot atualiza a cada ciclo) · sem refresh
+  CLOB — tickers Kalshi não existem na Polymarket.
+</div>
+{% endif %}

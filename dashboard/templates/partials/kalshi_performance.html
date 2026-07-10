@@ -1,0 +1,31 @@
+<section class="chart-grid">
+  <div class="card chart-card">
+    {{ chart_html|safe }}
+  </div>
+</section>
+
+<section class="card">
+  <h2>P&L diário — últimos {{ days }} dias</h2>
+  <p class="muted small">Cashouts + settlements (posições sem cashout contam
+    pelo payout da resolução).</p>
+  {% if not series %}
+    <div class="muted">No realized P&L in this window.</div>
+  {% else %}
+  <table class="data-table">
+    <thead>
+      <tr><th>Date</th><th>Daily P&L</th><th>Cumulative</th></tr>
+    </thead>
+    <tbody>
+      {% for p in series|reverse %}
+      <tr>
+        <td class="mono">{{ p.date }}</td>
+        <td class="mono {% if p.daily_pnl > 0 %}up{% elif p.daily_pnl < 0 %}down{% endif %}">
+          {{ "+" if p.daily_pnl >= 0 else "" }}${{ "%.2f"|format(p.daily_pnl) }}</td>
+        <td class="mono {% if p.cumulative_pnl > 0 %}up{% elif p.cumulative_pnl < 0 %}down{% endif %}">
+          {{ "+" if p.cumulative_pnl >= 0 else "" }}${{ "%.2f"|format(p.cumulative_pnl) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>

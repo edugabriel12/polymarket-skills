@@ -1,0 +1,76 @@
+{% if summary and summary.available and summary.n_total %}
+<div class="kpi-grid">
+  <div class="kpi">
+    <span class="kpi-label">Resolved</span>
+    <span class="kpi-value">{{ summary.n_total }}</span>
+    <span class="kpi-delta muted">{{ summary.n_wins }}W / {{ summary.n_losses }}L</span>
+  </div>
+  <div class="kpi">
+    <span class="kpi-label">Win rate</span>
+    <span class="kpi-value {% if summary.win_rate is not none and summary.win_rate >= 0.5 %}up{% elif summary.win_rate is not none %}down{% endif %}">
+      {% if summary.win_rate is not none %}{{ "%.0f"|format(summary.win_rate * 100) }}%{% else %}—{% endif %}
+    </span>
+  </div>
+  <div class="kpi">
+    <span class="kpi-label">Total P&L</span>
+    {% set tp = summary.total_pnl_usd %}
+    <span class="kpi-value {% if tp > 0 %}up{% elif tp < 0 %}down{% endif %}">
+      {{ "+" if tp >= 0 else "" }}${{ "%.2f"|format(tp) }}
+    </span>
+    <span class="kpi-delta muted">stake ${{ "%.2f"|format(summary.total_stake_usd) }}</span>
+  </div>
+  <div class="kpi">
+    <span class="kpi-label">P&L / $ staked</span>
+    <span class="kpi-value">
+      {% if summary.pnl_per_dollar is not none %}{{ "%.3f"|format(summary.pnl_per_dollar) }}{% else %}—{% endif %}
+    </span>
+  </div>
+</div>
+{% endif %}
+
+{% if not history %}
+  <div class="empty-state">
+    <div class="empty-icon">○</div>
+    <div class="empty-title">No resolved Kalshi positions yet</div>
+    <div class="empty-msg">Cashouts e settlements aparecem aqui com P&L
+      realizado e motivo de saída.</div>
+  </div>
+{% else %}
+<table class="data-table mobile-cards" id="kalshi-history-table">
+  <thead>
+    <tr>
+      <th>ID</th><th>Market</th><th>Side</th>
+      <th>Entry</th><th>Exit</th><th>Stake</th>
+      <th>P&L</th><th>Exit kind</th><th>Held</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for h in history %}
+    <tr>
+      <td class="mono" data-label="ID">#{{ h.entry_id }}</td>
+      <td data-label="Market">
+        <div class="city">{{ h.city or '?' }}</div>
+        <div class="slug muted small">{{ h.ticker }}</div>
+      </td>
+      <td data-label="Side">
+        <span class="side-badge side-{{ h.side|lower }}">{{ h.side }}</span>
+      </td>
+      <td class="mono" data-label="Entry">{{ "%.2f"|format(h.entry_price) }}</td>
+      <td class="mono" data-label="Exit">{{ "%.2f"|format(h.exit_price) }}
+        {% if h.exit_ts %}<div class="muted small">{{ h.exit_ts[:16] }}</div>{% endif %}
+      </td>
+      <td class="mono" data-label="Stake">${{ "%.2f"|format(h.size_usd) }}</td>
+      <td class="mono {% if h.is_win %}up{% else %}down{% endif %}" data-label="P&L">
+        {{ "+" if h.realized_pnl_usd >= 0 else "" }}${{ "%.2f"|format(h.realized_pnl_usd) }}
+        <div class="muted small">{{ "%+.1f"|format(h.pnl_pct) }}%</div>
+      </td>
+      <td data-label="Exit kind">
+        <span class="mono">{{ h.exit_kind }}</span>
+        {% if h.reason %}<div class="muted small">{{ h.reason|truncate(40) }}</div>{% endif %}
+      </td>
+      <td class="mono" data-label="Held">{{ h.held_human }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}

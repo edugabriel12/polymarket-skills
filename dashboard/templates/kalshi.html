@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="card notice">
+  <strong>Kalshi — temperatura EUA (piloto paper)</strong>
+  <span class="muted small">Banca paper separada "kalshi" · resolução via NWS
+    Climate Report (CLI) em hora padrão local · fee de taker já descontada do
+    edge · 11 cidades confirmadas por fonte primária.</span>
+</section>
+
+<div id="kalshi-kpis"
+     hx-get="/api/kalshi/kpis"
+     hx-trigger="load, every {{ refresh_kpi_sec }}s"
+     hx-swap="innerHTML">
+  <div class="muted">Loading KPIs…</div>
+</div>
+
+<section class="period-selector" id="kalshi-view-sel">
+  <span>View:</span>
+  <button class="period-btn active" data-view="positions"
+          onclick="setKalshiView(this)">Positions</button>
+  <button class="period-btn" data-view="history"
+          onclick="setKalshiView(this)">History</button>
+  <button class="period-btn" data-view="performance"
+          onclick="setKalshiView(this)">Performance</button>
+</section>
+
+<section class="card">
+  <div id="kalshi-body"
+       hx-get="/api/kalshi/positions"
+       hx-trigger="load, every {{ refresh_positions_sec }}s, kalshiview"
+       hx-swap="innerHTML">
+    <div class="muted">Loading…</div>
+  </div>
+</section>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // Sub-views da aba Kalshi: o seletor troca a URL do hx-get do #kalshi-body
+  // e dispara um fetch imediato; o auto-refresh continua na view ativa.
+  const KALSHI_VIEWS = {
+    positions:   "/api/kalshi/positions",
+    history:     "/api/kalshi/history",
+    performance: "/api/kalshi/performance?days={{ days }}",
+  };
+  function setKalshiView(btn) {
+    document.querySelectorAll('#kalshi-view-sel .period-btn')
+      .forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const body = document.getElementById('kalshi-body');
+    body.setAttribute('hx-get', KALSHI_VIEWS[btn.dataset.view]);
+    htmx.process(body);
+    htmx.trigger(body, 'kalshiview');
+  }
+</script>
+{% endblock %}
