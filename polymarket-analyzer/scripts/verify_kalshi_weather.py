@@ -55,178 +55,29 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import requests  # noqa: E402
+import requests  # noqa: E402  (usado pelos self-tests p/ monkeypatch)
 
-_ENV_BASE = os.environ.get("KALSHI_API_BASE")
-# v3 (2026-07-09, run real do operador com --debug): trading-api.kalshi.com
-# está DESCONTINUADO — responde 401 "API has been moved to
-# https://api.elections.kalshi.com/". Host confirmado ao vivo vai primeiro;
-# o antigo fica como fallback só por segurança (endpoint isolado que ainda
-# viva lá, ou reversão futura da Kalshi). Sem KALSHI_API_BASE explícita,
-# tenta em sequência e fixa o primeiro que responder 200 (cache em
-# _WORKING_BASE) — assim um host errado não precisa de retry manual.
-_CANDIDATE_BASES = ([_ENV_BASE] if _ENV_BASE else [
-    "https://api.elections.kalshi.com/trade-api/v2",
-    "https://trading-api.kalshi.com/trade-api/v2",
-])
-_WORKING_BASE: str | None = None  # preenchido na 1a chamada bem-sucedida
-_DEBUG = False
-
-# Categorias candidatas para o filtro de série da Kalshi. Tentadas em ordem;
-# resultados de TODAS as que baterem são combinados (não só a primeira).
-# "Climate and Weather" confirmado ao vivo como categoria real (200 com
-# dados) — mas run real também confirmou que ela mistura contratos que NÃO
-# são de temperatura (ex. HURRICANENAME), daí o filtro _is_temperature_series
-# abaixo, aplicado sempre, não só no fallback.
-_WEATHER_CATEGORIES = ("Climate and Weather", "Weather", "Climate")
-
-# Fallback client-side (usado só se NENHUMA categoria acima bater): mesma
-# desconfiança do filtro da plataforma que weather_edge_bot.fetch_weather_
-# markets já aplica pra Gamma ("Gamma's tag_slug=weather param is silently
-# ignored, so we filter ourselves").
-_WEATHER_KEYWORDS = re.compile(
-    r"\b(weather|temperature|temp|climate|high|low|degrees?|"
-    r"fahrenheit|celsius|°[fc])\b", re.IGNORECASE)
-
-# Filtro final por TEMPERATURA — aplicado a todo candidato achado, mesmo
-# via filtro de categoria: "Climate and Weather" confirmado incluir
-# contratos não-temperatura (furacão, etc.), então o filtro de categoria
-# sozinho não isola o que interessa pra comparar com a Polymarket (que só
-# opera mercados de temperatura — is_tradeable_spec). Julga pelo TÍTULO, não
-# pela categoria (que é igual pra furacão e temperatura).
-_TEMPERATURE_KEYWORDS = re.compile(
-    r"\btemp\w*|\bhigh\b|\blow\b|\bheat\b|\bhot\b|\bcold\b|\bdegrees?\b|"
-    r"\bfahrenheit\b|\bcelsius\b|°[fc]", re.IGNORECASE)
-
-
-def _safe_list(data: dict | None, key: str) -> list:
-    """data.get(key) que NUNCA retorna None. A Kalshi devolve
-    {'series': None} (não {'series': []}) pra uma categoria sem resultado —
-    dict.get(key, default) só usa o default quando a CHAVE está ausente, não
-    quando o valor é None, então `data.get('series', [])` ainda devolve None
-    aqui e quebra qualquer `for x in ...` (TypeError: 'NoneType' object is
-    not iterable — descoberto no run real do operador). Usar sempre esta
-    função em vez de .get(key, []) direto nas respostas da Kalshi."""
-    if not data:
-        return []
-    return data.get(key) or []
-
-
-def _is_temperature_series(s: dict) -> bool:
-    return bool(_TEMPERATURE_KEYWORDS.search(str(s.get("title", ""))))
-
-
-def _debug_log(base: str, path: str, params: dict | None, status, body) -> None:
-    if not _DEBUG:
-        return
-    print(f"[debug] GET {base}{path} params={params or {}}", file=sys.stderr)
-    print(f"[debug]   status={status}  body[:500]={str(body)[:500]!r}",
-          file=sys.stderr)
-
-
-def _get(path: str, params: dict | None = None, timeout: int = 20):
-    """GET num endpoint público da Kalshi. Fail-open: retorna None em
-    qualquer falha (não-200, exceção de rede, JSON malformado). Nunca
-    levanta — mesma disciplina de todo fetch_* deste projeto.
-
-    v2: sem KALSHI_API_BASE explícita, tenta os hosts candidatos em
-    sequência (nenhum foi confirmado ao vivo pela pesquisa) e fixa em
-    _WORKING_BASE o primeiro que responder — chamadas seguintes vão direto
-    nele, sem retentar os outros a cada vez. Com --debug, imprime status e
-    corpo cru (sucesso ou falha) de cada tentativa no stderr.
-    """
-    global _WORKING_BASE
-    bases = [_WORKING_BASE] if _WORKING_BASE else _CANDIDATE_BASES
-    for base in bases:
-        try:
-            r = requests.get(f"{base}{path}", params=params or {},
-                             timeout=timeout)
-            body_preview = None
-            try:
-                body_preview = r.json()
-            except Exception:
-                body_preview = r.text
-            _debug_log(base, path, params, r.status_code, body_preview)
-            if r.status_code != 200:
-                continue
-            _WORKING_BASE = base
-            return body_preview if isinstance(body_preview, (dict, list)) else None
-        except Exception as e:
-            _debug_log(base, path, params, "exception", str(e))
-            continue
-    return None
-
-
-def discover_weather_series(categories: tuple = _WEATHER_CATEGORIES) -> list[dict]:
-    """Descobre séries (templates recorrentes de mercado, ex. NHIGH para
-    Central Park/NYC) de TEMPERATURA especificamente.
-
-    Tenta o filtro de categoria documentado primeiro (combina resultados de
-    TODAS as categorias que baterem); se nenhuma bater, busca sem filtro e
-    aplica o fallback client-side por palavra-chave. Cada entrada ganha um
-    campo `_source` ('category_filter' ou 'keyword_fallback') para o
-    relatório deixar claro qual caminho encontrou cada série.
-
-    Sempre aplica, por último, um filtro por TEMPERATURA no título (run real
-    confirmou que a categoria 'Climate and Weather' mistura contratos
-    não-temperatura, ex. HURRICANENAME) — o filtro de categoria/palavra-
-    chave acima só restringe a clima em geral, não a temperatura. Com
-    --debug, loga quantas séries de clima foram descartadas por não
-    parecerem de temperatura (nunca descarta silenciosamente sem contar).
-
-    Retorna [] se a API estiver inacessível ou nada for encontrado — nunca
-    levanta.
-    """
-    found: dict[str, dict] = {}
-    for cat in categories:
-        data = _get("/series", params={"category": cat})
-        for s in _safe_list(data, "series"):
-            tk = s.get("ticker")
-            if tk and tk not in found:
-                found[tk] = {**s, "_source": "category_filter"}
-
-    if not found:
-        data = _get("/series", params={"limit": 200})
-        for s in _safe_list(data, "series"):
-            text = f"{s.get('title', '')} {s.get('category', '')}"
-            if _WEATHER_KEYWORDS.search(text):
-                tk = s.get("ticker")
-                if tk and tk not in found:
-                    found[tk] = {**s, "_source": "keyword_fallback"}
-
-    all_found = list(found.values())
-    temp_only = [s for s in all_found if _is_temperature_series(s)]
-    if _DEBUG and len(temp_only) != len(all_found):
-        print(f"[debug] {len(all_found)} série(s) de clima encontrada(s), "
-              f"{len(all_found) - len(temp_only)} descartada(s) por não "
-              f"parecer(em) de temperatura (ex. furacão/precipitação)",
-              file=sys.stderr)
-    return temp_only
-
-
-def fetch_open_markets(series_ticker: str, limit: int = 50) -> list[dict]:
-    """Mercados abertos hoje para uma série. Cada dict cru traz (confirmado
-    via --debug-market-sample contra api.elections.kalshi.com, NÃO a doc
-    antiga do trading-api descontinuado): volume_fp/open_interest_fp
-    (contagens, string numérica) e yes_bid_dollars/yes_ask_dollars/
-    no_bid_dollars/no_ask_dollars/last_price_dollars/liquidity_dollars
-    (preços/valores, string dolarizada tipo '0.0100') — ver _to_float().
-    Retorna [] em qualquer falha."""
-    data = _get("/markets", params={"series_ticker": series_ticker,
-                                    "status": "open", "limit": limit})
-    return _safe_list(data, "markets")
-
-
-def fetch_orderbook(ticker: str) -> dict | None:
-    """Profundidade de book (yes/no) de um mercado. None em qualquer falha."""
-    return _get(f"/markets/{ticker}/orderbook")
+# v4: cliente HTTP extraído para kalshi_market_io.py (fonte única — o
+# kalshi_edge_bot usa o mesmo cliente). Este script mantém só o relatório
+# de comparação Kalshi vs Polymarket. O estado mutável do cliente
+# (_WORKING_BASE/_DEBUG) vive em kio; os self-tests daqui manipulam
+# kio._WORKING_BASE / kio._DEBUG diretamente.
+import kalshi_market_io as kio  # noqa: E402
+from kalshi_market_io import (  # noqa: E402
+    _CANDIDATE_BASES,
+    _get,
+    _safe_list,
+    _spread,
+    _to_float,
+    discover_weather_series,
+    fetch_open_markets,
+    fetch_orderbook,
+)
 
 
 def _debug_market_sample(ticker: str | None) -> int:
@@ -424,10 +275,9 @@ def _print_report(report: dict, want_markets: bool, want_orderbook: bool) -> int
 # Self-test hermético (sem rede) — monkeypatch requests.get
 # ---------------------------------------------------------------------------
 def _test() -> int:
-    global _WORKING_BASE, _DEBUG
     saved = requests.get
-    saved_working_base, saved_debug = _WORKING_BASE, _DEBUG
-    _WORKING_BASE = None  # cada teste começa sem host cacheado
+    saved_working_base, saved_debug = kio._WORKING_BASE, kio._DEBUG
+    kio._WORKING_BASE = None  # cada teste começa sem host cacheado
 
     class _R:
         def __init__(self, status, payload):
@@ -548,7 +398,7 @@ def _test() -> int:
         # T9: 1o host candidato falha (conexão recusada), 2o responde 200 ->
         # _get tenta em sequência e fixa o 2o em _WORKING_BASE; chamada
         # seguinte vai direto nele (sem retentar o 1o).
-        _WORKING_BASE = None
+        kio._WORKING_BASE = None
         calls = {"first_base_tries": 0, "second_base_tries": 0}
         def fake_multi_base(url, params=None, **kw):
             if url.startswith(_CANDIDATE_BASES[0]):
@@ -559,7 +409,7 @@ def _test() -> int:
         requests.get = fake_multi_base
         r1 = _get("/series", params={"category": "Climate and Weather"})
         assert r1 == {"series": [{"ticker": "KXHIGHNY", "title": "x"}]}, r1
-        assert _WORKING_BASE == _CANDIDATE_BASES[1], _WORKING_BASE
+        assert kio._WORKING_BASE == _CANDIDATE_BASES[1], kio._WORKING_BASE
         assert calls["first_base_tries"] == 1 and calls["second_base_tries"] == 1, calls
         # 2a chamada: so o host cacheado e tentado (1o candidato nao sobe de novo).
         r2 = _get("/series", params={"category": "Weather"})
@@ -644,7 +494,7 @@ def _test() -> int:
         return 0
     finally:
         requests.get = saved
-        _WORKING_BASE, _DEBUG = saved_working_base, saved_debug
+        kio._WORKING_BASE, kio._DEBUG = saved_working_base, saved_debug
 
 
 def main() -> int:
@@ -679,8 +529,7 @@ def main() -> int:
         return _debug_market_sample(args.debug_market_sample or None)
 
     if args.debug:
-        global _DEBUG
-        _DEBUG = True
+        kio._DEBUG = True
 
     want_markets = args.markets or args.orderbook
     report = run(want_markets=want_markets, want_orderbook=args.orderbook,
