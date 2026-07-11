@@ -36,6 +36,15 @@ Uso:
     python verify_om_models.py --quiet         # sem progresso ao vivo (dump no final)
     python verify_om_models.py --json
     python verify_om_models.py --test          # self-test hermético (sem rede)
+
+v3 (2026-07-10, expansão Kalshi): `--kalshi` carrega
+references/kalshi-cities.json (20 cidades US do bot Kalshi) no lugar do
+weather-cities.json; `--candidates M1 M2` pré-valida chaves AINDA NÃO
+configuradas em nenhum om_models, probando cada uma em TODAS as cidades da
+config carregada (implica --per-city). É o passo obrigatório ANTES de
+editar om_models na config:
+
+    python verify_om_models.py --kalshi --candidates gfs_hrrr ncep_nbm_conus
 """
 from __future__ import annotations
 
@@ -52,6 +61,17 @@ import requests  # noqa: E402
 import weather_edge_helpers as weh  # noqa: E402
 
 OM_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+
+KALSHI_CITIES_PATH = (Path(__file__).resolve().parent.parent
+                      / "references" / "kalshi-cities.json")
+
+
+def _load_kalshi_stations() -> dict:
+    """kalshi-cities.json adaptado ao shape {'stations': {...}} que run()
+    espera — as entradas já usam os mesmos nomes de campo (lat/lon/station/
+    om_models), só mudam de 'cities' para 'stations'."""
+    data = json.loads(KALSHI_CITIES_PATH.read_text(encoding="utf-8"))
+    return {"stations": data.get("cities") or {}}
 
 # Classificação heurística do `reason` de um 400 da Open-Meteo. As mensagens
 # variam, então sempre imprimimos o reason cru; isto só rotula para o resumo.
@@ -180,7 +200,8 @@ def _fmt(rep: dict) -> str:
 
 
 def run(cities: dict, *, per_city: bool, only_models: list | None,
-        date_iso: str, progress: bool = False) -> dict:
+        date_iso: str, progress: bool = False,
+        candidates: list | None = None) -> dict:
     """Probe the trio baseline, each distinct om_models key, and (if per_city)
     every (city, model) pair. Sequential — a --per-city sweep over the full
     config is ~145 HTTP calls, each up to 20s on failure.
@@ -197,6 +218,12 @@ def run(cities: dict, *, per_city: bool, only_models: list | None,
     by_key = _distinct_keys(stations)
     if only_models:
         by_key = {k: v for k, v in by_key.items() if k in only_models}
+    # Candidatos: chaves AINDA NÃO configuradas em nenhum om_models —
+    # pré-validação antes de editar a config. Cada candidato ganha uma probe
+    # por-chave (na primeira cidade) E entra em todos os pares por-cidade.
+    if candidates:
+        for k in candidates:
+            by_key.setdefault(k, list(stations.keys()))
 
     # Baseline: o trio global DEVE ser sempre válido. Se falhar, o problema é
     # rede/API do host, não as chaves regionais.
@@ -213,6 +240,8 @@ def run(cities: dict, *, per_city: bool, only_models: list | None,
             if not isinstance(s, dict):
                 continue
             models = s.get("om_models") or []
+            if candidates:
+                models = list(dict.fromkeys(list(models) + list(candidates)))
             if only_models:
                 models = [m for m in models if m in only_models]
             if models:
@@ -435,7 +464,34 @@ def _test() -> int:
         print("T8 PASS: reset de conexão na 1a tentativa, retry recupera -> "
               "valid (não vira falso '⚠ revisar' por blip transitório)")
 
-        print("\nAll verify_om_models self-tests PASS (8/8)")
+        # T9 (v3): candidates — chave NÃO configurada em nenhum om_models é
+        # pré-validada em TODAS as cidades (shape kalshi: om_models null).
+        requests.get = lambda *a, **k: _R(
+            200, {"hourly": {"temperature_2m": [20.0, 25.0]}})
+        kcities = {"stations": {
+            "Seattle": {"lat": 47.44, "lon": -122.31, "station": "KSEA",
+                        "om_models": None},
+            "Dallas": {"lat": 32.90, "lon": -97.04, "station": "KDFW",
+                       "om_models": None},
+        }}
+        rep9 = run(kcities, per_city=True, only_models=None,
+                   date_iso="2026-07-10",
+                   candidates=["gfs_hrrr", "ncep_nbm_conus"])
+        keys9 = {r["model"] for r in rep9["per_key"]}
+        assert keys9 == {"gfs_hrrr", "ncep_nbm_conus"}, keys9
+        assert len(rep9["per_city"]) == 2, rep9["per_city"]
+        for entry in rep9["per_city"]:
+            probed = {p["model"] for p in entry["probes"]}
+            assert probed == {"gfs_hrrr", "ncep_nbm_conus"}, (entry["city"],
+                                                              probed)
+        # loader do kalshi-cities.json real: 20 cidades no shape stations
+        ks = _load_kalshi_stations()
+        assert len(ks["stations"]) == 20, len(ks["stations"])
+        assert ks["stations"]["Dallas"]["station"] == "KDFW"
+        print("T9 PASS: --candidates proba chaves não-configuradas em todas "
+              "as cidades; _load_kalshi_stations carrega as 20 (KDFW ok)")
+
+        print("\nAll verify_om_models self-tests PASS (9/9)")
         return 0
     finally:
         requests.get = saved
@@ -449,7 +505,14 @@ def main() -> int:
     ap.add_argument("--per-city", action="store_true",
                     help="probar cada par (cidade, modelo) — cobertura de domínio")
     ap.add_argument("--models", nargs="*", default=None,
-                    help="restringe às chaves dadas")
+                    help="restringe às chaves dadas (já configuradas)")
+    ap.add_argument("--kalshi", action="store_true",
+                    help="usa references/kalshi-cities.json (bot Kalshi) em "
+                         "vez do weather-cities.json")
+    ap.add_argument("--candidates", nargs="*", default=None,
+                    help="chaves AINDA NÃO configuradas para pré-validar em "
+                         "TODAS as cidades da config (implica --per-city). "
+                         "Ex.: --kalshi --candidates gfs_hrrr ncep_nbm_conus")
     ap.add_argument("--date", default=None,
                     help="dia-alvo YYYY-MM-DD (default: amanhã UTC)")
     ap.add_argument("--json", action="store_true", help="saída JSON crua")
@@ -464,10 +527,11 @@ def main() -> int:
         return _test()
 
     date_iso = args.date or _tomorrow_iso()
-    cities = weh.load_cities()
+    cities = _load_kalshi_stations() if args.kalshi else weh.load_cities()
     stream = not args.json and not args.quiet
-    report = run(cities, per_city=args.per_city, only_models=args.models,
-                 date_iso=date_iso, progress=stream)
+    report = run(cities, per_city=args.per_city or bool(args.candidates),
+                 only_models=args.models, date_iso=date_iso, progress=stream,
+                 candidates=args.candidates)
     if args.json:
         print(json.dumps(report, indent=2, ensure_ascii=False))
         # ainda retorna código de saída acionável
