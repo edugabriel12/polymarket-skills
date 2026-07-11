@@ -87,6 +87,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 DEFAULT_KALSHI_DB = Path.home() / ".polymarket-paper" / "kalshi_edge.db"
 os.environ.setdefault("WEATHER_EDGE_DB_PATH", str(DEFAULT_KALSHI_DB))
 
+import requests  # noqa: E402
+
 import weather_edge_db as db  # noqa: E402
 import weather_edge_bot as web  # noqa: E402
 import kalshi_market_io as kio  # noqa: E402
@@ -802,24 +804,94 @@ def _do_cashout_kalshi(row, book: dict, forecast: dict,
 _SETTLED_STATUSES = {"settled", "finalized"}
 
 
-def _observed_value_for_kalshi(row) -> Optional[float]:
-    """observed_value via METAR da estação — APENAS log/counterfactual.
-    Aproximações documentadas: METAR≈CLI (arredondamento/QC do NWS) e dia
-    UTC do METAR ≈ dia LST do CLI. A decisão de settlement NUNCA usa isto."""
+# Arquivo do IEM (Iowa Environmental Mesonet) para o produto CLI — a MESMA
+# fonte que liquida o mercado (NWS Daily Climate Report), com o dia
+# climatológico LST correto. Dois endpoints: o serviço /api/1 e o cli.py
+# legado como fallback (shapes de resposta ligeiramente diferentes).
+IEM_CLI_API = "https://mesonet.agron.iastate.edu/api/1/cli.json"
+IEM_CLI_LEGACY = "https://mesonet.agron.iastate.edu/json/cli.py"
+
+
+def fetch_iem_cli(icao: str, target_date: date) -> Optional[dict]:
+    """Valores do CLI arquivados pelo IEM para (estação, dia LST).
+
+    Retorna {"high_f", "low_f", "source"} ou None (fail-open — a decisão de
+    settlement NUNCA depende disto; é verdade-terra para log/counterfactual
+    e calibração). Parser defensivo: aceita lista em "data" (api/1) ou
+    "results" (cli.py), campos "M"/None tratados como ausentes."""
+    d_iso = target_date.isoformat()
+
+    def _pick(rows) -> Optional[dict]:
+        for r in rows or []:
+            if not isinstance(r, dict):
+                continue
+            if not str(r.get("valid") or "").startswith(d_iso):
+                continue
+            hi = kio._to_float(r.get("high"))
+            lo = kio._to_float(r.get("low"))
+            if hi is not None or lo is not None:
+                return {"high_f": hi, "low_f": lo}
+        return None
+
+    try:
+        r = requests.get(IEM_CLI_API,
+                         params={"station": icao, "date": d_iso}, timeout=15)
+        if r.status_code == 200:
+            body = r.json() or {}
+            got = _pick(body.get("data") or body.get("results"))
+            if got:
+                got["source"] = "iem_cli_api"
+                return got
+    except Exception:
+        pass
+    try:
+        r = requests.get(IEM_CLI_LEGACY,
+                         params={"station": icao,
+                                 "year": target_date.year}, timeout=20)
+        if r.status_code == 200:
+            body = r.json() or {}
+            got = _pick(body.get("results") or body.get("data"))
+            if got:
+                got["source"] = "iem_cli_legacy"
+                return got
+    except Exception:
+        pass
+    return None
+
+
+def _observed_value_for_kalshi(row) -> tuple[Optional[float], Optional[str]]:
+    """(observed_value, fonte) — APENAS log/counterfactual/calibração; a
+    decisão de settlement NUNCA usa isto.
+
+    Preferência: IEM CLI (arquivo do MESMO produto que liquida o mercado,
+    dia climatológico LST exato) → METAR como fallback (aproximações
+    documentadas: METAR≈CLI no arredondamento/QC e dia UTC ≈ dia LST)."""
     meta = _meta_load(row)
     icao = meta.get("station_icao")
     spec_d = meta.get("spec") or {}
     tgt = spec_d.get("target_date")
     kind = spec_d.get("temp_kind") or "high"
     if not icao or not tgt:
-        return None
+        return None, None
+    tgt_d = date.fromisoformat(tgt)
     try:
-        obs = fetch_metar_daily_extremes(icao, date.fromisoformat(tgt))
+        cli = fetch_iem_cli(icao, tgt_d)
+    except Exception:
+        cli = None
+    if cli:
+        v = cli.get("low_f" if kind == "low" else "high_f")
+        if v is not None:
+            return float(v), cli.get("source", "iem_cli")
+    try:
+        obs = fetch_metar_daily_extremes(icao, tgt_d)
     except Exception:
         obs = None
     if not obs:
-        return None
-    return obs.get("observed_min_f" if kind == "low" else "observed_max_f")
+        return None, None
+    v = obs.get("observed_min_f" if kind == "low" else "observed_max_f")
+    if v is None:
+        return None, None
+    return float(v), "metar"
 
 
 def run_resolution_sweep_kalshi(args) -> int:
@@ -862,7 +934,7 @@ def run_resolution_sweep_kalshi(args) -> int:
             if final_outcome == "VOID":
                 payout = float(row["entry_price"] or 0)
 
-            observed_value = _observed_value_for_kalshi(row)
+            observed_value, observed_src = _observed_value_for_kalshi(row)
             with db.connect() as conn2:
                 db.insert_resolution(
                     conn2, entry_id=row["entry_id"], ts_resolved=_now_iso(),
@@ -872,7 +944,8 @@ def run_resolution_sweep_kalshi(args) -> int:
             log_event("kalshi_resolution_observed", {
                 "entry_id": row["entry_id"], "ticker": ticker,
                 "outcome": final_outcome, "payout": payout,
-                "observed_value_metar_f": observed_value})
+                "observed_value_f": observed_value,
+                "observed_source": observed_src})
 
             try:
                 close_result = _paper_close(
@@ -984,6 +1057,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-multi-source", dest="multi_source",
                     action="store_false")
     ap.add_argument("--max-disagreement-pp", type=float, default=25)
+    ap.add_argument("--probe-cli", nargs="+", metavar="STATION [DATE]",
+                    help="smoke do operador: busca o CLI no arquivo do IEM e "
+                         "compara com o METAR (ex.: --probe-cli KSEA "
+                         "2026-07-09; DATE default = ontem UTC)")
     return ap
 
 
@@ -993,6 +1070,28 @@ def main() -> int:
 
     if args.log_file:
         web.LOG_FILE = Path(args.log_file)
+
+    if args.probe_cli:
+        from datetime import timedelta
+        icao = args.probe_cli[0].upper()
+        d = (date.fromisoformat(args.probe_cli[1]) if len(args.probe_cli) > 1
+             else datetime.now(timezone.utc).date() - timedelta(days=1))
+        cli = fetch_iem_cli(icao, d)
+        print(f"IEM CLI  {icao} {d}: {cli}")
+        try:
+            metar = fetch_metar_daily_extremes(icao, d)
+        except Exception as e:
+            metar = f"erro: {e}"
+        print(f"METAR    {icao} {d}: {metar}")
+        if cli:
+            print("OK — verdade-terra do observado virá do CLI (fonte de "
+                  "settlement); METAR fica como fallback.")
+        else:
+            print("IEM indisponível/sem dado — o bot cai no METAR "
+                  "(aproximação documentada). Se persistir, cheque o "
+                  "endpoint no navegador: "
+                  f"{IEM_CLI_API}?station={icao}&date={d}")
+        return 0
 
     kcities = kio.load_kalshi_cities()
     if not kcities.get("cities"):
@@ -1456,6 +1555,7 @@ def _test_resolution():
     saved_fetch_m = kio.fetch_market
     saved_close = g["_paper_close"]
     saved_metar = g["fetch_metar_daily_extremes"]
+    saved_cli = g["fetch_iem_cli"]
     closes = []
     try:
         def fake_close(args, token_id, side, reasoning,
@@ -1468,6 +1568,8 @@ def _test_resolution():
         g["_paper_close"] = fake_close
         g["fetch_metar_daily_extremes"] = lambda icao, tgt, hours=72: {
             "observed_max_f": 91.0, "observed_min_f": 72.0}
+        # IEM indisponível nos testes 1-4 → fallback METAR (91.0)
+        g["fetch_iem_cli"] = lambda icao, d: None
 
         past = (datetime.now(timezone.utc).timestamp()) - 3600
         past_iso = datetime.fromtimestamp(
@@ -1540,11 +1642,68 @@ def _test_resolution():
         assert abs(r["payout_per_share"] - 0.40) < 1e-9, dict(r)
         print("Test 4 PASS: settled sem result → VOID payout=entry_price")
 
-        print("\nAll --test-resolution PASS (4/4)")
+        # Test 5: IEM CLI tem PRECEDÊNCIA sobre METAR no observed_value
+        # (CLI 90.0 vs METAR 91.0 → grava 90.0), e o parser aceita os dois
+        # shapes do IEM + campos "M" ausentes.
+        with db.connect() as conn:
+            _wipe_entries(conn)
+            _seed_entry(conn, status="EXECUTED", end_date=past_iso,
+                        ticker="KXHIGHNY-26JUL12-T87")
+        g["fetch_iem_cli"] = lambda icao, d: {
+            "high_f": 90.0, "low_f": 71.0, "source": "iem_cli_api"}
+        kio.fetch_market = lambda tk: {"ticker": tk, "status": "settled",
+                                       "result": "yes"}
+        n5 = run_resolution_sweep_kalshi(args)
+        assert n5 == 1, n5
+        with db.connect() as conn:
+            r5 = conn.execute("SELECT observed_value FROM resolutions "
+                              "ORDER BY resolution_id DESC LIMIT 1").fetchone()
+        assert r5["observed_value"] == 90.0, r5["observed_value"]
+        # parser hermético do fetch_iem_cli (os dois shapes + "M")
+        g["fetch_iem_cli"] = saved_cli  # restaura a função real
+        saved_get = requests.get
+
+        class _R:
+            def __init__(self, status, payload):
+                self.status_code = status
+                self._p = payload
+            def json(self):
+                return self._p
+
+        try:
+            requests.get = lambda url, params=None, timeout=None: _R(
+                200, {"data": [{"valid": "2026-07-09", "station": "KSEA",
+                                "high": 78, "low": "M"}]})
+            got = fetch_iem_cli("KSEA", date(2026, 7, 9))
+            assert got == {"high_f": 78.0, "low_f": None,
+                           "source": "iem_cli_api"}, got
+            # api/1 falha → cai no legado (shape "results")
+            def _legacy_only(url, params=None, timeout=None):
+                if "api/1" in url:
+                    return _R(500, {})
+                return _R(200, {"results": [
+                    {"valid": "2026-07-08", "high": 70, "low": 50},
+                    {"valid": "2026-07-09", "high": 79, "low": 55}]})
+            requests.get = _legacy_only
+            got2 = fetch_iem_cli("KSEA", date(2026, 7, 9))
+            assert got2 == {"high_f": 79.0, "low_f": 55.0,
+                            "source": "iem_cli_legacy"}, got2
+            # tudo falha → None (fail-open)
+            def _boom(url, params=None, timeout=None):
+                raise RuntimeError("net down")
+            requests.get = _boom
+            assert fetch_iem_cli("KSEA", date(2026, 7, 9)) is None
+        finally:
+            requests.get = saved_get
+        print("Test 5 PASS: CLI do IEM precede METAR (90.0 gravado); parser "
+              "aceita data/results, 'M'→None, fail-open")
+
+        print("\nAll --test-resolution PASS (5/5)")
     finally:
         kio.fetch_market = saved_fetch_m
         g["_paper_close"] = saved_close
         g["fetch_metar_daily_extremes"] = saved_metar
+        g["fetch_iem_cli"] = saved_cli
         restore_db()
 
 

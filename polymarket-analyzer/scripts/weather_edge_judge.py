@@ -254,6 +254,50 @@ def get_nws_forecast(lat: float, lon: float) -> Optional[dict]:
         return None
 
 
+def get_nws_afd(wfo: str, max_chars: int = 2800) -> Optional[dict]:
+    """Area Forecast Discussion do WFO — o texto onde o meteorologista do
+    NWS explica o RACIOCÍNIO da previsão local (timing de brisa marítima,
+    dissipação de estrato, frentes). É a evidência "insider oficial" para as
+    cidades Kalshi: os fatores de erro nº 1 dessas estações (risk_notes) são
+    exatamente os que o AFD discute em texto.
+
+    Duas chamadas em api.weather.gov: lista de produtos AFD do escritório →
+    texto do mais recente. Corta em ".LONG TERM" (o judge só precisa do
+    curto prazo) e limita a max_chars. Fail-open None."""
+    if not wfo:
+        return None
+    ua = os.environ.get("NWS_USER_AGENT", "polymarket-skills weather-edge-bot")
+    headers = {"User-Agent": ua}
+    try:
+        r = requests.get(
+            f"https://api.weather.gov/products/types/AFD/locations/{wfo.upper()}",
+            headers=headers, timeout=12)
+        if r.status_code != 200:
+            return None
+        graph = (r.json() or {}).get("@graph") or []
+        if not graph:
+            return None
+        pid = graph[0].get("id") or str(graph[0].get("@id") or "").rsplit(
+            "/", 1)[-1]
+        if not pid:
+            return None
+        r2 = requests.get(f"https://api.weather.gov/products/{pid}",
+                          headers=headers, timeout=12)
+        if r2.status_code != 200:
+            return None
+        body = r2.json() or {}
+        text = str(body.get("productText") or "")
+        if not text.strip():
+            return None
+        cut = text.find(".LONG TERM")
+        if cut > 0:
+            text = text[:cut]
+        return {"wfo": wfo.upper(), "issued": body.get("issuanceTime"),
+                "text": text.strip()[:max_chars]}
+    except Exception:
+        return None
+
+
 def get_brightsky_forecast(lat: float, lon: float,
                            target_date: str) -> Optional[dict]:
     """DWD MOSMIX point forecast for `target_date` via the free Bright Sky
@@ -668,6 +712,14 @@ def review_proposal(entry: dict, system_prompt: str) -> Optional[dict]:
     # cities have NO regional forecast model and resolve off real METAR (the
     # ERA5 archive is too biased to settle a 1°C tick), so the ensemble's
     # confidence is worth less here — demand independent corroboration.
+    # v18: AFD do WFO local — o raciocínio textual do meteorologista do NWS
+    # sobre exatamente os fatores das risk_notes (timing de brisa, estrato,
+    # frentes). Só para venue kalshi (meta carrega o wfo); fail-open.
+    if venue == "kalshi" and meta.get("wfo"):
+        afd = get_nws_afd(str(meta["wfo"]))
+        if afd:
+            evidence["nws_afd"] = afd
+
     if _entry_is_pilot(entry):
         if venue == "kalshi":
             # Kalshi US temperature pilot: venue/estação novas para o bot.
@@ -2916,7 +2968,7 @@ def _test_kalshi_route():
     def _row(*, spec=spec_meta, ref=92.0, pilot=True, sigma=None,
              prob=0.80, side="YES"):
         dm = {"venue": "kalshi", "pilot": pilot, "lat": 40.7789,
-              "lon": -73.9692, "station_icao": "KNYC",
+              "lon": -73.9692, "station_icao": "KNYC", "wfo": "OKX",
               "risk_notes": "brisa marítima vs UHI", "spec": spec}
         if sigma is not None:
             dm["ensemble_calibrated"] = True
@@ -2937,7 +2989,8 @@ def _test_kalshi_route():
     saved = (helpers.parse_market, kio.fetch_orderbook, mod.JUDGE_AUTOROUTE,
              mod.get_nws_forecast, mod.get_brightsky_forecast,
              mod.get_metno_forecast, mod.get_ipma_forecast,
-             mod.get_visual_crossing, mod.call_claude, mod._geocode_city)
+             mod.get_visual_crossing, mod.call_claude, mod._geocode_city,
+             mod.get_nws_afd)
     try:
         # Test 1: _entry_spec prefere o spec do meta — parse_market plantado
         # para explodir prova que o caminho Kalshi nem o consulta.
@@ -3007,6 +3060,9 @@ def _test_kalshi_route():
         mod.get_ipma_forecast = lambda c, d: None
         mod.get_visual_crossing = lambda c, d: None
         mod.call_claude = lambda entry, evidence, prompt: {"evidence": evidence}
+        mod.get_nws_afd = lambda wfo, max_chars=2800: {
+            "wfo": wfo, "issued": "2026-07-11T09:00:00Z",
+            "text": "sea breeze arrives by 2pm, capping the high"}
         out = mod.review_proposal(_row(), "prompt")
         ev = out["evidence"]
         assert seen["coords"] == (40.7789, -73.9692), seen
@@ -3014,15 +3070,61 @@ def _test_kalshi_route():
         kp = ev["kalshi_pilot"]
         assert kp["station_icao"] == "KNYC" and kp["risk_notes"], kp
         assert "CLI" in kp["resolution"], kp["resolution"]
+        assert ev["nws_afd"]["wfo"] == "OKX" and "sea breeze" in \
+            ev["nws_afd"]["text"], ev.get("nws_afd")
         print("Test 5 PASS: review_proposal — coords do meta, evidência "
-              "kalshi_pilot com station/risk_notes/resolução CLI")
+              "kalshi_pilot + nws_afd (AFD do WFO do meta)")
 
-        print("\nAll --test-kalshi-route PASS (5/5)")
+        # Test 6: parser do get_nws_afd — 2 chamadas (lista → produto),
+        # corte no .LONG TERM, cap de chars, 404 → None (fail-open).
+        mod.get_nws_afd = saved[-1]  # restaura a função REAL (Test 5 mockou)
+        import requests as _rq
+        saved_get = _rq.get
+
+        class _R:
+            def __init__(self, status, payload):
+                self.status_code = status
+                self._p = payload
+            def json(self):
+                return self._p
+
+        calls = []
+        def _fake_get(url, headers=None, timeout=None):
+            calls.append(url)
+            assert headers and headers.get("User-Agent"), "NWS exige UA"
+            if "/products/types/AFD/locations/SEW" in url:
+                return _R(200, {"@graph": [{"id": "abc-123"}]})
+            if url.endswith("/products/abc-123"):
+                return _R(200, {
+                    "issuanceTime": "2026-07-11T09:14:00Z",
+                    "productText": (".SYNOPSIS...\nMarine stratus through "
+                                    "mid morning.\n\n.SHORT TERM...\nBurn-off "
+                                    "by early afternoon.\n&&\n\n.LONG TERM..."
+                                    "\nIsto nao deve aparecer.")})
+            return _R(404, {})
+        _rq.get = _fake_get
+        try:
+            afd = mod.get_nws_afd("sew")
+            assert afd and afd["wfo"] == "SEW", afd
+            assert "Burn-off" in afd["text"], afd["text"]
+            assert ".LONG TERM" not in afd["text"] and \
+                "nao deve aparecer" not in afd["text"], afd["text"]
+            assert len(calls) == 2, calls
+            # fail-open: escritório sem produto → None
+            assert mod.get_nws_afd("XXX") is None
+            assert mod.get_nws_afd("") is None
+        finally:
+            _rq.get = saved_get
+        print("Test 6 PASS: get_nws_afd — 2 fetches com UA, corte no "
+              ".LONG TERM, fail-open em 404/vazio")
+
+        print("\nAll --test-kalshi-route PASS (6/6)")
     finally:
         (helpers.parse_market, kio.fetch_orderbook, mod.JUDGE_AUTOROUTE,
          mod.get_nws_forecast, mod.get_brightsky_forecast,
          mod.get_metno_forecast, mod.get_ipma_forecast,
-         mod.get_visual_crossing, mod.call_claude, mod._geocode_city) = saved
+         mod.get_visual_crossing, mod.call_claude, mod._geocode_city,
+         mod.get_nws_afd) = saved
 
 
 if __name__ == "__main__":
