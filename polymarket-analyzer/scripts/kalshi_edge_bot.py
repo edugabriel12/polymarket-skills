@@ -972,6 +972,80 @@ def run_resolution_sweep_kalshi(args) -> int:
     return resolved
 
 
+def run_rejection_counterfactual_kalshi(args, limit: int = 40) -> int:
+    """"Custo da cautela": para entries REJECTED/SKIPPED cujo mercado já
+    encerrou, busca o settlement REAL da Kalshi (barato: 1 GET por ticker)
+    e grava em counterfactuals quanto o trade recusado TERIA rendido —
+    nocional padronizado de $100, líquido da fee taker.
+
+    Motivação (operador, 2026-07-11): com muitas fontes de evidência, o
+    judge pode ficar conservador demais e rejeitar trades lucrativos. Este
+    sweep transforma essa hipótese em telemetria: rejeições de trades
+    mortos aparecem com pnl<=0 (cautela correta); pnl>0 recorrente = lucro
+    deixado na mesa, base objetiva para afrouxar a régua.
+
+    Não altera status nem posições; counterfactuals ganha realized_pnl=0.0
+    (não operamos), hypothetical_hold_pnl=pnl hipotético e notes JSON.
+    `limit` por ciclo limita chamadas HTTP em backlogs grandes; o resto
+    fica para o próximo sweep (idempotente via LEFT JOIN)."""
+    now = _now_iso()
+    with db.connect() as conn:
+        rows = conn.execute(
+            "SELECT e.* FROM entries e "
+            "LEFT JOIN counterfactuals cf ON cf.entry_id = e.entry_id "
+            "WHERE e.status IN ('REJECTED','SKIPPED') "
+            "AND COALESCE(e.strategy,'') = ? "
+            "AND e.end_date IS NOT NULL AND e.end_date < ? "
+            "AND cf.counterfactual_id IS NULL "
+            "ORDER BY e.end_date ASC LIMIT ?",
+            (STRATEGY, now, limit)).fetchall()
+    if not rows:
+        return 0
+    done, n_win, total_pnl = 0, 0, 0.0
+    for row in rows:
+        ticker = row["token_id_yes"]
+        try:
+            m = kio.fetch_market(ticker)
+        except Exception:
+            m = None
+        if not m or (m.get("status") or "").lower() not in _SETTLED_STATUSES:
+            continue  # ainda não liquidado — próximo sweep tenta de novo
+        result = (m.get("result") or "").lower()
+        side = (row["side"] or "YES").upper()
+        entry_price = float(row["entry_price"] or 0)
+        if entry_price <= 0:
+            continue
+        if result in ("yes", "no"):
+            payout = 1.0 if result == side.lower() else 0.0
+        else:
+            payout = entry_price  # VOID: stake devolvido, pnl 0 antes da fee
+        contracts = 100.0 / entry_price
+        fee = kio.kalshi_taker_fee(entry_price, contracts)
+        hypo = round(contracts * (payout - entry_price) - fee, 2)
+        with db.connect() as conn:
+            db.upsert_counterfactual(
+                conn, row["entry_id"], realized_pnl=0.0,
+                hypothetical_hold_pnl=hypo, delta=hypo, computed_at=now,
+                notes=json.dumps({
+                    "kind": "rejection_counterfactual", "per_usd": 100,
+                    "status_at_skip": row["status"],
+                    "outcome": result or "void", "payout": payout,
+                    "entry_price": entry_price, "side": side,
+                    "fee_usd": fee}))
+        done += 1
+        total_pnl += hypo
+        n_win += 1 if hypo > 0 else 0
+        log_event("kalshi_rejection_counterfactual", {
+            "entry_id": row["entry_id"], "ticker": ticker, "side": side,
+            "status_at_skip": row["status"], "outcome": result or "void",
+            "hypo_pnl_per_100usd": hypo})
+    if done:
+        log_event("kalshi_caution_cost", {
+            "n_computed": done, "n_would_have_won": n_win,
+            "total_hypo_pnl_per_100usd": round(total_pnl, 2)})
+    return done
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1130,6 +1204,7 @@ def main() -> int:
         run_execute_kalshi(args)
         run_monitor_tick_kalshi(args, kcities)
         run_resolution_sweep_kalshi(args)
+        run_rejection_counterfactual_kalshi(args)
         return 0
 
     if not args.daemon:
@@ -1154,6 +1229,7 @@ def main() -> int:
                 if now - last_resolution >= RESOLUTION_SWEEP_INTERVAL:
                     last_resolution = now
                     run_resolution_sweep_kalshi(args)
+                    run_rejection_counterfactual_kalshi(args)
                 if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                     last_heartbeat = now
                     log_event("kalshi_heartbeat", {})
@@ -1707,6 +1783,89 @@ def _test_resolution():
         restore_db()
 
 
+def _test_caution_cost():
+    """Custo da cautela: counterfactual de REJECTED/SKIPPED — pnl hipotético
+    por $100 líquido de fee, idempotência, not-settled adiado, VOID=0−fee,
+    e entries EXECUTED intocadas."""
+    tmp, restore_db = _swap_test_db()
+    saved_fetch_m = kio.fetch_market
+    try:
+        past = (datetime.now(timezone.utc).timestamp()) - 3600
+        past_iso = datetime.fromtimestamp(
+            past, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        args = _mk_test_args()
+
+        # Rejeitado que TERIA vencido: YES @0.40 settled yes →
+        # 250 contratos × 0.60 − fee(ceil(0.07·250·0.4·0.6·100)/100=4.20)
+        # = 150 − 4.20 = 145.80 por $100.
+        with db.connect() as conn:
+            e1 = _seed_entry(conn, status="REJECTED", end_date=past_iso,
+                             ticker="KXHIGHNY-26JUL12-T87")
+        kio.fetch_market = lambda tk: {"ticker": tk, "status": "settled",
+                                       "result": "yes"}
+        n = run_rejection_counterfactual_kalshi(args)
+        assert n == 1, n
+        with db.connect() as conn:
+            cf = conn.execute("SELECT * FROM counterfactuals").fetchone()
+        assert cf["realized_pnl"] == 0.0, dict(cf)
+        assert abs(cf["hypothetical_hold_pnl"] - 145.80) < 0.01, \
+            cf["hypothetical_hold_pnl"]
+        meta = json.loads(cf["notes"])
+        assert meta["kind"] == "rejection_counterfactual", meta
+        assert meta["outcome"] == "yes" and meta["per_usd"] == 100, meta
+        print("Test 1 PASS: REJECTED que teria vencido → +$145.80/$100 "
+              "(líquido de fee) gravado em counterfactuals")
+
+        # Idempotente: segundo sweep não recomputa.
+        assert run_rejection_counterfactual_kalshi(args) == 0
+        print("Test 2 PASS: idempotente (LEFT JOIN counterfactuals)")
+
+        # SKIPPED que teria perdido (settled no vs side YES) → −100 − fee?
+        # payout 0: 250×(0−0.40) = −100; fee ainda paga → −104.20.
+        with db.connect() as conn:
+            _seed_entry(conn, status="SKIPPED", end_date=past_iso,
+                        ticker="KXHIGHCHI-26JUL12-T80")
+        kio.fetch_market = lambda tk: {"ticker": tk, "status": "finalized",
+                                       "result": "no"}
+        assert run_rejection_counterfactual_kalshi(args) == 1
+        with db.connect() as conn:
+            cf2 = conn.execute(
+                "SELECT cf.* FROM counterfactuals cf JOIN entries e "
+                "ON e.entry_id = cf.entry_id WHERE e.status='SKIPPED'"
+            ).fetchone()
+        assert abs(cf2["hypothetical_hold_pnl"] - (-104.20)) < 0.01, \
+            cf2["hypothetical_hold_pnl"]
+        print("Test 3 PASS: SKIPPED que teria perdido → −$104.20/$100 "
+              "(cautela correta aparece como pnl negativo)")
+
+        # Não-settled: adia (não grava), tenta no próximo sweep.
+        with db.connect() as conn:
+            _seed_entry(conn, status="REJECTED", end_date=past_iso,
+                        ticker="KXHIGHMIA-26JUL12-T95")
+        kio.fetch_market = lambda tk: {"ticker": tk, "status": "active",
+                                       "result": ""}
+        assert run_rejection_counterfactual_kalshi(args) == 0
+        # VOID (settled sem result): payout=entry → pnl = −fee só.
+        kio.fetch_market = lambda tk: {"ticker": tk, "status": "settled",
+                                       "result": ""}
+        assert run_rejection_counterfactual_kalshi(args) == 1
+        with db.connect() as conn:
+            n_cf = conn.execute(
+                "SELECT COUNT(*) FROM counterfactuals").fetchone()[0]
+            ex = conn.execute(
+                "SELECT COUNT(*) FROM entries WHERE status IN "
+                "('EXECUTED','FAST_PATH')").fetchone()[0]
+        assert n_cf == 3, n_cf
+        assert ex == 0  # nenhuma entry executada foi criada/tocada
+        print("Test 4 PASS: not-settled adiado; VOID = só a fee; entries "
+              "executadas fora do escopo")
+
+        print("\nAll --test-caution-cost PASS (4/4)")
+    finally:
+        kio.fetch_market = saved_fetch_m
+        restore_db()
+
+
 if __name__ == "__main__":
     if "--test-lst-date" in sys.argv:
         _test_lst_date()
@@ -1722,5 +1881,8 @@ if __name__ == "__main__":
         sys.exit(0)
     if "--test-resolution" in sys.argv:
         _test_resolution()
+        sys.exit(0)
+    if "--test-caution-cost" in sys.argv:
+        _test_caution_cost()
         sys.exit(0)
     raise SystemExit(main())
