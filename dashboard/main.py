@@ -169,6 +169,20 @@ def api_kalshi_history(request: Request, outcome: str = "all",
          "filter_outcome": outcome})
 
 
+@app.get("/api/kalshi/replay/{entry_id}", response_class=HTMLResponse)
+def api_kalshi_replay(request: Request, entry_id: int):
+    """Replay de um entry Kalshi — mesmo modal da Polymarket, DB próprio.
+    Kalshi não tem ladders (v1), então o trail vai vazio."""
+    try:
+        md = kalshi.replay_entry_md(entry_id)
+    except Exception as e:
+        md = f"_(replay indisponível: {e})_"
+    return templates.TemplateResponse(
+        request, "partials/replay_modal.html",
+        {"entry_id": entry_id, "md": md,
+         "ladder_trail": {"group_id": None, "events": []}})
+
+
 @app.get("/api/kalshi/performance", response_class=HTMLResponse)
 def api_kalshi_performance(request: Request, days: int = 30):
     series = kalshi.get_performance_series(days=days)

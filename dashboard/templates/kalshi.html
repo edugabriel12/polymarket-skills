@@ -26,6 +26,9 @@
 </section>
 
 <section class="card">
+  <p class="muted small">Clique numa linha (Positions/History) para ver o
+    replay: forecast no momento da entrada, veredito completo do judge e
+    desfecho.</p>
   <div id="kalshi-body"
        hx-get="/api/kalshi/positions"
        hx-trigger="load, every {{ refresh_positions_sec }}s, kalshiview"
@@ -33,6 +36,15 @@
     <div class="muted">Loading…</div>
   </div>
 </section>
+
+<div id="replay-modal" class="modal-backdrop hidden" onclick="closeReplay(event)">
+  <div class="modal-content" onclick="event.stopPropagation()">
+    <button class="modal-close" onclick="closeReplay()">×</button>
+    <div id="replay-body">
+      <div class="muted">Loading replay…</div>
+    </div>
+  </div>
+</div>
 
 {% endblock %}
 
@@ -54,5 +66,22 @@
     htmx.process(body);
     htmx.trigger(body, 'kalshiview');
   }
+  // Replay: mesmo modal da Polymarket, endpoint do mundo Kalshi.
+  function openKalshiReplay(entryId) {
+    const modal = document.getElementById('replay-modal');
+    const body = document.getElementById('replay-body');
+    body.innerHTML = '<div class="muted">Loading replay…</div>';
+    modal.classList.remove('hidden');
+    fetch(`/api/kalshi/replay/${entryId}`)
+      .then(r => r.text())
+      .then(html => { body.innerHTML = html; })
+      .catch(e => { body.innerHTML = '<div class="err">Failed: ' + e + '</div>'; });
+  }
+  function closeReplay(e) {
+    document.getElementById('replay-modal').classList.add('hidden');
+  }
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeReplay();
+  });
 </script>
 {% endblock %}
