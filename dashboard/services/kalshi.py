@@ -341,7 +341,7 @@ def get_history_summary() -> dict:
         wins = row["n_wins"] or 0
         pnl = float(row["total_pnl"] or 0)
         stake = float(row["total_stake"] or 0)
-        return {
+        out = {
             "available": True,
             "n_total": n,
             "n_wins": wins,
@@ -351,6 +351,25 @@ def get_history_summary() -> dict:
             "total_stake_usd": round(stake, 2),
             "pnl_per_dollar": round(pnl / stake, 4) if stake else None,
         }
+        # "Custo da cautela": counterfactuals das rejeições (bot grava
+        # quanto cada REJECTED/SKIPPED teria rendido por $100 nocionais).
+        # pnl>0 recorrente = judge deixando dinheiro na mesa.
+        try:
+            c = conn.execute("""
+                SELECT COUNT(*) n,
+                       SUM(cf.hypothetical_hold_pnl) total,
+                       SUM(CASE WHEN cf.hypothetical_hold_pnl > 0
+                           THEN 1 ELSE 0 END) n_win
+                FROM counterfactuals cf
+                JOIN entries e ON e.entry_id = cf.entry_id
+                WHERE e.status IN ('REJECTED','SKIPPED')
+            """).fetchone()
+            out["caution_n"] = c["n"] or 0
+            out["caution_would_win"] = c["n_win"] or 0
+            out["caution_total_per_100"] = round(float(c["total"] or 0), 2)
+        except sqlite3.OperationalError:
+            out["caution_n"] = 0
+        return out
     finally:
         conn.close()
 

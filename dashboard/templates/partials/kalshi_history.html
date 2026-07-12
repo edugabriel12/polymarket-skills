@@ -25,6 +25,16 @@
       {% if summary.pnl_per_dollar is not none %}{{ "%.3f"|format(summary.pnl_per_dollar) }}{% else %}—{% endif %}
     </span>
   </div>
+  {% if summary.caution_n %}
+  <div class="kpi" title="Counterfactual das rejeições: quanto cada trade REJECTED/SKIPPED teria rendido por $100 nocionais (líquido de fee), somado. Positivo recorrente = judge conservador demais; negativo = a cautela está pagando.">
+    <span class="kpi-label">Custo da cautela</span>
+    {% set cc = summary.caution_total_per_100 %}
+    <span class="kpi-value {% if cc > 0 %}down{% else %}up{% endif %}">
+      {{ "+" if cc >= 0 else "" }}${{ "%.2f"|format(cc) }}
+    </span>
+    <span class="kpi-delta muted">{{ summary.caution_would_win }}/{{ summary.caution_n }} rejeitados teriam vencido · por $100</span>
+  </div>
+  {% endif %}
 </div>
 {% endif %}
 
