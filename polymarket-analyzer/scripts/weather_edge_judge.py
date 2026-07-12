@@ -372,6 +372,170 @@ def _kalshi_city_cfg(city: str) -> dict:
         return {}
 
 
+def get_intraday_extremes(icao: str, tz_name: str,
+                          hours: int = 30) -> Optional[dict]:
+    """Extremos CORRIDOS de HOJE (dia LOCAL da estação) via METAR.
+
+    A máxima corrida é um PISO da máxima final (só sobe) e a mínima corrida
+    é um TETO da mínima final (só desce) — é o que torna esta evidência
+    decisiva para mercados do PRÓPRIO dia. Diferente do
+    fetch_metar_daily_extremes (convenção de dia UTC, usada na resolução),
+    aqui o filtro é pelo dia-calendário LOCAL da estação: com dia UTC, às
+    10h locais o "hoje" ainda conteria a noite quente de ontem (~19h-23h
+    locais) e o piso ficaria falsamente alto. Dia-calendário local ≈ dia
+    climatológico LST da Kalshi (mesma aproximação documentada da config).
+
+    METAR horário pode sub-ler o extremo real em 1-2°F (visto no probe
+    CLI 79 vs METAR 77) — o piso/teto continua VÁLIDO (só fica folgado).
+    Fail-open None."""
+    if not icao or not tz_name:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        return None
+    today_local = datetime.now(tz).date()
+    base = os.environ.get("AVIATIONWEATHER_BASE_URL",
+                          "https://aviationweather.gov/api/data")
+    try:
+        r = requests.get(
+            f"{base}/metar",
+            params={"ids": icao, "format": "json", "hours": hours},
+            headers={"Accept": "application/json"}, timeout=20)
+        if r.status_code != 200:
+            return None
+        rows = r.json()
+        if not isinstance(rows, list):
+            return None
+        temps, last_utc = [], None
+        for ob in rows:
+            t = ob.get("temp")
+            if t is None:
+                continue
+            dt_utc = None
+            rt = ob.get("reportTime")
+            if isinstance(rt, str) and len(rt) >= 16:
+                try:
+                    dt_utc = datetime.fromisoformat(
+                        rt.replace(" ", "T")).replace(tzinfo=timezone.utc)
+                except ValueError:
+                    dt_utc = None
+            if dt_utc is None and ob.get("obsTime") is not None:
+                try:
+                    dt_utc = datetime.fromtimestamp(int(ob["obsTime"]),
+                                                    tz=timezone.utc)
+                except (ValueError, OSError, OverflowError):
+                    dt_utc = None
+            if dt_utc is None:
+                continue  # obs sem data confiável — nunca adivinhar
+            if dt_utc.astimezone(tz).date() != today_local:
+                continue
+            try:
+                temps.append(float(t))
+            except (TypeError, ValueError):
+                continue
+            if last_utc is None or dt_utc > last_utc:
+                last_utc = dt_utc
+        if not temps:
+            return None
+        return {
+            "local_date": today_local.isoformat(),
+            "running_max_f": round(max(temps) * 9 / 5 + 32, 1),
+            "running_min_f": round(min(temps) * 9 / 5 + 32, 1),
+            "n_obs": len(temps),
+            "last_ob_utc": last_utc.isoformat() if last_utc else None,
+            "note": ("Running extremes of TODAY (station-local day) from "
+                     "METAR. The running max is a FLOOR for the final high; "
+                     "the running min is a CEILING for the final low. Hourly "
+                     "METAR can under-read the true extreme by 1-2°F."),
+        }
+    except Exception:
+        return None
+
+
+def _intraday_dead_side(spec, run_max_f, run_min_f) -> Optional[str]:
+    """Lado matematicamente MORTO dado os extremos corridos de hoje.
+
+    Comparações ESTRITAS (>/<): no boundary exato (.5) não trava — margem
+    de segurança sobre o arredondamento do CLI e a sub-leitura do METAR
+    (que só FOLGA o piso/teto, nunca o aperta). None = nada travado."""
+    try:
+        kind = getattr(spec, "temp_kind", "high")
+        comp = spec.comparison
+        t = float(spec.threshold_value)
+        hi = (float(spec.threshold_value_high)
+              if spec.threshold_value_high is not None else None)
+    except Exception:
+        return None
+    if kind != "low":
+        if run_max_f is None:
+            return None
+        if comp == "exceed" and run_max_f > t:
+            return "NO"    # máxima final ≥ corrida > T ⇒ YES travado
+        if comp == "below" and run_max_f > t:
+            return "YES"   # máxima já passou do cap
+        if comp == "range" and hi is not None and run_max_f > hi:
+            return "YES"   # máxima já estourou o teto do bracket
+        return None
+    if run_min_f is None:
+        return None
+    if comp == "below" and run_min_f < t:
+        return "NO"        # mínima final ≤ corrida < C ⇒ YES travado
+    if comp == "exceed" and run_min_f < t:
+        return "YES"       # mínima já furou o piso
+    if comp == "range" and run_min_f < t:
+        return "YES"       # mínima já abaixo do lo do bracket
+    return None
+
+
+def _intraday_lock_reason(entry_row) -> Optional[str]:
+    """Reason string quando os extremos corridos de HOJE já MATARAM o lado
+    proposto (mercado do próprio dia, venue kalshi) — None caso contrário.
+    Fail-open em qualquer dado ausente; 1 GET ao aviationweather apenas
+    para entries kalshi do dia corrente."""
+    meta = _entry_meta(entry_row)
+    if str(meta.get("venue") or "") != "kalshi":
+        return None
+    spec = _entry_spec(entry_row)
+    if not spec or spec.metric != "temp" or not spec.target_date:
+        return None
+    icao = meta.get("station_icao")
+    try:
+        city = entry_row["city_resolved"]
+    except (KeyError, IndexError, TypeError):
+        city = None
+    tz_name = (_kalshi_city_cfg(str(city)).get("timezone") if city else None)
+    if not icao or not tz_name:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        if spec.target_date != datetime.now(ZoneInfo(tz_name)).date():
+            return None  # mercado de outro dia: obs de hoje não decidem nada
+    except Exception:
+        return None
+    intr = get_intraday_extremes(str(icao), str(tz_name))
+    if not intr:
+        return None
+    dead = _intraday_dead_side(spec, intr.get("running_max_f"),
+                               intr.get("running_min_f"))
+    if not dead:
+        return None
+    try:
+        side = str(entry_row["side"] or "").upper()
+    except (KeyError, IndexError, TypeError):
+        return None
+    if side != dead:
+        return None
+    is_low = getattr(spec, "temp_kind", "high") == "low"
+    run = intr.get("running_min_f" if is_low else "running_max_f")
+    return (f"intraday_lock: running {'min' if is_low else 'max'} {run}°F "
+            f"at {icao} already decides {spec.comparison} @ "
+            f"{spec.threshold_value} against side {side} "
+            f"(obs {'ceiling' if is_low else 'floor'}, "
+            f"n={intr.get('n_obs')}, {intr.get('local_date')})")
+
+
 def get_brightsky_forecast(lat: float, lon: float,
                            target_date: str) -> Optional[dict]:
     """DWD MOSMIX point forecast for `target_date` via the free Bright Sky
@@ -805,6 +969,25 @@ def review_proposal(entry: dict, system_prompt: str) -> Optional[dict]:
                                  url=aux.get("url"))
             if mes:
                 evidence["ok_mesonet"] = mes
+
+    # v19: extremos corridos de HOJE na estação de settlement (só para
+    # mercado do próprio dia local) — piso da máxima / teto da mínima.
+    if venue == "kalshi" and meta.get("station_icao") and city:
+        tz_name = _kalshi_city_cfg(city).get("timezone")
+        spec_e = _entry_spec(entry)
+        same_day = False
+        if tz_name and spec_e is not None and spec_e.target_date:
+            try:
+                from zoneinfo import ZoneInfo
+                same_day = (spec_e.target_date
+                            == datetime.now(ZoneInfo(tz_name)).date())
+            except Exception:
+                same_day = False
+        if same_day:
+            intr = get_intraday_extremes(str(meta["station_icao"]),
+                                         str(tz_name))
+            if intr:
+                evidence["intraday_so_far"] = intr
 
     if _entry_is_pilot(entry):
         if venue == "kalshi":
@@ -1334,6 +1517,19 @@ def _judge_route(entry_row) -> Optional[dict]:
         return {"action": "auto_reject", "kind": "non_temperature",
                 "reason": (f"non_temperature_market: metric={spec0.metric} — "
                            f"bot is temperature-only (policy 2026-07-05)")}
+
+    # (0.2) v19 intraday lock (kalshi, mercado de HOJE): a máxima corrida é
+    # piso da final e a mínima corrida é teto — se isso já matou o lado
+    # proposto, REJECT determinístico sem LLM. É FATO observacional, não
+    # previsão, então roda ANTES do pilot (que mandaria tudo ao LLM) e
+    # independe de JUDGE_AUTOROUTE, como o guard não-temp. Fail-open.
+    try:
+        lock = _intraday_lock_reason(entry_row)
+    except Exception:
+        lock = None
+    if lock:
+        return {"action": "auto_reject", "kind": "intraday_lock",
+                "reason": lock}
 
     # (0.3) v17 Africa pilot: pilot entries NEVER take a deterministic route —
     # neither auto-approve nor cheap_convexity — they always go to the full LLM
@@ -3076,8 +3272,18 @@ def _test_kalshi_route():
              mod.get_nws_forecast, mod.get_brightsky_forecast,
              mod.get_metno_forecast, mod.get_ipma_forecast,
              mod.get_visual_crossing, mod.call_claude, mod._geocode_city,
-             mod.get_nws_afd, mod.get_ok_mesonet, mod._kalshi_city_cfg)
+             mod.get_nws_afd, mod.get_ok_mesonet, mod._kalshi_city_cfg,
+             mod.get_intraday_extremes)
+    # capturas nomeadas para restaurar funções REAIS no meio da suíte
+    real_afd = mod.get_nws_afd
+    real_mesonet = mod.get_ok_mesonet
+    real_intraday = mod.get_intraday_extremes
     try:
+        # Hermeticidade: o guard intraday (0.2) faria HTTP para entries
+        # kalshi do dia corrente — neutralizado por default na suíte;
+        # T8/T9 re-mockam/restauram conforme o caso.
+        mod.get_intraday_extremes = lambda icao, tz, hours=30: None
+
         # Test 1: _entry_spec prefere o spec do meta — parse_market plantado
         # para explodir prova que o caminho Kalshi nem o consulta.
         def _boom(*a, **k):
@@ -3171,7 +3377,7 @@ def _test_kalshi_route():
 
         # Test 6: parser do get_nws_afd — 2 chamadas (lista → produto),
         # corte no .LONG TERM, cap de chars, 404 → None (fail-open).
-        mod.get_nws_afd = saved[-3]  # restaura a função REAL (Test 5 mockou)
+        mod.get_nws_afd = real_afd  # restaura a função REAL (Test 5 mockou)
         import requests as _rq
         saved_get = _rq.get
 
@@ -3214,7 +3420,7 @@ def _test_kalshi_route():
 
         # Test 7: parser do get_ok_mesonet — CSV real-shape, filtro por
         # site, "M" ignorado, conversão C→F via config, fail-open.
-        mod.get_ok_mesonet = saved[-2]  # restaura a função REAL
+        mod.get_ok_mesonet = real_mesonet  # restaura a função REAL
         saved_get7 = _rq.get
 
         class _RT:
@@ -3249,13 +3455,104 @@ def _test_kalshi_route():
         print("Test 7 PASS: get_ok_mesonet — filtro por site, 'M' ignorado, "
               "C→F via config, fail-open")
 
-        print("\nAll --test-kalshi-route PASS (7/7)")
+        # Test 8: intraday lock — matriz de lado-morto + rota determinística.
+        from types import SimpleNamespace as _NS
+        from datetime import timedelta
+        from zoneinfo import ZoneInfo
+        dds = mod._intraday_dead_side
+
+        def _mkspec(**kw):
+            return _NS(temp_kind=kw.get("kind", "high"),
+                       comparison=kw["comp"], threshold_value=kw["t"],
+                       threshold_value_high=kw.get("hi"))
+        assert dds(_mkspec(comp="exceed", t=88.5), 89.2, None) == "NO"
+        assert dds(_mkspec(comp="exceed", t=88.5), 88.5, None) is None  # boundary estrito
+        assert dds(_mkspec(comp="below", t=92.5), 93.0, None) == "YES"
+        assert dds(_mkspec(comp="range", t=87.5, hi=89.5), 90.1, None) == "YES"
+        assert dds(_mkspec(comp="range", t=87.5, hi=89.5), 88.0, None) is None
+        assert dds(_mkspec(kind="low", comp="below", t=55.5), None, 54.9) == "NO"
+        assert dds(_mkspec(kind="low", comp="exceed", t=70.5), None, 69.8) == "YES"
+        assert dds(_mkspec(kind="low", comp="range", t=63.5, hi=65.5),
+                   None, 62.0) == "YES"
+        assert dds(_mkspec(comp="exceed", t=88.5), None, None) is None
+
+        # Rota: NO morto (máxima corrida 97.2 > strike 96.5 do dia de HOJE)
+        # → auto_reject SEM LLM mesmo sendo pilot; YES no mesmo mercado →
+        # segue ao LLM (None); mercado de OUTRO dia nem busca METAR.
+        today_ny = datetime.now(ZoneInfo("America/New_York")).date()
+        spec_today = dict(spec_meta, threshold_value=96.5,
+                          target_date=today_ny.isoformat())
+        mod._kalshi_city_cfg = lambda c: {"timezone": "America/New_York"}
+        mod.get_intraday_extremes = lambda icao, tz, hours=30: {
+            "running_max_f": 97.2, "running_min_f": 74.1, "n_obs": 9,
+            "local_date": today_ny.isoformat()}
+        r8 = mod._judge_route(_row(spec=spec_today, side="NO"))
+        assert r8 and r8["action"] == "auto_reject" \
+            and r8.get("kind") == "intraday_lock", r8
+        assert "97.2" in r8["reason"], r8["reason"]
+        r8b = mod._judge_route(_row(spec=spec_today, side="YES"))
+        assert r8b is None, r8b  # lado vivo → pilot → LLM
+
+        def _no_fetch(*a, **k):
+            raise AssertionError("não deve buscar METAR p/ mercado de outro dia")
+        mod.get_intraday_extremes = _no_fetch
+        spec_other = dict(spec_meta, target_date=(
+            today_ny - timedelta(days=1)).isoformat())
+        assert mod._judge_route(_row(spec=spec_other, side="NO")) is None
+        mod.get_intraday_extremes = lambda icao, tz, hours=30: None
+        print("Test 8 PASS: intraday_lock — matriz de lado-morto (9 casos), "
+              "NO morto auto-rejeitado antes do pilot, YES segue, outro dia "
+              "não busca METAR")
+
+        # Test 9: parser do get_intraday_extremes — filtro por dia LOCAL
+        # (obs de ontem 23h local ficaria DENTRO do dia UTC — é exatamente
+        # o caso que o filtro local elimina), conversão C→F, fail-open.
+        mod.get_intraday_extremes = real_intraday
+        tzc = ZoneInfo("America/Chicago")
+        d0 = datetime.now(tzc).date()
+        d_1 = d0 - timedelta(days=1)
+
+        def _utc_str(y, mo, dd, hh):
+            local = datetime(y, mo, dd, hh, 0, tzinfo=tzc)
+            return local.astimezone(timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S")
+        payload9 = [
+            {"reportTime": _utc_str(d_1.year, d_1.month, d_1.day, 23),
+             "temp": 35.0},   # ontem 23h local (95°F) — TEM que ficar fora
+            {"reportTime": _utc_str(d0.year, d0.month, d0.day, 6),
+             "temp": 30.0},   # hoje: 86.0°F
+            {"reportTime": _utc_str(d0.year, d0.month, d0.day, 5),
+             "temp": 25.5},   # hoje: 77.9°F
+            {"reportTime": _utc_str(d0.year, d0.month, d0.day, 6),
+             "temp": None},   # sem temp — ignorada
+        ]
+        saved_get9 = _rq.get
+        _rq.get = lambda url, params=None, headers=None, timeout=None: \
+            _R(200, payload9)
+        try:
+            intr = mod.get_intraday_extremes("KMDW", "America/Chicago")
+            assert intr and intr["n_obs"] == 2, intr
+            assert intr["running_max_f"] == 86.0, intr  # 95°F de ontem FORA
+            assert intr["running_min_f"] == 77.9, intr
+            assert intr["local_date"] == d0.isoformat(), intr
+            _rq.get = lambda url, params=None, headers=None, timeout=None: \
+                _R(500, [])
+            assert mod.get_intraday_extremes("KMDW", "America/Chicago") is None
+            assert mod.get_intraday_extremes("KMDW", "tz/Invalida") is None
+            assert mod.get_intraday_extremes("", "America/Chicago") is None
+        finally:
+            _rq.get = saved_get9
+        print("Test 9 PASS: get_intraday_extremes — dia LOCAL (ontem 23h "
+              "local excluído), C→F, fail-open em 500/tz inválida")
+
+        print("\nAll --test-kalshi-route PASS (9/9)")
     finally:
         (helpers.parse_market, kio.fetch_orderbook, mod.JUDGE_AUTOROUTE,
          mod.get_nws_forecast, mod.get_brightsky_forecast,
          mod.get_metno_forecast, mod.get_ipma_forecast,
          mod.get_visual_crossing, mod.call_claude, mod._geocode_city,
-         mod.get_nws_afd, mod.get_ok_mesonet, mod._kalshi_city_cfg) = saved
+         mod.get_nws_afd, mod.get_ok_mesonet, mod._kalshi_city_cfg,
+         mod.get_intraday_extremes) = saved
 
 
 if __name__ == "__main__":
