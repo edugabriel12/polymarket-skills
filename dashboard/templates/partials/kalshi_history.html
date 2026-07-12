@@ -56,7 +56,7 @@
   </thead>
   <tbody>
     {% for h in history %}
-    <tr>
+    <tr onclick="openKalshiReplay({{ h.entry_id }})" class="clickable">
       <td class="mono" data-label="ID">#{{ h.entry_id }}</td>
       <td data-label="Market">
         <div class="city">{{ h.city or '?' }}</div>

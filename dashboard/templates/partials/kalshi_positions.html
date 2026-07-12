@@ -18,13 +18,14 @@
   </thead>
   <tbody>
     {% for p in positions %}
-    <tr>
+    <tr onclick="openKalshiReplay({{ p.entry_id }})" class="clickable">
       <td class="mono" data-label="ID">#{{ p.entry_id }}</td>
       <td data-label="Market">
         <div class="city">{{ p.city or '?' }}</div>
         <div class="slug muted small">
           <a href="https://kalshi.com/markets/{{ p.ticker.split('-')[0]|lower }}"
              target="_blank" rel="noopener" class="market-link"
+             onclick="event.stopPropagation()"
              title="Abrir a série na Kalshi">
             {{ p.ticker }} ↗
           </a>

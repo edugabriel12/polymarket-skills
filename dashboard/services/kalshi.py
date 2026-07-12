@@ -375,6 +375,27 @@ def get_history_summary() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Replay
+# ---------------------------------------------------------------------------
+
+
+def replay_entry_md(entry_id: int) -> str:
+    """Replay markdown de um entry Kalshi — reusa o replay_entry
+    venue-agnóstico do analyzer (recebe a conexão), apontado para o
+    kalshi_edge.db. Inclui o veredito completo do judge (rationale,
+    probs, custo) gravado em judge_reviews. Fail-soft."""
+    try:
+        conn = _ro_conn(S.KALSHI_EDGE_DB)
+    except FileNotFoundError:
+        return "_(kalshi_edge.db não encontrado — o bot ainda não rodou)_"
+    try:
+        from weather_edge_analyzer import replay_entry
+        return replay_entry(conn, entry_id)
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Performance
 # ---------------------------------------------------------------------------
 
