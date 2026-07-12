@@ -281,6 +281,12 @@
         "gfs_hrrr",
         "ncep_nbm_conus"
       ],
+      "aux_obs": {
+        "provider": "ok_mesonet",
+        "sites": ["OKCW", "OKCN", "OKCE", "NRMN"],
+        "tair_unit": "F",
+        "_doc": "Observacoes 5-min da rede Oklahoma Mesonet perto de KOKC (OKCW=OKC West e a mais proxima de Will Rogers; NRMN=Norman, sede do WFO OUN). Feed publico de condicoes correntes; injetado como evidencia intradiaria do judge (get_ok_mesonet). Se o probe do operador mostrar TAIR em Celsius, trocar tair_unit para C -- sem mudanca de codigo."
+      },
       "risk_notes": "Dryline; jato noturno de baixos niveis + MCS (nuvens residuais suprimem inesperadamente o aquecimento diurno); blue northers; retroalimentacao de umidade do solo pos-conveccao. Edge local raro: Oklahoma Mesonet (120 estacoes, obs a cada 5 min) e NWS Norman.",
       "confirmation": "settlement_sources API (site=OUN, issuedby=OKC), sweep do operador 2026-07-10; hipotese da pesquisa (0.7, corroborada por IEM/CFTC) confirmada"
     },

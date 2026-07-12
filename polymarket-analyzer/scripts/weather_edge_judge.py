@@ -298,6 +298,80 @@ def get_nws_afd(wfo: str, max_chars: int = 2800) -> Optional[dict]:
         return None
 
 
+OK_MESONET_CURRENT_URL = ("https://www.mesonet.org/data/public/mesonet/"
+                          "current/current.csv.txt")
+
+
+def get_ok_mesonet(sites: list, tair_unit: str = "F",
+                   url: str | None = None) -> Optional[dict]:
+    """Observações correntes da rede Oklahoma Mesonet (feed público CSV) —
+    verdade INTRADIÁRIA de como o dia está correndo vs o strike, para OKC
+    (120 estações, obs a cada 5 min; a fonte de edge local mais densa do
+    país segundo a pesquisa).
+
+    Parser defensivo: localiza o cabeçalho pelas colunas STID/TAIR, aceita
+    vírgula ou espaços como separador, ignora valores não numéricos.
+    tair_unit vem da config (aux_obs.tair_unit) — se o feed publicar em C,
+    o operador troca na config, sem mudança de código. Fail-open None."""
+    if not sites:
+        return None
+    try:
+        r = requests.get(url or OK_MESONET_CURRENT_URL, timeout=12)
+        if r.status_code != 200:
+            return None
+        lines = [ln for ln in (r.text or "").splitlines() if ln.strip()]
+        hdr_i = next((i for i, ln in enumerate(lines)
+                      if "STID" in ln.upper() and "TAIR" in ln.upper()), None)
+        if hdr_i is None:
+            return None
+        import re as _re
+
+        def _split(ln: str) -> list:
+            return [c.strip() for c in
+                    (ln.split(",") if "," in ln
+                     else _re.split(r"\s+", ln.strip()))]
+
+        hdr = [h.upper() for h in _split(lines[hdr_i])]
+        i_st, i_ta = hdr.index("STID"), hdr.index("TAIR")
+        i_nm = hdr.index("NAME") if "NAME" in hdr else None
+        want = {s.upper() for s in sites}
+        out = []
+        for ln in lines[hdr_i + 1:]:
+            cols = _split(ln)
+            if len(cols) <= max(i_st, i_ta):
+                continue
+            stid = cols[i_st].upper()
+            if stid not in want:
+                continue
+            try:
+                v = float(cols[i_ta])
+            except ValueError:
+                continue  # "M"/"--" = dado ausente
+            tair_f = v if tair_unit.upper() == "F" else v * 9 / 5 + 32
+            out.append({"stid": stid,
+                        "name": (cols[i_nm] if i_nm is not None
+                                 and len(cols) > i_nm else None),
+                        "tair_f": round(tair_f, 1)})
+        if not out:
+            return None
+        return {"sites": out,
+                "note": ("Oklahoma Mesonet 5-min obs near KOKC — intraday "
+                         "ground truth of how the day is tracking vs the "
+                         "strike (OKCW is closest to Will Rogers).")}
+    except Exception:
+        return None
+
+
+def _kalshi_city_cfg(city: str) -> dict:
+    """Config da cidade no kalshi-cities.json (lazy import, fail-open {})."""
+    try:
+        import kalshi_market_io as kio_
+        return ((kio_.load_kalshi_cities().get("cities") or {}).get(city)
+                or {})
+    except Exception:
+        return {}
+
+
 def get_brightsky_forecast(lat: float, lon: float,
                            target_date: str) -> Optional[dict]:
     """DWD MOSMIX point forecast for `target_date` via the free Bright Sky
@@ -719,6 +793,18 @@ def review_proposal(entry: dict, system_prompt: str) -> Optional[dict]:
         afd = get_nws_afd(str(meta["wfo"]))
         if afd:
             evidence["nws_afd"] = afd
+
+    # v18.1: observações auxiliares config-driven (aux_obs na cidade do
+    # kalshi-cities.json). Hoje só ok_mesonet (OKC): obs 5-min como verdade
+    # intradiária de como o dia corre vs o strike. Fail-open.
+    if venue == "kalshi" and city:
+        aux = _kalshi_city_cfg(city).get("aux_obs") or {}
+        if aux.get("provider") == "ok_mesonet":
+            mes = get_ok_mesonet(aux.get("sites") or [],
+                                 tair_unit=aux.get("tair_unit", "F"),
+                                 url=aux.get("url"))
+            if mes:
+                evidence["ok_mesonet"] = mes
 
     if _entry_is_pilot(entry):
         if venue == "kalshi":
@@ -2990,7 +3076,7 @@ def _test_kalshi_route():
              mod.get_nws_forecast, mod.get_brightsky_forecast,
              mod.get_metno_forecast, mod.get_ipma_forecast,
              mod.get_visual_crossing, mod.call_claude, mod._geocode_city,
-             mod.get_nws_afd)
+             mod.get_nws_afd, mod.get_ok_mesonet, mod._kalshi_city_cfg)
     try:
         # Test 1: _entry_spec prefere o spec do meta — parse_market plantado
         # para explodir prova que o caminho Kalshi nem o consulta.
@@ -3063,6 +3149,12 @@ def _test_kalshi_route():
         mod.get_nws_afd = lambda wfo, max_chars=2800: {
             "wfo": wfo, "issued": "2026-07-11T09:00:00Z",
             "text": "sea breeze arrives by 2pm, capping the high"}
+        # aux_obs config-driven (ok_mesonet) — mock da config + do fetcher
+        mod._kalshi_city_cfg = lambda c: {"aux_obs": {
+            "provider": "ok_mesonet", "sites": ["OKCW"], "tair_unit": "F"}}
+        mod.get_ok_mesonet = lambda sites, tair_unit="F", url=None: {
+            "sites": [{"stid": "OKCW", "name": "OKC West", "tair_f": 97.3}],
+            "note": "mesonet"}
         out = mod.review_proposal(_row(), "prompt")
         ev = out["evidence"]
         assert seen["coords"] == (40.7789, -73.9692), seen
@@ -3072,12 +3164,14 @@ def _test_kalshi_route():
         assert "CLI" in kp["resolution"], kp["resolution"]
         assert ev["nws_afd"]["wfo"] == "OKX" and "sea breeze" in \
             ev["nws_afd"]["text"], ev.get("nws_afd")
+        assert ev["ok_mesonet"]["sites"][0]["tair_f"] == 97.3, \
+            ev.get("ok_mesonet")
         print("Test 5 PASS: review_proposal — coords do meta, evidência "
-              "kalshi_pilot + nws_afd (AFD do WFO do meta)")
+              "kalshi_pilot + nws_afd + ok_mesonet (aux_obs da config)")
 
         # Test 6: parser do get_nws_afd — 2 chamadas (lista → produto),
         # corte no .LONG TERM, cap de chars, 404 → None (fail-open).
-        mod.get_nws_afd = saved[-1]  # restaura a função REAL (Test 5 mockou)
+        mod.get_nws_afd = saved[-3]  # restaura a função REAL (Test 5 mockou)
         import requests as _rq
         saved_get = _rq.get
 
@@ -3118,13 +3212,50 @@ def _test_kalshi_route():
         print("Test 6 PASS: get_nws_afd — 2 fetches com UA, corte no "
               ".LONG TERM, fail-open em 404/vazio")
 
-        print("\nAll --test-kalshi-route PASS (6/6)")
+        # Test 7: parser do get_ok_mesonet — CSV real-shape, filtro por
+        # site, "M" ignorado, conversão C→F via config, fail-open.
+        mod.get_ok_mesonet = saved[-2]  # restaura a função REAL
+        saved_get7 = _rq.get
+
+        class _RT:
+            def __init__(self, status, text):
+                self.status_code = status
+                self.text = text
+
+        csv_body = ("# Oklahoma Mesonet current observations\n"
+                    "STID,NAME,LAT,LON,TAIR,RELH\n"
+                    "OKCW,OKC West,35.53,-97.60,98.1,40\n"
+                    "OKCN,OKC North,35.56,-97.51,M,38\n"
+                    "NRMN,Norman,35.24,-97.46,96.4,41\n"
+                    "ACME,Acme,34.81,-98.02,99.0,35\n")
+        _rq.get = lambda url, timeout=None: _RT(200, csv_body)
+        try:
+            mes = mod.get_ok_mesonet(["OKCW", "OKCN", "NRMN"])
+            assert mes and len(mes["sites"]) == 2, mes  # OKCN="M" fora
+            got = {s["stid"]: s["tair_f"] for s in mes["sites"]}
+            assert got == {"OKCW": 98.1, "NRMN": 96.4}, got
+            # unidade C na config → converte para F
+            mes_c = mod.get_ok_mesonet(["OKCW"], tair_unit="C")
+            assert mes_c["sites"][0]["tair_f"] == round(98.1 * 9 / 5 + 32, 1), \
+                mes_c
+            # fail-open: HTTP 500, sites vazios, feed sem cabeçalho
+            _rq.get = lambda url, timeout=None: _RT(500, "")
+            assert mod.get_ok_mesonet(["OKCW"]) is None
+            assert mod.get_ok_mesonet([]) is None
+            _rq.get = lambda url, timeout=None: _RT(200, "sem header valido")
+            assert mod.get_ok_mesonet(["OKCW"]) is None
+        finally:
+            _rq.get = saved_get7
+        print("Test 7 PASS: get_ok_mesonet — filtro por site, 'M' ignorado, "
+              "C→F via config, fail-open")
+
+        print("\nAll --test-kalshi-route PASS (7/7)")
     finally:
         (helpers.parse_market, kio.fetch_orderbook, mod.JUDGE_AUTOROUTE,
          mod.get_nws_forecast, mod.get_brightsky_forecast,
          mod.get_metno_forecast, mod.get_ipma_forecast,
          mod.get_visual_crossing, mod.call_claude, mod._geocode_city,
-         mod.get_nws_afd) = saved
+         mod.get_nws_afd, mod.get_ok_mesonet, mod._kalshi_city_cfg) = saved
 
 
 if __name__ == "__main__":
@@ -3151,5 +3282,12 @@ if __name__ == "__main__":
         _test_brightsky()
     elif "--test-kalshi-route" in sys.argv:
         _test_kalshi_route()
+    elif "--probe-mesonet" in sys.argv:
+        # smoke do operador: valida o feed público e a UNIDADE do TAIR
+        # (se vier ~20-40 no verão, é Celsius → trocar aux_obs.tair_unit).
+        _sites = [a for a in sys.argv[2:] if not a.startswith("-")] or \
+            ["OKCW", "OKCN", "OKCE", "NRMN"]
+        print(json.dumps(get_ok_mesonet(_sites), indent=2,
+                         ensure_ascii=False))
     else:
         main()
