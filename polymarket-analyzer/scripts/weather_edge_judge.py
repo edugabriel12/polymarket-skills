@@ -989,6 +989,34 @@ def review_proposal(entry: dict, system_prompt: str) -> Optional[dict]:
             if intr:
                 evidence["intraday_so_far"] = intr
 
+    # v19.1: web-search catalyst scan como EVIDÊNCIA no fluxo pilot Kalshi.
+    # O anomaly scan (única peça do judge com web_search) era acoplado ao
+    # caminho de auto-approve — que o pilot desliga — então as revisões
+    # Kalshi rodavam sem NENHUMA busca web (blogs/notícias só chegavam
+    # destilados via risk_notes). Aqui ele roda antes do judge completo e o
+    # resultado entra como evidência estruturada (catalyst sim/não +
+    # resumo). Conteúdo web = não-confiável: fica confinado ao formato do
+    # scan, nunca vira instrução. Custo (~$0.01-0.03) contabilizado no
+    # budget diário; JUDGE_ANOMALY_SCAN=0 desliga; fail-open.
+    if venue == "kalshi" and JUDGE_ANOMALY_SCAN:
+        try:
+            scan = _anomaly_scan(entry, note=(
+                "A temperature-market bot proposed a bet for this city/date "
+                "on Kalshi. Look ONLY for an active catalyst — extreme-"
+                "weather event, heat/cold warning, wildfire smoke, station "
+                "outage, or settlement/resolution news — that forecast "
+                "models might miss."))
+        except Exception:
+            scan = None
+        cost = ((scan or {}).get("_meta") or {}).get("cost_usd", 0.0)
+        if cost:
+            _record_spend(cost)
+        if scan:
+            evidence["web_anomaly_scan"] = {
+                "catalyst_found": bool(scan.get("catalyst_found")),
+                "summary": str(scan.get("summary") or "")[:600],
+            }
+
     if _entry_is_pilot(entry):
         if venue == "kalshi":
             # Kalshi US temperature pilot: venue/estação novas para o bot.
@@ -1713,10 +1741,11 @@ def _parse_scan_json(text: str) -> Optional[dict]:
             "summary": str(obj.get("summary") or "")[:500]}
 
 
-def _anomaly_scan(entry_row) -> Optional[dict]:
+def _anomaly_scan(entry_row, note: str | None = None) -> Optional[dict]:
     """v13.2 option-1: a CHEAP web-search-only catalyst check for a proposal the
     auto-router would otherwise approve without any LLM. See ANOMALY_SCAN notes
-    above.
+    above. v19.1: also reused as an EVIDENCE provider for Kalshi pilot reviews
+    (`note` override contextualizes the search for that use).
 
     Returns {"catalyst_found": bool, "summary": str, "_meta": {...}} on success,
     or None on ANY failure (missing key/SDK, API error, pause, unparseable) —
@@ -1736,9 +1765,10 @@ def _anomaly_scan(entry_row) -> Optional[dict]:
         "threshold_unit": entry_row.get("threshold_unit"),
         "comparison": entry_row.get("comparison"),
         "bot_side": entry_row.get("side"),
-        "note": ("The ensemble is confident the temperature will NOT land in "
-                 "the bin (bot is betting accordingly). Look only for a catalyst "
-                 "that would upset that, or affect how the market resolves."),
+        "note": note if note is not None else (
+            "The ensemble is confident the temperature will NOT land in "
+            "the bin (bot is betting accordingly). Look only for a catalyst "
+            "that would upset that, or affect how the market resolves."),
     }, ensure_ascii=False)
 
     # Basic web-search variant — supported on every model (incl. Haiku 4.5);
@@ -3361,19 +3391,43 @@ def _test_kalshi_route():
         mod.get_ok_mesonet = lambda sites, tair_unit="F", url=None: {
             "sites": [{"stid": "OKCW", "name": "OKC West", "tair_f": 97.3}],
             "note": "mesonet"}
-        out = mod.review_proposal(_row(), "prompt")
-        ev = out["evidence"]
-        assert seen["coords"] == (40.7789, -73.9692), seen
-        assert "kalshi_pilot" in ev and "africa_pilot" not in ev, ev.keys()
-        kp = ev["kalshi_pilot"]
-        assert kp["station_icao"] == "KNYC" and kp["risk_notes"], kp
-        assert "CLI" in kp["resolution"], kp["resolution"]
-        assert ev["nws_afd"]["wfo"] == "OKX" and "sea breeze" in \
-            ev["nws_afd"]["text"], ev.get("nws_afd")
-        assert ev["ok_mesonet"]["sites"][0]["tair_f"] == 97.3, \
-            ev.get("ok_mesonet")
-        print("Test 5 PASS: review_proposal — coords do meta, evidência "
-              "kalshi_pilot + nws_afd + ok_mesonet (aux_obs da config)")
+        # v19.1: scan web como evidência (mock) + custo no budget
+        saved_scan = (mod._anomaly_scan, mod.JUDGE_ANOMALY_SCAN,
+                      mod._record_spend)
+        spent = []
+        mod.JUDGE_ANOMALY_SCAN = True
+        mod._anomaly_scan = lambda e, note=None: {
+            "catalyst_found": True,
+            "summary": "Excessive Heat Warning ativo até sábado",
+            "_meta": {"cost_usd": 0.021}}
+        mod._record_spend = lambda amt: spent.append(amt)
+        try:
+            out = mod.review_proposal(_row(), "prompt")
+            ev = out["evidence"]
+            assert seen["coords"] == (40.7789, -73.9692), seen
+            assert "kalshi_pilot" in ev and "africa_pilot" not in ev, ev.keys()
+            kp = ev["kalshi_pilot"]
+            assert kp["station_icao"] == "KNYC" and kp["risk_notes"], kp
+            assert "CLI" in kp["resolution"], kp["resolution"]
+            assert ev["nws_afd"]["wfo"] == "OKX" and "sea breeze" in \
+                ev["nws_afd"]["text"], ev.get("nws_afd")
+            assert ev["ok_mesonet"]["sites"][0]["tair_f"] == 97.3, \
+                ev.get("ok_mesonet")
+            was = ev["web_anomaly_scan"]
+            assert was["catalyst_found"] is True and \
+                "Heat Warning" in was["summary"], was
+            assert spent == [0.021], spent  # custo do scan entrou no budget
+            # fail-open: scan indisponível → evidência simplesmente ausente
+            mod._anomaly_scan = lambda e, note=None: None
+            out2 = mod.review_proposal(_row(), "prompt")
+            assert "web_anomaly_scan" not in out2["evidence"], \
+                out2["evidence"].keys()
+        finally:
+            (mod._anomaly_scan, mod.JUDGE_ANOMALY_SCAN,
+             mod._record_spend) = saved_scan
+        print("Test 5 PASS: review_proposal — coords do meta, kalshi_pilot + "
+              "nws_afd + ok_mesonet + web_anomaly_scan (custo no budget, "
+              "fail-open sem scan)")
 
         # Test 6: parser do get_nws_afd — 2 chamadas (lista → produto),
         # corte no .LONG TERM, cap de chars, 404 → None (fail-open).
