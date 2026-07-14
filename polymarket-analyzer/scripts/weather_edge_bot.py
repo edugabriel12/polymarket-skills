@@ -186,6 +186,10 @@ def _now_iso() -> str:
 def log_event(event_type: str, payload: dict | None = None, level: str = "INFO") -> None:
     """Append one JSONL line to the log file AND print to stdout (journald)."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    # LOG_FILE pode ter sido redirecionado (--log-file / bot Kalshi) para um
+    # subdiretório que ainda não existe — sem este mkdir todo append viraria
+    # [log-error] silencioso (mesmo bug corrigido no judge).
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     rec = {"ts": _now_iso(), "level": level, "event_type": event_type,
            "payload": payload or {}}
     line = json.dumps(rec, default=str, ensure_ascii=False)

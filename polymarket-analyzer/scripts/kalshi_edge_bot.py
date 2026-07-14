@@ -44,7 +44,8 @@ Uso:
     python kalshi_edge_bot.py --once             # 1 ciclo com paper real
     python kalshi_edge_bot.py --daemon           # loop (systemd)
     python kalshi_edge_bot.py --test-discovery | --test-execute |
-        --test-monitor | --test-resolution | --test-lst-date
+        --test-monitor | --test-resolution | --test-lst-date |
+        --test-caution-cost | --test-logging
 
 Env:
     WEATHER_EDGE_DB_PATH  (default ~/.polymarket-paper/kalshi_edge.db —
@@ -109,6 +110,31 @@ KALSHI_LOG_FILE = Path.home() / ".polymarket-paper" / "kalshi_edge.jsonl"
 web.LOG_FILE = KALSHI_LOG_FILE
 log_event = web.log_event
 _now_iso = web._now_iso
+
+
+# log_event já espelha cada evento no JSONL E no terminal. O que escapava do
+# arquivo era um crash FORA do loop principal (startup, args, import): o
+# traceback ia só para o stderr — num terminal do Windows que fecha, a
+# evidência morre. O excepthook injeta o traceback no JSONL antes do print
+# padrão. Ctrl+C fica de fora (encerramento normal, não é crash).
+def _log_uncaught(exc_type, exc, tb):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc, tb)
+        return
+    import traceback as _tb
+    try:
+        log_event("error", {
+            "where": "kalshi_uncaught",
+            "err": f"{exc_type.__name__}: {exc}",
+            "traceback": "".join(
+                _tb.format_exception(exc_type, exc, tb))[-4000:],
+        }, level="ERROR")
+    except Exception:
+        pass  # logging nunca pode mascarar o traceback real
+    sys.__excepthook__(exc_type, exc, tb)
+
+
+sys.excepthook = _log_uncaught
 
 STRATEGY = "kalshi_weather"
 
@@ -1866,6 +1892,61 @@ def _test_caution_cost():
         restore_db()
 
 
+def _test_logging():
+    """Terminal ↔ JSONL: mkdir do --log-file em subdiretório novo +
+    excepthook gravando crash no arquivo. Hermético (tmpdir, sem rede).
+    Run: python kalshi_edge_bot.py --test-logging
+    """
+    import tempfile
+    saved_logfile = web.LOG_FILE
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            # Test 1: log_event cria o subdiretório do LOG_FILE redirecionado
+            # (mesmo bug de [log-error] que o judge tinha com o override).
+            web.LOG_FILE = Path(td) / "logs" / "novo" / "kalshi.jsonl"
+            log_event("test_log_dir", {"n": 1})
+            assert web.LOG_FILE.exists(), web.LOG_FILE
+            rec = json.loads(
+                web.LOG_FILE.read_text(encoding="utf-8").splitlines()[0])
+            assert rec["event_type"] == "test_log_dir", rec
+            print("Test 1 PASS: log_event cria subdiretório novo do "
+                  "--log-file (sem [log-error])")
+
+            # Test 2: excepthook injeta o traceback do crash no JSONL.
+            try:
+                raise RuntimeError("boom sintético do teste")
+            except RuntimeError:
+                et, ev, tb = sys.exc_info()
+            print("(traceback sintético abaixo é esperado)", file=sys.stderr)
+            _log_uncaught(et, ev, tb)
+            rec = json.loads(
+                web.LOG_FILE.read_text(encoding="utf-8").splitlines()[-1])
+            assert rec["event_type"] == "error", rec
+            assert rec["payload"]["where"] == "kalshi_uncaught", rec
+            assert "boom sintético do teste" in rec["payload"]["traceback"]
+            assert rec["level"] == "ERROR", rec
+            print("Test 2 PASS: crash não-tratado vira evento error com "
+                  "traceback no JSONL")
+
+            # Test 3: KeyboardInterrupt (Ctrl+C) NÃO vira evento — é
+            # encerramento normal, não crash.
+            n_before = len(
+                web.LOG_FILE.read_text(encoding="utf-8").splitlines())
+            try:
+                raise KeyboardInterrupt()
+            except KeyboardInterrupt:
+                et, ev, tb = sys.exc_info()
+            _log_uncaught(et, ev, tb)
+            n_after = len(
+                web.LOG_FILE.read_text(encoding="utf-8").splitlines())
+            assert n_after == n_before, (n_before, n_after)
+            print("Test 3 PASS: Ctrl+C não polui o JSONL")
+
+        print("\nAll --test-logging PASS (3/3)")
+    finally:
+        web.LOG_FILE = saved_logfile
+
+
 if __name__ == "__main__":
     if "--test-lst-date" in sys.argv:
         _test_lst_date()
@@ -1884,5 +1965,8 @@ if __name__ == "__main__":
         sys.exit(0)
     if "--test-caution-cost" in sys.argv:
         _test_caution_cost()
+        sys.exit(0)
+    if "--test-logging" in sys.argv:
+        _test_logging()
         sys.exit(0)
     raise SystemExit(main())
