@@ -50,7 +50,7 @@ Optional:
   JUDGE_ANOMALY_SCAN_MODEL   (default claude-sonnet-5)
   JUDGE_POLL_INTERVAL_SEC    (default 120)
   JUDGE_DAILY_BUDGET_USD     (default 15)
-  JUDGE_MAX_TOKENS           (default 16384; output budget do veredito,
+  JUDGE_MAX_TOKENS           (default 32768; output budget do veredito,
                               compartilhado com o thinking adaptativo)
 """
 from __future__ import annotations
@@ -203,7 +203,9 @@ ANOMALY_SCAN_MAX_TOKENS = int(os.environ.get("JUDGE_ANOMALY_SCAN_MAX_TOKENS", "1
 # exhausted it and the response came back stop_reason=max_tokens with no text
 # block (judge_failed, entries retried forever). Cost is per token actually
 # generated, so a higher ceiling costs nothing on well-behaved responses.
-JUDGE_MAX_TOKENS = int(os.environ.get("JUDGE_MAX_TOKENS", "16384"))
+# v19.3: 16384 → 32768 a pedido do operador — margem folgada para o thinking
+# nos payloads maiores; o retry sem thinking continua como rede de segurança.
+JUDGE_MAX_TOKENS = int(os.environ.get("JUDGE_MAX_TOKENS", "32768"))
 
 # Pricing per 1M tokens (adjust if model changed)
 PRICING = {
