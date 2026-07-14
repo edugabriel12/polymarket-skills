@@ -52,6 +52,9 @@ Optional:
   JUDGE_DAILY_BUDGET_USD     (default 15)
   JUDGE_MAX_TOKENS           (default 32768; output budget do veredito,
                               compartilhado com o thinking adaptativo)
+  JUDGE_HTTP_TIMEOUT_SEC     (default 900; timeout explícito por request —
+                              obrigatório com max_tokens alto, senão o SDK
+                              exige streaming)
 """
 from __future__ import annotations
 
@@ -206,6 +209,11 @@ ANOMALY_SCAN_MAX_TOKENS = int(os.environ.get("JUDGE_ANOMALY_SCAN_MAX_TOKENS", "1
 # v19.3: 16384 → 32768 a pedido do operador — margem folgada para o thinking
 # nos payloads maiores; o retry sem thinking continua como rede de segurança.
 JUDGE_MAX_TOKENS = int(os.environ.get("JUDGE_MAX_TOKENS", "32768"))
+# Acima de ~21k max_tokens o SDK exige streaming OU timeout explícito
+# (ValueError "Streaming is required for operations that may take longer
+# than 10 minutes"). Um timeout por request desarma o check — vereditos
+# reais levam 60–120s, então 900s é folga larga, não expectativa.
+JUDGE_HTTP_TIMEOUT = float(os.environ.get("JUDGE_HTTP_TIMEOUT_SEC", "900"))
 
 # Pricing per 1M tokens (adjust if model changed)
 PRICING = {
@@ -227,7 +235,10 @@ def _now_iso() -> str:
 
 
 def log_event(event_type: str, payload: dict | None = None, level: str = "INFO") -> None:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    # Cria o diretório do PRÓPRIO arquivo de log — com WEATHER_EDGE_JUDGE_LOG
+    # apontando para um subdiretório novo (ex.: logs/kalshi_judge.jsonl),
+    # criar só LOG_DIR deixava todo append falhando com [log-error].
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     rec = {"ts": _now_iso(), "level": level, "event_type": event_type,
            "payload": payload or {}, "actor": "judge"}
     line = json.dumps(rec, default=str, ensure_ascii=False)
@@ -809,6 +820,7 @@ def call_claude(entry_row: dict, evidence: dict, system_prompt: str) -> Optional
     request_kwargs = {
         "model": DEFAULT_MODEL,
         "max_tokens": JUDGE_MAX_TOKENS,
+        "timeout": JUDGE_HTTP_TIMEOUT,
         "system": [{"type": "text", "text": system_prompt,
                      "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
         "messages": [{"role": "user", "content": user_content}],
@@ -3727,6 +3739,9 @@ def _test_max_tokens_retry():
         assert out is not None and out["verdict"] == "APPROVE", out
         assert len(calls) == 2, len(calls)
         assert calls[0]["max_tokens"] == mod.JUDGE_MAX_TOKENS, calls[0]
+        # timeout explícito desarma o "Streaming is required..." do SDK
+        # quando max_tokens implica >10min estimados.
+        assert calls[0]["timeout"] == mod.JUDGE_HTTP_TIMEOUT > 0, calls[0]
         assert "thinking" in calls[0] and \
             calls[0]["output_config"].get("effort") == "medium", calls[0]
         assert "thinking" not in calls[1] and \
@@ -3788,7 +3803,23 @@ def _test_max_tokens_retry():
         assert "thinking" not in calls[0], calls[0]
         print("Test 5 PASS: Haiku sem thinking → 1 call, sem retry")
 
-        print("\nAll --test-max-tokens-retry PASS (5/5)")
+        # Test 6: log_event cria o diretório do PRÓPRIO LOG_FILE — override
+        # WEATHER_EDGE_JUDGE_LOG apontando para subdiretório inexistente não
+        # pode degradar para [log-error] em todo evento.
+        import tempfile
+        saved_logfile = mod.LOG_FILE
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                mod.LOG_FILE = Path(td) / "logs" / "sub" / "kalshi_judge.jsonl"
+                mod.log_event("test_log_dir", {"ok": True})
+                assert mod.LOG_FILE.exists(), mod.LOG_FILE
+                rec = json.loads(mod.LOG_FILE.read_text().splitlines()[0])
+                assert rec["event_type"] == "test_log_dir", rec
+        finally:
+            mod.LOG_FILE = saved_logfile
+        print("Test 6 PASS: log_event cria o diretório do LOG_FILE override")
+
+        print("\nAll --test-max-tokens-retry PASS (6/6)")
     finally:
         mod.DEFAULT_MODEL = saved_model
         if saved_anthropic is not None:
