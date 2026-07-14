@@ -50,6 +50,8 @@ Optional:
   JUDGE_ANOMALY_SCAN_MODEL   (default claude-sonnet-5)
   JUDGE_POLL_INTERVAL_SEC    (default 120)
   JUDGE_DAILY_BUDGET_USD     (default 15)
+  JUDGE_MAX_TOKENS           (default 32768; output budget do veredito,
+                              compartilhado com o thinking adaptativo)
 """
 from __future__ import annotations
 
@@ -194,6 +196,16 @@ JUDGE_ANOMALY_SCAN = os.environ.get("JUDGE_ANOMALY_SCAN", "1").strip().lower() n
     "0", "false", "no", "off", "")
 ANOMALY_SCAN_MAX_USES = int(os.environ.get("JUDGE_ANOMALY_SCAN_MAX_USES", "3"))
 ANOMALY_SCAN_MAX_TOKENS = int(os.environ.get("JUDGE_ANOMALY_SCAN_MAX_TOKENS", "1500"))
+
+# v19.2: output-token budget for the verdict call. Adaptive thinking shares
+# this budget with the final JSON — with the enlarged Kalshi evidence payload
+# (AFD + anomaly scan + intraday + mesonet) 8192 proved too small: thinking
+# exhausted it and the response came back stop_reason=max_tokens with no text
+# block (judge_failed, entries retried forever). Cost is per token actually
+# generated, so a higher ceiling costs nothing on well-behaved responses.
+# v19.3: 16384 → 32768 a pedido do operador — margem folgada para o thinking
+# nos payloads maiores; o retry sem thinking continua como rede de segurança.
+JUDGE_MAX_TOKENS = int(os.environ.get("JUDGE_MAX_TOKENS", "32768"))
 
 # Pricing per 1M tokens (adjust if model changed)
 PRICING = {
@@ -796,7 +808,7 @@ def call_claude(entry_row: dict, evidence: dict, system_prompt: str) -> Optional
     is_haiku = "haiku" in DEFAULT_MODEL.lower()
     request_kwargs = {
         "model": DEFAULT_MODEL,
-        "max_tokens": 8192,
+        "max_tokens": JUDGE_MAX_TOKENS,
         "system": [{"type": "text", "text": system_prompt,
                      "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
         "messages": [{"role": "user", "content": user_content}],
@@ -808,17 +820,48 @@ def call_claude(entry_row: dict, evidence: dict, system_prompt: str) -> Optional
         # Opus / Sonnet: enable adaptive thinking + medium effort
         request_kwargs["thinking"] = {"type": "adaptive"}
         request_kwargs["output_config"]["effort"] = "medium"
-    try:
-        response = client.messages.create(**request_kwargs)
-        duration_ms = int((time.monotonic() - t0) * 1000)
-    except Exception as e:
-        log_event("error", {"where": "anthropic_call", "err": str(e),
-                            "type": type(e).__name__}, level="ERROR")
-        return None
 
-    # Parse the structured JSON response
+    # v19.2: on stop_reason=max_tokens the verdict JSON is missing or
+    # truncated — unusable either way. Retry ONCE with thinking stripped so
+    # the entire output budget goes to the verdict itself (the Haiku code
+    # path, proven). Usage from both attempts is summed for cost accounting.
+    tokens_in = tokens_out = cache_read = 0
+    response = None
+    for attempt in ("with_thinking", "no_thinking"):
+        try:
+            response = client.messages.create(**request_kwargs)
+        except Exception as e:
+            log_event("error", {"where": "anthropic_call", "err": str(e),
+                                "type": type(e).__name__}, level="ERROR")
+            return None
+        u = response.usage
+        tokens_in += u.input_tokens
+        tokens_out += u.output_tokens
+        cache_read += (u.cache_read_input_tokens or 0)
+        if response.stop_reason != "max_tokens":
+            break
+        if attempt == "with_thinking" and "thinking" in request_kwargs:
+            try:
+                _eid = entry_row["id"]
+            except (KeyError, IndexError, TypeError):
+                _eid = None
+            log_event("judge_max_tokens_retry",
+                      {"entry_id": _eid, "max_tokens": JUDGE_MAX_TOKENS,
+                       "tokens_out_first_try": u.output_tokens},
+                      level="WARN")
+            request_kwargs = dict(request_kwargs)
+            request_kwargs.pop("thinking", None)
+            request_kwargs["output_config"] = {
+                k: v for k, v in request_kwargs["output_config"].items()
+                if k != "effort"}
+        else:
+            break
+    duration_ms = int((time.monotonic() - t0) * 1000)
+
+    # Parse the structured JSON response. A max_tokens stop is fatal even if
+    # a partial text block exists — truncated JSON never parses.
     text_block = next((b.text for b in response.content if b.type == "text"), None)
-    if not text_block:
+    if not text_block or response.stop_reason == "max_tokens":
         log_event("error", {"where": "claude_response_empty",
                             "stop_reason": response.stop_reason}, level="ERROR")
         return None
@@ -833,13 +876,12 @@ def call_claude(entry_row: dict, evidence: dict, system_prompt: str) -> Optional
                             "shutdown_in_progress": _shutdown}, level=level)
         return None
 
-    # Compute cost
-    usage = response.usage
+    # Compute cost (summed across the retry, when one happened)
     pricing = PRICING.get(DEFAULT_MODEL, PRICING["claude-haiku-4-5"])
     cost = (
-        usage.input_tokens * pricing["input"] / 1_000_000 +
-        usage.output_tokens * pricing["output"] / 1_000_000 +
-        (usage.cache_read_input_tokens or 0) * pricing["cache_read"] / 1_000_000
+        tokens_in * pricing["input"] / 1_000_000 +
+        tokens_out * pricing["output"] / 1_000_000 +
+        cache_read * pricing["cache_read"] / 1_000_000
     )
 
     # Capture any thinking/reasoning blocks for the audit trail.
@@ -850,9 +892,9 @@ def call_claude(entry_row: dict, evidence: dict, system_prompt: str) -> Optional
                                     or getattr(b, "text", ""))
 
     parsed["_meta"] = {
-        "tokens_in": usage.input_tokens,
-        "tokens_out": usage.output_tokens,
-        "cache_read_tokens": usage.cache_read_input_tokens or 0,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "cache_read_tokens": cache_read,
         "cost_usd": cost,
         "duration_ms": duration_ms,
         "model": DEFAULT_MODEL,
@@ -3609,6 +3651,152 @@ def _test_kalshi_route():
          mod.get_intraday_extremes) = saved
 
 
+def _test_max_tokens_retry():
+    """Hermetic test of the v19.2 stop_reason=max_tokens retry in call_claude.
+
+    Injects a fake `anthropic` module into sys.modules; no network, no key.
+    Run: python weather_edge_judge.py --test-max-tokens-retry
+    """
+    import types
+    mod = sys.modules[__name__]
+
+    class _Usage:
+        def __init__(self, i, o, c):
+            self.input_tokens = i
+            self.output_tokens = o
+            self.cache_read_input_tokens = c
+
+    class _Block:
+        def __init__(self, type_, text=None, thinking=None):
+            self.type = type_
+            if text is not None:
+                self.text = text
+            if thinking is not None:
+                self.thinking = thinking
+
+    class _Resp:
+        def __init__(self, stop_reason, content, usage):
+            self.stop_reason = stop_reason
+            self.content = content
+            self.usage = usage
+
+    _VERDICT = json.dumps({"verdict": "APPROVE", "confidence": 0.8,
+                           "judge_prob": 0.75, "rationale": "ok"})
+
+    calls: list[dict] = []
+    script: list[_Resp] = []
+
+    class _Messages:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return script.pop(0)
+
+    class _Client:
+        def __init__(self):
+            self.messages = _Messages()
+
+    fake = types.ModuleType("anthropic")
+    fake.Anthropic = _Client
+    saved_anthropic = sys.modules.get("anthropic")
+    sys.modules["anthropic"] = fake
+    saved_model = mod.DEFAULT_MODEL
+
+    entry = {
+        "id": 37, "market_question": "Highest temperature in Austin on Jul 14?",
+        "market_slug": "KXHIGHAUS-26JUL14-B105.5", "city_resolved": "Austin",
+        "threshold_value": 105.5, "threshold_unit": "F", "comparison": "exceed",
+        "end_date": "2026-07-15T05:00:00Z", "ttr_hours_at_entry": 18.0,
+        "side": "YES", "entry_price": 0.55, "forecast_prob_at_entry": 0.80,
+        "implied_prob_at_entry": 0.55, "edge_pp_at_entry": 25.0,
+        "forecast_snapshot_json": "{}", "discovery_meta_json": "{}",
+    }
+
+    try:
+        mod.DEFAULT_MODEL = "claude-sonnet-4-6"
+
+        # Test 1: 1ª tentativa estoura max_tokens (só thinking, sem texto) →
+        # retry sem thinking devolve o veredito; usage somado dos 2 calls.
+        calls.clear()
+        script[:] = [
+            _Resp("max_tokens", [_Block("thinking", thinking="...")],
+                  _Usage(1000, mod.JUDGE_MAX_TOKENS, 500)),
+            _Resp("end_turn", [_Block("text", text=_VERDICT)],
+                  _Usage(1000, 300, 500)),
+        ]
+        out = mod.call_claude(entry, {}, "system prompt")
+        assert out is not None and out["verdict"] == "APPROVE", out
+        assert len(calls) == 2, len(calls)
+        assert calls[0]["max_tokens"] == mod.JUDGE_MAX_TOKENS, calls[0]
+        assert "thinking" in calls[0] and \
+            calls[0]["output_config"].get("effort") == "medium", calls[0]
+        assert "thinking" not in calls[1] and \
+            "effort" not in calls[1]["output_config"], calls[1]
+        assert calls[1]["output_config"]["format"]["type"] == "json_schema"
+        meta = out["_meta"]
+        assert meta["tokens_out"] == mod.JUDGE_MAX_TOKENS + 300, meta
+        assert meta["tokens_in"] == 2000 and meta["cache_read_tokens"] == 1000
+        raw = json.loads(meta["raw_response_json"])
+        assert raw["stop_reason"] == "end_turn", raw
+        print("Test 1 PASS: max_tokens → retry sem thinking → veredito OK, "
+              "usage somado")
+
+        # Test 2: texto PARCIAL com stop_reason=max_tokens também dispara o
+        # retry (JSON truncado nunca parseia — não tentar).
+        calls.clear()
+        script[:] = [
+            _Resp("max_tokens", [_Block("text", text='{"verdict": "APPR')],
+                  _Usage(1000, mod.JUDGE_MAX_TOKENS, 0)),
+            _Resp("end_turn", [_Block("text", text=_VERDICT)],
+                  _Usage(1000, 250, 0)),
+        ]
+        out = mod.call_claude(entry, {}, "system prompt")
+        assert out is not None and out["verdict"] == "APPROVE", out
+        assert len(calls) == 2, len(calls)
+        print("Test 2 PASS: texto parcial truncado → retry, não parseia lixo")
+
+        # Test 3: retry também trunca → None, e exatamente 2 calls (sem loop).
+        calls.clear()
+        script[:] = [
+            _Resp("max_tokens", [], _Usage(1000, mod.JUDGE_MAX_TOKENS, 0)),
+            _Resp("max_tokens", [], _Usage(1000, mod.JUDGE_MAX_TOKENS, 0)),
+        ]
+        out = mod.call_claude(entry, {}, "system prompt")
+        assert out is None, out
+        assert len(calls) == 2, len(calls)
+        print("Test 3 PASS: retry também truncou → None após exatamente 2 calls")
+
+        # Test 4: resposta boa de primeira → 1 call só, sem retry.
+        calls.clear()
+        script[:] = [
+            _Resp("end_turn", [_Block("text", text=_VERDICT)],
+                  _Usage(1200, 400, 800)),
+        ]
+        out = mod.call_claude(entry, {}, "system prompt")
+        assert out is not None and len(calls) == 1, (out, len(calls))
+        assert out["_meta"]["tokens_out"] == 400
+        print("Test 4 PASS: resposta boa → 1 call, sem retry")
+
+        # Test 5: Haiku (sem thinking nos kwargs) não tem o que remover →
+        # max_tokens falha após 1 call, sem retry inútil.
+        mod.DEFAULT_MODEL = "claude-haiku-4-5"
+        calls.clear()
+        script[:] = [
+            _Resp("max_tokens", [], _Usage(500, 8192, 0)),
+        ]
+        out = mod.call_claude(entry, {}, "system prompt")
+        assert out is None and len(calls) == 1, (out, len(calls))
+        assert "thinking" not in calls[0], calls[0]
+        print("Test 5 PASS: Haiku sem thinking → 1 call, sem retry")
+
+        print("\nAll --test-max-tokens-retry PASS (5/5)")
+    finally:
+        mod.DEFAULT_MODEL = saved_model
+        if saved_anthropic is not None:
+            sys.modules["anthropic"] = saved_anthropic
+        else:
+            sys.modules.pop("anthropic", None)
+
+
 if __name__ == "__main__":
     import sys
     if "--test-rule6" in sys.argv:
@@ -3633,6 +3821,8 @@ if __name__ == "__main__":
         _test_brightsky()
     elif "--test-kalshi-route" in sys.argv:
         _test_kalshi_route()
+    elif "--test-max-tokens-retry" in sys.argv:
+        _test_max_tokens_retry()
     elif "--probe-mesonet" in sys.argv:
         # smoke do operador: valida o feed público e a UNIDADE do TAIR
         # (se vier ~20-40 no verão, é Celsius → trocar aux_obs.tair_unit).
