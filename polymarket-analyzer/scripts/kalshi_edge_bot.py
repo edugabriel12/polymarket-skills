@@ -1161,6 +1161,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="smoke do operador: busca o CLI no arquivo do IEM e "
                          "compara com o METAR (ex.: --probe-cli KSEA "
                          "2026-07-09; DATE default = ontem UTC)")
+    ap.add_argument("--status", action="store_true",
+                    help="raio-X operacional: caminho do DB, entries por "
+                         "status, posições abertas (mesma query do "
+                         "dashboard) e banca paper — e sai")
     return ap
 
 
@@ -1191,6 +1195,42 @@ def main() -> int:
                   "(aproximação documentada). Se persistir, cheque o "
                   "endpoint no navegador: "
                   f"{IEM_CLI_API}?station={icao}&date={d}")
+        return 0
+
+    if args.status:
+        # Diagnóstico do descasamento clássico: "aberta" pode significar
+        # coisas diferentes em cada camada. O dashboard lista entries do
+        # kalshi_edge.db (EXECUTED sem cashout/resolução); a banca paper
+        # vive no portfolio.db. Este comando mostra os DOIS lados com as
+        # MESMAS queries que cada um usa.
+        db_path = Path(str(db.DB_PATH))
+        print(f"DB do bot: {db_path}  (existe: {db_path.exists()})")
+        db.init_db()
+        with db.connect() as conn:
+            by_status = conn.execute(
+                "SELECT COALESCE(status, '?'), COUNT(*) FROM entries "
+                "GROUP BY status ORDER BY 2 DESC").fetchall()
+            print("entries por status:",
+                  {r[0]: r[1] for r in by_status} or "(nenhuma)")
+            open_rows = db.query_open_positions(conn)
+            print(f"abertas segundo bot/dashboard (EXECUTED sem "
+                  f"cashout/resolução): {len(open_rows)}")
+            for r in open_rows:
+                print(f"  #{r['entry_id']} {r['market_slug']} {r['side']} "
+                      f"{(r['size_shares'] or 0):.0f}x @ "
+                      f"{r['entry_price']}")
+        try:
+            pf = _make_engine(args.portfolio).get_portfolio(
+                refresh_prices=False)
+            poss = pf.get("positions") or []
+            print(f"banca paper {args.portfolio!r}: "
+                  f"cash ${pf.get('cash_balance', 0):.2f}, "
+                  f"{len(poss)} posição(ões) aberta(s)")
+            for p in poss:
+                print(f"  {p['token_id']} {p['side']} "
+                      f"{(p['shares'] or 0):.0f}x @ {p['avg_entry']}")
+        except Exception as e:
+            print(f"banca paper {args.portfolio!r} indisponível: {e}")
         return 0
 
     kcities = kio.load_kalshi_cities()
