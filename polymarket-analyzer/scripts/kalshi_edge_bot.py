@@ -1211,7 +1211,72 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="raio-X operacional: caminho do DB, entries por "
                          "status, posições abertas (mesma query do "
                          "dashboard) e banca paper — e sai")
+    ap.add_argument("--resync-bank", action="store_true",
+                    help="reconstrói a banca paper a partir das entries "
+                         "abertas do bot (re-abre posições faltantes ao "
+                         "preço de entrada; NUNCA fecha nada). Combine com "
+                         "--dry-run para só ver o plano. Usar após reset "
+                         "parcial (banca re-inicializada sem reset do DB)")
     return ap
+
+
+def run_resync_bank(args) -> int:
+    """Reconstrói a banca paper a partir das entries abertas do bot.
+
+    Aditivo e idempotente: re-abre na banca ATIVA as posições que existem
+    como entry EXECUTED (sem cashout/resolução) mas não existem na banca —
+    ao preço de entrada original, com a fee re-cobrada (aproximação
+    documentada). Nunca fecha nada: posições órfãs na banca (sem entry)
+    são apenas reportadas para fechamento manual.
+    """
+    db.init_db()
+    with db.connect() as conn:
+        open_rows = [dict(r) for r in db.query_open_positions(conn)]
+    try:
+        engine = _make_engine(args.portfolio)
+        pf = engine.get_portfolio(refresh_prices=False)
+    except Exception as e:
+        print(f"banca {args.portfolio!r} indisponível: {e}", file=sys.stderr)
+        return 1
+    bank_tokens = {p["token_id"] for p in (pf.get("positions") or [])}
+    entry_tokens = {r["token_id_yes"] for r in open_rows}
+    missing = [r for r in open_rows if r["token_id_yes"] not in bank_tokens]
+    orphans = sorted(bank_tokens - entry_tokens)
+    print(f"banca {args.portfolio!r}: {len(bank_tokens)} posição(ões) · "
+          f"bot: {len(open_rows)} entry(ies) aberta(s) · "
+          f"faltando na banca: {len(missing)} · órfãs na banca: {len(orphans)}")
+    for r in missing:
+        price = float(r["entry_price"] or 0)
+        shares = float(r["size_shares"] or 0)
+        if price <= 0 or shares <= 0:
+            print(f"  #{r['entry_id']} {r['market_slug']}: sem "
+                  f"price/shares válidos — pulando")
+            continue
+        # size = shares × preço (custo pré-fee): o engine recalcula
+        # shares = size/price e bate exato com a entry original.
+        size_usd = round(shares * price, 4)
+        label = (f"#{r['entry_id']} {r['market_slug']} {r['side']} "
+                 f"{shares:.0f}x @ {price} (${size_usd:.2f})")
+        if args.dry_run:
+            print(f"  re-abriria {label}")
+            continue
+        res = engine.open_position(
+            token_id=r["token_id_yes"], side=r["side"], size_usd=size_usd,
+            market_question=str(r["market_question"] or "")[:200],
+            fee_rate=kio.kalshi_fee_rate(price), price=price,
+            reasoning=f"resync-bank entry_id={r['entry_id']}")
+        ok = res.get("status") == "executed"
+        print(f"  re-aberta {label} → {res.get('status')}"
+              f"{'' if ok else ' (' + str(res.get('reason')) + ')'}")
+        log_event("kalshi_bank_resynced" if ok else "error",
+                  {"entry_id": r["entry_id"], "ticker": r["market_slug"],
+                   "size_usd": size_usd, "result": res.get("status"),
+                   "reason": res.get("reason")},
+                  level="INFO" if ok else "ERROR")
+    for t in orphans:
+        print(f"  órfã na banca (sem entry no bot): {t} — feche manualmente "
+              f"com close_position(force_exit_price=<resultado>)")
+    return 0
 
 
 def main() -> int:
@@ -1242,6 +1307,9 @@ def main() -> int:
                   "endpoint no navegador: "
                   f"{IEM_CLI_API}?station={icao}&date={d}")
         return 0
+
+    if args.resync_bank:
+        return run_resync_bank(args)
 
     if args.status:
         # Diagnóstico do descasamento clássico: "aberta" pode significar
@@ -2035,6 +2103,66 @@ def _test_caution_cost():
         restore_db()
 
 
+def _test_resync():
+    """--resync-bank: re-abre só o que falta, respeita --dry-run, reporta
+    órfãs, nunca fecha nada. Hermético (FakeEngine + DB temporário)."""
+    g = globals()
+    tmp, restore_db = _swap_test_db()
+    saved_engine = g["_make_engine"]
+    opened = []
+
+    class FakeEngine:
+        def __init__(self, positions):
+            self._positions = positions
+        def open_position(self, **kw):
+            opened.append(kw)
+            return {"status": "executed", "cost_usd": kw["size_usd"],
+                    "shares_filled": kw["size_usd"] / kw["price"],
+                    "avg_price": kw["price"], "fee": 0.0}
+        def get_portfolio(self, refresh_prices=True):
+            return {"cash_balance": 1000.0, "positions": self._positions}
+
+    try:
+        end_iso = (datetime.now(timezone.utc) +
+                   timedelta(hours=6)).isoformat().replace("+00:00", "Z")
+        with db.connect() as conn:
+            _seed_entry(conn, status="EXECUTED", end_date=end_iso,
+                        ticker="KXHIGHNY-26JUL12-T87", entry_price=0.40,
+                        size_shares=30, size_usd=12.0)
+            _seed_entry(conn, status="EXECUTED", end_date=end_iso,
+                        ticker="KXHIGHTDAL-26JUL15-B91.5", entry_price=0.80,
+                        size_shares=25, size_usd=20.0)
+
+        # Banca tem só a Dallas + uma órfã que o bot não conhece.
+        bank = [{"token_id": "KXHIGHTDAL-26JUL15-B91.5"},
+                {"token_id": "KXHIGHTSEA-26JUL14-B86.5"}]
+        g["_make_engine"] = lambda portfolio: FakeEngine(bank)
+
+        # Test 1: dry-run não abre nada.
+        args = _mk_test_args(dry_run=True)
+        rc = run_resync_bank(args)
+        assert rc == 0 and not opened, (rc, opened)
+        print("Test 1 PASS: --dry-run só imprime o plano, não abre nada")
+
+        # Test 2: aplica — re-abre SÓ a NY (30 × 0.40 = $12), com price e
+        # fee_rate corretos; Dallas (já na banca) e a órfã ficam intactas.
+        args = _mk_test_args(dry_run=False)
+        rc = run_resync_bank(args)
+        assert rc == 0 and len(opened) == 1, (rc, opened)
+        kw = opened[0]
+        assert kw["token_id"] == "KXHIGHNY-26JUL12-T87", kw
+        assert abs(kw["size_usd"] - 12.0) < 1e-6, kw
+        assert kw["price"] == 0.40, kw
+        assert abs(kw["fee_rate"] - kio.kalshi_fee_rate(0.40)) < 1e-9, kw
+        print("Test 2 PASS: re-abre só a faltante (NY $12 @ 0.40), "
+              "banca existente e órfã intocadas")
+
+        print("\nAll --test-resync PASS (2/2)")
+    finally:
+        g["_make_engine"] = saved_engine
+        restore_db()
+
+
 def _test_logging():
     """Terminal ↔ JSONL: mkdir do --log-file em subdiretório novo +
     excepthook gravando crash no arquivo. Hermético (tmpdir, sem rede).
@@ -2111,5 +2239,8 @@ if __name__ == "__main__":
         sys.exit(0)
     if "--test-logging" in sys.argv:
         _test_logging()
+        sys.exit(0)
+    if "--test-resync" in sys.argv:
+        _test_resync()
         sys.exit(0)
     raise SystemExit(main())

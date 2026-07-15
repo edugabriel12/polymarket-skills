@@ -17,10 +17,15 @@
     {% endif %}
   </div>
 
-  <div class="kpi" title="Posições Kalshi abertas vs cap de posições concorrentes (CLAUDE.md §2).">
+  <div class="kpi" title="Entries abertas do bot (kalshi_edge.db — mesma fonte da tabela) vs cap de posições concorrentes (CLAUDE.md §2). Se a banca paper descasar (reset parcial), o aviso aparece abaixo.">
     <span class="kpi-label">Open Positions</span>
     <span class="kpi-value">{{ k.open_positions }} / {{ k.max_positions }}</span>
-    <span class="kpi-delta muted">cash ${{ "%.2f"|format(k.cash_usd) }}</span>
+    {% if k.bank_synced is defined and not k.bank_synced %}
+      <span class="kpi-delta down">⚠ banca: {{ k.bank_open_count }} — descasada; rode
+        <code>kalshi_edge_bot.py --resync-bank</code></span>
+    {% else %}
+      <span class="kpi-delta muted">cash ${{ "%.2f"|format(k.cash_usd) }}</span>
+    {% endif %}
   </div>
 
   <div class="kpi" title="P&L realizado hoje (UTC): cashouts + settlements do dia no kalshi_edge.db.">
