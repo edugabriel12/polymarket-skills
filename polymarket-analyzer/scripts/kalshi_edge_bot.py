@@ -526,6 +526,25 @@ def run_execute_kalshi(args) -> int:
             continue
 
         fill_price = float(sizing["avg_fill"])
+
+        # Banda de preço re-aplicada na EXECUÇÃO: a banda do discovery valeu
+        # para o preço de então. Se o mercado desabou até aqui (ex.: fill a
+        # $0.01 no dia da liquidação), o re-check de edge até MELHORA — mas o
+        # colapso significa que o mercado tem informação intraday que o
+        # ensemble não tem; comprar nesse momento é seleção adversa (smoke:
+        # entries 62/71 executaram a $0.01 e a 62 já liquidou em -100%).
+        # Skip PERMANENTE — com o cooldown de re-proposta, não ressuscita.
+        if not (float(args.min_entry_price) <= fill_price
+                <= float(args.max_entry_price)):
+            log_event("kalshi_execute_skipped", {
+                "entry_id": entry_id, "reason": "price_out_of_band",
+                "fill_price": round(fill_price, 4), "side": side,
+                "band": [args.min_entry_price, args.max_entry_price]})
+            with db.connect() as conn2:
+                db.update_entry_status(conn2, entry_id, "SKIPPED",
+                                       skip_reason="price_out_of_band")
+            continue
+
         forecast_prob = row["forecast_prob_at_entry"]
         if forecast_prob is not None and side != row["side"]:
             forecast_prob = 1.0 - float(forecast_prob)
@@ -585,9 +604,18 @@ def run_execute_kalshi(args) -> int:
             continue
         size_usd = round(contracts * fill_price, 4)
         if size_usd < args.min_trade_usd:
+            # SKIPPED permanente, não retry: a entry ficava APPROVED/ADJUSTED
+            # e era re-tentada a CADA loop (~1/min) — 5.9k eventos numa noite.
+            # Pior: cap de ADJUST $10 + mínimo $10 + floor de contratos é
+            # estruturalmente inexecutável (fills caem em $9.2-9.9), e o
+            # único "escape" era o preço desabar até caber — exatamente
+            # quando não se deve comprar (seleção adversa).
             log_event("kalshi_execute_skipped", {
                 "entry_id": entry_id, "reason": "size_below_min",
                 "size_usd": size_usd, "min_trade_usd": args.min_trade_usd})
+            with db.connect() as conn2:
+                db.update_entry_status(conn2, entry_id, "SKIPPED",
+                                       skip_reason="size_below_min")
             continue
 
         fee_rate = kio.kalshi_fee_rate(fill_price)
@@ -1610,7 +1638,48 @@ def _test_execute():
         assert abs(calls[0]["size_usd"] - 4.0) < 1e-6, calls[0]["size_usd"]
         print("Test 3 PASS: cap do judge ($4) → 10 contratos → $4.00")
 
-        print("\nAll --test-execute PASS (3/3)")
+        # Banda de preço na EXECUÇÃO: mercado desabou até fill 0.01 (caso
+        # real: entries 62/71 — seleção adversa no dia da liquidação).
+        # Edge re-check "melhora" (P 0.80 vs 0.01) mas a banda barra ANTES,
+        # e o skip é permanente (SKIPPED).
+        calls.clear()
+        with db.connect() as conn:
+            _wipe_entries(conn)
+            _seed_entry(conn, status="APPROVED", end_date=end_iso)
+        kio.fetch_orderbook = lambda tk: {
+            "orderbook": {"yes": [[0.005, 2000]], "no": [[0.99, 2000]]}}
+        n4 = run_execute_kalshi(args)
+        assert n4 == 0 and not calls, (n4, calls)
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT status, skip_reason FROM entries").fetchone()
+        assert row["status"] == "SKIPPED", row["status"]
+        assert row["skip_reason"] == "price_out_of_band", row["skip_reason"]
+        print("Test 4 PASS: fill 0.01 fora da banda [0.30, 0.85] → SKIPPED "
+              "permanente (sem seleção adversa)")
+
+        # size_below_min vira SKIPPED (não retry infinito): depth 30 @0.40 →
+        # $12 < min $13 → skip; segunda rodada não re-tenta.
+        calls.clear()
+        with db.connect() as conn:
+            _wipe_entries(conn)
+            _seed_entry(conn, status="APPROVED", end_date=end_iso)
+        kio.fetch_orderbook = lambda tk: {
+            "orderbook": {"yes": [[0.35, 100]], "no": [[0.60, 30]]}}
+        args5 = _mk_test_args(min_trade_usd=13.0, execute_min_edge_pp=8)
+        n5 = run_execute_kalshi(args5)
+        assert n5 == 0 and not calls, (n5, calls)
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT status, skip_reason FROM entries").fetchone()
+        assert row["status"] == "SKIPPED", row["status"]
+        assert row["skip_reason"] == "size_below_min", row["skip_reason"]
+        n5b = run_execute_kalshi(args5)
+        assert n5b == 0 and not calls, "SKIPPED não pode ser re-tentado"
+        print("Test 5 PASS: size $12 < min $13 → SKIPPED permanente, sem "
+              "loop de retry")
+
+        print("\nAll --test-execute PASS (5/5)")
     finally:
         kio.fetch_orderbook = saved_fetch_ob
         web._risk_block_reason = saved_risk
