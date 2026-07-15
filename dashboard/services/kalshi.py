@@ -59,8 +59,14 @@ def get_kpis() -> dict:
     except FileNotFoundError:
         return {"available": False, "reason": "portfolio.db não encontrado"}
     try:
+        # active=1 + id DESC: --action init desativa a banca antiga e cria
+        # uma nova com o MESMO nome; sem o filtro, fetchone() devolvia a
+        # linha mais antiga (desativada) e o card mostrava a banca errada
+        # após qualquer re-init (visto no smoke: $997.57 da banca morta
+        # enquanto --status mostrava $2000 da ativa).
         pf = pconn.execute(
-            "SELECT * FROM portfolios WHERE name = ?",
+            "SELECT * FROM portfolios WHERE name = ? AND active = 1 "
+            "ORDER BY id DESC LIMIT 1",
             (S.KALSHI_PORTFOLIO,)).fetchone()
         if not pf:
             return {"available": False,

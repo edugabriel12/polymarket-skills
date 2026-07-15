@@ -55,8 +55,11 @@ def get_kpis(portfolio_name: str = "default",
     # Cash balance + open positions value (using last known bid from monitor_checks)
     pconn = _ro_conn(S.PORTFOLIO_DB)
     try:
+        # active=1 + id DESC: re-init cria uma linha nova com o mesmo nome e
+        # desativa a antiga — sem o filtro, fetchone() pegava a banca morta.
         pf = pconn.execute(
-            "SELECT * FROM portfolios WHERE name = ?", (portfolio_name,),
+            "SELECT * FROM portfolios WHERE name = ? AND active = 1 "
+            "ORDER BY id DESC LIMIT 1", (portfolio_name,),
         ).fetchone()
         if not pf:
             return _empty_kpis()
