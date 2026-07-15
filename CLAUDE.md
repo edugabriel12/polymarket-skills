@@ -88,6 +88,32 @@ Position size = portfolio_value * (Full Kelly / 2)
 
 For full entry/exit decision trees and stop-loss math, see `polymarket-strategy-advisor/references/decision-framework.md`.
 
+### 2.1 Kalshi Paper Pilot Overrides (operator decision, 2026-07-15)
+
+The operator explicitly raised these limits for the SEPARATE "kalshi" paper
+bank only (kalshi_edge_bot + its judge instance). They override the tables
+above for this pilot; the Polymarket bot keeps the base limits. These
+overrides apply to PAPER trading only — no live mode is covered by them,
+and rule #4 (per-trade human confirmation for live) is untouched.
+
+| Parameter | Pilot value | Enforced at |
+|---|---|---|
+| Minimum trade size | $50 | `kalshi_edge_bot --min-trade-usd` |
+| Max per trade | 20% of bank ($200 @ $1,000) | bank `risk_config.max_position_pct = 0.20` |
+| Judge ADJUST cap (rule 6) | $75 | `JUDGE_RULE6_DOWNSIZE_USD_KALSHI` |
+| Judge ADJUST cap (range calibration) | $75 | `JUDGE_RANGE_ADJUST_SIZE_USD_KALSHI` |
+| Human approval threshold | disabled (paper only) | bank `risk_config.human_approval_pct = 1.0` |
+| Max market (ticker) exposure | $200 | `--max-market-exposure-usd` |
+| Max event exposure (city+day) | $400 | `--max-event-exposure-usd` |
+| Max single-market exposure (engine layer) | 40% | bank `risk_config.max_single_market_pct = 0.40` |
+| Daily realized-loss breaker | disabled (100% of bank) | `--daily-loss-limit-pct 100` + bank `risk_config.daily_loss_limit_pct = 1.0` |
+| Drawdown halt from peak | **unchanged: 20%** | `--max-drawdown-halt-pct` |
+
+The graduated drawdown response and forced-exit conditions above remain in
+force for the pilot — the 20% drawdown halt is the active circuit breaker.
+Bank-level values are applied with
+`paper_engine.py --action set-risk --name kalshi --risk '<JSON>'`.
+
 ---
 
 ## 3. Daily Workflow

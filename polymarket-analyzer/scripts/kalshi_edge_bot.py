@@ -1180,19 +1180,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--execute-min-edge-pp", type=float, default=8,
                     help="edge mínimo LÍQUIDO de fee na execução (pp)")
     ap.add_argument("--max-slippage", type=float, default=0.20)
-    ap.add_argument("--max-market-exposure-usd", type=float, default=50)
-    ap.add_argument("--max-event-exposure-usd", type=float, default=100,
+    # Limites do piloto Kalshi por decisão do operador (2026-07-15) —
+    # documentados no override da §2.1 do CLAUDE.md.
+    ap.add_argument("--max-market-exposure-usd", type=float, default=200)
+    ap.add_argument("--max-event-exposure-usd", type=float, default=400,
                     help="cap somado sobre todas as brackets de um mesmo "
                          "evento (mesma cidade+dia)")
-    ap.add_argument("--min-trade-usd", type=float, default=10,
-                    help="tamanho mínimo por trade (constituição §2)")
+    ap.add_argument("--min-trade-usd", type=float, default=50,
+                    help="tamanho mínimo por trade (override do operador; "
+                         "§2.1 do CLAUDE.md)")
     # Monitor
     ap.add_argument("--profit-lock-pp", type=float, default=50)
     ap.add_argument("--trailing-drawdown-pct", type=float, default=30)
     ap.add_argument("--convergence-pp", type=float, default=5)
     # Risk
     ap.add_argument("--max-drawdown-halt-pct", type=float, default=20)
-    ap.add_argument("--daily-loss-limit-pct", type=float, default=5)
+    # 100% = breaker diário efetivamente desativado por decisão do operador
+    # (equivale a $1000 na banca de $1000); o halt de drawdown 20% segue
+    # sendo o breaker real. Ver §2.1 do CLAUDE.md.
+    ap.add_argument("--daily-loss-limit-pct", type=float, default=100)
     # Forecast (consumidos por _compute_mae_for_market via getattr)
     ap.add_argument("--open-meteo", dest="open_meteo", action="store_true",
                     default=True)

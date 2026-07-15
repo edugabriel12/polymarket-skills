@@ -55,6 +55,10 @@ Optional:
   JUDGE_HTTP_TIMEOUT_SEC     (default 900; timeout explícito por request —
                               obrigatório com max_tokens alto, senão o SDK
                               exige streaming)
+  JUDGE_RULE6_DOWNSIZE_USD_KALSHI    (default 75; cap de ADJUST rule6 para
+                                      entries do piloto Kalshi)
+  JUDGE_RANGE_ADJUST_SIZE_USD_KALSHI (default 75; cap de ADJUST de range
+                                      calibration para o piloto Kalshi)
 """
 from __future__ import annotations
 
@@ -162,6 +166,23 @@ RANGE_ADJUST_SIZE_USD = float(os.environ.get("JUDGE_RANGE_ADJUST_SIZE_USD", "20.
 # disagrees). A trade the judge itself sees as -EV (judge_prob <= the side's
 # price) is still REJECTed — never trade without a quantifiable edge.
 RULE6_DOWNSIZE_USD = float(os.environ.get("JUDGE_RULE6_DOWNSIZE_USD", "10.0"))
+# Caps de ADJUST específicos do piloto Kalshi (operador, 2026-07-15 — §2.1
+# do CLAUDE.md): $75 nos dois mecanismos. A postura Polymarket (10/20)
+# fica intocada; a distinção é por venue da entry.
+RULE6_DOWNSIZE_USD_KALSHI = float(
+    os.environ.get("JUDGE_RULE6_DOWNSIZE_USD_KALSHI", "75.0"))
+RANGE_ADJUST_SIZE_USD_KALSHI = float(
+    os.environ.get("JUDGE_RANGE_ADJUST_SIZE_USD_KALSHI", "75.0"))
+
+
+def _adjust_caps_for(entry_row) -> tuple[float, float]:
+    """(cap_rule6, cap_range) da entry, por venue."""
+    try:
+        if _entry_venue(entry_row) == "kalshi":
+            return RULE6_DOWNSIZE_USD_KALSHI, RANGE_ADJUST_SIZE_USD_KALSHI
+    except Exception:
+        pass
+    return RULE6_DOWNSIZE_USD, RANGE_ADJUST_SIZE_USD
 
 # v13.2 (option B, 2026-07-01): CONDITIONAL judge gating. The LLM judge was a
 # universal per-trade gate, but forensics showed it is a *worse* forecaster
@@ -1952,9 +1973,10 @@ def apply_verdict(conn, entry_row, verdict: dict) -> None:
                         f"{entry_price:.2f} (bot {bot_prob:.2f})")
                     override_kind = "rule6_adjust_no_edge"
                 else:
+                    rule6_cap, _ = _adjust_caps_for(entry_row)
                     cur_cap = verdict.get("adjusted_size_usd")
-                    new_cap = (RULE6_DOWNSIZE_USD if not cur_cap
-                               else min(float(cur_cap), RULE6_DOWNSIZE_USD))
+                    new_cap = (rule6_cap if not cur_cap
+                               else min(float(cur_cap), rule6_cap))
                     verdict["adjusted_size_usd"] = new_cap
                     log_event("rule6_adjust_downsize", {
                         "entry_id": entry_row["entry_id"],
@@ -2011,9 +2033,10 @@ def apply_verdict(conn, entry_row, verdict: dict) -> None:
             if rc["near"]:
                 prev_verdict = verdict["verdict"]
                 verdict["verdict"] = "ADJUST"
+                _, range_cap = _adjust_caps_for(entry_row)
                 cur_cap = verdict.get("adjusted_size_usd")
-                new_cap = (RANGE_ADJUST_SIZE_USD if not cur_cap
-                           else min(float(cur_cap), RANGE_ADJUST_SIZE_USD))
+                new_cap = (range_cap if not cur_cap
+                           else min(float(cur_cap), range_cap))
                 verdict["adjusted_size_usd"] = new_cap
                 log_event("range_calibration_adjust", {
                     "entry_id": entry_row["entry_id"],
@@ -3689,7 +3712,22 @@ def _test_kalshi_route():
         print("Test 9 PASS: get_intraday_extremes — dia LOCAL (ontem 23h "
               "local excluído), C→F, fail-open em 500/tz inválida")
 
-        print("\nAll --test-kalshi-route PASS (9/9)")
+        # Test 10: caps de ADJUST por venue — kalshi usa os caps do piloto
+        # (75/75 default), Polymarket mantém 10/20; row quebrada fail-open.
+        kalshi_row = {"discovery_meta_json": json.dumps({"venue": "kalshi"}),
+                      "market_question": "q", "entry_id": 1}
+        poly_row = {"discovery_meta_json": "{}",
+                    "market_question": "q", "entry_id": 2}
+        assert mod._adjust_caps_for(kalshi_row) == \
+            (mod.RULE6_DOWNSIZE_USD_KALSHI, mod.RANGE_ADJUST_SIZE_USD_KALSHI)
+        assert mod._adjust_caps_for(poly_row) == \
+            (mod.RULE6_DOWNSIZE_USD, mod.RANGE_ADJUST_SIZE_USD)
+        assert mod._adjust_caps_for({}) == \
+            (mod.RULE6_DOWNSIZE_USD, mod.RANGE_ADJUST_SIZE_USD)
+        print("Test 10 PASS: caps de ADJUST venue-aware (kalshi 75/75, "
+              "polymarket 10/20, fail-open)")
+
+        print("\nAll --test-kalshi-route PASS (10/10)")
     finally:
         (helpers.parse_market, kio.fetch_orderbook, mod.JUDGE_AUTOROUTE,
          mod.get_nws_forecast, mod.get_brightsky_forecast,

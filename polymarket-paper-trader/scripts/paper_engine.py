@@ -309,6 +309,34 @@ def init_portfolio(
     }
 
 
+def set_risk_config(name: str, updates: dict) -> dict:
+    """Merge de overrides de limites de risco no risk_config armazenado da
+    banca ATIVA. Só aceita chaves conhecidas (DEFAULT_RISK); valores são
+    persistidos na linha do portfolio — é assim que um piloto (ex.: kalshi)
+    opera com limites próprios sem tocar as outras bancas."""
+    unknown = set(updates) - set(DEFAULT_RISK)
+    if unknown:
+        raise ValueError(f"unknown risk keys: {sorted(unknown)}; "
+                         f"valid: {sorted(DEFAULT_RISK)}")
+    conn = _get_db()
+    try:
+        pf = _active_portfolio(conn, name)
+        try:
+            current = json.loads(pf["risk_config"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            current = {}
+        merged = {**DEFAULT_RISK, **current, **updates}
+        conn.execute(
+            "UPDATE portfolios SET risk_config = ?, updated_at = ? "
+            "WHERE id = ?",
+            (json.dumps(merged),
+             datetime.now(timezone.utc).isoformat(), pf["id"]))
+        conn.commit()
+        return merged
+    finally:
+        conn.close()
+
+
 def _active_portfolio(conn: sqlite3.Connection, name: str = "default") -> dict:
     """Fetch the active portfolio row or raise."""
     row = conn.execute(
@@ -1184,8 +1212,14 @@ Examples:
     )
     parser.add_argument("--action", required=True,
                         choices=["init", "buy", "sell", "close",
-                                 "portfolio", "trades", "snapshot"],
+                                 "portfolio", "trades", "snapshot",
+                                 "set-risk"],
                         help="Action to perform")
+    parser.add_argument("--risk", default=None,
+                        help='set-risk: JSON com overrides, ex.: '
+                             '\'{"max_position_pct": 0.20}\' — chaves '
+                             'válidas = DEFAULT_RISK; persiste na banca '
+                             'ativa de --name')
     parser.add_argument("--balance", type=float, default=DEFAULT_BALANCE,
                         help="Starting balance (init only)")
     parser.add_argument("--name", default="default",
@@ -1216,6 +1250,19 @@ Examples:
             else:
                 print(f"Portfolio '{result['name']}' initialized with "
                       f"${result['starting_balance']:,.2f}")
+
+        elif args.action == "set-risk":
+            if not args.risk:
+                raise ValueError(
+                    "set-risk exige --risk '<JSON>' (chaves: "
+                    + ", ".join(sorted(DEFAULT_RISK)) + ")")
+            merged = set_risk_config(args.name, json.loads(args.risk))
+            if args.json:
+                print(json.dumps(merged, indent=2))
+            else:
+                print(f"Risk config da banca '{args.name}' atualizado:")
+                for k in sorted(merged):
+                    print(f"  {k}: {merged[k]}")
 
         elif args.action in ("buy", "sell"):
             if not args.token:
@@ -1355,6 +1402,46 @@ def _swap_test_db():
         global DB_DIR, DB_PATH
         DB_DIR, DB_PATH = old_dir, old_path
     return DB_PATH, restore
+
+
+def _test_set_risk():
+    """set-risk: merge persistido no risk_config da banca ativa, chaves
+    inválidas rejeitadas, outras bancas intocadas. Hermético."""
+    _, restore = _swap_test_db()
+    try:
+        init_portfolio(1000.0, "kalshi")
+        init_portfolio(1000.0, "default")
+        merged = set_risk_config("kalshi", {
+            "max_position_pct": 0.20, "max_single_market_pct": 0.40,
+            "daily_loss_limit_pct": 1.0, "human_approval_pct": 1.0})
+        assert merged["max_position_pct"] == 0.20, merged
+        assert merged["max_concurrent_positions"] == 50, merged  # herdado
+        conn = _get_db()
+        try:
+            kcfg = json.loads(conn.execute(
+                "SELECT risk_config FROM portfolios "
+                "WHERE name='kalshi' AND active=1").fetchone()[0])
+            dcfg = json.loads(conn.execute(
+                "SELECT risk_config FROM portfolios "
+                "WHERE name='default' AND active=1").fetchone()[0])
+        finally:
+            conn.close()
+        assert kcfg["daily_loss_limit_pct"] == 1.0, kcfg
+        assert kcfg["human_approval_pct"] == 1.0, kcfg
+        assert dcfg["max_position_pct"] == 0.10, dcfg
+        print("Test 1 PASS: merge persistido na banca kalshi ativa; "
+              "banca default intocada")
+
+        try:
+            set_risk_config("kalshi", {"chave_invalida": 1})
+            raise AssertionError("chave desconhecida deveria falhar")
+        except ValueError:
+            pass
+        print("Test 2 PASS: chave desconhecida rejeitada (ValueError)")
+
+        print("\nAll --test-set-risk PASS (2/2)")
+    finally:
+        restore()
 
 
 def _test_migration_positions():
@@ -1611,7 +1698,9 @@ def _test_external_venue():
 
 
 if __name__ == "__main__":
-    if "--test-migration-positions" in sys.argv:
+    if "--test-set-risk" in sys.argv:
+        _test_set_risk()
+    elif "--test-migration-positions" in sys.argv:
         _test_migration_positions()
     elif "--test-no-open-position" in sys.argv:
         _test_no_open_position()
