@@ -243,7 +243,10 @@ def log_event(event_type: str, payload: dict | None = None, level: str = "INFO")
            "payload": payload or {}, "actor": "judge"}
     line = json.dumps(rec, default=str, ensure_ascii=False)
     try:
-        with LOG_FILE.open("a") as f:
+        # encoding explícito: no Windows o default é cp1252, que não codifica
+        # Δ/°/— — o evento inteiro era perdido do JSONL com [log-error]
+        # 'charmap' (visto no smoke com threshold_proximity_override).
+        with LOG_FILE.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception as e:
         print(f"[log-error] {e}", file=sys.stderr, flush=True)
@@ -1783,12 +1786,25 @@ def _parse_scan_json(text: str) -> Optional[dict]:
     if blob is None:
         m = re.search(r"(\{[^{}]*\"catalyst_found\"[^{}]*\})", text, re.DOTALL)
         blob = m.group(1) if m else None
+
+    # Salvage de saída TRUNCADA: o scan roda com max_tokens curto
+    # (ANOMALY_SCAN_MAX_TOKENS) e às vezes estoura no meio do JSON — sem `}`
+    # nem fence de fechamento, as regex acima falham. O booleano é o sinal;
+    # extrai direto, com summary best-effort até onde o texto foi.
+    def _salvage() -> Optional[dict]:
+        mb = re.search(r'"catalyst_found"\s*:\s*(true|false)', text)
+        if not mb:
+            return None
+        ms = re.search(r'"summary"\s*:\s*"((?:[^"\\]|\\.)*)', text, re.DOTALL)
+        return {"catalyst_found": mb.group(1) == "true",
+                "summary": (ms.group(1) if ms else "")[:500]}
+
     if blob is None:
-        return None
+        return _salvage()
     try:
         obj = json.loads(blob)
     except json.JSONDecodeError:
-        return None
+        return _salvage()
     if not isinstance(obj, dict) or "catalyst_found" not in obj:
         return None
     return {"catalyst_found": bool(obj.get("catalyst_found")),
@@ -2125,13 +2141,20 @@ def main():
                                  "daily_budget_usd": DAILY_BUDGET_USD,
                                  "system_prompt_chars": len(system_prompt)})
 
+    # Throttle do warn de budget: sem isso o loop emitia um WARN idêntico a
+    # cada poll (2 min) até a virada do dia UTC — centenas de linhas de ruído
+    # (visto no smoke: ~220 warns em 7h). O sweep de SKIP continua a cada
+    # poll; só o log é espaçado.
+    last_budget_warn = float("-inf")
     while not _shutdown:
         try:
             spent = _spent_today()
             if spent >= DAILY_BUDGET_USD:
-                log_event("judge_budget_exceeded", {"spent_usd": spent,
-                                                     "cap": DAILY_BUDGET_USD},
-                          level="WARN")
+                if time.monotonic() - last_budget_warn >= 3600:
+                    last_budget_warn = time.monotonic()
+                    log_event("judge_budget_exceeded",
+                              {"spent_usd": spent, "cap": DAILY_BUDGET_USD},
+                              level="WARN")
                 # Skip remaining proposals for the day
                 with db.connect() as conn:
                     rows = db.query_pending_proposals(conn)
@@ -3062,7 +3085,20 @@ def _test_anomaly():
     assert _scan_outcome({"catalyst_found": False, "summary": "x"}) == "approve"
     print("Test 6 PASS: outcome None→unavailable, True→escalate, False→approve")
 
-    print("\nAll anomaly-scan tests PASS (6/6)")
+    # Saída TRUNCADA no max_tokens do scan (sem } nem fence de fechamento) —
+    # caso real do smoke (anomaly_scan_unparseable, entries 10 e 26): o
+    # booleano é salvo; summary vai até onde o texto foi.
+    r = _parse_scan_json('```json\n{"catalyst_found": true, "summary": '
+                         '"An active monsoon pattern is bringing daily')
+    assert r is not None and r["catalyst_found"] is True, r
+    assert r["summary"].startswith("An active monsoon"), r
+    r = _parse_scan_json('```json\n{"catalyst_found": false, "summary": "quiet')
+    assert r is not None and r["catalyst_found"] is False, r
+    assert _parse_scan_json('```json\n{"summary": "truncado sem o booleano') \
+        is None
+    print("Test 7 PASS: JSON truncado no max_tokens → salvage do booleano")
+
+    print("\nAll anomaly-scan tests PASS (7/7)")
 
 
 def _test_brightsky():

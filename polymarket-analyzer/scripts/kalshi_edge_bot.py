@@ -65,7 +65,7 @@ import sys
 import time
 from collections import defaultdict
 from dataclasses import asdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -261,6 +261,17 @@ def run_discovery_kalshi(args, kcities: dict) -> int:
             "SELECT market_slug, side FROM entries "
             "WHERE status IN ('PROPOSED','APPROVED','ADJUSTED')")}
         live_tokens = db.query_live_tokens(conn)
+        # Cooldown de re-proposta: REJECTED/SKIPPED saía do dedup e o mesmo
+        # (ticker, side) voltava a ser proposto no discovery seguinte — o
+        # judge re-julgava o MESMO mercado a cada hora (~$0.10/review) até
+        # estourar o budget diário (visto no smoke: 196 entries numa noite,
+        # $21 queimados nos mesmos ~10 mercados reciclados).
+        cooldown_h = float(getattr(args, "reproposal_cooldown_hours", 6))
+        cutoff = (datetime.now(timezone.utc) -
+                  timedelta(hours=cooldown_h)).isoformat()
+        cooled = {(r["market_slug"], r["side"]) for r in conn.execute(
+            "SELECT market_slug, side FROM entries "
+            "WHERE status IN ('REJECTED','SKIPPED') AND ts >= ?", (cutoff,))}
 
     forecast_cache: dict[str, dict] = {}
 
@@ -355,6 +366,9 @@ def run_discovery_kalshi(args, kcities: dict) -> int:
 
             if (ticker, side) in pending:
                 skipped["duplicate_pending"] += 1
+                continue
+            if (ticker, side) in cooled:
+                skipped["reproposal_cooldown"] += 1
                 continue
             if ticker in live_tokens:
                 skipped["duplicate_token_open"] += 1
@@ -1130,6 +1144,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--min-entry-price", type=float, default=0.30)
     ap.add_argument("--max-entry-price", type=float, default=0.85)
     ap.add_argument("--max-markets-per-series", type=int, default=50)
+    ap.add_argument("--reproposal-cooldown-hours", type=float, default=6,
+                    help="não re-propõe (ticker, side) REJECTED/SKIPPED há "
+                         "menos de N horas — sem isso o judge re-julga o "
+                         "mesmo mercado a cada ciclo de discovery")
     # Execute
     ap.add_argument("--execute-min-edge-pp", type=float, default=8,
                     help="edge mínimo LÍQUIDO de fee na execução (pp)")
@@ -1453,7 +1471,23 @@ def _test_discovery():
         assert n4 == 0, n4
         print("Test 3 PASS: dedup (ticker, side) pendente")
 
-        print("\nAll --test-discovery PASS (3/3)")
+        # Cooldown de re-proposta: REJECTED recente NÃO volta; REJECTED
+        # antigo (fora da janela) volta a ser proposto.
+        with db.connect() as conn:
+            conn.execute(
+                "UPDATE entries SET status = 'REJECTED'")
+        n5 = run_discovery_kalshi(args, _TEST_KCITIES)
+        assert n5 == 0, n5
+        old_ts = (datetime.now(timezone.utc) -
+                  timedelta(hours=7)).isoformat()
+        with db.connect() as conn:
+            conn.execute("UPDATE entries SET ts = ?", (old_ts,))
+        n6 = run_discovery_kalshi(args, _TEST_KCITIES)
+        assert n6 == 1, n6
+        print("Test 4 PASS: cooldown de re-proposta — REJECTED recente "
+              "bloqueia, REJECTED de 7h atrás (janela 6h) libera")
+
+        print("\nAll --test-discovery PASS (4/4)")
     finally:
         (kio.fetch_open_markets, kio.discover_weather_series,
          _web.fetch_forecast, _web._compute_mae_for_market) = saved
