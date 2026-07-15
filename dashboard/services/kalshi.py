@@ -80,8 +80,24 @@ def get_kpis() -> dict:
         positions_value = sum(
             float(p["shares"]) * float(p["current_price"] or p["avg_entry"])
             for p in rows)
-        open_count = len(rows)
+        bank_open_count = len(rows)
         total = cash + positions_value
+
+        # "Open Positions" conta as ENTRIES abertas do bot (kalshi_edge.db),
+        # a MESMA fonte da tabela logo abaixo — a banca paper pode descasar
+        # após um reset parcial (init da banca sem reset do DB, ou
+        # vice-versa), e mostrar a contagem da banca ao lado de uma tabela
+        # com outra contagem era pura confusão. O descasamento vira aviso
+        # explícito (bank_synced=False) em vez de números contraditórios.
+        open_count = bank_open_count
+        try:
+            wconn2 = _ro_conn(S.KALSHI_EDGE_DB)
+            try:
+                open_count = len(wdb.query_open_positions(wconn2))
+            finally:
+                wconn2.close()
+        except FileNotFoundError:
+            pass
 
         # Realizado hoje (UTC): cashouts + resoluções liquidadas hoje
         # (excluindo entries que já tiveram cashout — mesmo critério do
@@ -140,6 +156,8 @@ def get_kpis() -> dict:
                                           if delta_today is not None else None),
             "open_positions": open_count,
             "max_positions": max_pos,
+            "bank_open_count": bank_open_count,
+            "bank_synced": bank_open_count == open_count,
             "realized_pnl_today_usd": round(realized_today, 2),
             "drawdown_pct_from_peak": round(dd_pct, 2),
             "drawdown_peak_usd": round(peak, 2),

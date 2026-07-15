@@ -55,6 +55,10 @@ Optional:
   JUDGE_HTTP_TIMEOUT_SEC     (default 900; timeout explícito por request —
                               obrigatório com max_tokens alto, senão o SDK
                               exige streaming)
+  JUDGE_RULE6_DOWNSIZE_USD_KALSHI    (default 75; cap de ADJUST rule6 para
+                                      entries do piloto Kalshi)
+  JUDGE_RANGE_ADJUST_SIZE_USD_KALSHI (default 75; cap de ADJUST de range
+                                      calibration para o piloto Kalshi)
 """
 from __future__ import annotations
 
@@ -162,6 +166,23 @@ RANGE_ADJUST_SIZE_USD = float(os.environ.get("JUDGE_RANGE_ADJUST_SIZE_USD", "20.
 # disagrees). A trade the judge itself sees as -EV (judge_prob <= the side's
 # price) is still REJECTed — never trade without a quantifiable edge.
 RULE6_DOWNSIZE_USD = float(os.environ.get("JUDGE_RULE6_DOWNSIZE_USD", "10.0"))
+# Caps de ADJUST específicos do piloto Kalshi (operador, 2026-07-15 — §2.1
+# do CLAUDE.md): $75 nos dois mecanismos. A postura Polymarket (10/20)
+# fica intocada; a distinção é por venue da entry.
+RULE6_DOWNSIZE_USD_KALSHI = float(
+    os.environ.get("JUDGE_RULE6_DOWNSIZE_USD_KALSHI", "75.0"))
+RANGE_ADJUST_SIZE_USD_KALSHI = float(
+    os.environ.get("JUDGE_RANGE_ADJUST_SIZE_USD_KALSHI", "75.0"))
+
+
+def _adjust_caps_for(entry_row) -> tuple[float, float]:
+    """(cap_rule6, cap_range) da entry, por venue."""
+    try:
+        if _entry_venue(entry_row) == "kalshi":
+            return RULE6_DOWNSIZE_USD_KALSHI, RANGE_ADJUST_SIZE_USD_KALSHI
+    except Exception:
+        pass
+    return RULE6_DOWNSIZE_USD, RANGE_ADJUST_SIZE_USD
 
 # v13.2 (option B, 2026-07-01): CONDITIONAL judge gating. The LLM judge was a
 # universal per-trade gate, but forensics showed it is a *worse* forecaster
@@ -243,7 +264,10 @@ def log_event(event_type: str, payload: dict | None = None, level: str = "INFO")
            "payload": payload or {}, "actor": "judge"}
     line = json.dumps(rec, default=str, ensure_ascii=False)
     try:
-        with LOG_FILE.open("a") as f:
+        # encoding explícito: no Windows o default é cp1252, que não codifica
+        # Δ/°/— — o evento inteiro era perdido do JSONL com [log-error]
+        # 'charmap' (visto no smoke com threshold_proximity_override).
+        with LOG_FILE.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception as e:
         print(f"[log-error] {e}", file=sys.stderr, flush=True)
@@ -1783,12 +1807,25 @@ def _parse_scan_json(text: str) -> Optional[dict]:
     if blob is None:
         m = re.search(r"(\{[^{}]*\"catalyst_found\"[^{}]*\})", text, re.DOTALL)
         blob = m.group(1) if m else None
+
+    # Salvage de saída TRUNCADA: o scan roda com max_tokens curto
+    # (ANOMALY_SCAN_MAX_TOKENS) e às vezes estoura no meio do JSON — sem `}`
+    # nem fence de fechamento, as regex acima falham. O booleano é o sinal;
+    # extrai direto, com summary best-effort até onde o texto foi.
+    def _salvage() -> Optional[dict]:
+        mb = re.search(r'"catalyst_found"\s*:\s*(true|false)', text)
+        if not mb:
+            return None
+        ms = re.search(r'"summary"\s*:\s*"((?:[^"\\]|\\.)*)', text, re.DOTALL)
+        return {"catalyst_found": mb.group(1) == "true",
+                "summary": (ms.group(1) if ms else "")[:500]}
+
     if blob is None:
-        return None
+        return _salvage()
     try:
         obj = json.loads(blob)
     except json.JSONDecodeError:
-        return None
+        return _salvage()
     if not isinstance(obj, dict) or "catalyst_found" not in obj:
         return None
     return {"catalyst_found": bool(obj.get("catalyst_found")),
@@ -1936,9 +1973,10 @@ def apply_verdict(conn, entry_row, verdict: dict) -> None:
                         f"{entry_price:.2f} (bot {bot_prob:.2f})")
                     override_kind = "rule6_adjust_no_edge"
                 else:
+                    rule6_cap, _ = _adjust_caps_for(entry_row)
                     cur_cap = verdict.get("adjusted_size_usd")
-                    new_cap = (RULE6_DOWNSIZE_USD if not cur_cap
-                               else min(float(cur_cap), RULE6_DOWNSIZE_USD))
+                    new_cap = (rule6_cap if not cur_cap
+                               else min(float(cur_cap), rule6_cap))
                     verdict["adjusted_size_usd"] = new_cap
                     log_event("rule6_adjust_downsize", {
                         "entry_id": entry_row["entry_id"],
@@ -1995,9 +2033,10 @@ def apply_verdict(conn, entry_row, verdict: dict) -> None:
             if rc["near"]:
                 prev_verdict = verdict["verdict"]
                 verdict["verdict"] = "ADJUST"
+                _, range_cap = _adjust_caps_for(entry_row)
                 cur_cap = verdict.get("adjusted_size_usd")
-                new_cap = (RANGE_ADJUST_SIZE_USD if not cur_cap
-                           else min(float(cur_cap), RANGE_ADJUST_SIZE_USD))
+                new_cap = (range_cap if not cur_cap
+                           else min(float(cur_cap), range_cap))
                 verdict["adjusted_size_usd"] = new_cap
                 log_event("range_calibration_adjust", {
                     "entry_id": entry_row["entry_id"],
@@ -2125,13 +2164,20 @@ def main():
                                  "daily_budget_usd": DAILY_BUDGET_USD,
                                  "system_prompt_chars": len(system_prompt)})
 
+    # Throttle do warn de budget: sem isso o loop emitia um WARN idêntico a
+    # cada poll (2 min) até a virada do dia UTC — centenas de linhas de ruído
+    # (visto no smoke: ~220 warns em 7h). O sweep de SKIP continua a cada
+    # poll; só o log é espaçado.
+    last_budget_warn = float("-inf")
     while not _shutdown:
         try:
             spent = _spent_today()
             if spent >= DAILY_BUDGET_USD:
-                log_event("judge_budget_exceeded", {"spent_usd": spent,
-                                                     "cap": DAILY_BUDGET_USD},
-                          level="WARN")
+                if time.monotonic() - last_budget_warn >= 3600:
+                    last_budget_warn = time.monotonic()
+                    log_event("judge_budget_exceeded",
+                              {"spent_usd": spent, "cap": DAILY_BUDGET_USD},
+                              level="WARN")
                 # Skip remaining proposals for the day
                 with db.connect() as conn:
                     rows = db.query_pending_proposals(conn)
@@ -3062,7 +3108,20 @@ def _test_anomaly():
     assert _scan_outcome({"catalyst_found": False, "summary": "x"}) == "approve"
     print("Test 6 PASS: outcome None→unavailable, True→escalate, False→approve")
 
-    print("\nAll anomaly-scan tests PASS (6/6)")
+    # Saída TRUNCADA no max_tokens do scan (sem } nem fence de fechamento) —
+    # caso real do smoke (anomaly_scan_unparseable, entries 10 e 26): o
+    # booleano é salvo; summary vai até onde o texto foi.
+    r = _parse_scan_json('```json\n{"catalyst_found": true, "summary": '
+                         '"An active monsoon pattern is bringing daily')
+    assert r is not None and r["catalyst_found"] is True, r
+    assert r["summary"].startswith("An active monsoon"), r
+    r = _parse_scan_json('```json\n{"catalyst_found": false, "summary": "quiet')
+    assert r is not None and r["catalyst_found"] is False, r
+    assert _parse_scan_json('```json\n{"summary": "truncado sem o booleano') \
+        is None
+    print("Test 7 PASS: JSON truncado no max_tokens → salvage do booleano")
+
+    print("\nAll anomaly-scan tests PASS (7/7)")
 
 
 def _test_brightsky():
@@ -3653,7 +3712,22 @@ def _test_kalshi_route():
         print("Test 9 PASS: get_intraday_extremes — dia LOCAL (ontem 23h "
               "local excluído), C→F, fail-open em 500/tz inválida")
 
-        print("\nAll --test-kalshi-route PASS (9/9)")
+        # Test 10: caps de ADJUST por venue — kalshi usa os caps do piloto
+        # (75/75 default), Polymarket mantém 10/20; row quebrada fail-open.
+        kalshi_row = {"discovery_meta_json": json.dumps({"venue": "kalshi"}),
+                      "market_question": "q", "entry_id": 1}
+        poly_row = {"discovery_meta_json": "{}",
+                    "market_question": "q", "entry_id": 2}
+        assert mod._adjust_caps_for(kalshi_row) == \
+            (mod.RULE6_DOWNSIZE_USD_KALSHI, mod.RANGE_ADJUST_SIZE_USD_KALSHI)
+        assert mod._adjust_caps_for(poly_row) == \
+            (mod.RULE6_DOWNSIZE_USD, mod.RANGE_ADJUST_SIZE_USD)
+        assert mod._adjust_caps_for({}) == \
+            (mod.RULE6_DOWNSIZE_USD, mod.RANGE_ADJUST_SIZE_USD)
+        print("Test 10 PASS: caps de ADJUST venue-aware (kalshi 75/75, "
+              "polymarket 10/20, fail-open)")
+
+        print("\nAll --test-kalshi-route PASS (10/10)")
     finally:
         (helpers.parse_market, kio.fetch_orderbook, mod.JUDGE_AUTOROUTE,
          mod.get_nws_forecast, mod.get_brightsky_forecast,

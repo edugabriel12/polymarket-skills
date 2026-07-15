@@ -65,7 +65,7 @@ import sys
 import time
 from collections import defaultdict
 from dataclasses import asdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -261,6 +261,17 @@ def run_discovery_kalshi(args, kcities: dict) -> int:
             "SELECT market_slug, side FROM entries "
             "WHERE status IN ('PROPOSED','APPROVED','ADJUSTED')")}
         live_tokens = db.query_live_tokens(conn)
+        # Cooldown de re-proposta: REJECTED/SKIPPED saía do dedup e o mesmo
+        # (ticker, side) voltava a ser proposto no discovery seguinte — o
+        # judge re-julgava o MESMO mercado a cada hora (~$0.10/review) até
+        # estourar o budget diário (visto no smoke: 196 entries numa noite,
+        # $21 queimados nos mesmos ~10 mercados reciclados).
+        cooldown_h = float(getattr(args, "reproposal_cooldown_hours", 6))
+        cutoff = (datetime.now(timezone.utc) -
+                  timedelta(hours=cooldown_h)).isoformat()
+        cooled = {(r["market_slug"], r["side"]) for r in conn.execute(
+            "SELECT market_slug, side FROM entries "
+            "WHERE status IN ('REJECTED','SKIPPED') AND ts >= ?", (cutoff,))}
 
     forecast_cache: dict[str, dict] = {}
 
@@ -355,6 +366,9 @@ def run_discovery_kalshi(args, kcities: dict) -> int:
 
             if (ticker, side) in pending:
                 skipped["duplicate_pending"] += 1
+                continue
+            if (ticker, side) in cooled:
+                skipped["reproposal_cooldown"] += 1
                 continue
             if ticker in live_tokens:
                 skipped["duplicate_token_open"] += 1
@@ -512,6 +526,25 @@ def run_execute_kalshi(args) -> int:
             continue
 
         fill_price = float(sizing["avg_fill"])
+
+        # Banda de preço re-aplicada na EXECUÇÃO: a banda do discovery valeu
+        # para o preço de então. Se o mercado desabou até aqui (ex.: fill a
+        # $0.01 no dia da liquidação), o re-check de edge até MELHORA — mas o
+        # colapso significa que o mercado tem informação intraday que o
+        # ensemble não tem; comprar nesse momento é seleção adversa (smoke:
+        # entries 62/71 executaram a $0.01 e a 62 já liquidou em -100%).
+        # Skip PERMANENTE — com o cooldown de re-proposta, não ressuscita.
+        if not (float(args.min_entry_price) <= fill_price
+                <= float(args.max_entry_price)):
+            log_event("kalshi_execute_skipped", {
+                "entry_id": entry_id, "reason": "price_out_of_band",
+                "fill_price": round(fill_price, 4), "side": side,
+                "band": [args.min_entry_price, args.max_entry_price]})
+            with db.connect() as conn2:
+                db.update_entry_status(conn2, entry_id, "SKIPPED",
+                                       skip_reason="price_out_of_band")
+            continue
+
         forecast_prob = row["forecast_prob_at_entry"]
         if forecast_prob is not None and side != row["side"]:
             forecast_prob = 1.0 - float(forecast_prob)
@@ -571,9 +604,18 @@ def run_execute_kalshi(args) -> int:
             continue
         size_usd = round(contracts * fill_price, 4)
         if size_usd < args.min_trade_usd:
+            # SKIPPED permanente, não retry: a entry ficava APPROVED/ADJUSTED
+            # e era re-tentada a CADA loop (~1/min) — 5.9k eventos numa noite.
+            # Pior: cap de ADJUST $10 + mínimo $10 + floor de contratos é
+            # estruturalmente inexecutável (fills caem em $9.2-9.9), e o
+            # único "escape" era o preço desabar até caber — exatamente
+            # quando não se deve comprar (seleção adversa).
             log_event("kalshi_execute_skipped", {
                 "entry_id": entry_id, "reason": "size_below_min",
                 "size_usd": size_usd, "min_trade_usd": args.min_trade_usd})
+            with db.connect() as conn2:
+                db.update_entry_status(conn2, entry_id, "SKIPPED",
+                                       skip_reason="size_below_min")
             continue
 
         fee_rate = kio.kalshi_fee_rate(fill_price)
@@ -1130,23 +1172,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--min-entry-price", type=float, default=0.30)
     ap.add_argument("--max-entry-price", type=float, default=0.85)
     ap.add_argument("--max-markets-per-series", type=int, default=50)
+    ap.add_argument("--reproposal-cooldown-hours", type=float, default=6,
+                    help="não re-propõe (ticker, side) REJECTED/SKIPPED há "
+                         "menos de N horas — sem isso o judge re-julga o "
+                         "mesmo mercado a cada ciclo de discovery")
     # Execute
     ap.add_argument("--execute-min-edge-pp", type=float, default=8,
                     help="edge mínimo LÍQUIDO de fee na execução (pp)")
     ap.add_argument("--max-slippage", type=float, default=0.20)
-    ap.add_argument("--max-market-exposure-usd", type=float, default=50)
-    ap.add_argument("--max-event-exposure-usd", type=float, default=100,
+    # Limites do piloto Kalshi por decisão do operador (2026-07-15) —
+    # documentados no override da §2.1 do CLAUDE.md.
+    ap.add_argument("--max-market-exposure-usd", type=float, default=200)
+    ap.add_argument("--max-event-exposure-usd", type=float, default=400,
                     help="cap somado sobre todas as brackets de um mesmo "
                          "evento (mesma cidade+dia)")
-    ap.add_argument("--min-trade-usd", type=float, default=10,
-                    help="tamanho mínimo por trade (constituição §2)")
+    ap.add_argument("--min-trade-usd", type=float, default=50,
+                    help="tamanho mínimo por trade (override do operador; "
+                         "§2.1 do CLAUDE.md)")
     # Monitor
     ap.add_argument("--profit-lock-pp", type=float, default=50)
     ap.add_argument("--trailing-drawdown-pct", type=float, default=30)
     ap.add_argument("--convergence-pp", type=float, default=5)
     # Risk
     ap.add_argument("--max-drawdown-halt-pct", type=float, default=20)
-    ap.add_argument("--daily-loss-limit-pct", type=float, default=5)
+    # 100% = breaker diário efetivamente desativado por decisão do operador
+    # (equivale a $1000 na banca de $1000); o halt de drawdown 20% segue
+    # sendo o breaker real. Ver §2.1 do CLAUDE.md.
+    ap.add_argument("--daily-loss-limit-pct", type=float, default=100)
     # Forecast (consumidos por _compute_mae_for_market via getattr)
     ap.add_argument("--open-meteo", dest="open_meteo", action="store_true",
                     default=True)
@@ -1165,7 +1217,72 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="raio-X operacional: caminho do DB, entries por "
                          "status, posições abertas (mesma query do "
                          "dashboard) e banca paper — e sai")
+    ap.add_argument("--resync-bank", action="store_true",
+                    help="reconstrói a banca paper a partir das entries "
+                         "abertas do bot (re-abre posições faltantes ao "
+                         "preço de entrada; NUNCA fecha nada). Combine com "
+                         "--dry-run para só ver o plano. Usar após reset "
+                         "parcial (banca re-inicializada sem reset do DB)")
     return ap
+
+
+def run_resync_bank(args) -> int:
+    """Reconstrói a banca paper a partir das entries abertas do bot.
+
+    Aditivo e idempotente: re-abre na banca ATIVA as posições que existem
+    como entry EXECUTED (sem cashout/resolução) mas não existem na banca —
+    ao preço de entrada original, com a fee re-cobrada (aproximação
+    documentada). Nunca fecha nada: posições órfãs na banca (sem entry)
+    são apenas reportadas para fechamento manual.
+    """
+    db.init_db()
+    with db.connect() as conn:
+        open_rows = [dict(r) for r in db.query_open_positions(conn)]
+    try:
+        engine = _make_engine(args.portfolio)
+        pf = engine.get_portfolio(refresh_prices=False)
+    except Exception as e:
+        print(f"banca {args.portfolio!r} indisponível: {e}", file=sys.stderr)
+        return 1
+    bank_tokens = {p["token_id"] for p in (pf.get("positions") or [])}
+    entry_tokens = {r["token_id_yes"] for r in open_rows}
+    missing = [r for r in open_rows if r["token_id_yes"] not in bank_tokens]
+    orphans = sorted(bank_tokens - entry_tokens)
+    print(f"banca {args.portfolio!r}: {len(bank_tokens)} posição(ões) · "
+          f"bot: {len(open_rows)} entry(ies) aberta(s) · "
+          f"faltando na banca: {len(missing)} · órfãs na banca: {len(orphans)}")
+    for r in missing:
+        price = float(r["entry_price"] or 0)
+        shares = float(r["size_shares"] or 0)
+        if price <= 0 or shares <= 0:
+            print(f"  #{r['entry_id']} {r['market_slug']}: sem "
+                  f"price/shares válidos — pulando")
+            continue
+        # size = shares × preço (custo pré-fee): o engine recalcula
+        # shares = size/price e bate exato com a entry original.
+        size_usd = round(shares * price, 4)
+        label = (f"#{r['entry_id']} {r['market_slug']} {r['side']} "
+                 f"{shares:.0f}x @ {price} (${size_usd:.2f})")
+        if args.dry_run:
+            print(f"  re-abriria {label}")
+            continue
+        res = engine.open_position(
+            token_id=r["token_id_yes"], side=r["side"], size_usd=size_usd,
+            market_question=str(r["market_question"] or "")[:200],
+            fee_rate=kio.kalshi_fee_rate(price), price=price,
+            reasoning=f"resync-bank entry_id={r['entry_id']}")
+        ok = res.get("status") == "executed"
+        print(f"  re-aberta {label} → {res.get('status')}"
+              f"{'' if ok else ' (' + str(res.get('reason')) + ')'}")
+        log_event("kalshi_bank_resynced" if ok else "error",
+                  {"entry_id": r["entry_id"], "ticker": r["market_slug"],
+                   "size_usd": size_usd, "result": res.get("status"),
+                   "reason": res.get("reason")},
+                  level="INFO" if ok else "ERROR")
+    for t in orphans:
+        print(f"  órfã na banca (sem entry no bot): {t} — feche manualmente "
+              f"com close_position(force_exit_price=<resultado>)")
+    return 0
 
 
 def main() -> int:
@@ -1196,6 +1313,9 @@ def main() -> int:
                   "endpoint no navegador: "
                   f"{IEM_CLI_API}?station={icao}&date={d}")
         return 0
+
+    if args.resync_bank:
+        return run_resync_bank(args)
 
     if args.status:
         # Diagnóstico do descasamento clássico: "aberta" pode significar
@@ -1453,7 +1573,23 @@ def _test_discovery():
         assert n4 == 0, n4
         print("Test 3 PASS: dedup (ticker, side) pendente")
 
-        print("\nAll --test-discovery PASS (3/3)")
+        # Cooldown de re-proposta: REJECTED recente NÃO volta; REJECTED
+        # antigo (fora da janela) volta a ser proposto.
+        with db.connect() as conn:
+            conn.execute(
+                "UPDATE entries SET status = 'REJECTED'")
+        n5 = run_discovery_kalshi(args, _TEST_KCITIES)
+        assert n5 == 0, n5
+        old_ts = (datetime.now(timezone.utc) -
+                  timedelta(hours=7)).isoformat()
+        with db.connect() as conn:
+            conn.execute("UPDATE entries SET ts = ?", (old_ts,))
+        n6 = run_discovery_kalshi(args, _TEST_KCITIES)
+        assert n6 == 1, n6
+        print("Test 4 PASS: cooldown de re-proposta — REJECTED recente "
+              "bloqueia, REJECTED de 7h atrás (janela 6h) libera")
+
+        print("\nAll --test-discovery PASS (4/4)")
     finally:
         (kio.fetch_open_markets, kio.discover_weather_series,
          _web.fetch_forecast, _web._compute_mae_for_market) = saved
@@ -1576,7 +1712,48 @@ def _test_execute():
         assert abs(calls[0]["size_usd"] - 4.0) < 1e-6, calls[0]["size_usd"]
         print("Test 3 PASS: cap do judge ($4) → 10 contratos → $4.00")
 
-        print("\nAll --test-execute PASS (3/3)")
+        # Banda de preço na EXECUÇÃO: mercado desabou até fill 0.01 (caso
+        # real: entries 62/71 — seleção adversa no dia da liquidação).
+        # Edge re-check "melhora" (P 0.80 vs 0.01) mas a banda barra ANTES,
+        # e o skip é permanente (SKIPPED).
+        calls.clear()
+        with db.connect() as conn:
+            _wipe_entries(conn)
+            _seed_entry(conn, status="APPROVED", end_date=end_iso)
+        kio.fetch_orderbook = lambda tk: {
+            "orderbook": {"yes": [[0.005, 2000]], "no": [[0.99, 2000]]}}
+        n4 = run_execute_kalshi(args)
+        assert n4 == 0 and not calls, (n4, calls)
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT status, skip_reason FROM entries").fetchone()
+        assert row["status"] == "SKIPPED", row["status"]
+        assert row["skip_reason"] == "price_out_of_band", row["skip_reason"]
+        print("Test 4 PASS: fill 0.01 fora da banda [0.30, 0.85] → SKIPPED "
+              "permanente (sem seleção adversa)")
+
+        # size_below_min vira SKIPPED (não retry infinito): depth 30 @0.40 →
+        # $12 < min $13 → skip; segunda rodada não re-tenta.
+        calls.clear()
+        with db.connect() as conn:
+            _wipe_entries(conn)
+            _seed_entry(conn, status="APPROVED", end_date=end_iso)
+        kio.fetch_orderbook = lambda tk: {
+            "orderbook": {"yes": [[0.35, 100]], "no": [[0.60, 30]]}}
+        args5 = _mk_test_args(min_trade_usd=13.0, execute_min_edge_pp=8)
+        n5 = run_execute_kalshi(args5)
+        assert n5 == 0 and not calls, (n5, calls)
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT status, skip_reason FROM entries").fetchone()
+        assert row["status"] == "SKIPPED", row["status"]
+        assert row["skip_reason"] == "size_below_min", row["skip_reason"]
+        n5b = run_execute_kalshi(args5)
+        assert n5b == 0 and not calls, "SKIPPED não pode ser re-tentado"
+        print("Test 5 PASS: size $12 < min $13 → SKIPPED permanente, sem "
+              "loop de retry")
+
+        print("\nAll --test-execute PASS (5/5)")
     finally:
         kio.fetch_orderbook = saved_fetch_ob
         web._risk_block_reason = saved_risk
@@ -1932,6 +2109,66 @@ def _test_caution_cost():
         restore_db()
 
 
+def _test_resync():
+    """--resync-bank: re-abre só o que falta, respeita --dry-run, reporta
+    órfãs, nunca fecha nada. Hermético (FakeEngine + DB temporário)."""
+    g = globals()
+    tmp, restore_db = _swap_test_db()
+    saved_engine = g["_make_engine"]
+    opened = []
+
+    class FakeEngine:
+        def __init__(self, positions):
+            self._positions = positions
+        def open_position(self, **kw):
+            opened.append(kw)
+            return {"status": "executed", "cost_usd": kw["size_usd"],
+                    "shares_filled": kw["size_usd"] / kw["price"],
+                    "avg_price": kw["price"], "fee": 0.0}
+        def get_portfolio(self, refresh_prices=True):
+            return {"cash_balance": 1000.0, "positions": self._positions}
+
+    try:
+        end_iso = (datetime.now(timezone.utc) +
+                   timedelta(hours=6)).isoformat().replace("+00:00", "Z")
+        with db.connect() as conn:
+            _seed_entry(conn, status="EXECUTED", end_date=end_iso,
+                        ticker="KXHIGHNY-26JUL12-T87", entry_price=0.40,
+                        size_shares=30, size_usd=12.0)
+            _seed_entry(conn, status="EXECUTED", end_date=end_iso,
+                        ticker="KXHIGHTDAL-26JUL15-B91.5", entry_price=0.80,
+                        size_shares=25, size_usd=20.0)
+
+        # Banca tem só a Dallas + uma órfã que o bot não conhece.
+        bank = [{"token_id": "KXHIGHTDAL-26JUL15-B91.5"},
+                {"token_id": "KXHIGHTSEA-26JUL14-B86.5"}]
+        g["_make_engine"] = lambda portfolio: FakeEngine(bank)
+
+        # Test 1: dry-run não abre nada.
+        args = _mk_test_args(dry_run=True)
+        rc = run_resync_bank(args)
+        assert rc == 0 and not opened, (rc, opened)
+        print("Test 1 PASS: --dry-run só imprime o plano, não abre nada")
+
+        # Test 2: aplica — re-abre SÓ a NY (30 × 0.40 = $12), com price e
+        # fee_rate corretos; Dallas (já na banca) e a órfã ficam intactas.
+        args = _mk_test_args(dry_run=False)
+        rc = run_resync_bank(args)
+        assert rc == 0 and len(opened) == 1, (rc, opened)
+        kw = opened[0]
+        assert kw["token_id"] == "KXHIGHNY-26JUL12-T87", kw
+        assert abs(kw["size_usd"] - 12.0) < 1e-6, kw
+        assert kw["price"] == 0.40, kw
+        assert abs(kw["fee_rate"] - kio.kalshi_fee_rate(0.40)) < 1e-9, kw
+        print("Test 2 PASS: re-abre só a faltante (NY $12 @ 0.40), "
+              "banca existente e órfã intocadas")
+
+        print("\nAll --test-resync PASS (2/2)")
+    finally:
+        g["_make_engine"] = saved_engine
+        restore_db()
+
+
 def _test_logging():
     """Terminal ↔ JSONL: mkdir do --log-file em subdiretório novo +
     excepthook gravando crash no arquivo. Hermético (tmpdir, sem rede).
@@ -2008,5 +2245,8 @@ if __name__ == "__main__":
         sys.exit(0)
     if "--test-logging" in sys.argv:
         _test_logging()
+        sys.exit(0)
+    if "--test-resync" in sys.argv:
+        _test_resync()
         sys.exit(0)
     raise SystemExit(main())
